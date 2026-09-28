@@ -1,0 +1,752 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py i/src/tensorfold/families/glm5_next/cuda/batch.py
+index 7aae7e4..d4a61af 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ i/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -65,6 +65,24 @@ with a prompt in flight (running or admitted in the same round): sessions admitt
+ each other. Which side of a save decision a batcher is on is its role (``follow`` = rank 1), never ``g.rank``, as
+ for every other message of a round.
+ 
++Batched parallelism (patches/0200; each knob off by default, the ranks must agree):
++``GLM53_TF_BATCH_CAPTURE_AFTER=N`` captures a multi-sequence graph key on its N-th sighting (``batchplan.Sightings``;
++keys met once run eagerly through the same capturable code instead of paying a capture); ``GLM53_TF_BATCH_PAD=2,4,8``
++pads each slot's window to the next listed size with its last token (``_pad``: fewer keys; padded rows are verified
++like drafts that can never be accepted and ``commit`` gets the padded row count, so the kept bits are the unpadded
++window's); ``GLM53_TF_BATCH_SHORT=N`` gives every prompt with at most N tokens left its piece in the round it is
++admitted, several a round, outside the fair share (``batchplan.pick_pieces``); ``GLM53_TF_BATCH_PARITY_KEY=1`` puts
++each slot's KDA parity in the graph key instead of copying a state left in buffer 1 back to buffer 0 before every
++graphed round (71 MB a slot and round; every slot flips each round, so the keys only double: the graph bakes in
++``rec[cur]`` / ``rec[1 - cur]`` as the engine's own (rows, parity) graphs do). Each request's stats carry
++``round_kinds`` (alone / graph / eager / capture rounds, padded rows, and the wall ms of its verify rounds, of its
++own drafting, and of other requests' prefill pieces it waited through). ``GLM53_TF_BATCH_MTP=1`` drafts the MTP
++chains of all slots together (``MtpChains``: one head pass absorbs every slot's backlog, one pass per chained step
++over the slots still drafting; the head's weights read once a pass instead of once a slot).
++``GLM53_TF_BATCH_ROW_MS=F`` prices a row past the calibrated verify table at no less than F ms in the batch-aware
++cost-derived depths (``batchplan.verify_ms``; the table's flattening top alone, ~4.5 ms, drafts too deep at 3-4
++sequences where a row costs 6-10 ms).
++
+ Kept in step with ``forward.py``: ``compute_multi``'s layer loop, ``_kda`` and ``_dsa`` mirror ``forward.compute``,
+ ``kda_block`` and ``dsa_block`` (and ``latent``'s pieces); a change there must be made here too (the tests compare
+ batched rows with lone ones bit for bit).
+@@ -137,20 +155,30 @@ def _kda(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+ 
+ 
+ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[int], T: int,
+-         nchs: Sequence[int] | None, host_pos: Sequence[int] | None, npbs: Sequence[int] | None) -> torch.Tensor:
++         nchs: Sequence[int] | None, host_pos: Sequence[int] | None, npbs: Sequence[int] | None,
++         caches: Sequence[tuple] | None = None) -> torch.Tensor:
+     """``forward.dsa_block`` over T rows of several sequences: projections once, cache and attention per sequence.
+-    Per sequence: ``host_pos`` (eager), or ``npbs`` (capturable: 0 dense, else patches/0050's pool bucket)."""
++    Per sequence: ``host_pos`` (eager), or ``npbs`` (capturable: 0 dense, else patches/0050's pool bucket).
++    ``caches`` (patches/0200, the MTP head): per sequence (k cache, v cache, device position, indexer caches or
++    None) instead of the sequence's own layer caches."""
+ 
+     c = w.cfg
+     indexed = sts[0].index is not None
++
++    def cache(i: int, st: State) -> tuple:
++        if caches is not None:
++            return caches[i]
++        di = st.dsa_index[layer.index]
++        return st.kc[di], st.vc[di], st.pos_dev, st.index[di] if indexed else None
++
+     if latent.on(w):                     # GLM53_TF_LATENT_KV=1 (patches/0060): ``latent.dsa_block_latent`` per slot
+         latent._project(layer, w, b, T)
+         if indexed:
+             latent._index_proj(layer, w, b, T)
+         for i, (st, R, o) in enumerate(zip(sts, Rs, offs)):
+-            di = st.dsa_index[layer.index]
+-            latent._attend(layer, w, st.kc[di], st.pos_dev, b, o, R, nchs[i] if nchs is not None else None,
+-                           st.index[di] if indexed else None, host_pos[i] if host_pos is not None else None,
++            kc, _, pos_dev, index = cache(i, st)
++            latent._attend(layer, w, kc, pos_dev, b, o, R, nchs[i] if nchs is not None else None,
++                           index, host_pos[i] if host_pos is not None else None,
+                            (npbs[i] or None) if npbs is not None else None)
+         return latent._output(layer, w, b, T)
+     a = layer.dsa
+@@ -169,33 +197,32 @@ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+         glue.router(b.normed[:T], ix.gate, b.igr[:T])
+     scale = c.qk_dim ** -0.5
+     for i, (st, R, o) in enumerate(zip(sts, Rs, offs)):
+-        di = st.dsa_index[layer.index]
+-        kc, vc = st.kc[di], st.vc[di]
+-        kv_write(b.kn[o:o + R], b.vn[o:o + R], kc, vc, st.pos_dev)
++        kc, vc, pos_dev, index = cache(i, st)
++        kv_write(b.kn[o:o + R], b.vn[o:o + R], kc, vc, pos_dev)
+         hp = host_pos[i] if host_pos is not None else None
+         npb = (npbs[i] or None) if npbs is not None else None
+         sparse_rows = indexed and hp is not None and hp + R - 1 >= c.dense_limit
+         every_sparse = npb is not None or (sparse_rows and hp >= c.dense_limit)
+         sparse_rows = sparse_rows or npb is not None
+         if indexed:
+-            ik, ig, pk = st.index[di]
++            ik, ig, pk = index
+             sparse.index_update(b.ikr[o:o + R, :c.index_dim], b.igr[o:o + R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
+-                                st.pos_dev)
++                                pos_dev)
+         out = b.attn.out[o:o + R]
+         if not every_sparse:
+-            attention(b.q[o:o + R], kc, vc, st.pos_dev, b.attn, scale=scale,
++            attention(b.q[o:o + R], kc, vc, pos_dev, b.attn, scale=scale,
+                       nch=nchs[i] if nchs is not None else None, out=out)
+         if sparse_rows:
+             qmm.matmul(b.qr[o:o + R], ix.qb, b.xs_qr[o:o + R], out=b.qi[o:o + R], part=b.sk)
+             if npb is not None:
+                 tokens, counts = sparse.select_tokens_dev(b.qi[o:o + R], b.ikr[o:o + R, c.index_dim:], pk,
+-                                                          st.pos_dev, R, npb, b.lc)
++                                                          pos_dev, R, npb, b.lc)
+             else:
+                 np_max = pk.shape[0] - 2
+                 if w.meta.get("longctx_bound"):            # patches/0050: score only the pools that exist
+                     np_max = sparse.pool_bucket(hp + R, np_max)
+                 tokens, counts = sparse.select_tokens(b.qi[o:o + R], b.ikr[o:o + R, c.index_dim:], pk, hp, R,
+-                                                      np_max, st.pos_dev)
++                                                      np_max, pos_dev)
+             lc = b.lc if npb is not None or w.meta.get("longctx_bound") else None
+             sparse.sparse_attention(b.q[o:o + R], kc, vc, tokens, counts, out, scale, lc)
+     o_all = b.attn.out[:T].view(T, HL * c.v_dim)
+@@ -291,6 +318,220 @@ def sample_multi(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Sequen
+     return out
+ 
+ 
++# -- patches/0200: MTP drafts of several slots in one pass --------------------------------------------------------------
++def sample_drafts(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Any, bool]]) -> list[tuple[int, float | None]]:
++    """``decode.sample_rows`` for one row each of several sequences' draft logits (specs: (row, position, sampling,
++    with probability)) with ONE all-gather: per row the same candidates (top-k, or 20 + MARGIN for a greedy draft
++    whose probability is wanted), the same draw and ``_probability``. -> [(token, probability or None)]."""
++
++    from .decode import _probability
++
++    parts, ks = [], []
++    V = logits.shape[1]
++    for row, _, sampling, want in specs:
++        greedy = sampling is None or sampling.temperature <= 0
++        k = 1 if greedy else min(V, int(sampling.top_k) + MARGIN)
++        if want and greedy:
++            k = min(V, 20 + MARGIN)
++        vals, ids = torch.topk(logits[row:row + 1].float(), k, dim=-1)
++        ids = (ids + w.vocab_offset).to(torch.int32)
++        parts.append(torch.cat([vals, ids.view(torch.float32)], dim=1).reshape(-1))
++        ks.append(k)
++    flat = torch.cat(parts).contiguous()
++    if w.comm is None:
++        world = 1
++        got = flat.view(1, -1).cpu()
++    else:
++        world = w.world
++        buf = torch.empty((world * flat.numel(),), dtype=torch.float32, device=logits.device)
++        w.comm.all_gather(flat, buf)
++        got = buf.view(world, -1).cpu()
++    out, at = [], 0
++    for (row, pos, sampling, want), k in zip(specs, ks):
++        seg = got[:, at:at + 2 * k].reshape(world, 1, 2 * k)
++        at += 2 * k
++        values = torch.cat([seg[r, :, :k] for r in range(world)], dim=1).numpy().astype(np.float32)
++        tokens = torch.cat([seg[r, :, k:].contiguous().view(torch.int32) for r in range(world)], dim=1).numpy()
++        tokens = tokens.astype(np.int64)
++        if sampling is None or sampling.temperature <= 0:
++            order = np.lexsort((tokens, -values), axis=-1)
++            chosen = [int(tokens[0, order[0, 0]])]
++        else:
++            chosen = choose_rows(values, tokens, [pos], sampling)
++        out.append((int(chosen[0]), _probability(values, tokens, chosen, sampling)[0] if want else None))
++    return out
++
++
++def mtp_multi(w, sts: Sequence[State], b, tokens: Sequence[Sequence[int]], hidden: Sequence[torch.Tensor]) -> torch.Tensor:
++    """``mtp.mtp_stage`` + ``mtp_compute`` (eager, last row of each sequence) for several sequences' MTP rows in ONE
++    head pass: sequence i's rows (``hidden[i]`` [n_i, D], the tokens after them) at its head-cache slots mtp_len..;
++    the head's weights (its half of the vocabulary head, the MoE layer) are read once for all of them. Row-local
++    kernels over all rows; the DSA cache write and attention per sequence on its own head cache (``_dsa`` with
++    ``caches``). -> logits [N, draft_n] (row i: sequence i's last row), the head's output rows in b.fnormed[:N] (the
++    chained drafts' hidden). The caller advances each ``mtp_len``."""
++
++    from .attention import CHUNK
++    from .forward import _join
++
++    c = w.cfg
++    m = w.mtp
++    D = c.hidden
++    ns = [len(t) for t in tokens]
++    offs = _starts(ns)
++    T = sum(ns)
++    N = len(sts)
++    if T > b.rows:
++        raise ValueError(f"MTP rows of {N} sequences: {T}, the head's buffers hold {b.rows}")
++    for st, n in zip(sts, ns):
++        check_room(w, st, n, pos=st.mtp_len)
++    zero = [o for st, o in zip(sts, offs) if st.mtp_len == 0]      # ``mtp_stage``'s zero_first, per sequence
++    b.staged.synchronize()
++    b.ids_host[:T].numpy()[:] = [int(t) for tt in tokens for t in tt]
++    b.ids[:T].copy_(b.ids_host[:T], non_blocking=True)
++    for h, o, n in zip(hidden, offs, ns):
++        if h.data_ptr() != b.hin[o:o + n].data_ptr():
++            b.hin[o:o + n].copy_(h)
++    b.staged.record()
++    glue.embed(b.ids[:T], w.embed, D, 1, b.me[:T])
++    for o in zero:
++        b.me[o].zero_()
++    glue.rmsnorm(b.me[:T], m.enorm, c.eps, b.mcat[:T, :D])
++    glue.rmsnorm(b.hin[:T], m.hnorm, c.eps, b.mcat[:T, D:])
++    qmm.matmul(b.mcat[:T], m.eh, qmm.group_sums(b.mcat[:T], b.mxs[:T]), out=b.mx[:T], part=b.sk)
++    layer = m.layer
++    glue.rmsnorm(b.mx[:T], layer.in_norm, c.eps, b.normed[:T], b.xs[:T])
++    b.site = ("mtp", "a")
++    caches = [(st.mtp_kc, st.mtp_vc, st.mtp_pos_dev, st.index[-1] if st.index is not None else None) for st in sts]
++    g = _dsa(layer, w, sts, b, ns, offs, T, [-(-(st.mtp_len + n) // CHUNK) for st, n in zip(sts, ns)],
++             [st.mtp_len for st in sts], None, caches=caches)
++    glue.residual_add(b.mx[:T], b.mx[:T], g)
++    glue.rmsnorm(b.mx[:T], layer.post_norm, c.eps, b.normed[:T], b.xs[:T])
++    b.site = ("mtp", "f")
++    g = moe_block(layer, w, b, T)
++    glue.residual_add(b.mx[:T], b.mx[:T], g)
++    for i, (o, n) in enumerate(zip(offs, ns)):                     # each sequence's last row, as ``last_only``
++        glue.rmsnorm(b.mx[o + n - 1:o + n], m.norm, c.eps, b.fnormed[i:i + 1], b.fxs[i:i + 1])
++    head = w.draft_head if w.draft_head is not None else w.head
++    out = qmm.matmul(b.fnormed[:N], head, b.fxs[:N], out=b.logits[:N, :w.head.n], part=b.sk)
++    _join(w)
++    return out
++
++
++class MtpChains:
++    """patches/0200 (GLM53_TF_BATCH_MTP=1): the MTP drafts of every slot whose next window is an MTP one, chained
++    together: one head pass absorbs every slot's backlog, then one head pass per chained step over the slots still
++    drafting. Each slot's chain follows ``decode.draft`` step for step (its own sampling, confidence or cost-depth
++    stop, positions, head cache), and each row is the bits of the slot's own head pass (row-local kernels, attention
++    per slot), so the drafts are those the slot would draft alone. Drafts only propose: replies never depend on them."""
++
++    def __init__(self) -> None:
++        self.items: list[SimpleNamespace] = []
++
++    def add(self, stepper: "Stepper", st: State, backlog: int, depth: int) -> None:
++        self.items.append(SimpleNamespace(stepper=stepper, st=st, backlog=backlog, depth=depth))
++
++    def _alone(self, bat: "Batcher", it) -> None:
++        from .decode import draft
++
++        q = it.stepper
++        with bat._on(q.slot) as e:
++            drafts = draft(e, q.m_rows[:it.backlog], q.m_next, e.st.pos + 1, it.depth, q.job.sampling,
++                           q.m_policy.confidence, opt=q.opt)
++        self._done(it, drafts)
++
++    @staticmethod
++    def _done(it, drafts: list[int]) -> None:
++        q = it.stepper
++        q.arm, q.drafts, q.steps, q.backlog = "m", list(drafts), 1 + it.st.mtp_drafted, it.backlog
++        q.m_next = []
++
++    def run(self, bat: "Batcher") -> bool:
++        """Draft every added chain. -> whether they ran together (else each alone)."""
++
++        items = self.items
++        self.items = []
++        if not items:
++            return False
++        e = bat.g.e
++        w, b = e.w, e.mbuf
++        if len(items) < 2 or sum(it.backlog for it in items) > b.rows:
++            for it in items:                        # one slot (its own head graphs), or more rows than the buffers
++                self._alone(bat, it)
++            return False
++        for it in items:                            # ``decode.absorb``: the chained entries of the last round go
++            st = it.st
++            if st.mtp_drafted:
++                st.set_mtp_len(st.mtp_len - st.mtp_drafted)
++                st.mtp_drafted = 0
++            it.n, it.j, it.chain, it.drafts, it.pos = len(it.stepper.m_next), 0, 1.0, [], st.pos + 1
++            it.opt = it.stepper.opt
++            it.conf = it.stepper.m_policy.confidence
++            if it.opt is not None:
++                it.opt.mtp_begin()
++        sts = [it.st for it in items]
++        logits = mtp_multi(w, sts, b, [it.stepper.m_next for it in items],
++                           [it.stepper.m_rows[:it.backlog] for it in items])[:, :e.draft_n]
++        for it in items:
++            it.st.set_mtp_len(it.st.mtp_len + it.n)
++        live = list(range(len(items)))              # items still drafting, in the order of the logits rows
++        from .decode import Engine
++
++        # the engine samples with ``sample_rows`` (not a stand-in): every live row's draft in one all-gather
++        one_gather = type(e).sample is Engine.sample and "sample" not in vars(e)
++        while live:
++            step = []                               # (item, draft) that take one more head step
++            if one_gather:
++                drawn = sample_drafts(w, logits, [(r, items[i].pos + items[i].j, items[i].stepper.job.sampling,
++                                                   items[i].opt is not None or items[i].conf > 0)
++                                                  for r, i in enumerate(live)])
++            for r, i in enumerate(live):
++                it = items[i]
++                q = it.stepper
++                want = it.opt is not None or it.conf > 0
++                probs: list[float] = []
++                if one_gather:
++                    d, p = drawn[r]
++                    if want:
++                        probs.append(p)
++                else:
++                    d = e.sample(logits[r:r + 1], [it.pos + it.j], q.job.sampling, draft=True,
++                                 probs=probs if want else None)[0]
++                if it.opt is not None:              # ``decode.draft`` with ``opt`` (patches/0071)
++                    take, more = it.opt.mtp_next(it.j, probs[0], it.depth)
++                    if not take:
++                        continue
++                    it.drafts.append(d)
++                    if more:
++                        step.append((i, d, r))
++                    continue
++                if it.conf > 0 and it.j > 0 and it.chain * probs[0] < it.conf:
++                    continue
++                it.drafts.append(d)
++                if it.conf > 0:
++                    it.chain *= probs[0]
++                    if it.chain < it.conf:
++                        continue
++                if it.j + 1 < it.depth:
++                    step.append((i, d, r))
++            if not step:
++                break
++            # the head's output rows of this pass feed the next (``Engine.draft_hidden``); copied out first, the
++            # pass overwrites b.fnormed
++            prev = [b.fnormed[r:r + 1].clone() for _, _, r in step]
++            logits = mtp_multi(w, [items[i].st for i, _, _ in step], b, [[d] for _, d, _ in step], prev)[:, :e.draft_n]
++            live = []
++            for i, _, _ in step:
++                it = items[i]
++                it.st.set_mtp_len(it.st.mtp_len + 1)
++                it.st.mtp_drafted += 1
++                it.j += 1
++                if it.j < it.depth:                 # ``for j in range(count)``: the chain ends at count
++                    live.append(i)
++        for it in items:
++            self._done(it, it.drafts)
++        return True
++
++
+ # -- per-slot DFlash2 contexts --------------------------------------------------------------------------------------
+ def _drafter_view(d):
+     """The DFlash2 drafter with its own context: the weights and per-pass buffers shared with ``d`` (one pass runs at
+@@ -410,8 +651,9 @@ class Stepper:
+     def done(self, eos) -> bool:
+         return len(self.out) >= self.job.max_tokens or (self.job.stop_eos and self.out[-1] in eos)
+ 
+-    def propose(self, e) -> None:
+-        """The next window's drafts (``e``: the engine on this slot)."""
++    def propose(self, e, chains: "MtpChains | None" = None) -> None:
++        """The next window's drafts (``e``: the engine on this slot). ``chains`` (patches/0200): an MTP window's
++        chain is left to ``chains``, which drafts every slot's MTP chain together (after this call returns)."""
+ 
+         from .decode import draft
+ 
+@@ -428,6 +670,10 @@ class Stepper:
+         elif arm == "m":
+             backlog = len(self.m_next)
+             depth = max(1, min(self.m_policy.next(*self.last["m"]) if self.opt is None else self.opt.most_m, room))
++            if chains is not None:
++                self.arm, self.drafts, self.steps, self.backlog = "m", [], 0, backlog
++                chains.add(self, st, backlog, depth)
++                return
+             drafts = draft(e, self.m_rows[:backlog], self.m_next, st.pos + 1, depth, job.sampling,
+                            self.m_policy.confidence, opt=self.opt)
+             steps = 1 + st.mtp_drafted
+@@ -452,9 +698,10 @@ class Stepper:
+     def window(self) -> list[int]:
+         return [self.out[-1]] + self.drafts
+ 
+-    def accept(self, e, sampled: list[int], off: int, shared: bool) -> int:
++    def accept(self, e, sampled: list[int], off: int, shared: bool, rows: int | None = None) -> int:
+         """The round's sampled rows (this request's, at ``off`` of the forward): keep up to the first mismatch,
+-        commit, and hand the kept rows to the drafters' backlogs. -> rows kept."""
++        commit, and hand the kept rows to the drafters' backlogs. ``rows`` (patches/0200): the rows the forward ran
++        for this request when its window was padded (the padded rows are never kept). -> rows kept."""
+ 
+         from .decode import absorb
+ 
+@@ -467,7 +714,7 @@ class Stepper:
+             if sampled[i] != d or (job.stop_eos and sampled[i] in bat.eos):
+                 break
+             keep += 1
+-        commit(w, st, b, R, keep)
++        commit(w, st, b, max(R, int(rows or R)), keep)
+         if self.policy is not None:
+             if self.use_mtp:
+                 if len(self.m_next) + keep > BACKLOG:
+@@ -549,11 +796,17 @@ class Seq:
+     pieces: int = 0
+     emitted: int = 0                              # tokens produced by this run (a rerun re-produces the sent ones)
+     marks: tuple = ()                             # patches/0180: the session store's marks for this prompt
++    kinds: collections.Counter = field(default_factory=collections.Counter)   # patches/0200: its rounds by kind
+ 
+ 
+ class Batcher:
+     """Up to ``n`` concurrent requests on a ``GlmEngine`` (both ranks)."""
+ 
++    short = 0                                     # patches/0200 defaults (a batcher built without ``__init__``)
++    parity_key = False
++    batch_mtp = False
++    last_kind = "alone"
++
+     def __init__(self, g, n: int) -> None:
+         from .engine import GRAPH_ROWS, MAX_ROWS
+ 
+@@ -567,11 +820,24 @@ class Batcher:
+         self.max_graphs = _env_int("GLM53_TF_BATCH_MAX_GRAPHS", 256)
+         self.piece = _env_int("GLM53_TF_BATCH_PIECE", 2048)
+         self.use_graphs = e.graphs is not None and os.environ.get("GLM53_TF_BATCH_GRAPHS", "1").strip() != "0"
+-        both = g._gather_ints([n, int(self.use_graphs), self.graph_rows, self.max_graphs, self.piece])
++        # patches/0200 (each off by default): graph keys captured on their N-th sighting, windows padded to fewer
++        # graph keys, short prompts prefilled without waiting for the fair share
++        self.sightings = batchplan.Sightings(_env_int("GLM53_TF_BATCH_CAPTURE_AFTER", 1))
++        self.pad = batchplan.pad_mask(os.environ.get("GLM53_TF_BATCH_PAD", ""), MAX_ROWS)
++        self.short = max(0, _env_int("GLM53_TF_BATCH_SHORT", 0))
++        self.parity_key = _env_int("GLM53_TF_BATCH_PARITY_KEY", 0) == 1
++        self.batch_mtp = _env_int("GLM53_TF_BATCH_MTP", 0) == 1 and g.w.mtp is not None
++        self.row_ms = float(os.environ.get("GLM53_TF_BATCH_ROW_MS", "") or 0.0)
++        self.last_rows: list[int] = []                 # the rows each slot had in the last ``_forward`` (padded)
++        both = g._gather_ints([n, int(self.use_graphs), self.graph_rows, self.max_graphs, self.piece,
++                               self.sightings.after, self.pad, self.short, int(self.parity_key),
++                               int(self.batch_mtp), int(round(self.row_ms * 1000))])
+         if both[0] != both[1]:
+             raise RuntimeError(f"the two ranks were started with different batch settings: rank 0 {both[0]}, "
+                                f"rank 1 {both[1]} (GLM53_TF_BATCH, GLM53_TF_BATCH_GRAPHS, GLM53_TF_BATCH_GRAPH_ROWS, "
+-                               "GLM53_TF_BATCH_MAX_GRAPHS, GLM53_TF_BATCH_PIECE)")
++                               "GLM53_TF_BATCH_MAX_GRAPHS, GLM53_TF_BATCH_PIECE, GLM53_TF_BATCH_CAPTURE_AFTER, "
++                               "GLM53_TF_BATCH_PAD, GLM53_TF_BATCH_SHORT, GLM53_TF_BATCH_PARITY_KEY, "
++                               "GLM53_TF_BATCH_MTP, GLM53_TF_BATCH_ROW_MS)")
+         # rank 0 only: scheduling (its decisions travel in the round plans)
+         self.fair = batchplan.Fairness(float(os.environ.get("GLM53_TF_BATCH_PREFILL_SHARE", "") or 0.5))
+         # memory kept free: at load, for the slots (prefill transients, lazily captured graphs); at admission, while
+@@ -630,11 +896,12 @@ class Batcher:
+         self.round = 0
+         self.eos = tuple(w.cfg.eos)
+         self.costs = g.costs
+-        self.round_costs = batchplan.RoundCosts(self.costs)
++        self.round_costs = batchplan.RoundCosts(self.costs, self.row_ms)
+         self.defaults = g._knob_state()                            # the load-time knob values (rank 0's requests)
+         self.log: collections.deque = collections.deque(maxlen=256)    # finished requests (both ranks; tests)
+         self.trace: collections.deque = collections.deque(maxlen=4096)  # (round, pieces, verified slots)
+         self.last_piece_s = 0.0
++        self.last_kind = "alone"
+         if g.rank == 0 and torch.cuda.is_available():
+             torch.cuda.synchronize()
+             extra = (free0 - self._free()) / 2**30
+@@ -980,9 +1247,7 @@ class Batcher:
+                 decoding = True
+         for slot, cached, job in admits:
+             prefilling.append((slot, len(job.prompt) - cached, self.round + 1))
+-        pieces = []
+-        if prefilling and self.fair.allow(decoding):
+-            pieces = [batchplan.pick_piece(prefilling)]
++        pieces = batchplan.pick_pieces(prefilling, self.fair.allow(decoding), self.short) if prefilling else []
+         plan = batchplan.encode_plan(cancels, [(slot, cached, self._header(job)) for slot, cached, job in admits],
+                                      pieces)
+         self.g._share(plan)
+@@ -1066,10 +1331,13 @@ class Batcher:
+                 self._finish(s, cancelled=True)
+         for slot, cached, job in admits:
+             self._admit(slot, cached, job)
++        waiting = [q for q in self.seqs if q is not None and q.stepper is not None] if pieces else []
+         for s in pieces:
+             t0 = time.perf_counter()
+             self._piece(s)
+             self.last_piece_s += time.perf_counter() - t0
++        for q in waiting:                       # patches/0200: decode time lost to other requests' pieces
++            q.kinds["piece_ms"] += self.last_piece_s * 1e3
+         active = [s for s in range(self.n) if self.seqs[s] is not None and self.seqs[s].stepper is not None]
+         self.trace.append((self.round, tuple(pieces), tuple(active)))
+         if active:
+@@ -1205,25 +1473,55 @@ class Batcher:
+             return sparse.pool_bucket(st.pos + R, st.index[0][2].shape[0] - 2)
+         return None
+ 
++    def _pad(self, sts: Sequence[State], windows: list[list[int]], modes: list) -> tuple[list[list[int]], list]:
++        """patches/0200 (GLM53_TF_BATCH_PAD): each window padded up to the next listed size with its last token, where
++        that stays in the cache, in the slot's window rows and in the same context mode (``batchplan.padded``)."""
++
++        c = self.g.w.cfg
++        out_w, out_m = [], []
++        for st, win, m in zip(sts, windows, modes):
++            R = len(win)
++            Rp = batchplan.padded(R, self.pad)
++            if Rp > R and m is not None and Rp <= self.graph_rows and Rp <= st.proj.shape[1] \
++                    and st.pos + Rp <= st.capacity and (st.index is not None or st.pos + Rp <= c.dense_limit) \
++                    and self._mode(st, Rp) == m:
++                win = list(win) + [win[-1]] * (Rp - R)
++                self.counts["pad_rows"] += Rp - R
++            out_w.append(win)
++            out_m.append(m)
++        return out_w, out_m
++
+     def _forward(self, active: list[int], windows: list[list[int]]) -> torch.Tensor:
++        """One forward over the active slots' windows -> their logits rows. ``last_rows``: the rows each slot had in
++        it (its window's length, or more with GLM53_TF_BATCH_PAD: its rows start at the running sum of these)."""
++
+         g = self.g
+         e, w, b = g.e, g.w, g.e.buf
+         e.rows_from = None                      # patches/0082: rows come from the window buffers again
++        self.last_rows = [len(x) for x in windows]
+         if active == [0]:
+             with self._on(0):
+                 self.counts["alone"] += 1
++                self.last_kind = "alone"
+                 return e.forward(windows[0])    # the engine's own graphs
+         sts = [self.states[s] for s in active]
++        modes = [self._mode(st, len(x)) for st, x in zip(sts, windows)]
++        if self.pad and self.use_graphs and all(m is not None for m in modes):
++            windows, modes = self._pad(sts, windows, modes)
++        self.last_rows = [len(x) for x in windows]
+         T = stage_multi(w, sts, b, windows)
+         Rs = [len(x) for x in windows]
+-        modes = [self._mode(st, R) for st, R in zip(sts, Rs)]
+         if self.use_graphs and all(m is not None for m in modes) and max(Rs) <= self.graph_rows:
+-            for st in sts:
+-                self._parity0(st)
+-            key = (tuple(active), tuple(Rs), tuple(modes))
++            if self.parity_key:                 # patches/0200: the parities in the key, no state copies
++                key = (tuple(active), tuple(Rs), tuple(modes), tuple(st.cur[0] if st.cur else 0 for st in sts))
++            else:
++                for st in sts:
++                    self._parity0(st)
++                key = (tuple(active), tuple(Rs), tuple(modes))
+             graph = self.multi.get(key)
+             if graph is not None:
+                 self.counts["graph"] += 1
++                self.last_kind = "graph"
+                 graph.replay()
+                 return b.logits[:T]
+ 
+@@ -1232,7 +1530,10 @@ class Batcher:
+ 
+             run()                               # the round's result, through the code the graph holds
+             self.counts["eager"] += 1
+-            if len(self.multi) < self.max_graphs:
++            self.last_kind = "eager"
++            # patches/0200: a key is captured on its N-th sighting (GLM53_TF_BATCH_CAPTURE_AFTER; 1 = the first)
++            if len(self.multi) < self.max_graphs and self.sightings.capture(key):
++                self.last_kind = "capture"
+                 torch.cuda.synchronize()
+                 graph = torch.cuda.CUDAGraph()
+                 try:
+@@ -1248,6 +1549,7 @@ class Batcher:
+                     self.counts["capture"] += 1
+             return b.logits[:T]
+         self.counts["eager"] += 1
++        self.last_kind = "eager"
+         return compute_multi(w, sts, b, Rs, nchs=[chunks_for(st, R) for st, R in zip(sts, Rs)],
+                              host_pos=[st.pos for st in sts])
+ 
+@@ -1255,25 +1557,33 @@ class Batcher:
+         g = self.g
+         w = g.w
+         seqs = [self.seqs[s] for s in active]
++        t_round = time.perf_counter()
+         windows = [q.stepper.window() for q in seqs]
+-        parts = [q.stepper.part() for q in seqs]
++        self.last_rows = [len(x) for x in windows]
+         logits = self._forward(active, windows)
++        ran = list(self.last_rows)              # patches/0200: rows per slot in the forward (padded or not)
++        parts = [(a, n, st_, bl) for (a, _, st_, bl), n in zip((q.stepper.part() for q in seqs), ran)]
+         torch.cuda.synchronize()
+         specs, off = [], 0
+-        for s, q, win in zip(active, seqs, windows):
++        for s, q, win, n in zip(active, seqs, windows, ran):
+             pos = self.states[s].pos
+             specs.append((off, len(win), [pos + 1 + r for r in range(len(win))], q.job.sampling))
+-            off += len(win)
++            off += n
++            q.kinds[self.last_kind] += 1
++            q.kinds["pad_rows"] += n - len(win)
+         sampled = sample_multi(w, logits, specs)
+         shared = len(active) > 1
+         tokens = 0
+-        for s, q, (off, R, _, _), rows in zip(active, seqs, specs, sampled):
++        for s, q, (off, R, _, _), rows, n in zip(active, seqs, specs, sampled, ran):
+             with self._on(s) as e:
+-                keep = q.stepper.accept(e, rows, off, shared)
++                keep = q.stepper.accept(e, rows, off, shared, n) if n != R else q.stepper.accept(e, rows, off, shared)
+             tokens += keep
+             out = q.stepper.out
+             self._emit(q, rows[:keep][:max(0, q.job.max_tokens - (len(out) - keep))])
+         self.round_costs.record(parts, tokens)
++        verify_ms = (time.perf_counter() - t_round) * 1e3      # patches/0200: forward, sampling, accept, commit
++        for q in seqs:
++            q.kinds["verify_ms"] += verify_ms
+         going = []
+         for s, q in zip(active, seqs):
+             if q.stepper.done(self.eos):
+@@ -1281,13 +1591,26 @@ class Batcher:
+             else:
+                 going.append((s, q))
+         rows_of = {s: len(q.stepper.window()) for s, q in zip(active, seqs)}
++        # patches/0200 (GLM53_TF_BATCH_MTP=1): the MTP chains of all slots drafted together after the loop
++        chains = MtpChains() if self.batch_mtp and len(going) > 1 else None
+         for s, q in going:
+             st = q.stepper
+             if st.opt is not None:              # batch-aware depths: this request's rows come after the others'
+                 others = sum(r for o, r in rows_of.items() if o != s and self.seqs[o] is not None)
+                 st.opt.verify = self.round_costs.table(others)
++            t_draft = time.perf_counter()
+             with self._on(s) as e:
+-                st.propose(e)
++                st.propose(e, chains) if chains is not None else st.propose(e)
++            q.kinds["draft_ms"] += (time.perf_counter() - t_draft) * 1e3
++        if chains is not None and chains.items:
++            t_draft = time.perf_counter()
++            mine = [it.stepper for it in chains.items]
++            together = chains.run(self)
++            share = (time.perf_counter() - t_draft) * 1e3 / len(mine)
++            for s, q in going:
++                if q.stepper in mine:
++                    q.kinds["draft_ms"] += share
++                    q.kinds["mtp_batched"] += int(together)
+ 
+     def _finish(self, slot: int, *, cancelled: bool = False) -> None:
+         from .decode import take_snapshot
+@@ -1320,7 +1643,7 @@ class Batcher:
+             job.stats.update(decode_s=round(time.perf_counter() - st.start, 4), rounds=st.rounds,
+                              batched_rounds=st.shared, min_rows=1 + min(st.depths, default=0),
+                              tokens_per_round=round((len(tokens) - 1) / max(st.rounds, 1), 3), sha256=sha,
+-                             keeps=st.keeps, drafters="".join(st.arms))
++                             keeps=st.keeps, drafters="".join(st.arms), round_kinds={k: round(v, 1) for k, v in q.kinds.items()})
+         job.stats.update(cancelled=cancelled)
+         if self.store is not None:                  # patches/0180
+             job.stats["sessions"] = self.store.describe()
+diff --git c/src/tensorfold/families/glm5_next/cuda/batchplan.py i/src/tensorfold/families/glm5_next/cuda/batchplan.py
+index 45c4a06..b492f55 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batchplan.py
++++ i/src/tensorfold/families/glm5_next/cuda/batchplan.py
+@@ -9,7 +9,8 @@ as one int list before every round (``encode_plan`` / ``parse_plan``):
+ - cancels: slots whose request ends now (the client went away, or a background request steps aside);
+ - admits: queued requests placed in free slots, each with its request header (``encode_header``: sampling, stop,
+   max tokens, rank 0's cost-depth flag, its ``tf_knobs`` block and policy code, all resolved on rank 0);
+-- pieces: slots that prefill their next piece of prompt this round (at most one; ``Fairness``).
++- pieces: slots that prefill their next piece of prompt this round (at most one long one, ``Fairness``; with
++  patches/0200's GLM53_TF_BATCH_SHORT also every short prompt, ``pick_pieces``).
+ 
+ Everything else in a round (piece bounds, drafts, windows, sampling, keeps, when a request ends, the round's model
+ cost for batch-aware depths) is a function of shared inputs, computed alike on both ranks.
+@@ -177,6 +178,74 @@ def pick_piece(prefilling: Sequence[tuple[int, int, int]]) -> int | None:
+     return min(prefilling, key=lambda p: (p[1], p[2], p[0]))[0]
+ 
+ 
++def pick_pieces(prefilling: Sequence[tuple[int, int, int]], allow: bool, short: int = 0) -> list[int]:
++    """patches/0200 (GLM53_TF_BATCH_SHORT=N > 0): this round's pieces, from (slot, tokens left, admission order).
++    Every prompt with at most ``short`` tokens left prefills now, fewest left first, whether or not the fair share
++    allows a piece (its piece ends it: a few hundred ms of expert reads, where waiting a share for each of several
++    new prompts staggers their first tokens by seconds); then, when ``allow``, the next piece of the others
++    (``pick_piece``). short = 0: ``pick_piece`` alone (patches/0120)."""
++
++    if short <= 0:
++        one = pick_piece(prefilling) if allow else None
++        return [] if one is None else [one]
++    small = sorted((p for p in prefilling if p[1] <= short), key=lambda p: (p[1], p[2], p[0]))
++    out = [p[0] for p in small]
++    rest = [p for p in prefilling if p[1] > short]
++    if allow and rest:
++        out.append(pick_piece(rest))
++    return out
++
++
++# -- patches/0200: graph keys ---------------------------------------------------------------------------------------
++def pad_mask(spec: str, most: int) -> int:
++    """GLM53_TF_BATCH_PAD ("2,4,8" or "" / "0": off) as a bit mask of window sizes (bit r-1 for r rows, r <= most):
++    the int both ranks compare at load."""
++
++    mask = 0
++    for part in str(spec or "").replace(";", ",").split(","):
++        part = part.strip()
++        if not part or part == "0":
++            continue
++        r = int(part)
++        if not 1 <= r <= most:
++            raise ValueError(f"GLM53_TF_BATCH_PAD={spec!r}: window sizes are 1..{most}")
++        mask |= 1 << (r - 1)
++    return mask
++
++
++def padded(R: int, mask: int) -> int:
++    """A window of R rows padded up to the next size in ``mask`` (R itself when none is >= R or the mask is 0).
++    Padded rows repeat the window's last token; they are verified like drafts that can never be accepted (the accept
++    rule only reads the real drafts), so the committed rows and every kept bit are those of the unpadded window
++    (rows never depend on their window-mates). The point: fewer distinct (slots, rows) graph keys."""
++
++    r = int(R)
++    while mask and r <= mask.bit_length():
++        if mask >> (r - 1) & 1:
++            return r
++        r += 1
++    return int(R)
++
++
++class Sightings:
++    """patches/0200 (GLM53_TF_BATCH_CAPTURE_AFTER=N): a multi-sequence graph key is captured the N-th time it is met;
++    before that its rounds run eagerly through the same capturable code (the same bits). A capture costs a warm-up
++    forward, the capture itself and the graph's instantiation (tens of ms against a ~90 ms round), so keys met once
++    (most of them, with 2-4 slots of 1-8 rows each) no longer pay it. N = 1: every key on first sight (patches/0120).
++    Both ranks count the same keys in the same order (the rounds are the same)."""
++
++    def __init__(self, after: int = 1) -> None:
++        if int(after) < 1:
++            raise ValueError(f"GLM53_TF_BATCH_CAPTURE_AFTER={after}: expected >= 1")
++        self.after = int(after)
++        self.seen: dict = {}
++
++    def capture(self, key) -> bool:
++        n = self.seen.get(key, 0) + 1
++        self.seen[key] = n
++        return n >= self.after
++
++
+ # -- queue and placement -------------------------------------------------------------------------------------------
+ def admission_order(background: Sequence[bool]) -> list[int]:
+     """Queue indices in admission order: every foreground request in arrival order, then background ones."""
+@@ -223,9 +292,12 @@ def is_title_request(messages, tools) -> bool:
+ 
+ 
+ # -- the round's model cost (batch-aware draft depths) -------------------------------------------------------------
+-def verify_ms(table: Sequence[float], rows: int) -> float:
++def verify_ms(table: Sequence[float], rows: int, slope_min: float = 0.0) -> float:
+     """Model ms of a forward of ``rows`` rows from the calibrated window costs (1..len(table) rows), extended past
+-    the table along the slope of its upper half (rows of other sequences add experts as extra draft rows do)."""
++    the table along the slope of its upper half (rows of other sequences add experts as extra draft rows do), or
++    ``slope_min`` ms a row when that is more (patches/0200, GLM53_TF_BATCH_ROW_MS: rows of other sequences share
++    fewer experts than a sequence's own draft rows, so past the table a row costs about the curve's mean slope,
++    6-10 ms on two Sparks, not its flattening top)."""
+ 
+     table = list(table)
+     n = len(table)
+@@ -233,7 +305,7 @@ def verify_ms(table: Sequence[float], rows: int) -> float:
+         return float(table[max(rows, 1) - 1])
+     half = n // 2
+     slope = (table[-1] - table[half - 1]) / max(n - half, 1) if n >= 2 else 0.0
+-    return float(table[-1] + max(slope, 0.0) * (rows - n))
++    return float(table[-1] + max(slope, float(slope_min), 0.0) * (rows - n))
+ 
+ 
+ class RoundCosts:
+@@ -244,9 +316,10 @@ class RoundCosts:
+ 
+     WINDOW = 16
+ 
+-    def __init__(self, costs: dict) -> None:
++    def __init__(self, costs: dict, row_ms: float = 0.0) -> None:
+         self.costs = costs
+         self.verify = list(costs["verify"])
++        self.row_ms = float(row_ms)             # patches/0200: the slope floor past the table (0: 0120's model)
+         self.rounds: list[tuple[int, float]] = []
+         self.shared = False
+ 
+@@ -256,7 +329,7 @@ class RoundCosts:
+         from .lookup import round_ms
+ 
+         total = sum(r for _, r, _, _ in parts)
+-        ms = verify_ms(self.verify, total)
++        ms = verify_ms(self.verify, total, self.row_ms)
+         for arm, rows, steps, backlog in parts:
+             if arm in ("m", "f"):
+                 ms += round_ms(self.costs, arm, rows, steps, backlog) - round_ms(self.costs, "l", rows, 0, 0)
+@@ -279,4 +352,4 @@ class RoundCosts:
+ 
+         if others <= 0:
+             return list(self.verify)
+-        return [verify_ms(self.verify, others + k + 1) for k in range(len(self.verify))]
++        return [verify_ms(self.verify, others + k + 1, self.row_ms) for k in range(len(self.verify))]

@@ -1,0 +1,52 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/attention.py w/src/tensorfold/families/glm5_next/cuda/attention.py
+index 76b26e2..59134c7 100644
+--- i/src/tensorfold/families/glm5_next/cuda/attention.py
++++ w/src/tensorfold/families/glm5_next/cuda/attention.py
+@@ -108,7 +108,9 @@ def attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, pos
+ 
+     R, H, D = q.shape
+     nch = scratch.nch if nch is None else min(nch, scratch.nch)
+-    if R > BR * 8 or D not in (128, 256):
++    # any row count: the grid tiles rows by BR and each tile's rows are independent (longer prefill chunks,
++    # GLM53_TF_PREFILL_ROWS); the scratch is sized for the engine's largest window
++    if D not in (128, 256) or scratch.out.shape[0] < R:
+         raise ValueError("unsupported attention shape")
+     po = scratch.po[:nch * R * H * D]
+     pm = scratch.pm[:nch * R * H]
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index ca0d4a0..68358af 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -159,7 +159,12 @@ class GlmEngine:
+             from .dflash2 import Drafter
+ 
+             self.drafter = Drafter(drafter, w, capacity=capacity)
+-        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=64, graphs=True, graph_rows=GRAPH_ROWS,
++        # GLM53_TF_PREFILL_ROWS: rows a prefill chunk commits at once (upstream 64). Each chunk reads every weight
++        # once, so larger chunks prefill faster; rows never depend on their chunk-mates, so the committed state
++        # keeps the same bits. Costs about 5 MB of window buffers a row on an EXL3 checkpoint.
++        prefill_rows = int(os.environ.get("GLM53_TF_PREFILL_ROWS", "64"))
++        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
++                        graph_rows=GRAPH_ROWS,
+                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
+         if self.drafter is not None:
+             self.drafter.capture()
+diff --git i/src/tensorfold/families/glm5_next/cuda/qmm.py w/src/tensorfold/families/glm5_next/cuda/qmm.py
+index 8ec4859..970bd03 100644
+--- i/src/tensorfold/families/glm5_next/cuda/qmm.py
++++ w/src/tensorfold/families/glm5_next/cuda/qmm.py
+@@ -133,10 +133,13 @@ def split_k(n: int, k: int) -> int:
+ 
+ 
+ def bucket(m: int) -> int:
++    """Rows a program computes: windows of up to 128 rows in one tile, longer prefill chunks
++    (GLM53_TF_PREFILL_ROWS) in several 128-row tiles; a row's sums never depend on its tile."""
++
+     for b in (16, 32, 64, 128):
+         if m <= b:
+             return b
+-    raise ValueError(f"at most 128 rows, got {m}")
++    return 128
+ 
+ 
+ def gpi_for(per: int, want: int) -> int:

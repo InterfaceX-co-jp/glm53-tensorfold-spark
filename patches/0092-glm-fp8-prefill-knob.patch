@@ -1,0 +1,109 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index a90e2a3..00a1a50 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -318,8 +318,11 @@ class GlmEngine:
+         """A request's ``tf_knobs`` validated against this engine (ValueError says why not); rank 0."""
+ 
+         most = getattr(self.e, "prefill_max", self.e.rows)          # patches/0082: the lean set's rows, if any
++        from . import fp8pf
++
+         return knobs_mod.parse(raw, rows_max=most, batch=self.batch is not None,
+-                               longctx_ok=self.longctx_buffers or not self.long_context)
++                               longctx_ok=self.longctx_buffers or not self.long_context,
++                               fp8_ok=fp8pf.available())          # patches/0092
+ 
+     def _knob_state(self) -> dict[str, int]:
+         """This rank's current value of every knob in the header (the load-time defaults between requests)."""
+@@ -329,7 +332,8 @@ class GlmEngine:
+         return {"expert_loop": int(bool(exl3_mm.LOOP)), "prefill_rows": int(self.e.prefill_rows),
+                 "longctx_graphs": int(bool(self.e.longctx)), "profile": int(bool(profile.ON)),
+                 "auto_fdrafts": int(self.f_most), "calib_online": int(bool(self.calib_on)),
+-                "fast_prefill": int(bool(self.e.fast_prefill))}          # patches/0091
++                "fast_prefill": int(bool(self.e.fast_prefill)),          # patches/0091
++                "fp8_prefill": int(bool(getattr(self.e, "fp8_prefill", False)))}      # patches/0092
+ 
+     def _set_knobs(self, values: dict[str, int]) -> None:
+         """Set the knobs whose value differs from the current one (the others are left exactly as they are)."""
+@@ -359,6 +363,8 @@ class GlmEngine:
+             self.calib_on = bool(changed["calib_online"])
+         if "fast_prefill" in changed:           # patches/0091
+             self.e.fast_prefill = bool(changed["fast_prefill"])
++        if "fp8_prefill" in changed:            # patches/0092
++            self.e.fp8_prefill = bool(changed["fp8_prefill"])
+ 
+     def _knobs(self, values: dict[str, int]):
+         """Context: the request's knobs on this rank, then this rank's previous values again (also on errors)."""
+@@ -689,7 +695,7 @@ class GlmEngine:
+             self.online = OnlineCosts(self.base_costs["verify"])
+         stop_eos = bool(getattr(self.request, "stop_eos", True))
+         # patches/0091: a snapshot made by the request's own prefill mode (exact, or fast on the request's grid)
+-        grid = self._grid(bool(values["fast_prefill"]), values["prefill_rows"])
++        grid = self._grid(bool(values["fast_prefill"]), values["prefill_rows"], bool(values["fp8_prefill"]))
+         hit = self._resume(list(prompt), code, grid) if draft else None
+         # patches/0070: frozen for the request; patches/0090: only while its calib_online is on
+         table = self.online.table() if self.online is not None and values["calib_online"] else []
+diff --git a/src/tensorfold/families/glm5_next/cuda/knobs.py b/src/tensorfold/families/glm5_next/cuda/knobs.py
+index d7589a9..bd062ad 100644
+--- a/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ b/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -7,7 +7,8 @@ already proven exact (drafted == serial, chunk-size independence, bit-identical
+ depend on them. ``fast_prefill`` (patches/0091) runs the prompt through patches/0080's fast kernels: the request's
+ tokens then depend on it and on ``prefill_rows`` (its chunk grid, rounded down to a multiple of 64), while drafted
+ == serial and resumed == fresh still hold within the same setting (fast snapshots resume fast requests of the same
+-grid only).
++grid only). ``fp8_prefill`` (patches/0092) likewise changes a fast request's tokens (patches/0083's FP8 kernels);
++its snapshots are tagged C + 1 and resume FP8 fast requests of the same grid only.
+ 
+     key             values                   env default                    what it switches
+     lookup          0 | 1                    GLM53_TF_LOOKUP (1)            prompt-lookup drafts inside ``auto``
+@@ -23,6 +24,9 @@ grid only).
+     depth           "cost" | "threshold"     GLM53_TF_DEPTH (threshold)     plain ``auto``'s draft depths
+     fast_prefill    0 | 1                    GLM53_TF_FAST_PREFILL (0)      patches/0080's fast prefill (needs a
+                                                                             PREFILL_ROWS_MAX of at least 64)
++    fp8_prefill     0 | 1                    GLM53_TF_FP8_PREFILL (0)       patches/0083's FP8 kernels in fast
++                                                                            chunks (no effect with fast_prefill 0;
++                                                                            needs FP8 tensor cores)
+ 
+ Knobs fixed at load (``LOAD_ONLY``) are refused with the reason. Rank 0 validates a request's knobs
+ (``parse``), resolves every knob to the value the request runs with, and sends the integers rank 1 needs in the
+@@ -47,12 +51,14 @@ RANGES: dict[str, tuple[int, int | None]] = {
+     "longctx_graphs": (0, 1),
+     "profile": (0, 1),
+     "fast_prefill": (0, 1),              # patches/0091
++    "fp8_prefill": (0, 1),               # patches/0092
+ }
+ PER_REQUEST = tuple(RANGES) + ("depth",)
+ 
+ # the knobs rank 1 applies itself, in header order (lookup / lookup_min travel in the policy code, depth as
+ # patches/0071's cost flag, calib_online as rank 0's cost table)
+-HEADER = ("expert_loop", "prefill_rows", "longctx_graphs", "profile", "auto_fdrafts", "calib_online", "fast_prefill")
++HEADER = ("expert_loop", "prefill_rows", "longctx_graphs", "profile", "auto_fdrafts", "calib_online", "fast_prefill",
++          "fp8_prefill")
+ 
+ LOAD_ONLY: dict[str, str] = {
+     "nonexpert": "GLM53_TF_NONEXPERT is the stored weight format, quantized once at load",
+@@ -65,10 +71,12 @@ LOAD_ONLY: dict[str, str] = {
+ }
+ 
+ 
+-def parse(raw: Any, *, rows_max: int, longctx_ok: bool = True, batch: bool = False) -> dict[str, Any]:
++def parse(raw: Any, *, rows_max: int, longctx_ok: bool = True, batch: bool = False,
++          fp8_ok: bool = True) -> dict[str, Any]:
+     """A request's ``tf_knobs`` as {key: value} (only the keys it sets), or ValueError naming the problem.
+     ``rows_max``: the most prefill rows the buffers hold; ``longctx_ok``: long-context graphs can be turned on
+-    (the engine was loaded with GLM53_TF_LONGCTX_GRAPHS=1); ``batch``: the engine batches requests (no knobs)."""
++    (the engine was loaded with GLM53_TF_LONGCTX_GRAPHS=1); ``batch``: the engine batches requests (no knobs);
++    ``fp8_ok``: the FP8 prefill kernels can run here (patches/0092)."""
+ 
+     if raw is None:
+         return {}
+@@ -101,6 +109,8 @@ def parse(raw: Any, *, rows_max: int, longctx_ok: bool = True, batch: bool = Fal
+         if key == "fast_prefill" and value and rows_max < 64:          # patches/0091: the smallest chunk grid
+             raise ValueError(f"tf_knobs.fast_prefill=1: fast prefill chunks are multiples of 64 rows, the buffers hold "
+                              f"{rows_max} (GLM53_TF_PREFILL_ROWS_MAX at load)")
++        if key == "fp8_prefill" and value and not fp8_ok:              # patches/0092
++            raise ValueError("tf_knobs.fp8_prefill=1: this GPU / Triton has no FP8 (e4m3) tensor-core dots")
+         if key == "longctx_graphs" and value and not longctx_ok:
+             raise ValueError("tf_knobs.longctx_graphs=1: this engine was loaded with GLM53_TF_LONGCTX_GRAPHS=0 (no "
+                              "long-context graph buffers); load with the default 1 to switch it per request")

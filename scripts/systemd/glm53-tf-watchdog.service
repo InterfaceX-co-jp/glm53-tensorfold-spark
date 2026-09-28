@@ -1,0 +1,29 @@
+# One watchdog tick for the two TensorFold ranks (scripts/serve.sh watch --once). User unit on the head node:
+#
+#   cp scripts/systemd/glm53-tf-watchdog.{service,timer} ~/.config/systemd/user/
+#   $EDITOR ~/.config/systemd/user/glm53-tf-watchdog.service     # the repo path below
+#   loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload && systemctl --user enable --now glm53-tf-watchdog.timer
+#   journalctl --user -u glm53-tf-watchdog -f
+#
+# Stop the timer before A/B windows (systemctl --user stop glm53-tf-watchdog.timer): a deliberate `serve.sh stop` is
+# recognised (both containers absent), but a half-stopped pair during experiments is not.
+# Healing (stop + start of both ranks) is off unless WATCH_HEAL=1 is set here or in the config file.
+[Unit]
+Description=GLM-5.3 TensorFold watchdog tick
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+# edit: the checkout of this repo on the head node
+WorkingDirectory=%h/glm53-tensorfold-spark
+Environment=CONFIG=config/tensorfold.env
+# Environment=WATCH_HEAL=1
+# Environment=WATCH_ALERT=%h/bin/notify
+ExecStart=/usr/bin/env bash scripts/serve.sh watch --once
+# a failed tick (unhealthy) is logged, not a unit failure that trips start limits
+SuccessExitStatus=1
+# the heal runs `serve.sh restart` detached (setsid ... &); without this, systemd kills it with the rest of the
+# oneshot's cgroup the moment the tick exits (found in the 2026-09-28 heal test: heal.log empty, nothing restarted)
+KillMode=process
+TimeoutStartSec=300

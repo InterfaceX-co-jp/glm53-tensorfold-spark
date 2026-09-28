@@ -1,0 +1,530 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index d9b9845..d91df29 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -10,6 +10,7 @@ row's top candidates and draw with the same rule, so both ranks agree without a
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ from dataclasses import dataclass, field
+ from typing import Sequence
+@@ -88,6 +89,10 @@ class Engine:
+                  taps: tuple[int, ...] = ()) -> None:
+         self.w = w
+         w.meta["long_context"] = long_context
++        # patches/0050, GLM53_TF_LONGCTX_GRAPHS (default 1): past 2,051 tokens, score only the pools that exist and
++        # replay CUDA graphs per (rows, parity, pool bucket); 0 is upstream's path (eager, every pool scored)
++        self.longctx = long_context and os.environ.get("GLM53_TF_LONGCTX_GRAPHS", "1").strip() != "0"
++        w.meta["longctx_bound"] = self.longctx
+         rows = max(max_rows, prefill_rows)
+         self.rows = rows
+         self.prefill_rows = prefill_rows
+@@ -95,6 +100,14 @@ class Engine:
+         if taps:
+             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
+         self.mbuf = Buffers(w, rows, capacity) if w.mtp is not None else None
++        if self.longctx:
++            from .sparse import LongScratch
++
++            c = w.cfg
++            for bb in (self.buf, self.mbuf):
++                if bb is not None:
++                    bb.lc = LongScratch(max_rows, capacity, c.heads // w.world, c.qk_dim, w.device)
++        self.long_rows = tuple(range(1, max_rows + 1)) if self.longctx else ()
+         self.st = State(w, capacity, rows)
+         self.last_hidden: torch.Tensor | None = None
+         self.draft_n = w.head.n
+@@ -105,7 +118,7 @@ class Engine:
+         if graphs:
+             from .graphs import Graphs
+ 
+-            self.graphs = Graphs(self, graph_rows, graph_rows)
++            self.graphs = Graphs(self, graph_rows, graph_rows, self.long_rows)
+             self.reset()
+ 
+     def reset(self) -> None:
+@@ -120,8 +133,24 @@ class Engine:
+         if g is not None:
+             g.replay()
+             return self.buf.logits[:R]
++        npb = self._long_bucket(self.st.pos, R)
++        if npb is not None:                  # patches/0050: every row past 2050, a graph per pool bucket
++            w, st, b = self.w, self.st, self.buf
++            self.graphs.long_step(("main", R, st.parity, npb), lambda: compute(w, st, b, R, npb=npb))
++            return self.buf.logits[:R]
+         return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
+ 
++    def _long_bucket(self, pos: int, R: int) -> int | None:
++        """patches/0050: the pool bucket of a window at ``pos`` whose rows are all sparse (pos >= 2051), when a
++        long-context graph serves it; else None (eager)."""
++
++        g = self.graphs
++        if g is None or R not in g.long_rows or pos < self.w.cfg.dense_limit or self.st.index is None:
++            return None
++        from .sparse import pool_bucket
++
++        return pool_bucket(pos + R, self.st.index[0][2].shape[0] - 2)
++
+     def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor) -> torch.Tensor:
+         """The MTP head on rows (hidden, next token): logits of the last row [1, V/world]."""
+ 
+@@ -131,6 +160,11 @@ class Engine:
+         if g is not None:
+             g.replay()
+             return self.mbuf.logits[:1, :self.draft_n]
++        npb = None if self.mbuf.zero_first else self._long_bucket(self.st.mtp_len, n)
++        if npb is not None:                  # patches/0050
++            w, st, b = self.w, self.st, self.mbuf
++            self.graphs.long_step(("mtp", n, npb), lambda: mtp_compute(w, st, b, n, npb=npb))
++            return self.mbuf.logits[:1, :self.draft_n]
+         from .attention import CHUNK
+ 
+         return mtp_compute(self.w, self.st, self.mbuf, n, nch=-(-(self.st.mtp_len + n) // CHUNK),
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index f2f7c26..a4b4aa9 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -169,12 +169,13 @@ class GlmEngine:
+         self.comm.barrier()
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         self.f_most = auto_f_most()
+-        mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), self.f_most]
++        longctx = int(os.environ.get("GLM53_TF_LONGCTX_GRAPHS", "1").strip() != "0")      # patches/0050
++        mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), self.f_most, longctx]
+         both = self._gather_ints(mine)
+         if both[0] != both[1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts): "
+                                f"rank 0 {both[0]}, rank 1 {both[1]}; pull the draft model on both machines (or pass "
+-                               "--drafter none to both) and give both the same flags")
++                               "--drafter none to both) and give both the same flags (and GLM53_TF_LONGCTX_GRAPHS)")
+         w = load(model_dir, rank=rank)
+         w.comm = self.comm
+         self.comm.barrier()
+diff --git i/src/tensorfold/families/glm5_next/cuda/forward.py w/src/tensorfold/families/glm5_next/cuda/forward.py
+index 03bb25b..fbf8203 100644
+--- i/src/tensorfold/families/glm5_next/cuda/forward.py
++++ w/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -76,6 +76,7 @@ class Buffers:
+         self.ikr = torch.empty((rows, c.index_dim + c.index_heads), dtype=bf, device=dev)
+         self.igr = torch.empty((rows, c.index_dim), dtype=f32, device=dev)
+         self.qi = torch.empty((rows, c.index_heads * c.index_dim), dtype=bf, device=dev)
++        self.lc = None                   # patches/0050: sparse.LongScratch of the capturable long-context steps
+         # dense MLP
+         dl = c.dense_width // w.world
+         self.gu = torch.empty((rows, 2 * dl), dtype=bf, device=dev)
+@@ -272,10 +273,13 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+ 
+ 
+ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+-              R: int, nch: int | None, index=None, host_pos: int | None = None) -> torch.Tensor:
++              R: int, nch: int | None, index=None, host_pos: int | None = None,
++              npb: int | None = None) -> torch.Tensor:
+     """``pos_dev``: the committed length on the device; ``nch``: attention chunks to visit (None: the capacity's).
+     ``index``: this layer's indexer caches (long contexts): the window's index keys and pools are always written;
+-    rows past 2050 then attend to their top-512 pools (``host_pos`` given, eager only)."""
++    rows past 2050 then attend to their top-512 pools (``host_pos`` given, eager only). ``npb`` (patches/0050):
++    every row is past 2050 and has at most ``npb`` complete pools; the selection runs on the device over ``npb``
++    pools into ``b.lc`` (capturable, no host position)."""
+ 
+     c = w.cfg
+     a = layer.dsa
+@@ -290,6 +294,10 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+     if profile.ON:
+         profile.lap("dsa.proj")
+     sparse_rows = index is not None and host_pos is not None and host_pos + R - 1 >= c.dense_limit
++    if npb is not None and index is None:
++        raise ValueError("dsa_block: a long-context step needs the indexer caches")
++    every_sparse = npb is not None or (sparse_rows and host_pos >= c.dense_limit)
++    sparse_rows = sparse_rows or npb is not None
+     if index is not None:
+         ik, ig, pk = index
+         ix = a.index
+@@ -298,7 +306,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+         sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+         if profile.ON:
+             profile.lap("dsa.indexer")
+-    if sparse_rows and host_pos >= c.dense_limit:
++    if every_sparse:
+         o = b.attn.out[:R]                     # every row sparse: the dense pass is skipped
+     else:
+         o = attention(b.q[:R], kc, vc, pos_dev, b.attn, scale=c.qk_dim ** -0.5, nch=nch)
+@@ -306,11 +314,18 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+             profile.lap("dsa.attn")
+     if sparse_rows:
+         qmm.matmul(b.qr[:R], ix.qb, b.xs_qr[:R], out=b.qi[:R], part=b.sk)
+-        tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
+-                                              pk.shape[0] - 2, pos_dev)
++        if npb is not None:
++            tokens, counts = sparse.select_tokens_dev(b.qi[:R], b.ikr[:R, c.index_dim:], pk, pos_dev, R, npb, b.lc)
++        else:
++            # patches/0050 (GLM53_TF_LONGCTX_GRAPHS=1): score only the pools that exist (same selection)
++            np_max = pk.shape[0] - 2
++            if w.meta.get("longctx_bound"):
++                np_max = sparse.pool_bucket(host_pos + R, np_max)
++            tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R, np_max,
++                                                  pos_dev)
+         if profile.ON:
+             profile.lap("dsa.indexer")
+-        sparse.sparse_attention(b.q[:R], kc, vc, tokens, counts, o, c.qk_dim ** -0.5)
++        sparse.sparse_attention(b.q[:R], kc, vc, tokens, counts, o, c.qk_dim ** -0.5, b.lc)
+         if profile.ON:
+             profile.lap("dsa.sparse_attn")
+     o = o.view(R, HL * c.v_dim)
+@@ -372,7 +387,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+ 
+ 
+ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+-                  host_pos: int | None = None) -> None:
++                  host_pos: int | None = None, npb: int | None = None) -> None:
+     c = w.cfg
+     x = b.x[:R]
+     h = layer.attn_hc
+@@ -386,7 +401,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+     else:
+         di = st.dsa_index[layer.index]
+         g = dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
+-                      st.index[di] if st.index is not None else None, host_pos)
++                      st.index[di] if st.index is not None else None, host_pos, npb)
+     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+     h = layer.ffn_hc
+     glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+@@ -424,16 +439,17 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+ 
+ 
+ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
+-            host_pos: int | None = None):
++            host_pos: int | None = None, npb: int | None = None):
+     """The GPU work of a forward on staged rows (capturable: static buffers, device-side positions). ``host_pos``
+-    (eager calls): the committed length, which long contexts need to switch rows to sparse attention."""
++    (eager calls): the committed length, which long contexts need to switch rows to sparse attention. ``npb``
++    (patches/0050, capturable): every row is past 2050 with at most ``npb`` complete pools (``dsa_block``)."""
+ 
+     c = w.cfg
+     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
+     if profile.ON:
+         profile.lap("embed")
+     for layer in w.layers:
+-        layer_forward(layer, w, st, b, R, nch, host_pos)
++        layer_forward(layer, w, st, b, R, nch, host_pos, npb)
+         for slot in b.tap_at.get(layer.index, ()):
+             glue.stream_mean(b.x[:R], b.taps[slot][:R])
+     glue.stream_mean(b.x[:R], b.hidden[:R])
+diff --git i/src/tensorfold/families/glm5_next/cuda/graphs.py w/src/tensorfold/families/glm5_next/cuda/graphs.py
+index 63a5134..833626f 100644
+--- i/src/tensorfold/families/glm5_next/cuda/graphs.py
++++ w/src/tensorfold/families/glm5_next/cuda/graphs.py
+@@ -2,21 +2,35 @@
+ count for the MTP head. A captured step replays the eager kernels with their arguments (static buffers,
+ positions read on the device), so its bits equal the eager step's; attention visits every chunk the cache
+ can hold (empty chunks are skipped by the merge). Collectives (NCCL on the current stream) are captured too.
++
++patches/0050: past 2,051 tokens (every row of the window sparse) a step replays a graph per (rows, parity, pool
++bucket) for the model and per (rows, pool bucket) for the MTP head, captured the first time the key is met:
++that step runs eagerly through the same capturable code (``compute(..., npb=)``), which is the warm-up and the
++step's result (its writes are the replay's: uncommitted cache slots, the other KDA state buffer, static
++buffers), then the graph is captured for the next steps. Both ranks meet the same keys in the same order.
+ """
+ 
+ from __future__ import annotations
+ 
++import os
++import sys
++
+ import torch
+ 
++from . import profile
+ from .forward import compute
+ from .mtp import mtp_compute
+ 
+ 
+ class Graphs:
+-    def __init__(self, e, main_rows=(1, 2, 3, 4), mtp_rows=(1, 2, 3, 4)) -> None:
++    def __init__(self, e, main_rows=(1, 2, 3, 4), mtp_rows=(1, 2, 3, 4), long_rows=()) -> None:
+         self.pool = torch.cuda.graph_pool_handle()
+         self.main: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+         self.mtp: dict[int, torch.cuda.CUDAGraph] = {}
++        # patches/0050: long-context graphs, captured lazily; keys ("main", R, parity, npb) and ("mtp", n, npb)
++        self.long_rows = frozenset(long_rows)
++        self.long: dict[tuple, torch.cuda.CUDAGraph] = {}
++        self.long_max = int(os.environ.get("GLM53_TF_LONGCTX_MAX_GRAPHS", "256"))
+         w, st = e.w, e.st
+         saved = list(st.cur)
+         parities = (0, 1) if st.cur else (0,)
+@@ -43,3 +57,28 @@ class Graphs:
+                         mtp_compute(w, st, e.mbuf, n)
+                     self.mtp[n] = g
+         torch.cuda.synchronize()
++
++    def long_step(self, key: tuple, run) -> None:
++        """patches/0050: replay the long-context graph for ``key``; the first time, run the step eagerly (``run``,
++        the same capturable code) and capture it for the next ones. A failed capture turns the long graphs off
++        (the step's result is already in the buffers; later steps run eagerly, both ranks alike)."""
++
++        g = self.long.get(key)
++        if g is not None:
++            g.replay()
++            return
++        run()
++        if not self.long_rows or len(self.long) >= self.long_max or (profile.ON and profile.P.active):
++            return                           # (a profiled prefill's MTP absorb records timing events: no capture)
++        torch.cuda.synchronize()
++        g = torch.cuda.CUDAGraph()
++        try:
++            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
++                run()
++        except Exception as exc:  # noqa: BLE001 - any capture failure: keep serving eagerly
++            self.long_rows = frozenset()
++            print(f"[tensorfold] long-context CUDA graph capture failed ({type(exc).__name__}: {exc}); "
++                  "decoding past 2,051 tokens eagerly", file=sys.stderr, flush=True)
++            torch.cuda.synchronize()
++            return
++        self.long[key] = g
+diff --git i/src/tensorfold/families/glm5_next/cuda/mtp.py w/src/tensorfold/families/glm5_next/cuda/mtp.py
+index 11599d1..dc2d51e 100644
+--- i/src/tensorfold/families/glm5_next/cuda/mtp.py
++++ w/src/tensorfold/families/glm5_next/cuda/mtp.py
+@@ -41,8 +41,8 @@ def mtp_stage(w: Weights, st: State, b: Buffers, next_tokens: Sequence[int], hid
+ 
+ 
+ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool = True,
+-                nch: int | None = None, host_pos: int | None = None) -> torch.Tensor:
+-    """The MTP head's GPU work on staged rows (capturable)."""
++                nch: int | None = None, host_pos: int | None = None, npb: int | None = None) -> torch.Tensor:
++    """The MTP head's GPU work on staged rows (capturable; ``npb``: patches/0050's long-context step)."""
+ 
+     c = w.cfg
+     m = w.mtp
+@@ -59,7 +59,7 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool =
+         profile.lap("misc")
+     b.site = ("mtp", "a")
+     g = dsa_block(layer, w, st.mtp_kc, st.mtp_vc, st.mtp_pos_dev, b, n, nch,
+-                  st.index[-1] if st.index is not None else None, host_pos)
++                  st.index[-1] if st.index is not None else None, host_pos, npb)
+     glue.residual_add(b.mx[:n], b.mx[:n], g)
+     glue.rmsnorm(b.mx[:n], layer.post_norm, c.eps, b.normed[:n], b.xs[:n])
+     b.site = ("mtp", "f")
+diff --git i/src/tensorfold/families/glm5_next/cuda/sparse.py w/src/tensorfold/families/glm5_next/cuda/sparse.py
+index 25bfd31..4b94f82 100644
+--- i/src/tensorfold/families/glm5_next/cuda/sparse.py
++++ w/src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -16,6 +16,8 @@ ascending position, 512 at a time, and merges the chunks in order.
+ 
+ from __future__ import annotations
+ 
++import math
++
+ import torch
+ import triton
+ import triton.language as tl
+@@ -82,9 +84,14 @@ def index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln
+ 
+ 
+ @triton.jit
+-def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, H: tl.constexpr, D: tl.constexpr, BP: tl.constexpr):
++def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, H: tl.constexpr, D: tl.constexpr, BP: tl.constexpr,
++            NH: tl.constexpr = 32, WS: tl.constexpr = 1.0 / 5.656854249492381):
+     """Program (r, pool block): s_p = sum_h w_h relu(scale * qi_h . pool_p) for pools p ending at or before
+-    pos + r (-inf after)."""
++    pos + r (-inf after). patches/0050: ``NH`` the indexer's heads (rows of NH x D), ``H`` >= NH the tile's
++    (padded to 16 for tl.dot; the padded heads load 0 and weigh 0), ``WS`` = NH ** -0.5. GLM-5.3 (NH = H = 32)
++    runs upstream's code, the same bits. Upstream hard-coded 32 heads, so a checkpoint with fewer (the synthetic
++    test one) read past each row: other rows' and stale buffer values, which made a row's selection depend on
++    its window and on earlier steps, and out of bounds on long prefill chunks."""
+ 
+     r = tl.program_id(0)
+     pb = tl.program_id(1)
+@@ -93,15 +100,30 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, H: tl.constexpr, D: tl.
+     p = pb * BP + tl.arange(0, BP)
+     d = tl.arange(0, D)
+     hh = tl.arange(0, H)
+-    q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :]).to(tl.bfloat16)           # [H, D]
++    if NH == 32:                                                                      # GLM-5.3: upstream's code
++        q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :]).to(tl.bfloat16)       # [H, D]
++        w = tl.load(W + r * w_stride + hh).to(tl.float32) * (1.0 / 5.656854249492381)  # 32 ** -0.5
++    else:
++        hm = hh < NH
++        q = tl.load(QI + (r * NH + hh[:, None]) * D + d[None, :], mask=hm[:, None], other=0.0).to(tl.bfloat16)
++        w = tl.load(W + r * w_stride + hh, mask=hm, other=0.0).to(tl.float32) * WS
+     k = tl.load(PK + p[:, None] * D + d[None, :], mask=(p < npool)[:, None], other=0.0).to(tl.bfloat16)  # [BP, D]
+     dots = tl.dot(q, tl.trans(k))                                                     # [H, BP] fp32
+-    w = tl.load(W + r * w_stride + hh).to(tl.float32) * (1.0 / 5.656854249492381)     # 32 ** -0.5
+     s = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
+     s = tl.where(p < npool, s, float("-inf"))
+     tl.store(OUT + r * NP + p, s, mask=p < NP)
+ 
+ 
++def _heads(qi: torch.Tensor, wts: torch.Tensor) -> dict:
++    """patches/0050: ``_scores``' head arguments from the tensors (qi [R, NH x D], wts [R, NH])."""
++
++    nh = wts.shape[1]
++    d = qi.shape[1] // nh
++    if nh * d != qi.shape[1] or d != 128:
++        raise ValueError(f"select_tokens: index queries of {qi.shape[1]} for {nh} heads (128 wide expected)")
++    return dict(H=max(16, triton.next_power_of_2(nh)), D=d, NH=nh, WS=1.0 / math.sqrt(nh))
++
++
+ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
+                   pos_dev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+     """Each row's attended tokens: [R, 2051] int32 ascending (-1 padded) and how many, for rows past 2050."""
+@@ -109,8 +131,8 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
+     scores = torch.empty((R, np_max), dtype=torch.float32, device=qi.device)
+     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
+         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
+-    _scores[(R, triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, np_max, 128 ** -0.5, H=32,
+-                                         D=128, BP=64, num_warps=4)
++    _scores[(R, triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, np_max, 128 ** -0.5,
++                                         BP=64, num_warps=4, **_heads(qi, wts))
+     order = torch.sort(scores, dim=1, descending=True, stable=True).indices[:, :TOPK_POOLS]
+     pools = torch.sort(order, dim=1).values                                            # ascending pool index
+     width = TOPK_POOLS * POOL + POOL - 1
+@@ -131,6 +153,120 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
+     return tokens.contiguous(), counts
+ 
+ 
++# -- patches/0050: long-context decode (bounded scoring, a capturable selection) --------------------------------
++#
++# Scoring only the pools that can exist changes nothing: a row at position q sees npool = (q + 1) // 4 complete
++# pools and ``_scores`` gives every later pool -inf, so the pools past ``np`` >= max npool are -inf entries with
++# higher indices than every kept one. They rank after every kept pool in the stable descending order (score, then
++# lower index), and a row with more than 512 pools never reaches them: its top 512 (and so its tokens) are the
++# same. ``pool_bucket`` rounds that bound up to a power of two (at least 1024 pools, at most the capacity's), so a
++# CUDA graph captured for a bucket serves every position in it.
++
++MIN_BUCKET = 1024
++
++
++def pool_bucket(end: int, cap_pools: int) -> int:
++    """Pools to score for rows ending at position ``end - 1`` (max npool = end // 4): a power of two >= 1024,
++    capped at the cache's ``cap_pools``."""
++
++    need = end // POOL
++    if need > cap_pools:
++        raise ValueError(f"pool_bucket: {need} pools past the cache's {cap_pools}")
++    b = MIN_BUCKET
++    while b < need:
++        b *= 2
++    return min(b, cap_pools)
++
++
++@triton.jit
++def _keys(S, K, NP, BLOCK: tl.constexpr):
++    """Program (r, block): a unique int64 key per score, ordered as the stable descending sort orders them:
++    (score, then the lower pool) -> larger key. -0.0 ranks as +0.0 (they compare equal) and NaN above +inf."""
++
++    r = tl.program_id(0).to(tl.int64)
++    p = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    ok = p < NP
++    s = tl.load(S + r * NP + p, mask=ok, other=float("-inf"))
++    b = s.to(tl.int32, bitcast=True)
++    b = tl.where(s == 0.0, 0, b)
++    b = tl.where(s != s, 0x7FC00000, b)
++    b = tl.where(b < 0, b ^ 0x7FFFFFFF, b)            # sign-magnitude -> two's-complement order
++    key = (b.to(tl.int64) << 32) + (0x7FFFFFFF - p).to(tl.int64)
++    tl.store(K + r * NP + p, key, mask=ok)
++
++
++@triton.jit
++def _expand(POOLS, TOK, CNT, POS, W: tl.constexpr, K: tl.constexpr, PL: tl.constexpr):
++    """Program r: the row's tokens from its ascending pools and its position (read on the device), as
++    ``select_tokens`` lists them: 4 tokens a pool, then the visible tokens of the incomplete last pool, -1 after;
++    a dense row (at most K complete pools) gets count 0 and no tokens."""
++
++    r = tl.program_id(0)
++    q = tl.load(POS) + r
++    npool = (q + 1) // PL
++    sp = npool > K
++    j = tl.arange(0, K * PL)
++    pool = tl.load(POOLS + r * K + j // PL).to(tl.int32)
++    tok = tl.where(sp, pool * PL + j % PL, -1)
++    tl.store(TOK + r * W + j, tok)
++    lane = tl.arange(0, PL)
++    tail_len = q + 1 - npool * PL
++    tail = tl.where(sp & (lane < tail_len), npool * PL + lane, -1)
++    tl.store(TOK + r * W + K * PL + lane, tail, mask=lane < PL - 1)
++    tl.store(CNT + r, tl.where(sp, K * PL + tail_len, 0))
++
++
++class LongScratch:
++    """Preallocated buffers of the capturable selection and sparse attention for windows of up to ``rows`` rows
++    and a cache of ``capacity`` tokens (scores and keys for every pool the cache holds)."""
++
++    def __init__(self, rows: int, capacity: int, heads: int, dim: int, device) -> None:
++        self.rows = rows
++        self.cap_pools = capacity // POOL
++        n = rows * self.cap_pools
++        width = TOPK_POOLS * POOL + POOL - 1
++        self.scores = torch.empty((n,), dtype=torch.float32, device=device)
++        self.keys = torch.empty((n,), dtype=torch.int64, device=device)
++        self.top_v = torch.empty((rows, TOPK_POOLS), dtype=torch.int64, device=device)
++        self.top_i = torch.empty((rows, TOPK_POOLS), dtype=torch.int64, device=device)
++        self.pools = torch.empty((rows, TOPK_POOLS), dtype=torch.int64, device=device)
++        self.perm = torch.empty((rows, TOPK_POOLS), dtype=torch.int64, device=device)
++        self.tokens = torch.empty((rows, width), dtype=torch.int32, device=device)
++        self.counts = torch.empty((rows,), dtype=torch.int32, device=device)
++        nch = triton.cdiv(width, 512)
++        self.po = torch.empty((nch * rows * heads * dim,), dtype=torch.float32, device=device)
++        self.pm = torch.empty((nch * rows * heads,), dtype=torch.float32, device=device)
++        self.pl = torch.empty((nch * rows * heads,), dtype=torch.float32, device=device)
++
++    def part(self, R: int, H: int, D: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        nch = triton.cdiv(self.tokens.shape[1], 512)
++        return self.po[:nch * R * H * D], self.pm[:nch * R * H], self.pl[:nch * R * H]
++
++
++def select_tokens_dev(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos_dev: torch.Tensor, R: int,
++                      np_: int, sc: LongScratch) -> tuple[torch.Tensor, torch.Tensor]:
++    """``select_tokens`` with the position read on the device, scoring ``np_`` pools (>= every row's npool and
++    >= 512), into ``sc``'s buffers: no host value, allocation or sync, so a CUDA graph can hold it. The same
++    scores (the same kernel), and the same top 512: keys are unique and ordered as the stable descending sort
++    orders the scores, so ``torch.topk`` over them returns exactly that set, whatever its algorithm and order;
++    the set is then sorted ascending, as ``select_tokens`` lists it."""
++
++    if R > sc.rows or not TOPK_POOLS <= np_ <= sc.cap_pools:
++        raise ValueError(f"select_tokens_dev: {R} rows / {np_} pools outside the scratch ({sc.rows} / {sc.cap_pools})")
++    if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
++        raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
++    scores = sc.scores[:R * np_].view(R, np_)
++    _scores[(R, triton.cdiv(np_, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, np_, 128 ** -0.5, BP=64,
++                                      num_warps=4, **_heads(qi, wts))
++    keys = sc.keys[:R * np_].view(R, np_)
++    _keys[(R, triton.cdiv(np_, 1024))](scores, keys, np_, BLOCK=1024, num_warps=4)
++    torch.topk(keys, TOPK_POOLS, dim=1, largest=True, sorted=False, out=(sc.top_v[:R], sc.top_i[:R]))
++    torch.sort(sc.top_i[:R], dim=1, out=(sc.pools[:R], sc.perm[:R]))
++    tokens, counts = sc.tokens[:R], sc.counts[:R]
++    _expand[(R,)](sc.pools, tokens, counts, pos_dev, W=tokens.shape[1], K=TOPK_POOLS, PL=POOL, num_warps=4)
++    return tokens, counts
++
++
+ @triton.jit
+ def _gtile(q, k, v, m, l, o, valid, SCALE: tl.constexpr):
+     scores = tl.dot(q, tl.trans(k)).to(tl.float32) * SCALE
+@@ -202,9 +338,9 @@ def _sparse_merge(PO, PM, PL, OUT, CNT, RS, H: tl.constexpr, D: tl.constexpr, NC
+ 
+ 
+ def sparse_attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
+-                     out: torch.Tensor, scale: float) -> None:
++                     out: torch.Tensor, scale: float, part: LongScratch | None = None) -> None:
+     """Rows with counts > 0: attention over their selected tokens, written into ``out`` [R, H, D] (other rows
+-    untouched)."""
++    untouched). ``part`` (patches/0050): preallocated chunk partials (a captured step allocates nothing)."""
+ 
+     R, H, D = q.shape
+     W = tokens.shape[1]
+@@ -212,9 +348,12 @@ def sparse_attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, tokens
+     nch = triton.cdiv(W, CH)
+     # chunk partials for every row of the window (upstream sized them for 128 rows, the verify windows; longer
+     # prefill chunks, GLM53_TF_PREFILL_ROWS, need R); the row stride only places partials, not their bits
+-    po = torch.empty((nch * R * H * D,), dtype=torch.float32, device=q.device)
+-    pm = torch.empty((nch * R * H,), dtype=torch.float32, device=q.device)
+-    pl = torch.empty((nch * R * H,), dtype=torch.float32, device=q.device)
++    if part is not None and R <= part.rows:
++        po, pm, pl = part.part(R, H, D)
++    else:
++        po = torch.empty((nch * R * H * D,), dtype=torch.float32, device=q.device)
++        pm = torch.empty((nch * R * H,), dtype=torch.float32, device=q.device)
++        pl = torch.empty((nch * R * H,), dtype=torch.float32, device=q.device)
+     _sparse_chunks[(R, H, nch)](q, kc, vc, tokens, counts, po, pm, pl, R, W=W, H=H, D=D, CH=CH, SCALE=scale,
+                                 num_warps=4, num_stages=1)
+     _sparse_merge[(R, H)](po, pm, pl, out, counts, R, H=H, D=D, NCH=nch, CH=CH, num_warps=4)

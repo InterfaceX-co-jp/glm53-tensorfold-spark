@@ -1,0 +1,751 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/fast_kda.py b/src/tensorfold/families/glm5_next/cuda/fast_kda.py
+new file mode 100644
+index 0000000..a0261cf
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/fast_kda.py
+@@ -0,0 +1,416 @@
++"""Chunked (WY / UT-transform) KDA prefill for GLM-5.3-Flash (patches/0081).
++
++``kda_prefill_chunked`` is a drop-in for ``kda.chain`` over the R rows of a prefill chunk at absolute positions
++pos .. pos + R - 1: the same inputs (projection rows, gates, conv state, recurrent state, A_log, dt_bias, norm,
++eps, lower bound) and the same outputs (the gated-RMSNorm rows [R, H*128] bf16 and the fp32 state after the last
++row, [H, 128, 128] in the decode kernel's layout s[h, value j, key i]), so ``commit`` and serial decode continue
++from it unchanged. The recurrence is evaluated 64 rows at a time with matmuls instead of row by row.
++
++Per row t (``kda.cu``): conv + SiLU (bf16), q and k L2-normalized (q * 128^-0.5), v, per-channel log decay
++gl_t = lower * sigmoid(exp(A_log) * (a_t + dt_bias)), beta_t = bf16(sigmoid(b_t)), and with S the [DV, DK] state:
++
++    S'_t = S_{t-1} diag(exp(gl_t))                         (decay along the key channel)
++    e_t  = beta_t (v_t - S'_t k_t)                         (delta-rule correction)
++    S_t  = S'_t + e_t k_t^T,       o_t = S_t q_t,          out_t = gated_rmsnorm(bf16(o_t))
++
++Chunk form (C = 64 rows, S0 the state entering the chunk, G_t = sum_{s<=t} gl_s inside the chunk, per channel):
++
++    S_t = S0 diag(e^{G_t}) + sum_{s<=t} e_s k_s^T diag(e^{G_t - G_s})                               (unrolling)
++    e_t + sum_{s<t} A_ts e_s = beta_t (v_t - S0 (e^{G_t} * k_t)),  A_ts = beta_t sum_i k_ti k_si e^{G_ti - G_si}
++    => E = T (beta V) - T (beta K~) S0^T = U - W S0^T,   T = (I + A)^-1 (unit lower triangular; the UT transform)
++    O = Q~ S0^T + P E,             P_ts = sum_i q_ti k_si e^{G_ti - G_si} (s <= t)
++    S_C = S0 diag(e^{G_C}) + E^T K^,                                   K~_t = e^{G_t} k_t, Q~_t = e^{G_t} q_t,
++                                                                       K^_s = e^{G_C - G_s} k_s
++
++Numerics. Every factor that multiplies S0 or the state update is <= 1 (G decreases). A and P need
++e^{G_t - G_s} (<= 1 for s <= t) as a matmul, so they are built per 16-row block a with a reference r = G at the
++block's first row: [k_t e^{G_t - r}] . [k_s e^{r - G_s}] -- the left factor is <= 1, the right one is <= 1 for
++earlier blocks and at most e^{15 |lower|} (e^75 for GLM's lower = -5) inside the block, well inside fp32 (the
++wrapper hands |lower| > 5.33 to the serial chain). Rows past the block are zeroed before the exponential. T is
++solved blockwise: the 16 x 16 diagonal blocks by forward substitution, the off-diagonal blocks by
++T_ab = -T_aa sum_{b<=c<a} A_ac T_cb.
++State and all accumulation are fp32; the big products (W, U, E, O, the state update) use ``DOT_PRECISION``
++(tf32 tensor cores by default, "ieee" for fp32 FMA), the 16 x 16 solve always ieee.
++
++Chunk boundaries sit at ABSOLUTE positions that are multiples of 64. If ``pos`` is not a multiple of 64 the
++leading rows up to the next multiple form a partial chunk of their own (and a trailing partial chunk ends the
++call): unused slots of a chunk are identity steps (k = q = v = 0, beta = 0, decay 1) and add nothing. A row's
++bits therefore depend only on its chunk's rows and the state entering the chunk, so a prompt prefilled in calls
++split at multiples of 64 gives the same bits whatever the call sizes (the fast-prefill framework aligns its
++calls; a call starting mid-chunk is still correct, with other last bits). The result is NOT bit-identical to the
++serial ``kda.chain`` (different fp32 summation order); ``tests/cuda/test_fastk_patches.py`` bounds the error.
++
++Three kernels (the FLA layout): (1) one program per (chunk, head), all in parallel: the chunk's prologue, A, P,
++the UT transform T, W = T (beta K~), U = T (beta V), Q~, K^ -- everything that does not depend on the state; (2)
++one program per (head, block of BV value rows of the state): the chunks in order, only E = U - W S^T, the raw
++outputs O = Q~ S^T + P E and S <- S diag(e^{G_C}) + E^T K^; (3) the gated RMSNorm, per (row block, head).
++Deterministic: every reduction has a fixed order; no atomics. Scratch: ~177 KB per (chunk, head), 94 MB at 1024
++rows with 32 heads (``workspace``).
++"""
++
++from __future__ import annotations
++
++import math
++
++import torch
++import triton
++import triton.language as tl
++
++DK = DV = 128
++CHUNK = 64
++BC = 16                               # sub-block rows of the A / P / T construction
++DOT_PRECISION = "tf32"                # "tf32" (tensor cores), "tf32x3" (~fp32, 3x the mma) or "ieee" (fp32 FMA)
++MAX_ABS_LOWER = 80.0 / (BC - 1)       # e^{(BC - 1) |lower|} must stay finite in fp32 with margin
++
++BV_DEFAULT = 64                       # value rows of the state per kernel-2 program (128 / 64 = 2 programs a head)
++STORE_BF16 = ""                       # which of W, U, Q~, K^ ("wuqk") kernel 2 reads as bf16: "wuqk" is 1.50 ms
++#                                       against 1.82 at 1024 rows x 32 heads, but doubles the state error (1.1e-3 -> 2.3e-3)
++STATE_CFG = {16: (4, 1), 32: (4, 1), 64: (8, 1), 128: (8, 1)}      # kernel 2's (warps, stages) by value rows
++
++# scratch layout per (chunk, head), in fp32 elements (kernel 1 writes it, kernel 2 reads it)
++_K = 0                                    # k, then K^ = e^{G_C - G_t} k_t
++_Q = _K + CHUNK * DK                      # q, then Q~ = e^{G_t} q_t
++_V = _Q + CHUNK * DK                      # v, then U = T (beta V)
++_G = _V + CHUNK * DV                      # G (cumulative log decay), then W = T (beta K~)
++_BETA = _G + CHUNK * DK
++_A = _BETA + CHUNK
++_P = _A + CHUNK * CHUNK
++_T = _P + CHUNK * CHUNK
++_DEC = _T + CHUNK * CHUNK                 # e^{G_C} [DK]
++WORK = _DEC + DK
++OFF_K, OFF_Q, OFF_V, OFF_G = tl.constexpr(_K), tl.constexpr(_Q), tl.constexpr(_V), tl.constexpr(_G)
++OFF_BETA, OFF_A, OFF_P, OFF_T = tl.constexpr(_BETA), tl.constexpr(_A), tl.constexpr(_P), tl.constexpr(_T)
++OFF_DEC, WORK_C = tl.constexpr(_DEC), tl.constexpr(WORK)
++
++
++@triton.jit
++def _conv_act(P, p_stride, CS, CW, row, valid, ch, C: tl.constexpr):
++    """bf16(silu(4-tap depthwise conv)) for rows ``row`` (call-relative; < 0 reads the conv state) of channels ch."""
++
++    acc = tl.zeros((row.shape[0], ch.shape[0]), dtype=tl.float32)
++    for tap in tl.static_range(4):
++        src = row + (tap - 3)
++        from_p = src >= 0
++        sp = tl.where(from_p, src, 0)
++        sc = tl.where(from_p, 0, src + 3)
++        xp = tl.load(P + sp[:, None].to(tl.int64) * p_stride + ch[None, :], mask=(valid & from_p)[:, None],
++                     other=0.0)
++        xc = tl.load(CS + sc[:, None] * C + ch[None, :], mask=(valid & (src < 0))[:, None], other=0.0)
++        x = tl.where(from_p[:, None], xp.to(tl.float32), xc.to(tl.float32))
++        w = tl.load(CW + ch * 4 + tap).to(tl.float32)
++        acc = acc + w[None, :] * x
++    act = acc / (1.0 + tl.exp(-acc))
++    return act.to(tl.bfloat16).to(tl.float32)
++
++
++
++
++@triton.jit
++def _kda_prep(P, p_stride, b_off, A, a_stride, CS, CW, A_LOG, DT_BIAS, WORKBUF, SW, SU, SQ, SK, KSAVE, VSAVE, GSAVE, BSAVE, lower,
++              R, off, H: tl.constexpr, SAVE: tl.constexpr, BCC: tl.constexpr, PREC: tl.constexpr):
++    """Kernel 1, program (chunk c, head h): everything of the chunk that does not depend on the state entering it.
++    Leaves in the chunk's scratch: K^ (K region), Q~ (Q region), U = T (beta V) (V region), W = T (beta K~) (G
++    region), P, and e^{G_C} (DEC)."""
++
++    c = tl.program_id(0)
++    h = tl.program_id(1)
++    C: tl.constexpr = 3 * H * 128
++    NSUB: tl.constexpr = 64 // BCC
++    l = tl.arange(0, 64)
++    i = tl.arange(0, 128)
++    bl = tl.arange(0, BCC)
++    work = WORKBUF + (c * H + h).to(tl.int64) * WORK_C
++    WK = work + OFF_K
++    WQ = work + OFF_Q
++    WV = work + OFF_V
++    WG = work + OFF_G
++    WB = work + OFF_BETA
++    WA = work + OFF_A
++    WP = work + OFF_P
++    WT = work + OFF_T
++    WD = work + OFF_DEC
++    decay_rate = tl.exp(tl.load(A_LOG + h))
++    dtb = tl.load(DT_BIAS + h * 128 + i)
++    row = c * 64 - off + l
++    valid = (row >= 0) & (row < R)
++    rowc = tl.where(valid, row, 0).to(tl.int64)
++    # -- per-row inputs (the chain kernel's prologue) -----------------------------------------------------------
++    qa = _conv_act(P, p_stride, CS, CW, row, valid, h * 128 + i, C)
++    ka = _conv_act(P, p_stride, CS, CW, row, valid, H * 128 + h * 128 + i, C)
++    va = _conv_act(P, p_stride, CS, CW, row, valid, 2 * H * 128 + h * 128 + i, C)
++    qinv = 1.0 / tl.sqrt(tl.sum(qa * qa, axis=1) + 1e-6)
++    kinv = 1.0 / tl.sqrt(tl.sum(ka * ka, axis=1) + 1e-6)
++    q = tl.where(valid[:, None], (qa * qinv[:, None]) * (1.0 / tl.sqrt(128.0)), 0.0)
++    k = tl.where(valid[:, None], ka * kinv[:, None], 0.0)
++    v = tl.where(valid[:, None], va, 0.0)
++    araw = tl.load(A + rowc[:, None] * a_stride + h * 128 + i[None, :], mask=valid[:, None], other=0.0)
++    z = decay_rate * (araw.to(tl.float32) + dtb[None, :])
++    gl = tl.where(valid[:, None], lower * (1.0 / (1.0 + tl.exp(-z))), 0.0)
++    braw = tl.load(P + rowc * p_stride + b_off + h, mask=valid, other=0.0).to(tl.float32)
++    beta = tl.where(valid, (1.0 / (1.0 + tl.exp(-braw))).to(tl.bfloat16).to(tl.float32), 0.0)
++    gc = tl.cumsum(gl, axis=0)
++    tl.store(WK + l[:, None] * 128 + i[None, :], k)
++    tl.store(WQ + l[:, None] * 128 + i[None, :], q)
++    tl.store(WV + l[:, None] * 128 + i[None, :], v)
++    tl.store(WG + l[:, None] * 128 + i[None, :], gc)
++    tl.store(WB + l, beta)
++    if SAVE:
++        sv = (rowc * H + h) * 128
++        tl.store(KSAVE + sv[:, None] + i[None, :], k, mask=valid[:, None])
++        tl.store(GSAVE + sv[:, None] + i[None, :], tl.exp(gl), mask=valid[:, None])
++        tl.store(VSAVE + sv[:, None] + i[None, :], v.to(tl.bfloat16), mask=valid[:, None])
++        tl.store(BSAVE + rowc * H + h, beta, mask=valid)
++    tl.debug_barrier()
++    # -- A (strictly lower, times beta_t) and P (lower incl. the diagonal), by 16-row blocks ----------------------
++    gs = tl.load(WG + l[:, None] * 128 + i[None, :])
++    ks = tl.load(WK + l[:, None] * 128 + i[None, :])
++    for a in tl.static_range(NSUB):
++        ra = a * BCC + bl
++        gref = tl.load(WG + a * BCC * 128 + i)
++        gt = tl.load(WG + ra[:, None] * 128 + i[None, :])
++        lk = tl.load(WK + ra[:, None] * 128 + i[None, :]) * tl.exp(gt - gref[None, :])
++        lq = tl.load(WQ + ra[:, None] * 128 + i[None, :]) * tl.exp(gt - gref[None, :])
++        s_ok = l < (a + 1) * BCC
++        rk = tl.where(s_ok[:, None], ks * tl.exp(tl.where(s_ok[:, None], gref[None, :] - gs, 0.0)), 0.0)
++        aa = tl.dot(lk, tl.trans(rk), input_precision=PREC)
++        pa = tl.dot(lq, tl.trans(rk), input_precision=PREC)
++        bt = tl.load(WB + ra)
++        aa = tl.where(l[None, :] < ra[:, None], aa * bt[:, None], 0.0)
++        pa = tl.where(l[None, :] <= ra[:, None], pa, 0.0)
++        tl.store(WA + ra[:, None] * 64 + l[None, :], aa)
++        tl.store(WP + ra[:, None] * 64 + l[None, :], pa)
++    tl.debug_barrier()
++    # -- T = (I + A)^-1: the four 16 x 16 diagonal blocks together, by forward substitution ------------------------
++    ab = tl.arange(0, NSUB)
++    r3 = ab[:, None, None] * BCC + bl[None, :, None]
++    c3 = ab[:, None, None] * BCC + bl[None, None, :]
++    nd = tl.load(WA + r3 * 64 + c3)
++    x = tl.where(r3 == c3, 1.0, 0.0)
++    for r in tl.static_range(1, BCC):
++        nrow = tl.sum(tl.where(bl[None, :, None] == r, nd, 0.0), axis=1)                  # [NSUB, BCC]: row r
++        new = tl.where(bl[None, :] == r, 1.0, 0.0) - tl.sum(nrow[:, :, None] * x, axis=1)
++        x = tl.where(bl[None, :, None] == r, new[:, None, :], x)
++    tl.store(WT + r3 * 64 + c3, x)
++    tl.debug_barrier()
++    # off-diagonal blocks by doubling: [[T0, 0], [-T1 A10 T0, T1]] for the 16-row pairs, then the 32-row halves
++    for a in tl.static_range(1, NSUB, 2):
++        ra = a * BCC + bl
++        rb = (a - 1) * BCC + bl
++        taa = tl.load(WT + ra[:, None] * 64 + ra[None, :])
++        tbb = tl.load(WT + rb[:, None] * 64 + rb[None, :])
++        aab = tl.load(WA + ra[:, None] * 64 + rb[None, :])
++        tab = -tl.dot(taa, tl.dot(aab, tbb, input_precision="ieee"), input_precision="ieee")
++        tl.store(WT + ra[:, None] * 64 + rb[None, :], tab)
++    tl.debug_barrier()
++    hi = 32 + tl.arange(0, 32)
++    lo = tl.arange(0, 32)
++    blk_lo = (lo[None, :] // BCC) <= (lo[:, None] // BCC)
++    thi = tl.load(WT + hi[:, None] * 64 + hi[None, :], mask=blk_lo, other=0.0)
++    tlo = tl.load(WT + lo[:, None] * 64 + lo[None, :], mask=blk_lo, other=0.0)
++    ahl = tl.load(WA + hi[:, None] * 64 + lo[None, :])
++    thl = -tl.dot(thi, tl.dot(ahl, tlo, input_precision="ieee"), input_precision="ieee")
++    tl.debug_barrier()
++    tl.store(WT + hi[:, None] * 64 + lo[None, :], thl)
++    tl.debug_barrier()
++    # -- Q~, K^ (in place of q, k), then W and U (in place of G, V) -------------------------------------------------
++    gc = tl.load(WG + l[:, None] * 128 + i[None, :])
++    glast = tl.load(WG + 63 * 128 + i)
++    bt = tl.load(WB + l)
++    k = tl.load(WK + l[:, None] * 128 + i[None, :])
++    kt = (bt[:, None] * k) * tl.exp(gc)
++    khat = k * tl.exp(glast[None, :] - gc)
++    qt = tl.load(WQ + l[:, None] * 128 + i[None, :]) * tl.exp(gc)
++    tl.debug_barrier()
++    tl.store(WK.to(SK.dtype) + l[:, None] * 128 + i[None, :], khat.to(SK.dtype.element_ty))
++    tl.store(WQ.to(SQ.dtype) + l[:, None] * 128 + i[None, :], qt.to(SQ.dtype.element_ty))
++    tl.store(WD + i, tl.exp(glast))
++    lower_blk = (l[None, :] // BCC) <= (l[:, None] // BCC)
++    t = tl.load(WT + l[:, None] * 64 + l[None, :], mask=lower_blk, other=0.0)
++    w = tl.dot(t, kt, input_precision=PREC)
++    v = tl.load(WV + l[:, None] * 128 + i[None, :])
++    u = tl.dot(t, bt[:, None] * v, input_precision=PREC)
++    tl.debug_barrier()
++    tl.store(WG.to(SW.dtype) + l[:, None] * 128 + i[None, :], w.to(SW.dtype.element_ty))
++    tl.store(WV.to(SU.dtype) + l[:, None] * 128 + i[None, :], u.to(SU.dtype.element_ty))
++
++
++@triton.jit
++def _kda_state(WORKBUF, SW, SU, SQ, SK, S_IN, S_OUT, OUT, R, off, NC, H: tl.constexpr, BV: tl.constexpr, PREC: tl.constexpr):
++    """Kernel 2, program (head h, value block): the chunks in order, only what needs the state S (rows jr of
++    [DV, DK]): E = U - W S^T, the chunk's raw outputs O = Q~ S^T + P E (bf16, before the norm), and
++    S <- S diag(e^{G_C}) + E^T K^."""
++
++    h = tl.program_id(0)
++    jr = tl.program_id(1) * BV + tl.arange(0, BV)
++    l = tl.arange(0, 64)
++    i = tl.arange(0, 128)
++    sptr = h.to(tl.int64) * (128 * 128) + jr[:, None] * 128 + i[None, :]
++    s = tl.load(S_IN + sptr)
++    for c in range(NC):
++        work = WORKBUF + (c * H + h).to(tl.int64) * WORK_C
++        # operands loaded right before their products (live ranges, hence shared memory, stay short)
++        w = tl.load((work + OFF_G).to(SW.dtype) + l[:, None] * 128 + i[None, :]).to(tl.float32)
++        ub = tl.load((work + OFF_V).to(SU.dtype) + l[:, None] * 128 + jr[None, :]).to(tl.float32)
++        eb = ub - tl.dot(w, tl.trans(s), input_precision=PREC)
++        qt = tl.load((work + OFF_Q).to(SQ.dtype) + l[:, None] * 128 + i[None, :]).to(tl.float32)
++        pm = tl.load(work + OFF_P + l[:, None] * 64 + l[None, :])
++        ob = tl.dot(qt, tl.trans(s), input_precision=PREC) + tl.dot(pm, eb, input_precision=PREC)
++        row = c * 64 - off + l
++        valid = (row >= 0) & (row < R)
++        tl.store(OUT + tl.where(valid, row, 0).to(tl.int64)[:, None] * (H * 128) + h * 128 + jr[None, :],
++                 ob.to(tl.bfloat16), mask=valid[:, None])
++        kh = tl.load((work + OFF_K).to(SK.dtype) + l[:, None] * 128 + i[None, :]).to(tl.float32)
++        dec = tl.load(work + OFF_DEC + i)
++        s = s * dec[None, :] + tl.dot(tl.trans(eb), kh, input_precision=PREC)
++    tl.store(S_OUT + sptr, s)
++
++
++@triton.jit
++def _kda_norm(OUT, G, g_stride, NORM_W, eps, R, H: tl.constexpr, BR: tl.constexpr):
++    """Kernel 3, program (row block, head): the gated RMSNorm in place,
++    bf16(w * (y * rsqrt(mean(y^2) + eps)) * sigmoid(gate))."""
++
++    h = tl.program_id(1)
++    r = tl.program_id(0) * BR + tl.arange(0, BR)
++    i = tl.arange(0, 128)
++    ok = r < R
++    rr = tl.where(ok, r, 0).to(tl.int64)
++    optr = OUT + rr[:, None] * (H * 128) + h * 128 + i[None, :]
++    y = tl.load(optr, mask=ok[:, None], other=0.0).to(tl.float32)
++    rinv = 1.0 / tl.sqrt(tl.sum(y * y, axis=1) / 128.0 + eps)
++    gate = tl.load(G + rr[:, None] * g_stride + h * 128 + i[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++    nw = tl.load(NORM_W + i).to(tl.float32)
++    res = (nw[None, :] * (y * rinv[:, None])) * (1.0 / (1.0 + tl.exp(-gate)))
++    tl.store(optr, res.to(tl.bfloat16), mask=ok[:, None])
++
++
++_WORK: dict[tuple, torch.Tensor] = {}
++
++
++def workspace(heads: int, chunks: int, device) -> torch.Tensor:
++    """The per-(chunk, head) scratch (fp32, ~177 KB each), cached per (heads, device) and grown to ``chunks``
++    chunks; private to one call at a time on a stream."""
++
++    key = (heads, str(device))
++    buf = _WORK.get(key)
++    if buf is None or buf.numel() < chunks * heads * WORK:
++        buf = torch.empty((chunks * heads * WORK,), dtype=torch.float32, device=device)
++        _WORK[key] = buf
++    return buf
++
++
++def supported(lower: float) -> bool:
++    """Whether the chunked form is safe in fp32 for this lower bound (GLM-5.3: -5.0)."""
++
++    return math.isfinite(lower) and abs(lower) <= MAX_ABS_LOWER
++
++
++def kda_prefill_chunked(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
++                        conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
++                        norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch=None,
++                        state_out: torch.Tensor | None = None, *, pos: int, save_replay: bool = False,
++                        out: torch.Tensor | None = None, work: torch.Tensor | None = None,
++                        precision: str | None = None, bv: int = BV_DEFAULT, num_warps: int = 8) -> torch.Tensor:
++    """``kda.chain``'s contract, chunked. Same positional arguments as ``kda.chain``; ``pos`` (keyword, required):
++    the absolute position of row 0 (chunks are cut at multiples of 64 of it).
++
++    p: [>= rows, >= b_off + H] bf16 projection rows [q | k | v | ... | b at b_off] (row stride p.stride(0), unit
++    column stride); a, g: forget-gate and output-gate rows [rows, H*128] bf16 (own row strides); conv_state
++    [3, 3*H*128] bf16; conv_w [3*H*128, 4] bf16; state_in [H, 128, 128] fp32 (s[h, value, key]); a_log [H] fp32;
++    dt_bias [H*128] fp32; norm_w [128] bf16. Writes the rows' outputs (``scratch.out[:rows]`` when ``scratch`` is a
++    ``kda.KDAScratch``, else ``out`` or a new [rows, H*128] bf16 tensor) and the state after the last row into
++    ``state_out`` (required; may be ``state_in`` itself). With |lower| > MAX_ABS_LOWER (not GLM-5.3's -5) it runs
++    ``kda.chain`` instead (``supported``). The conv state is NOT advanced (``forward.commit`` does
++    that from the projection rows, as for ``kda.chain``). ``save_replay``: also fill ``scratch.k/v/g/b`` as the
++    chain kernel does, so a later ``commit(keep < rows)`` could replay (prefill commits every row, so the default
++    skips the ~40 MB a layer of writes). ``bv``: value rows of the state per kernel-2 program (16, 32, 64 or 128).
++    Returns the [rows, H*128] bf16 outputs."""
++
++    H = int(a_log.numel())
++    if state_out is None:
++        raise ValueError("kda_prefill_chunked: state_out is required")
++    if not supported(lower):             # the 16-row blocks could overflow fp32: the serial chain instead
++        from . import kda as kda_mod
++
++        return kda_mod.chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows,
++                             scratch, state_out)
++    if rows < 1 or p.shape[0] < rows or a.shape[0] < rows or g.shape[0] < rows:
++        raise ValueError("kda_prefill_chunked: rows")
++    if p.stride(1) != 1 or a.stride(1) != 1 or g.stride(1) != 1:
++        raise ValueError("kda_prefill_chunked: unit column strides expected")
++    if p.dtype != torch.bfloat16 or a.dtype != torch.bfloat16 or g.dtype != torch.bfloat16:
++        raise ValueError("kda_prefill_chunked: bf16 projection/gate rows expected")
++    if not (conv_state.is_contiguous() and conv_w.is_contiguous() and state_in.is_contiguous()
++            and state_out.is_contiguous()):
++        raise ValueError("kda_prefill_chunked: conv state, conv weight and states must be contiguous")
++    if state_in.numel() != H * DK * DV or state_out.numel() != H * DK * DV or state_in.dtype != torch.float32:
++        raise ValueError("kda_prefill_chunked: states must be fp32 [H, 128, 128]")
++    if conv_w.shape[0] != 3 * H * DK or conv_w.shape[1] != 4:
++        raise ValueError("kda_prefill_chunked: conv weight [3*H*128, 4] expected")
++    prec = precision or DOT_PRECISION
++    if prec not in ("tf32", "tf32x3", "ieee"):
++        raise ValueError(f"kda_prefill_chunked: precision {prec!r}")
++    if bv not in (16, 32, 64, 128):
++        raise ValueError("kda_prefill_chunked: bv must be 16, 32, 64 or 128")
++    if scratch is not None:
++        o = scratch.out[:rows]
++    elif out is not None:
++        o = out[:rows]
++    else:
++        o = torch.empty((rows, H * DV), dtype=torch.bfloat16, device=p.device)
++    if o.shape != (rows, H * DV) or not o.is_contiguous():
++        raise ValueError("kda_prefill_chunked: out must be a contiguous [rows, H*128] bf16")
++    if save_replay and scratch is None:
++        raise ValueError("kda_prefill_chunked: save_replay needs the KDAScratch")
++    off = int(pos) % CHUNK
++    nc = -(-(off + rows) // CHUNK)
++    if work is None:
++        work = workspace(H, nc, p.device)
++    if work.numel() < nc * H * WORK:
++        raise ValueError("kda_prefill_chunked: work too small")
++    dummy = work
++    ks, vs, gs, bs = (scratch.k, scratch.v, scratch.g, scratch.b) if save_replay else (dummy, dummy, dummy, dummy)
++    b16 = work.view(torch.bfloat16)
++    st = [b16 if name in STORE_BF16 else work for name in "wuqk"]     # only their element types are used
++    _kda_prep[(nc, H)](p, p.stride(0), int(b_off), a, a.stride(0), conv_state, conv_w, a_log, dt_bias, work, *st, ks, vs,
++                       gs, bs, float(lower), int(rows), off, H=H, SAVE=bool(save_replay), BCC=BC, PREC=prec,
++                       num_warps=num_warps, num_stages=1)
++    _kda_state[(H, DV // bv)](work, *st, state_in, state_out, o, int(rows), off, nc, H=H, BV=int(bv), PREC=prec,
++                              num_warps=STATE_CFG[bv][0], num_stages=STATE_CFG[bv][1])
++    _kda_norm[(triton.cdiv(rows, 32), H)](o, g, g.stride(0), norm_w, float(eps), int(rows), H=H, BR=32, num_warps=4)
++    return o
++
++# -- reference ------------------------------------------------------------------------------------------------
++def serial_reference(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows):
++    """The chain kernel's arithmetic row by row in torch fp32 (a CPU/GPU stand-in for ``kda.chain`` in tests):
++    returns (out [rows, H*128] bf16, state [H, 128, 128] fp32)."""
++
++    H = int(a_log.numel())
++    C = 3 * H * DK
++    f32 = torch.float32
++    dev = p.device
++    x = torch.cat([conv_state.to(f32), p[:rows, :C].to(f32)], 0)                    # [3 + rows, C]
++    w = conv_w.to(f32)
++    s = state_in.to(f32).clone().view(H, DV, DK)
++    out = torch.empty((rows, H * DV), dtype=torch.bfloat16, device=dev)
++    rate = torch.exp(a_log.to(f32))                                                 # [H]
++    for r in range(rows):
++        acc = torch.zeros(C, dtype=f32, device=dev)
++        for tap in range(4):
++            acc = acc + w[:, tap] * x[r + tap]
++        act = (acc / (1.0 + torch.exp(-acc))).to(torch.bfloat16).to(f32)
++        qa, ka, va = act[:H * DK].view(H, DK), act[H * DK:2 * H * DK].view(H, DK), act[2 * H * DK:].view(H, DV)
++        q = qa / torch.sqrt((qa * qa).sum(-1, keepdim=True) + 1e-6) * (1.0 / math.sqrt(DK))
++        k = ka / torch.sqrt((ka * ka).sum(-1, keepdim=True) + 1e-6)
++        z = rate[:, None] * (a[r, :H * DK].to(f32).view(H, DK) + dt_bias.to(f32).view(H, DK))
++        gd = torch.exp(lower * torch.sigmoid(z))                                    # [H, DK]
++        beta = torch.sigmoid(p[r, b_off:b_off + H].to(f32)).to(torch.bfloat16).to(f32)
++        s = s * gd[:, None, :]
++        kv = (s * k[:, None, :]).sum(-1)                                            # [H, DV]
++        delta = (va - kv) * beta[:, None]
++        s = s + delta[:, :, None] * k[:, None, :]
++        o = (s * q[:, None, :]).sum(-1).to(torch.bfloat16).to(f32)                  # [H, DV]
++        rinv = 1.0 / torch.sqrt((o * o).mean(-1, keepdim=True) + eps)
++        gate = g[r, :H * DV].to(f32).view(H, DV)
++        out[r] = ((norm_w.to(f32) * (o * rinv)) * torch.sigmoid(gate)).reshape(-1).to(torch.bfloat16)
++    return out, s
+diff --git a/src/tensorfold/families/glm5_next/cuda/fast_qmm.py b/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+new file mode 100644
+index 0000000..7f8dea1
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+@@ -0,0 +1,323 @@
++"""Prefill-shaped 4-bit / BF16 matmuls for GLM-5.3-Flash (patches/0081), for M in 256..2048 rows.
++
++``matmul_prefill`` has the signature and semantics of ``qmm.matmul`` (``qmm.Q4``: MLX affine 4-bit in groups of 64
++along K; ``qmm.B16``: plain BF16) and is meant for the fast-prefill path (patches/0080, ``GLM53_TF_FAST_PREFILL``).
++
++What changes against ``qmm._qmm`` / ``qmm._bmm`` (tuned for 1-16 row decode steps):
++
++- One program owns a BM x BN output tile (BM 128, 64 under 512 rows; BN 128, or 64 when the shape has several
++  K slices, see ``CONFIG``) over the WHOLE K range: no split-K partial buffer, no
++  second reduce kernel. At M = 1024 on the KDA projection (12576 x 4096, 4 K slices) ``qmm`` writes and re-reads
++  4 x 1024 x 12576 fp32 partials = 206 MB each way; here nothing leaves the registers but the output.
++- A 64 x BN weight group is unpacked once per program and feeds a BM-row tensor-core dot, and the M tiles of one
++  column block are consecutive program ids (M fastest), so the concurrently running programs share each weight
++  tile in L2 and the weights stream from DRAM about once per call.
++- The arithmetic is qmm's, operation for operation. For weight group g (64 inputs):
++
++      P[m, n, g] = x[m, g-block] . q[n, g-block]          tl.dot, bf16 x integer-valued bf16 -> fp32
++      acc[m, n] += P[m, n, g] * s[n, g] + xs[m, g] * b[n, g]
++
++  and qmm's K split (``qmm.split_k`` / ``qmm.b16_split_k``, fixed by the weight's shape) is kept as an ORDER of
++  summation: the program walks the SK slices in turn, sums each slice from zero exactly as qmm's slice program
++  does, and adds the slice sums in slice order exactly as ``qmm._reduce`` does. A row's value therefore does not
++  depend on the row tile, the column tile or the other rows, and is meant to equal ``qmm.matmul`` bit for bit
++  (``tests/cuda/test_fastk_patches.py::test_fast_qmm_bitwise`` checks it on hardware). ``exact=False`` drops the
++  slice order (one accumulator, lower register pressure); still deterministic and row-invariant, not qmm's bits.
++
++``matmul_fast`` (what fast-prefill chunks run): ``exact=False``, one accumulator over K and a 128 x 64 tile at 4
++warps (``LOOSE``), 1.1-1.7x faster than the exact tiles; deterministic and row-independent, not qmm's bits.
++
++``hc_partial``: ``glue.hc_pre``'s 24 mixing dots for fast chunks, 64 rows a program sharing each fn tile (bf16
++tensor-core dots, fp32 sums; not ``glue``'s bits, row-independent).
++
++Deterministic: no atomics, fixed reduction order, no autotuning (``CONFIG`` below is a fixed table by (N, K) and
++the row bucket; no entry changes bits).
++"""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++from . import qmm
++from .qmm import B16, GS, Q4
++
++# Per rank of GLM-5.3-Flash at TP=2 (N x K):
++#   KDA  [q|k|v|f_a|g_a|b] 12576x4096, f_b/g_b 4096x128, o_proj 4096x4096
++#   DSA  q_a|kv_a 2048x4096, q_b 8192x1536, kv_b (k, v) 8192x512 each, o_proj 4096x8192
++#   dense MLP gate|up 12288x4096, down 4096x6144; EXL3 shared expert gate|up 2048x4096, down 4096x1024
++#   indexer k|w 160x4096, q_b 4096x1536; MTP eh_proj 4096x8192; head 77440x4096
++# Value: (BM for M >= 512, BM for M < 512, warps, stages, groups per unrolled step). Columns per program: 128 when
++# the shape has one K slice, 64 when it has several: the exact variant then keeps two BM x BN fp32 accumulators
++# (slice sum and total) plus the dot result live, 3 x 128 x 64 / 256 threads = 96 registers at 8 warps, where
++# 128 x 128 would need 192 and spill. K slices per shape (qmm.split_k): 12576x4096 4, 4096x4096 2, 2048x4096 4,
++# 8192x1536 4, 8192x512 4, 4096x8192 8, 4096x6144 4, 4096x1024 2, 4096x1536 2, 160x4096 8; one slice: 12288x4096,
++# 4096x128, the head. No entry changes bits. Used for row counts and shapes ``TUNED`` does not cover.
++CONFIG: dict[str, tuple[int, int, int, int, int]] = {
++    "4096x128": (128, 64, 8, 2, 2),
++    "160x4096": (64, 64, 4, 3, 1),
++}
++DEFAULT = (128, 64, 8, 3, 1)
++BN_ONE, BN_SPLIT = 128, 64          # columns per program with one K slice / with several (exact variant)
++BN_STORED = qmm.BN                  # columns of one stored weight tile (64)
++MIN_ROWS = 64                       # fewer rows go to qmm.matmul (tuned for 1-128 rows)
++
++# Measured on GB10 (tests/cuda/test_fastk_patches.py::test_fast_qmm_timing; every tile config gives qmm's bits, so
++# the choice is free): per (N x K) and row bucket, (BM, BN, warps, stages) of the fastest config, or None where qmm's
++# split-K kernels were faster (they then run, with the caller's ``part`` buffer). Buckets: 512 for 512..1535 rows
++# (measured at 1024), 1536 for 1536+ rows (measured at 2048). ms at 1024 rows qmm -> this entry: 12576x4096
++# 3.29 -> 2.54, 4096x4096 0.80 -> 0.80, 2048x4096 0.51 -> 0.42, 8192x1536 1.52 -> 0.67, 8192x512 1.36 -> 0.23,
++# 4096x6144 1.35 -> 1.30, 4096x1024 0.39 -> 0.21, 4096x1536 0.45 -> 0.31; qmm kept: 4096x8192 2.04 (tiles 2.30),
++# 12288x4096 1.82 (1.83), 4096x128 0.028 (0.033), 160x4096 0.045 (0.060).
++TUNED: dict[str, dict[int, tuple[int, int, int, int] | None]] = {
++    "12576x4096": {512: (64, 64, 4, 3), 1536: (64, 64, 4, 3)},
++    "4096x4096": {512: (128, 64, 4, 3), 1536: (128, 64, 4, 3)},
++    "2048x4096": {512: (64, 64, 4, 2), 1536: (64, 64, 4, 3)},
++    "8192x1536": {512: (64, 64, 4, 2), 1536: (64, 64, 4, 2)},
++    "8192x512": {512: (64, 64, 4, 2), 1536: (64, 64, 4, 3)},
++    "4096x8192": {512: None, 1536: None},
++    "12288x4096": {512: None, 1536: (128, 64, 4, 3)},
++    "4096x6144": {512: (64, 64, 4, 2), 1536: None},
++    "4096x1024": {512: (128, 64, 4, 2), 1536: (128, 64, 4, 2)},
++    "4096x128": {512: None, 1536: (64, 64, 4, 2)},
++    "160x4096": {512: None, 1536: None},
++    "4096x1536": {512: (64, 64, 4, 2), 1536: (128, 64, 4, 3)},
++}
++USE_QMM = "qmm"
++
++# ``exact=False`` (what fast-prefill chunks run, ``matmul_fast``): one accumulator over all of K, so the tile is free
++# of qmm's slice order and a 128 x 64 tile at 4 warps wins everywhere it was measured (M 400 / 1024 / 2048 on GB10):
++# ms at 1024 rows, exact tiles -> one accumulator: 12576x4096 2.64 -> 1.82, 4096x4096 0.80 -> 0.61, 2048x4096
++# 0.42 -> 0.34, 8192x1536 0.67 -> 0.46, 8192x512 0.24 -> 0.17, 4096x8192 2.12 (qmm) -> 1.24, 12288x4096 1.86 -> 1.81,
++# 4096x6144 1.31 -> 0.94, 4096x1024 0.21 -> 0.16, 4096x1536 0.31 -> 0.23. The two tiny shapes keep their own tile
++# (qmm is up to 0.01 ms faster on them below 1536 rows, but a shape that switched kernels by row count would give a
++# row other bits in a short call than in a long one).
++LOOSE = (128, 64, 4, 3)
++LOOSE_TUNED: dict[str, tuple[int, int, int, int]] = {"4096x128": (64, 64, 4, 2), "160x4096": (128, 64, 8, 3)}
++
++
++def config(n: int, k: int, m: int, sk: int, *, tuned: bool = True, loose: bool = False):
++    """(BM, BN, warps, stages, gpi) for an (n, k) weight at m rows summed in ``sk`` K slices, or ``USE_QMM`` where
++    ``qmm.matmul`` is faster (``TUNED``, measured for 4-bit weights; ``tuned=False``: the fixed table only;
++    ``loose``: the one-accumulator variant, ``LOOSE``)."""
++
++    if tuned and sk == 1 and loose:
++        bm, bn, warps, stages = LOOSE_TUNED.get(f"{n}x{k}", LOOSE)
++        return bm, bn, warps, stages, 1
++    row = TUNED.get(f"{n}x{k}") if tuned else None
++    if row is not None and m >= 512:
++        entry = row[1536 if m >= 1536 else 512]
++        if entry is None:
++            return USE_QMM
++        bm, bn, warps, stages = entry
++        return bm, bn, warps, stages, 1
++    bm_big, bm_small, warps, stages, gpi = CONFIG.get(f"{n}x{k}", DEFAULT)
++    bm = bm_big if m >= 512 else bm_small
++    return bm, (BN_ONE if sk == 1 else BN_SPLIT), warps, stages, gpi
++
++
++# Program order (``_tile``): M tiles fastest within groups of GROUP_M row tiles, the groups one after another, so a
++# group's rows (GROUP_M * BM x K bf16, 16 MB at 2048 x 4096) stay in L2 while every column block streams past them
++# once. Up to GROUP_M row tiles this is the plain M-fastest order; past it (lean 4096-8192-row chunks) the plain
++# order re-read the whole x from DRAM for every column block (12576x4096 at 8192 rows: 43 ms, 20 TF/s). The order
++# changes no bits (each tile's arithmetic is its own).
++GROUP_M = tl.constexpr(16)
++
++
++@triton.jit
++def _tile(pid, M, N, BM: tl.constexpr, BN: tl.constexpr, GM: tl.constexpr):
++    num_m = tl.cdiv(M, BM)
++    per_group = GM * tl.cdiv(N, BN)
++    first = (pid // per_group) * GM
++    size = tl.minimum(num_m - first, GM)
++    return first + (pid % per_group) % size, (pid % per_group) // size
++
++
++@triton.jit
++def _fq4(X, XS, W, S, B, OUT, M, x_stride,
++         N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
++         TN: tl.constexpr, GPI: tl.constexpr, F32: tl.constexpr):
++    """Program (M tile fastest, column tile): out[BM, BN] over all K, qmm's per-group arithmetic, qmm's K slices
++    summed in slice order."""
++
++    KG: tl.constexpr = K // 64
++    PER: tl.constexpr = KG // SK
++    pid_m, pid_n = _tile(tl.program_id(0), M, N, BM, BN, GROUP_M)
++    rm = pid_m * BM + tl.arange(0, BM)
++    rn = pid_n * BN + tl.arange(0, BN)
++    rk = tl.arange(0, 64)
++    rw = tl.arange(0, 8)
++    shifts = tl.arange(0, 8) * 4
++    m_ok = rm < M
++    n_ok = rn < N
++    # stored tiles: words [N/64][K/64][64][8]; column n lives in tile n // 64 at local row n % 64
++    wrow = (rn // TN).to(tl.int64) * (KG * TN * 8) + (rn % TN) * 8
++    total = tl.zeros((BM, BN), dtype=tl.float32)
++    for sl in tl.static_range(SK):
++        acc = tl.zeros((BM, BN), dtype=tl.float32)
++        for i in range(PER // GPI):
++            for j in tl.static_range(GPI):
++                g = sl * PER + i * GPI + j
++                words = tl.load(W + wrow[:, None] + g * (TN * 8) + rw[None, :], mask=n_ok[:, None], other=0)
++                x = tl.load(X + rm[:, None] * x_stride + (g * 64 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++                q = (words[:, :, None] >> shifts[None, None, :]) & 0xF
++                q = tl.reshape(q, (BN, 64)).to(tl.bfloat16)
++                p = tl.dot(x, tl.trans(q))
++                s = tl.load(S + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
++                b = tl.load(B + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
++                xs = tl.load(XS + rm * KG + g, mask=m_ok, other=0.0)
++                acc = acc + p * s[None, :] + xs[:, None] * b[None, :]
++        if sl == 0:
++            total = acc
++        else:
++            total = total + acc
++    out_mask = m_ok[:, None] & n_ok[None, :]
++    optr = OUT + rm[:, None].to(tl.int64) * N + rn[None, :]
++    if F32:
++        tl.store(optr, total, mask=out_mask)
++    else:
++        tl.store(optr, total.to(tl.bfloat16), mask=out_mask)
++
++
++@triton.jit
++def _fb16(X, W, OUT, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
++          BN: tl.constexpr, BK: tl.constexpr, F32: tl.constexpr):
++    """BF16 weights: qmm._bmm's arithmetic (K in BK steps, fp32 sums), its K slices summed in slice order."""
++
++    PER: tl.constexpr = K // SK
++    pid_m, pid_n = _tile(tl.program_id(0), M, N, BM, BN, GROUP_M)
++    rm = pid_m * BM + tl.arange(0, BM)
++    rn = pid_n * BN + tl.arange(0, BN)
++    rk = tl.arange(0, BK)
++    m_ok = rm < M
++    n_ok = rn < N
++    total = tl.zeros((BM, BN), dtype=tl.float32)
++    for sl in tl.static_range(SK):
++        acc = tl.zeros((BM, BN), dtype=tl.float32)
++        for k0 in range(sl * PER, sl * PER + PER, BK):
++            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++            w = tl.load(W + rn[:, None].to(tl.int64) * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
++            acc = acc + tl.dot(x, tl.trans(w))
++        if sl == 0:
++            total = acc
++        else:
++            total = total + acc
++    out_mask = m_ok[:, None] & n_ok[None, :]
++    optr = OUT + rm[:, None].to(tl.int64) * N + rn[None, :]
++    if F32:
++        tl.store(optr, total, mask=out_mask)
++    else:
++        tl.store(optr, total.to(tl.bfloat16), mask=out_mask)
++
++
++def _out(x: torch.Tensor, n: int, out: torch.Tensor | None, f32: bool) -> torch.Tensor:
++    m = x.shape[0]
++    if out is None:
++        return torch.empty((m, n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
++    if out.shape != (m, n) or not out.is_contiguous():
++        raise ValueError(f"matmul_prefill: out {tuple(out.shape)} must be a contiguous ({m}, {n})")
++    if out.dtype != (torch.float32 if f32 else torch.bfloat16):
++        raise ValueError(f"matmul_prefill: out dtype {out.dtype} does not match f32={f32}")
++    return out
++
++
++def matmul_prefill(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
++                   f32: bool = False, part: torch.Tensor | None = None, exact: bool = True) -> torch.Tensor:
++    """``qmm.matmul`` for prefill-sized M: x (M, K) bf16 (rows may be strided, unit column stride) @ q.T ->
++    (M, N) bf16, or the unrounded fp32 sums with ``f32``. ``xs``: x's fp32 64-input group sums (Q4 only; computed
++    when None). ``part`` is only used below ``MIN_ROWS`` rows, where ``qmm.matmul`` runs (no split-K partials
++    here). ``exact``: keep qmm's K-slice summation order (qmm's bits); False sums all of K in one accumulator."""
++
++    m, k = x.shape
++    if m < MIN_ROWS:                     # decode-sized (e.g. the last row's logits): qmm's kernels, the same bits
++        return qmm.matmul(x, q, xs, out=out, f32=f32, part=part)
++    if k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
++        raise ValueError(f"matmul_prefill: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
++    out = _out(x, q.n, out, f32)
++    if m == 0:
++        return out
++    if isinstance(q, B16):
++        if k % qmm.B16_BK:
++            raise ValueError(f"matmul_prefill: K={k} is not a multiple of {qmm.B16_BK}")
++        sk = qmm.b16_split_k(q.n, q.k) if exact else 1
++        bm, bn, warps, stages, _ = config(q.n, q.k, m, sk, tuned=False)
++        grid = (triton.cdiv(m, bm) * triton.cdiv(q.n, bn),)
++        _fb16[grid](x, q.weight, out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm, BN=bn, BK=qmm.B16_BK, F32=f32,
++                    num_warps=warps, num_stages=stages)
++        return out
++    sk = qmm.split_k(q.n, q.k) if exact else 1
++    cfg = config(q.n, q.k, m, sk, loose=not exact)
++    if cfg == USE_QMM:                   # exact, and qmm's split-K kernels are faster on this shape: the same bits
++        return qmm.matmul(x, q, xs, out=out, f32=f32, part=part)
++    if xs is None:
++        xs = qmm.group_sums(x)
++    bm, bn, warps, stages, gpi = cfg
++    per = (k // GS) // sk
++    grid = (triton.cdiv(m, bm) * triton.cdiv(q.n, bn),)
++    _fq4[grid](x, xs, q.weight, q.scales, q.biases, out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm, BN=bn,
++               TN=BN_STORED, GPI=qmm.gpi_for(per, gpi), F32=f32, num_warps=warps, num_stages=stages)
++    return out
++
++
++def matmul_fast(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
++                f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor:
++    """What fast-prefill chunks run behind ``qmm.matmul`` (``fastpf.chunk``): ``matmul_prefill(exact=False)``, one
++    accumulator over K (not qmm's bits; deterministic and row-independent)."""
++
++    return matmul_prefill(x, q, xs, out=out, f32=f32, part=part, exact=False)
++
++
++def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
++           f32: bool = False, part: torch.Tensor | None = None, min_rows: int = 256) -> torch.Tensor:
++    """Dispatch helper for callers: ``matmul_prefill`` from ``min_rows`` rows up, ``qmm.matmul`` below (the decode
++    kernels are tuned for 1-16 rows)."""
++
++    if x.shape[0] >= min_rows:
++        return matmul_prefill(x, q, xs, out=out, f32=f32, part=part)
++    return qmm.matmul(x, q, xs, out=out, f32=f32, part=part)
++
++
++# -- hyper-connection mixing dots for fast chunks ------------------------------------------------------------------
++@triton.jit
++def _hc_partial_mm(X, FN, PART, R, WIDE: tl.constexpr, NB: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr):
++    """Program (row tile, K block b): ``glue._hc_partial``'s outputs for BM rows -- PART[r, b, 0:24] the dots of
++    the flattened streams with fn over K block b, PART[r, b, 24] the sum of squares -- with fn read once per BM
++    rows (bf16 tensor-core dots, fp32 sums; the per-row kernel re-reads fn's 786 KB from L2 for every row)."""
++
++    pid = tl.program_id(0)
++    b = tl.program_id(1)
++    KB: tl.constexpr = WIDE // NB
++    rows = pid * BM + tl.arange(0, BM)
++    ok = rows < R
++    rr = tl.where(ok, rows, 0).to(tl.int64)
++    m = tl.arange(0, 32)
++    k = tl.arange(0, BK)
++    acc = tl.zeros((BM, 32), dtype=tl.float32)
++    ss = tl.zeros((BM,), dtype=tl.float32)
++    for t in range(KB // BK):
++        base = b * KB + t * BK
++        x = tl.load(X + rr[:, None] * WIDE + base + k[None, :], mask=ok[:, None], other=0.0)
++        w = tl.load(FN + m[:, None] * WIDE + base + k[None, :], mask=m[:, None] < 24, other=0.0)
++        acc = tl.dot(x, tl.trans(w), acc)
++        xf = x.to(tl.float32)
++        ss += tl.sum(xf * xf, axis=1)
++    pp = PART + (rr[:, None] * NB + b) * 32 + m[None, :]
++    tl.store(pp, acc, mask=ok[:, None] & (m[None, :] < 24))
++    tl.store(PART + (rr * NB + b) * 32 + 24, ss, mask=ok)
++
++
++def hc_partial(x: torch.Tensor, fn: torch.Tensor, part: torch.Tensor, nb: int) -> None:
++    """``glue._hc_partial`` for a fast-prefill chunk: x [R, S*D] bf16 streams, fn [24, S*D] bf16 -> part [R, nb, 32]
++    fp32 (24 dots, then the sum of squares). Row-independent and deterministic (fixed K order), not its bits."""
++
++    rows, wide = x.shape
++    if x.stride(1) != 1 or x.stride(0) != wide or not fn.is_contiguous() or wide % (nb * 64):
++        raise ValueError("hc_partial: contiguous [R, S*D] streams and fn, S*D a multiple of 64 * nb expected")
++    bm = 64
++    _hc_partial_mm[(triton.cdiv(rows, bm), nb)](x, fn, part, rows, WIDE=wide, NB=nb, BM=bm, BK=64, num_warps=4,
++                                                 num_stages=3)
++
++
++def flops(m: int, n: int, k: int) -> float:
++    return 2.0 * m * n * k

@@ -1,0 +1,49 @@
+{
+ "label": "",
+ "base": "http://127.0.0.1:8080",
+ "model": "GLM-5.3-Flash-Uncensored",
+ "started": "2026-09-27T23:26:36+0700",
+ "args": {
+  "base": "http://127.0.0.1:8080",
+  "model": "GLM-5.3-Flash-Uncensored",
+  "key": "",
+  "suites": "ctx",
+  "reps": 5,
+  "long_tokens": 512,
+  "edit_tokens": 1024,
+  "ctx": "8000",
+  "extra": "{}",
+  "label": "",
+  "out": "results/B2/warm.json"
+ },
+ "suites": {
+  "ctx": [
+   {
+    "ctx": 8000,
+    "prompt_tokens": 7045,
+    "cold": {
+     "ttft_s": 7.594184936999227,
+     "decode_s": 3.046118695005134,
+     "prompt_tokens": 7045,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 83.71308722084127,
+     "sha256": "2ac106c6ed0dc59f",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "warm": {
+     "ttft_s": 0.11444833599671256,
+     "decode_s": 2.7848074740031734,
+     "prompt_tokens": 7045,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 91.56826903851861,
+     "sha256": "2ac106c6ed0dc59f",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "prefill_tps": 927.7
+   }
+  ]
+ },
+ "finished": "2026-09-27T23:26:49+0700"
+}

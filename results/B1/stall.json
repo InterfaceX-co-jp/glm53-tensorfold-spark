@@ -1,0 +1,32 @@
+{
+ "label": "",
+ "args": {
+  "base": "http://127.0.0.1:8080",
+  "model": "GLM-5.3-Flash-Uncensored",
+  "modes": "stall",
+  "doc": 28000,
+  "system": 2000,
+  "append": 2000,
+  "tokens": 64,
+  "long_tokens": 1024,
+  "streams": "4",
+  "reps": 2,
+  "delay": 4.0,
+  "extra": "{}",
+  "label": "",
+  "out": "results/B1/stall.json"
+ },
+ "stall": {
+  "decoders": 3,
+  "prefill_tokens": 34778,
+  "prefill_ttft_s": 105.75027519399737,
+  "max_gap_during_prefill_s": 0.10342852499888977,
+  "sum_gaps_during_prefill_s": 71.19559763000143,
+  "median_gap_outside_s": 0.05557462300203042,
+  "decode_tps": [
+   40.975636255070285,
+   41.18083429304437,
+   40.87465177453667
+  ]
+ }
+}

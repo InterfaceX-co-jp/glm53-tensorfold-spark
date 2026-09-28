@@ -1,0 +1,740 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index 6ca59fb..d65c142 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -262,6 +262,14 @@ class GlmEngine:
+                   f"does not depend on them), snapshots every {pfgrid.snapshot_grid()} tokens (tail "
+                   f"{pfgrid.snapshot_tail()}), {'bf16' if fastpf.gather16() else 'fp32'} gathers"
+                   + (f"; row-invariant kernels for {gone}" if gone else ""), flush=True)
++        # patches/0170: GLM53_TF_KDA_PROJ_BF16=1: a bf16 copy of each KDA input projection (the 4-bit weights'
++        # values, rounded once) for fast chunks; checked equal on both ranks by fastpf.settings() above
++        if fastpf.kda_bf16():
++            extra = fastpf.attach_kda_bf16(w)
++            fastboot.mark("KDA projections in bf16", f"+{extra / 2**30:.2f} GiB")
++            if rank == 0:
++                print(f"[tensorfold] KDA input projections: bf16 copies for fast prefill chunks, +{extra / 2**30:.2f} "
++                      "GiB a rank (patches/0170)", flush=True)
+         # patches/0083: GLM53_TF_FP8_PREFILL (the default of the FP8 kernels in fast chunks) and whether they can run
+         from . import fp8pf
+ 
+@@ -400,7 +408,8 @@ class GlmEngine:
+                 "auto_fdrafts": int(self.f_most), "calib_online": int(bool(self.calib_on)),
+                 "fast_prefill": int(bool(self.e.fast_prefill)),          # patches/0091
+                 "fp8_prefill": int(bool(getattr(self.e, "fp8_prefill", False))),     # patches/0092
+-                "prefill_overlap": int(pfoverlap.on())}                  # patches/0093
++                "prefill_overlap": int(pfoverlap.on()),                  # patches/0093
++                "fat_experts": int(bool(exl3_mm.FAT))}                   # patches/0170
+ 
+     def _set_knobs(self, values: dict[str, int]) -> None:
+         """Set the knobs whose value differs from the current one (the others are left exactly as they are)."""
+@@ -436,6 +445,8 @@ class GlmEngine:
+             from . import pfoverlap
+ 
+             pfoverlap.set_request(bool(changed["prefill_overlap"]))
++        if "fat_experts" in changed:            # patches/0170: the same bits either way (fat == fast2)
++            exl3_mm.FAT = bool(changed["fat_experts"])
+ 
+     def _knobs(self, values: dict[str, int]):
+         """Context: the request's knobs on this rank, then this rank's previous values again (also on errors)."""
+diff --git i/src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp w/src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp
+index 6b35103..ac5915b 100644
+--- i/src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp
++++ w/src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp
+@@ -7,6 +7,15 @@ void exl3_fast_gateup_cuda(const at::Tensor&, const at::Tensor&, const at::Tenso
+                            const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, double);
+ void exl3_fast_down_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                          const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
++// patches/0170: the fat variants and the one-matrix input rotation
++void exl3_fat_gateup_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                          const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                          const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, double, bool,
++                          int64_t, bool);
++void exl3_fat_down_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                        const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, bool);
++void exl3_rot_in1_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t,
++                       int64_t, int64_t);
+ 
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
+@@ -51,7 +60,63 @@ void down(const at::Tensor& XD, const at::Tensor& TD, const at::Tensor& uids, co
+     exl3_fast_down_cuda(XD, TD, uids, ucount, members, svh_d, y, K, N, slots);
+ }
+ 
++// patches/0170: ``gateup``'s contract; ``shared_x``: both matrices multiply XG (XU is not read); stages 3 | 4
++void gateup_fat(const at::Tensor& XG, const at::Tensor& XU, const at::Tensor& TG, const at::Tensor& TU,
++                const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, const at::Tensor& svh_g,
++                const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor xd, int64_t K, int64_t N, int64_t slots,
++                double limit, bool shared_x, int64_t stages, bool ticket) {
++    check(XG, at::kHalf, "XG");
++    if (!shared_x) check(XU, at::kHalf, "XU");
++    check(TG, at::kInt, "TG");
++    check(TU, at::kInt, "TU");
++    check(uids, at::kInt, "uids");
++    check(ucount, at::kInt, "ucount");
++    check(members, at::kInt, "members");
++    check(svh_g, at::kHalf, "svh_g");
++    check(svh_u, at::kHalf, "svh_u");
++    check(suh_d, at::kHalf, "suh_d");
++    check(xd, at::kHalf, "xd");
++    TORCH_CHECK(XG.size(-1) == K && (shared_x || XU.size(-1) == K) && xd.size(-1) == N, "gateup_fat: X [P, K], Xd [P, N]");
++    TORCH_CHECK(TG.size(1) * 16 == K && TG.size(2) * 16 == N && TG.sizes() == TU.sizes(), "gateup_fat: trellis shapes");
++    TORCH_CHECK(svh_g.size(-1) == N && svh_u.size(-1) == N && suh_d.size(-1) == N, "gateup_fat: scales [E, N]");
++    c10::cuda::CUDAGuard guard(XG.device());
++    exl3_fat_gateup_cuda(XG, XU, TG, TU, uids, ucount, members, svh_g, svh_u, suh_d, xd, K, N, slots, limit, shared_x,
++                         stages, ticket);
++}
++
++void down_fat(const at::Tensor& XD, const at::Tensor& TD, const at::Tensor& uids, const at::Tensor& ucount,
++              const at::Tensor& members, const at::Tensor& svh_d, at::Tensor y, int64_t K, int64_t N, int64_t slots,
++              int64_t stages, bool ticket) {
++    check(XD, at::kHalf, "XD");
++    check(TD, at::kInt, "TD");
++    check(uids, at::kInt, "uids");
++    check(ucount, at::kInt, "ucount");
++    check(members, at::kInt, "members");
++    check(svh_d, at::kHalf, "svh_d");
++    check(y, at::kFloat, "y");
++    TORCH_CHECK(XD.size(-1) == K && y.size(-1) == N, "down_fat: Xd [P, K], Y [P, N]");
++    TORCH_CHECK(TD.size(1) * 16 == K && TD.size(2) * 16 == N, "down_fat: trellis shape");
++    TORCH_CHECK(svh_d.size(-1) == N, "down_fat: scales [E, N]");
++    c10::cuda::CUDAGuard guard(XD.device());
++    exl3_fat_down_cuda(XD, TD, uids, ucount, members, svh_d, y, K, N, slots, stages, ticket);
++}
++
++// exl3.cu ``rot_in``'s first output only (x bf16 [rows, >= K] with row stride x_stride; out0 [rows * slots, K] fp16)
++void rot_in1(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0, at::Tensor out0,
++             int64_t rows, int64_t K, int64_t slots) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16, "rot_in1: x bf16");
++    check(pick, at::kInt, "pick");
++    check(suh0, at::kHalf, "suh0");
++    check(out0, at::kHalf, "out0");
++    TORCH_CHECK(out0.size(-1) == K && out0.size(0) >= rows * slots, "rot_in1: out0 [rows * slots, K]");
++    c10::cuda::CUDAGuard guard(x.device());
++    exl3_rot_in1_cuda(x, x_stride, pick, suh0, out0, rows, K, slots);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("gateup", &gateup);
+     m.def("down", &down);
++    m.def("gateup_fat", &gateup_fat);        // patches/0170
++    m.def("down_fat", &down_fat);
++    m.def("rot_in1", &rot_in1);
+ }
+diff --git i/src/tensorfold/families/glm5_next/cuda/exl3_fast.cu w/src/tensorfold/families/glm5_next/cuda/exl3_fast.cu
+index 8a05fcf..4c02fc7 100644
+--- i/src/tensorfold/families/glm5_next/cuda/exl3_fast.cu
++++ w/src/tensorfold/families/glm5_next/cuda/exl3_fast.cu
+@@ -673,6 +673,321 @@ inline bool enabled() {
+ 
+ }  // namespace fast2
+ 
++// -- fat (patches/0170, GLM53_TF_FAST_EXPERTS=fat): fast2 with the data movement of the MiaAI-Lab / Reederey87 E2/E3
++// grouped "fat" expert GEMM (overlay/exl3_fat_moe.cu, Apache-2.0 / MIT; see NOTICE). What is taken from it:
++//
++//   * the trellis words go through the same cp.async multi-stage ring as the member rows (fast2 loaded them with
++//     __ldg one stage ahead into registers): NSA - 1 stages of weights AND rows in flight, and no word registers;
++//   * gate/up read ONE rotated input when the checkpoint's gate and up input sign vectors are identical (true for
++//     every expert of the GLM-5.3-Flash EXL3 checkpoints; ``exl3_mm`` checks it per layer at first use): ``rot_in1``
++//     writes Xg only (half of rot_in's 1.2 GB at 8192 rows), and the ring holds one matrix of rows (half the cp.async
++//     traffic and shared memory of a stage);
++//   * XOR-swizzled row stages (no padding: ldmatrix phases hit 8 distinct 16-byte bank groups), so a CTA fits 48 KB
++//     and two CTAs of 8 warps share an SM (``__launch_bounds__(256, 2)``; fast2's gate/up ran one CTA an SM at
++//     ~224 registers);
++//   * a ticket scheduler (Mia's S2a): CTAs claim work items with one atomicAdd each instead of a static stride, so a
++//     skewed expert's passes do not leave SMs idle at the end (``GLM53_TF_FAT_TICKET=0``: the static stride).
++//
++// What is NOT taken: Mia's orientation (rows as the mma A operand, weights as B) and its epilogue arithmetic. fat keeps
++// fast2's: weights decoded into registers as the m16n8k16 A fragment, the member rows as B, every output element the
++// same chain of mma over ascending k tiles, the same 128-point transforms and formulas. So fat == fast2 == v1 BIT FOR
++// BIT whatever the stages, the ticket or the CTA count (only the data movement changed), and it inherits their
++// guarantees (patches/0085): row-independent (a pair's outputs depend only on its own row; the member count only
++// decides how many B columns are zero-filled), deterministic (no atomics on data; the ticket only decides which CTA
++// runs an item). With the shared input, bit equality also needs rot_in1 == rot_in (the same code, one matrix);
++// tests/cuda/test_mia_prefill_patches.py checks both on hardware.
++namespace fat {
++
++// the row ring's 16-byte chunk c of row r (CPR chunks a row): XOR-swizzled so the 8 rows of an ldmatrix phase hit
++// 8 distinct bank groups
++template <int CPR>
++__device__ __forceinline__ int swz(int r, int c) {
++    static_assert(CPR == 8 || CPR == 4, "rows of 64 or 32 halves");
++    return CPR == 8 ? (c ^ (r & 7)) : (c ^ ((r >> 1) & 3));
++}
++
++template <int MATS, int MTL, int NG, int KS, int NSA, int NGR, bool SHX>
++struct Cfg {
++    static constexpr int BM = NG * 8, WPM = NB / MTL, W = MATS * WPM, THREADS = W * 32;
++    static constexpr int XM = SHX ? 1 : MATS;                       // matrices of member rows in a stage
++    static constexpr int CPR = KS * 2;                              // 16-byte chunks of a row in a stage
++    static constexpr int LDA = KS * 16;                             // halves a row (swizzled, no padding)
++    static constexpr int LDE = 132, ER = NGR * 8, ROUNDS = NG / NGR;
++    static constexpr size_t A_BYTES = (size_t)XM * BM * LDA * sizeof(half);
++    static constexpr size_t W_BYTES = (size_t)MATS * KS * NB * 32 * sizeof(uint32_t);
++    static constexpr size_t STAGE = A_BYTES + W_BYTES;
++    static constexpr size_t RING = (size_t)NSA * STAGE;
++    static constexpr size_t EPI = (size_t)MATS * ER * LDE * sizeof(float);
++    static constexpr size_t SMEM = RING > EPI ? RING : EPI;
++    static_assert(A_BYTES % 16 == 0, "stage alignment");
++};
++
++// MINB: CTAs an SM the registers are capped for (2: <= 128 registers at 256 threads)
++template <int MATS, int MTL, int NG, int KS, int NSA, int NGR, bool SHX, int MINB>
++__global__ void __launch_bounds__(Cfg<MATS, MTL, NG, KS, NSA, NGR, SHX>::THREADS, MINB) expert_kernel(
++    const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
++    const uint32_t* __restrict__ T1, const int* __restrict__ uids, const int* __restrict__ members,
++    const int* __restrict__ plan, int* __restrict__ ticket, int K, int N, int maxm, int slots, int maxu,
++    const half* __restrict__ sv0, const half* __restrict__ sv1, const half* __restrict__ sd, half* __restrict__ xd,
++    float* __restrict__ y, float limit) {
++    using C = Cfg<MATS, MTL, NG, KS, NSA, NGR, SHX>;
++    constexpr int W = C::W, THREADS = C::THREADS, BM = C::BM, LDA = C::LDA, LDE = C::LDE, ER = C::ER, CPR = C::CPR;
++    static_assert(NG % 2 == 0 && NG % NGR == 0 && NGR % 2 == 0, "n groups in pairs");
++    extern __shared__ __align__(16) unsigned char smem[];
++    float* ep = reinterpret_cast<float*>(smem);              // [MATS][ER][LDE], after the K loop
++    __shared__ int rows_sh[BM];
++    __shared__ int item_sh, u_sh, cnt_sh;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int mat = warp / C::WPM, slice = warp % C::WPM;   // columns slice * 16 MTL .. + 16 MTL of the item
++    const int xmat = SHX ? 0 : mat;                          // the matrix of rows this warp multiplies
++    const int g = lane >> 2, t = lane & 3;
++    const int KT = K >> 4, NTILES = N >> 4, S = KT / KS, NBLK = N / 128;
++    const int total = plan[0] * NBLK;
++    // ldmatrix: this lane's row within a 16-row pair of n groups, and its chunk's swizzle (constant per lane)
++    const int lr = (lane & 7) + ((lane >> 4) << 3);
++    const int lc = (lane >> 3) & 1;
++
++    int u = 0;                                               // thread 0: the distinct expert of the last item
++    int next = blockIdx.x;                                   // static stride (no ticket)
++    for (;;) {
++        __syncthreads();                                     // the previous item is done with rows_sh / smem
++        if (threadIdx.x == 0) {
++            const int it = ticket ? atomicAdd(ticket, 1) : next;
++            item_sh = it;
++            if (it < total) {
++                // items come in ascending order per CTA (stride or ticket): walk u forward from the last one
++                const int tt = it / NBLK;
++                while (u + 1 < maxu && __ldg(plan + 2 + u) <= tt) ++u;
++                u_sh = u;
++            }
++            cnt_sh = 0;
++        }
++        next += gridDim.x;
++        __syncthreads();
++        const int item = item_sh;
++        if (item >= total) break;
++        const int tt = item / NBLK, nb = item % NBLK;
++        const int uu = u_sh, pass = tt - plan[1 + uu], e = uids[uu];
++        for (int i = threadIdx.x; i < BM; i += THREADS) {
++            const int m = pass * BM + i;
++            const int code = m < maxm ? members[(size_t)uu * maxm + m] : -1;
++            rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
++            if (code >= 0) atomicMax(&cnt_sh, i + 1);
++        }
++        __syncthreads();
++        const int cnt = cnt_sh;                              // members of this pass (they come first)
++
++        // stage s: the member rows' k range [s KS 16, (s + 1) KS 16) (zero-filled past the last member), then the
++        // item's trellis words of k tiles s KS .. s KS + KS - 1, all MATS matrices, the NB column tiles of block nb
++        auto load_stage = [&](int s) {
++            unsigned char* st = smem + (size_t)(s % NSA) * C::STAGE;
++            half* ra = reinterpret_cast<half*>(st);
++            const int k0 = s * KS * 16;
++#pragma unroll
++            for (int i = threadIdx.x; i < C::XM * BM * CPR; i += THREADS) {
++                const int m = i / (BM * CPR), r = (i / CPR) % BM, c = i % CPR;
++                const int row = rows_sh[r];
++                const half* src = (m ? X1 : X0) + (size_t)(row < 0 ? 0 : row) * K + k0 + c * 8;
++                fast2::cp_async16(ra + ((size_t)m * BM + r) * LDA + swz<CPR>(r, c) * 8, src, row >= 0);
++            }
++            uint32_t* rw = reinterpret_cast<uint32_t*>(st + C::A_BYTES);
++            constexpr int WCH = MATS * KS * NB * 8;          // 16-byte chunks: 8 a 16 x 16 tile
++#pragma unroll
++            for (int i = threadIdx.x; i < WCH; i += THREADS) {
++                const int q = i & 7, n = (i >> 3) % NB, kk = (i / (8 * NB)) % KS, m = i / (8 * NB * KS);
++                const uint32_t* src = (m ? T1 : T0) + (((size_t)e * KT + s * KS + kk) * NTILES + nb * NB + n) * 32 + q * 4;
++                fast2::cp_async16(rw + ((m * KS + kk) * NB + n) * 32 + q * 4, src, true);
++            }
++        };
++
++        float acc[MTL][NG][4];
++#pragma unroll
++        for (int l = 0; l < MTL; ++l)
++#pragma unroll
++            for (int n = 0; n < NG; ++n)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[l][n][c] = 0.f;
++
++#pragma unroll
++        for (int s = 0; s < NSA - 1; ++s) {
++            if (s < S) load_stage(s);
++            fast2::cp_commit();
++        }
++        fast2::cp_wait<NSA - 2>();
++        __syncthreads();
++        for (int s = 0; s < S; ++s) {
++            if (s + NSA - 1 < S) load_stage(s + NSA - 1);
++            fast2::cp_commit();
++            const unsigned char* st = smem + (size_t)(s % NSA) * C::STAGE;
++            const half* A = reinterpret_cast<const half*>(st) + (size_t)xmat * BM * LDA;
++            const uint32_t* Wd = reinterpret_cast<const uint32_t*>(st + C::A_BYTES) + (size_t)mat * KS * NB * 32 +
++                                 slice * MTL * 32 + lane;
++#pragma unroll
++            for (int kk = 0; kk < KS; ++kk) {
++                uint32_t af[MTL][4];
++#pragma unroll
++                for (int l = 0; l < MTL; ++l) {
++                    uint32_t b0[2], b1[2];
++                    decode_tile(Wd[(kk * NB + l) * 32], lane, b0, b1);
++                    af[l][0] = b0[0]; af[l][1] = b1[0]; af[l][2] = b0[1]; af[l][3] = b1[1];
++                }
++                const int chunk = swz<CPR>(lr, kk * 2 + lc);
++#pragma unroll
++                for (int np = 0; np < NG / 2; ++np) {
++                    if (16 * np < cnt) {                         // warp-uniform
++                        uint32_t b[4];
++                        fast2::ldsm4(b, A + (16 * np + lr) * LDA + chunk * 8);
++#pragma unroll
++                        for (int l = 0; l < MTL; ++l) {
++                            mma16816(acc[l][2 * np], af[l], b[0], b[1]);
++                            mma16816(acc[l][2 * np + 1], af[l], b[2], b[3]);
++                        }
++                    }
++                }
++            }
++            fast2::cp_wait<NSA - 2>();
++            __syncthreads();
++        }
++
++        // epilogue: fast2's, unchanged (ER rows a round: accumulators -> ep[mat][row][col] fp32, one warp a row)
++#pragma unroll
++        for (int rd = 0; rd < C::ROUNDS; ++rd) {
++            if (rd) __syncthreads();
++            if (ER * rd < cnt) {
++#pragma unroll
++                for (int n = 0; n < NGR; ++n) {
++                    const int ng = rd * NGR + n;
++                    float* E = ep + ((size_t)mat * ER + 8 * n + 2 * t) * LDE + slice * 16 * MTL + g;
++#pragma unroll
++                    for (int l = 0; l < MTL; ++l) {
++                        E[l * 16] = acc[l][ng][0];
++                        E[LDE + l * 16] = acc[l][ng][1];
++                        E[l * 16 + 8] = acc[l][ng][2];
++                        E[LDE + l * 16 + 8] = acc[l][ng][3];
++                    }
++                }
++            }
++            __syncthreads();
++            for (int r = warp; r < ER && ER * rd + r < cnt; r += W) {
++                const int row = rows_sh[ER * rd + r];
++                const int c0 = 4 * lane;
++                float v[4];
++                *reinterpret_cast<float4*>(v) = *reinterpret_cast<const float4*>(ep + (size_t)r * LDE + c0);
++                fast2::fwht_row(v, lane);
++                if constexpr (MATS == 2) {
++                    float w[4];
++                    *reinterpret_cast<float4*>(w) = *reinterpret_cast<const float4*>(ep + ((size_t)ER + r) * LDE + c0);
++                    fast2::fwht_row(w, lane);
++                    const half* sg = sv0 + (size_t)e * N + nb * 128 + c0;
++                    const half* su = sv1 + (size_t)e * N + nb * 128 + c0;
++                    const half* sdd = sd + (size_t)e * N + nb * 128 + c0;
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) {
++                        const float gg = fminf(bf16r(v[j] * HAD_SCALE * __half2float(sg[j])), limit);
++                        const float uu2 = fminf(fmaxf(bf16r(w[j] * HAD_SCALE * __half2float(su[j])), -limit), limit);
++                        const float a = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu2);
++                        v[j] = a * __half2float(sdd[j]);
++                    }
++                    fast2::fwht_row(v, lane);
++                    half2* o = reinterpret_cast<half2*>(xd + (size_t)row * N + nb * 128 + c0);
++                    o[0] = __halves2half2(__float2half_rn(v[0] * HAD_SCALE), __float2half_rn(v[1] * HAD_SCALE));
++                    o[1] = __halves2half2(__float2half_rn(v[2] * HAD_SCALE), __float2half_rn(v[3] * HAD_SCALE));
++                } else {
++                    const half* sv = sv0 + (size_t)e * N + nb * 128 + c0;
++                    float4 o;
++                    o.x = v[0] * HAD_SCALE * __half2float(sv[0]);
++                    o.y = v[1] * HAD_SCALE * __half2float(sv[1]);
++                    o.z = v[2] * HAD_SCALE * __half2float(sv[2]);
++                    o.w = v[3] * HAD_SCALE * __half2float(sv[3]);
++                    *reinterpret_cast<float4*>(y + (size_t)row * N + nb * 128 + c0) = o;
++                }
++            }
++        }
++    }
++}
++
++template <int MATS, int MTL, int NG, int KS, int NSA, int NGR, bool SHX, int MINB>
++void launch(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
++            const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, const half* sv0,
++            const half* sv1, const half* sd, half* xd, float* y, int K, int N, int slots, float limit, bool ticket) {
++    using C = Cfg<MATS, MTL, NG, KS, NSA, NGR, SHX>;
++    auto kern = expert_kernel<MATS, MTL, NG, KS, NSA, NGR, SHX, MINB>;
++    static int per_sm = 0;
++    if (per_sm == 0) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)C::SMEM));
++        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kern, C::THREADS, C::SMEM));
++        TORCH_CHECK(per_sm > 0, "fat experts: the configuration does not fit an SM");
++    }
++    const int maxu = (int)uids.size(0), maxm = (int)members.size(1);
++    TORCH_CHECK(maxu <= fast2::MAXU, "too many distinct experts");
++    TORCH_CHECK((K / 16) % KS == 0 && N % 128 == 0, "fat experts: K % (16 KS), N % 128");
++    auto stream = at::cuda::getCurrentCUDAStream();
++    // plan[0] = items, plan[1 + u] = first pass of u (fast2's plan kernel), plan[maxu + 2] = the ticket counter
++    at::Tensor plan = at::zeros({maxu + 3}, uids.options());
++    fast2::plan_kernel<<<1, fast2::MAXU, 0, stream>>>(uids.data_ptr<int>(), ucount.data_ptr<int>(),
++                                                      members.data_ptr<int>(), maxu, maxm, (int)T0.size(0), C::BM,
++                                                      plan.data_ptr<int>());
++    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    kern<<<sms * per_sm, C::THREADS, C::SMEM, stream>>>(
++        reinterpret_cast<const half*>(X0.data_ptr()), reinterpret_cast<const half*>(X1.data_ptr()),
++        reinterpret_cast<const uint32_t*>(T0.data_ptr()), reinterpret_cast<const uint32_t*>(T1.data_ptr()),
++        uids.data_ptr<int>(), members.data_ptr<int>(), plan.data_ptr<int>(),
++        ticket ? plan.data_ptr<int>() + maxu + 2 : nullptr, K, N, maxm, slots, maxu, sv0, sv1, sd, xd, y, limit);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// rot_in for one matrix (the gate's sign vector; used when gate and up share it): exl3.cu rot_in_kernel's code for
++// mat 0, 8 warps a block (one (pair, 128-block of K) a warp, as there), so Xg gets rot_in's bits.
++__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++
++__global__ void __launch_bounds__(256) rot_in1_kernel(const __nv_bfloat16* __restrict__ x, int x_stride,
++                                                      const int* __restrict__ pick, const half* __restrict__ suh0,
++                                                      half* __restrict__ out0, int K, int slots, int items) {
++    const int item = blockIdx.x * 8 + (threadIdx.x >> 5);
++    if (item >= items) return;                     // warp-uniform
++    const int KB = K / 128;
++    const int p = item / KB, blk = item % KB;
++    const int row = p / slots, slot = p % slots;
++    if (slot == slots - 1) return;
++    const int lane = threadIdx.x & 31;
++    const int e = pick[row * slots + slot];
++    const half* suh = suh0 + (size_t)e * K + blk * 128 + 4 * lane;
++    const __nv_bfloat16* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) v[j] = __bfloat162float(xr[j]) * __half2float(suh[j]);
++    fwht128(v, lane);
++    half* o = out0 + (size_t)p * K + blk * 128 + 4 * lane;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
++}
++
++// (MTL, NG, KS, NSA, NGR) as fast2's configurations (the tiling of a pass is the same; the choice is free).
++#define FAT_GU 2, 8, 4
++#define FAT_DN 2, 8, 4
++#define FAT_DN_LARGE 2, 16, 2
++
++}  // namespace fat
++
++namespace fat {
++// 2 CTAs an SM when two fit the shared memory (102,400 B an SM, 1 KB reserved a CTA, ~0.3 KB static)
++template <int MATS, int MTL, int NG, int KS, int NSA, int NGR, bool SHX>
++constexpr int minb() {
++    return 2 * (Cfg<MATS, MTL, NG, KS, NSA, NGR, SHX>::SMEM + 1024 + 512) <= 102400 ? 2 : 1;
++}
++}  // namespace fat
++
+ constexpr int GATEUP_KS = 2;     // 2 matrices x 2 k tiles x 8 n tiles a slab (one row a warp): 16 KB a buffer
+ constexpr int DOWN_KS = 4;       // 1 matrix x 4 k tiles x 8 n tiles (one row a warp): 16 KB a buffer
+ 
+@@ -732,3 +1047,61 @@ void exl3_fast_down_cuda(const at::Tensor& XD, const at::Tensor& TD, const at::T
+         reinterpret_cast<const half*>(svh_d.data_ptr()), y.data_ptr<float>(), (int)K, (int)N, maxm, (int)slots, (int)E);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
++
++// patches/0170: the fat variant of exl3_fast_gateup_cuda / exl3_fast_down_cuda (same arguments and outputs, same bits;
++// ``shared_x``: XU is not read, both matrices multiply XG; ``stages``: 3 or 4; ``ticket``: dynamic item claiming).
++void exl3_fat_gateup_cuda(const at::Tensor& XG, const at::Tensor& XU, const at::Tensor& TG, const at::Tensor& TU,
++                          const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members,
++                          const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor& xd,
++                          int64_t K, int64_t N, int64_t slots, double limit, bool shared_x, int64_t stages,
++                          bool ticket) {
++    TORCH_CHECK(N % 128 == 0 && K % 64 == 0, "fat gate/up: N % 128, K % 64");
++    TORCH_CHECK(stages == 3 || stages == 4, "fat gate/up: 3 or 4 stages");
++    const half* sg = reinterpret_cast<const half*>(svh_g.data_ptr());
++    const half* su = reinterpret_cast<const half*>(svh_u.data_ptr());
++    const half* sd = reinterpret_cast<const half*>(suh_d.data_ptr());
++    half* o = reinterpret_cast<half*>(xd.data_ptr());
++#define FAT_GU_LAUNCH(NSA, SHX)                                                                                     \
++    fat::launch<2, FAT_GU, NSA, 4, SHX, fat::minb<2, FAT_GU, NSA, 4, SHX>()>(                                      \
++        XG, SHX ? XG : XU, TG, TU, uids, ucount, members, sg, su, sd, o, nullptr, (int)K, (int)N, (int)slots,      \
++        (float)limit, ticket)
++    if (stages == 3) {
++        if (shared_x) FAT_GU_LAUNCH(3, true); else FAT_GU_LAUNCH(3, false);
++    } else {
++        if (shared_x) FAT_GU_LAUNCH(4, true); else FAT_GU_LAUNCH(4, false);
++    }
++#undef FAT_GU_LAUNCH
++}
++
++void exl3_fat_down_cuda(const at::Tensor& XD, const at::Tensor& TD, const at::Tensor& uids, const at::Tensor& ucount,
++                        const at::Tensor& members, const at::Tensor& svh_d, at::Tensor& y, int64_t K, int64_t N,
++                        int64_t slots, int64_t stages, bool ticket) {
++    TORCH_CHECK(N % 128 == 0 && K % 64 == 0, "fat down: N % 128, K % 64");
++    TORCH_CHECK(stages == 3 || stages == 4, "fat down: 3 or 4 stages");
++    const half* sv = reinterpret_cast<const half*>(svh_d.data_ptr());
++    float* out = y.data_ptr<float>();
++    const bool large = members.size(1) >= 4096;       // fast2's switch (same bits either way)
++#define FAT_DN_LAUNCH(CFG, NSA)                                                                                     \
++    fat::launch<1, CFG, NSA, 8, false, fat::minb<1, CFG, NSA, 8, false>()>(                                        \
++        XD, XD, TD, TD, uids, ucount, members, sv, sv, sv, nullptr, out, (int)K, (int)N, (int)slots, 0.f, ticket)
++    if (large) {
++        if (stages == 3) FAT_DN_LAUNCH(FAT_DN_LARGE, 3); else FAT_DN_LAUNCH(FAT_DN_LARGE, 4);
++    } else {
++        if (stages == 3) FAT_DN_LAUNCH(FAT_DN, 3); else FAT_DN_LAUNCH(FAT_DN, 4);
++    }
++#undef FAT_DN_LAUNCH
++}
++
++// Xg only (``fat::rot_in1_kernel``: rot_in's code for the gate's sign vector), for gate and up sharing it.
++void exl3_rot_in1_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
++                       at::Tensor& out0, int64_t rows, int64_t K, int64_t slots) {
++    TORCH_CHECK(K % 128 == 0, "rot_in1: K % 128");
++    const int64_t items = rows * slots * (K / 128);
++    if (items == 0) return;
++    TORCH_CHECK(items < (int64_t)1 << 31, "rot_in1: too many items");
++    fat::rot_in1_kernel<<<(unsigned)((items + 7) / 8), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride, pick.data_ptr<int>(),
++        reinterpret_cast<const half*>(suh0.data_ptr()), reinterpret_cast<half*>(out0.data_ptr()), (int)K, (int)slots,
++        (int)items);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git i/src/tensorfold/families/glm5_next/cuda/exl3_mm.py w/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+index c549dd5..3fb3eb9 100644
+--- i/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ w/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -44,6 +44,35 @@ DOWN_CFG = (8, 4, 1)
+ LOOP = os.environ.get("GLM53_TF_EXPERT_LOOP", "1").strip() not in ("0", "", "false", "no", "off")
+ LOOP_CFG = tuple(int(v) for v in os.environ.get("GLM53_TF_EXPERT_LOOP_CFG", "4,2").split(","))
+ 
++# patches/0170: GLM53_TF_FAST_EXPERTS=fat runs fast chunks' experts through exl3_fast.cu's ``fat`` kernels (fast2's
++# arithmetic with the MiaAI-Lab E2/E3 data movement: same bits); per request: tf_knobs.fat_experts. The others:
++# GLM53_TF_FAT_STAGES (3 | 4 cp.async stages), GLM53_TF_FAT_TICKET (1: dynamic item claiming), GLM53_TF_FAT_SHARED_X
++# (auto: gate and up read one rotated input when their sign vectors are equal, checked per layer; 0: never)
++def _env(name: str, default: str) -> str:
++    return os.environ.get(name, default).strip().lower()
++
++
++FAT = _env("GLM53_TF_FAST_EXPERTS", "fast2") == "fat"
++FAT_STAGES = int(_env("GLM53_TF_FAT_STAGES", "3"))
++FAT_TICKET = _env("GLM53_TF_FAT_TICKET", "1") not in ("0", "false", "no", "off")
++FAT_SHARED_X = _env("GLM53_TF_FAT_SHARED_X", "auto") not in ("0", "false", "no", "off")
++if FAT_STAGES not in (3, 4):
++    raise ValueError(f"GLM53_TF_FAT_STAGES={FAT_STAGES}: expected 3 or 4")
++if _env("GLM53_TF_FAST_EXPERTS", "fast2") not in ("fast2", "v1", "fat"):
++    raise ValueError(f"GLM53_TF_FAST_EXPERTS={os.environ.get('GLM53_TF_FAST_EXPERTS')!r}: expected fast2, v1 or fat")
++
++
++def shared_suh(ex: "Exl3Experts") -> bool:
++    """patches/0170: gate and up of every expert of this layer have the same input sign vector, so one rotated input
++    serves both (true for the GLM-5.3-Flash EXL3 checkpoints; checked once per layer, on the device)."""
++
++    v = ex.__dict__.get("_shared_suh")
++    if v is None:
++        v = ex.suh_g.data_ptr() == ex.suh_u.data_ptr() or bool(torch.equal(ex.suh_g, ex.suh_u))
++        ex.__dict__["_shared_suh"] = v
++    return v
++
++
+ # patches/0130: ``decode_v2`` while GLM53_TF_DECODE_KERNELS=v2 has ``exl3`` (windows of <= 16 rows through exl3_dec.cu:
+ # three kernels, the same bits); None otherwise
+ V2 = None
+@@ -122,6 +151,18 @@ def routed(x: torch.Tensor, pick: torch.Tensor, group, ex: Exl3Experts, s: Scrat
+     ext = _ext()
+     slots, P = s.slots, s.rows * s.slots
+     D, NI = ex.dims, ex.width
++    if fast and FAT:                     # patches/0170: the same bits as the branch below
++        fx = _fast_ext()
++        shx = FAT_SHARED_X and shared_suh(ex)
++        if shx:
++            fx.rot_in1(x, x.stride(0), pick, ex.suh_g, s.xg, R, D, slots)
++        else:
++            ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
++        fx.gateup_fat(s.xg, s.xg if shx else s.xu, ex.gt, ex.ut, group.ids, group.count, group.members, ex.svh_g,
++                      ex.svh_u, ex.suh_d, s.xd, D, NI, slots, float(limit), shx, FAT_STAGES, FAT_TICKET)
++        fx.down_fat(s.xd, ex.dt, group.ids, group.count, group.members, ex.svh_d, y, NI, D, slots, FAT_STAGES,
++                    FAT_TICKET)
++        return
+     if fast:
+         fx = _fast_ext()
+         ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+diff --git i/src/tensorfold/families/glm5_next/cuda/fast_qmm.py w/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+index 229a24f..7b2dcbc 100644
+--- i/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
++++ w/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+@@ -253,6 +253,9 @@ def matmul_prefill(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None,
+         sk = qmm.b16_split_k(q.n, q.k) if exact else 1
+         # patches/0085: one-accumulator tiles by shape only (the row bucket never changed a bit; now it is not read)
+         bm, bn, warps, stages, _ = config(q.n, q.k, m if exact else 512, sk, tuned=False)
++        tile = getattr(q, "tile", None)          # patches/0170: GLM53_TF_KDA_BF16_TILE on the KDA copies (same bits)
++        if tile is not None and not exact:
++            bm, bn, warps, stages = tile
+         grid = (triton.cdiv(m, bm) * triton.cdiv(q.n, bn),)
+         _fb16[grid](x, q.weight, out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm, BN=bn, BK=qmm.B16_BK, F32=f32,
+                     num_warps=warps, num_stages=stages)
+diff --git i/src/tensorfold/families/glm5_next/cuda/fastpf.py w/src/tensorfold/families/glm5_next/cuda/fastpf.py
+index 2784b9c..61df490 100644
+--- i/src/tensorfold/families/glm5_next/cuda/fastpf.py
++++ w/src/tensorfold/families/glm5_next/cuda/fastpf.py
+@@ -146,12 +146,86 @@ def grid(rows: int) -> int:
+ 
+ def settings() -> list[int]:
+     """This rank's load-time fast-prefill settings (both ranks must agree: they decide the prefill's bits, and
+-    patches/0085's snapshot grid and tail decide its chunks)."""
++    patches/0085's snapshot grid and tail decide its chunks; patches/0170: the KDA projections' bf16 copies)."""
+ 
+     from . import pfgrid
+ 
+     return [int(enabled()), int(gather16()), int(fast_kda is not None), int(fast_qmm is not None),
+-            *pfgrid.settings()]
++            *pfgrid.settings(), int(kda_bf16())]
++
++
++# -- patches/0170: the KDA input projection in bf16 for fast chunks (the idea of MiaAI-Lab PR #233, re-implemented) --
++# The fused KDA projection [q | k | v | f_a | g_a | b] (12576 x 4096 a rank) is the largest non-expert matmul of a fast
++# chunk (``kda.proj`` ~94 ms of a 28k prefill's profile at 1024-row sub-blocks, patches/0084). With
++# GLM53_TF_KDA_PROJ_BF16=1 each KDA layer also keeps a bf16 copy of the SAME 4-bit weights (s * q + b per group,
++# computed in fp32 and rounded once to bf16: the logical weights decode and exact prefill use, not the checkpoint's
++# original bf16), and a fast chunk multiplies it with ``fast_qmm``'s one-accumulator bf16 kernel instead of unpacking
++# the 4-bit words per tile. Cost: 12576 x 4096 x 2 B = 98.25 MiB a KDA layer and rank (+3.3 GiB a rank on GLM-5.3-Flash).
++#
++# Row-independent (patches/0085): the bf16 kernel's tile is fixed by the shape, one fp32 accumulator walks K in order,
++# and EVERY fast-chunk call of the projection uses the copy whatever its row count. Mia's M > 512 threshold (small M
++# stays on FP8-Marlin there) is deliberately not taken: a row-count switch would give a prompt's short last chunk or a
++# lean tail other bits than the same rows inside a longer chunk. Decode, verify, exact prefill, the MTP head and batched
++# rounds keep the 4-bit weights. New arithmetic for fast chunks (the weights are rounded to bf16), so it is a load-time
++# setting that both ranks check (``settings``); fast snapshots of one server never mix the two.
++def kda_bf16() -> bool:
++    """GLM53_TF_KDA_PROJ_BF16 (default 0)."""
++
++    return os.environ.get("GLM53_TF_KDA_PROJ_BF16", "0").strip().lower() in ("1", "true", "yes", "on")
++
++
++def kda_bf16_tile() -> tuple[int, int, int, int] | None:
++    """GLM53_TF_KDA_BF16_TILE=bm,bn,warps,stages: the bf16 kernel's tile for the copies (a tile never changes a row's
++    operations, only which program runs them: same bits); default: fast_qmm's table."""
++
++    v = os.environ.get("GLM53_TF_KDA_BF16_TILE", "").strip()
++    if not v:
++        return None
++    t = tuple(int(p) for p in v.split(","))
++    if len(t) != 4 or t[0] not in (16, 32, 64, 128, 256) or t[1] not in (32, 64, 128, 256):
++        raise ValueError(f"GLM53_TF_KDA_BF16_TILE={v!r}: expected bm,bn,warps,stages (bm 16-256, bn 32-256)")
++    return t
++
++
++def kda_bf16_bytes(n: int, k: int, layers: int) -> int:
++    """Memory of the copies: n x k bf16 a KDA layer (host arithmetic for the estimate)."""
++
++    return int(n) * int(k) * 2 * int(layers)
++
++
++def attach_kda_bf16(w) -> int:
++    """Give every KDA layer of ``w`` its projection's bf16 copy (``KDAW.proj16``, a ``qmm.B16``); returns the bytes."""
++
++    import torch
++
++    from . import qmm
++
++    total = 0
++    for layer in w.layers:
++        if layer.kind != "kda":
++            continue
++        k = layer.kda
++        if getattr(k, "proj16", None) is None:
++            dq = qmm.dequantize_q4(k.proj)                   # fp32 s * q + b, [n, K]
++            k.proj16 = qmm.make_b16(dq)                      # rounded once to nearest even
++            del dq
++        k.proj16.tile = kda_bf16_tile()
++        total += k.proj16.nbytes()
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++    return total
++
++
++def kda_proj(k):
++    """The KDA input projection a call multiplies: the bf16 copy while a fast chunk runs (``qmm.FAST_MM`` installed
++    by ``chunk``, FP8 prefill off), the 4-bit weights otherwise."""
++
++    from . import fp8pf, qmm
++
++    p16 = getattr(k, "proj16", None)
++    if p16 is None or qmm.FAST_MM is None or fp8pf.ON:
++        return k.proj
++    return p16
+ 
+ 
+ @contextlib.contextmanager
+diff --git i/src/tensorfold/families/glm5_next/cuda/forward.py w/src/tensorfold/families/glm5_next/cuda/forward.py
+index 9d17171..95c2137 100644
+--- i/src/tensorfold/families/glm5_next/cuda/forward.py
++++ w/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -355,7 +355,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+     k = layer.kda
+     li = st.kda_index[layer.index]
+     p = st.proj[li, :R]
+-    qmm.matmul(b.normed[:R], k.proj, b.xs[:R], out=p, part=b.sk)
++    qmm.matmul(b.normed[:R], fastpf.kda_proj(k), b.xs[:R], out=p, part=b.sk)     # patches/0170
+     fa = p[:, k.fa_off:k.fa_off + 128]
+     ga = p[:, k.ga_off:k.ga_off + 128]
+     if b.fast or not dv2.kda_gates(p, k, b, R):          # patches/0130: v2 sums and matmuls both gates at once
+diff --git i/src/tensorfold/families/glm5_next/cuda/knobs.py w/src/tensorfold/families/glm5_next/cuda/knobs.py
+index 2fe522f..d7e74a6 100644
+--- i/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ w/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -31,6 +31,8 @@ its snapshots are tagged C + 1 and resume FP8 fast requests of the same grid onl
+     prefill_overlap 0 | 1                    GLM53_TF_PREFILL_OVERLAP (0)   patches/0084's pipelined lean chunks
+                                                                             (same bits; 1 = the env's variant, or
+                                                                             gather,slab)
++    fat_experts     0 | 1                    GLM53_TF_FAST_EXPERTS=fat (0)  patches/0170's fat expert kernels in
++                                                                            fast chunks (same bits as fast2)
+ 
+ Knobs fixed at load (``LOAD_ONLY``) are refused with the reason. Rank 0 validates a request's knobs
+ (``parse``), resolves every knob to the value the request runs with, and sends the integers rank 1 needs in the
+@@ -57,13 +59,14 @@ RANGES: dict[str, tuple[int, int | None]] = {
+     "fast_prefill": (0, 1),              # patches/0091
+     "fp8_prefill": (0, 1),               # patches/0092
+     "prefill_overlap": (0, 1),           # patches/0093
++    "fat_experts": (0, 1),               # patches/0170
+ }
+ PER_REQUEST = tuple(RANGES) + ("depth",)
+ 
+ # the knobs rank 1 applies itself, in header order (lookup / lookup_min travel in the policy code, depth as
+ # patches/0071's cost flag, calib_online as rank 0's cost table)
+ HEADER = ("expert_loop", "prefill_rows", "longctx_graphs", "profile", "auto_fdrafts", "calib_online", "fast_prefill",
+-          "fp8_prefill", "prefill_overlap")
++          "fp8_prefill", "prefill_overlap", "fat_experts")
+ 
+ LOAD_ONLY: dict[str, str] = {
+     "nonexpert": "GLM53_TF_NONEXPERT is the stored weight format, quantized once at load",
+@@ -73,6 +76,8 @@ LOAD_ONLY: dict[str, str] = {
+     "prefill_rows_max": "GLM53_TF_PREFILL_ROWS_MAX sizes the window buffers at load (a request picks any "
+                         "prefill_rows up to it)",
+     "calib": "GLM53_TF_CALIB is the load-time cost calibration (use calib_online per request)",
++    "kda_proj_bf16": "GLM53_TF_KDA_PROJ_BF16 keeps (or not) the KDA projections' bf16 copies, made at load, and "
++                     "changes a fast prefill's bits (snapshots are not tagged by it)",
+ }
+ 
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/lean.py w/src/tensorfold/families/glm5_next/cuda/lean.py
+index 59fe691..fdf1431 100644
+--- i/src/tensorfold/families/glm5_next/cuda/lean.py
++++ w/src/tensorfold/families/glm5_next/cuda/lean.py
+@@ -223,7 +223,7 @@ def _kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, lb: LeanBuffers
+     p = st.proj[li, :r]
+     normed = b.normed[:r] if normed is None else normed
+     xs = b.xs[:r] if xs is None else xs
+-    qmm.matmul(normed, k.proj, xs, out=p, part=b.sk)
++    qmm.matmul(normed, fastpf.kda_proj(k), xs, out=p, part=b.sk)       # patches/0170
+     fa = p[:, k.fa_off:k.fa_off + 128]
+     ga = p[:, k.ga_off:k.ga_off + 128]
+     qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:r]), out=b.ka[:r], part=b.sk)

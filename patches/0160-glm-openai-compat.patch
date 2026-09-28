@@ -1,0 +1,199 @@
+diff --git i/src/tensorfold/cuda/server.py w/src/tensorfold/cuda/server.py
+index 135487b..7e862ef 100644
+--- i/src/tensorfold/cuda/server.py
++++ w/src/tensorfold/cuda/server.py
+@@ -16,6 +16,7 @@ A family's CUDA engine (``cuda_engine`` in its package) provides:
+ from __future__ import annotations
+ 
+ import json
++import os
+ import re
+ import threading
+ import time
+@@ -101,6 +102,83 @@ def hide_tool_calls(text: str, *, finished: bool) -> str:
+         pos = end + len(_CALL_CLOSE)
+ 
+ 
++def _visible_spans(text: str, *, finished: bool) -> tuple[str, list[tuple[int, int]]]:
++    """patches/0160: ``hide_tool_calls``'s text plus, for each kept piece, (its start in the result, its start in
++    ``text``), so a position in the visible text maps back to the raw text."""
++
++    out: list[str] = []
++    spans: list[tuple[int, int]] = []
++    pos = n = 0
++    while True:
++        start = text.find(_CALL_OPEN, pos)
++        if start < 0:
++            tail = text[pos:]
++            tail = tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))]
++            spans.append((n, pos))
++            out.append(tail)
++            return "".join(out), spans
++        spans.append((n, pos))
++        out.append(text[pos:start])
++        n += start - pos
++        end = text.find(_CALL_CLOSE, start)
++        if end < 0:
++            return "".join(out), spans
++        pos = end + len(_CALL_CLOSE)
++
++
++def _raw_index(spans: list[tuple[int, int]], index: int) -> int:
++    """patches/0160: the raw position of visible position ``index`` (``_visible_spans``)."""
++
++    vis, raw = 0, 0
++    for v, r in spans:
++        if v > index:
++            break
++        vis, raw = v, r
++    return raw + index - vis
++
++
++def parse_stop(value: Any) -> list[str] | None:
++    """patches/0160: OpenAI's ``stop`` (a string or a list of strings) as a list without empty strings; raises
++    ValueError for anything else."""
++
++    if value is None:
++        return []
++    if isinstance(value, str):
++        value = [value]
++    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
++        raise ValueError("stop must be a string or a list of strings")
++    return [v for v in value if v]
++
++
++def find_stop(text: str, stops: list[str], start: int = 0) -> int:
++    """patches/0160: the earliest position (from ``start``) where any stop string begins, or -1."""
++
++    best = -1
++    for s in stops:
++        i = text.find(s, start)
++        if i >= 0 and (best < 0 or i < best):
++            best = i
++    return best
++
++
++def stop_holdback(text: str, stops: list[str]) -> int:
++    """patches/0160: how many trailing characters could still begin a stop string (held back while streaming)."""
++
++    return max((_partial_tag(text, s) for s in stops), default=0)
++
++
++def reasoning_fields(text: str) -> dict[str, str]:
++    """patches/0160: the reply's reasoning under the field names GLM53_TF_REASONING_FIELDS asks for:
++    ``both`` (default: ``reasoning_content`` and ``reasoning``), ``reasoning_content`` or ``reasoning``."""
++
++    mode = (os.environ.get("GLM53_TF_REASONING_FIELDS") or "both").strip().lower()
++    if mode == "reasoning_content":
++        return {"reasoning_content": text}
++    if mode == "reasoning":
++        return {"reasoning": text}
++    return {"reasoning_content": text, "reasoning": text}
++
++
+ def _tool_name(tool: dict[str, Any]) -> str:
+     fn = tool.get("function") if isinstance(tool, dict) else None
+     return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
+@@ -247,6 +325,13 @@ class App:
+             return "this model's CUDA engine has no serial switch (\"draft\": false)"
+         if not isinstance(body.get("messages", []), list):
+             return "messages must be a list"
++        try:                                        # patches/0160
++            parse_stop(body.get("stop"))
++        except ValueError as exc:
++            return str(exc)
++        n = body.get("n")
++        if n is not None and n != 1:
++            return f"n must be 1 on this server (got {n!r}): it returns one choice a request"
+         if body.get("tf_knobs") is not None:        # patches/0090: per-request engine knobs, validated up front
+             parse = getattr(self.engine, "parse_knobs", None)
+             if parse is None:
+@@ -284,6 +369,11 @@ class App:
+         out: list[int] = []
+         sent = {"reasoning": 0, "content": 0}
+         stopped = {"client": False}
++        # patches/0160: OpenAI ``stop`` strings end the visible answer (not the reasoning, not a tool call's text):
++        # the reply is cut before the first one and nothing after it is sent. ``at``: the tokens received when it
++        # was seen (the reply's reported length)
++        stops = parse_stop(body.get("stop"))
++        hit = {"stop": False, "at": 0}
+         stream = StreamDecoder(self.tok, tuple(self.engine.eos))
+ 
+         def visible(finished: bool) -> tuple[str, str]:
+@@ -298,18 +388,29 @@ class App:
+ 
+         def on_tokens(new: list[int]) -> bool:
+             out.extend(new)
++            if hit["stop"]:                         # patches/0160: past a stop string: nothing more is sent
++                return True
+             stream.add(new)
+             reasoning, answer = visible(False)
++            if stops:                               # patches/0160
++                cut = find_stop(answer, stops, max(0, sent["content"] - max(map(len, stops)) + 1))
++                if cut >= 0:
++                    answer = answer[:cut]
++                    hit.update(stop=True, at=len(out))
++                else:
++                    answer = answer[: len(answer) - stop_holdback(answer, stops)]
+             delta: dict[str, Any] = {}
+             if len(reasoning) > sent["reasoning"]:
+-                delta["reasoning_content"] = reasoning[sent["reasoning"]:]
++                delta.update(reasoning_fields(reasoning[sent["reasoning"]:]))
+                 sent["reasoning"] = len(reasoning)
+             if len(answer) > sent["content"]:
+                 delta["content"] = answer[sent["content"]:]
+                 sent["content"] = len(answer)
+             if delta and not emit(delta):
+                 stopped["client"] = True
+-            return stopped["client"]
++            # patches/0160: True after a stop string too; the batch engine (GLM53_TF_BATCH) then ends the request
++            # in its next round (a cancel both ranks share), a single-request engine decodes on unheard
++            return stopped["client"] or hit["stop"]
+ 
+         draft = body.get("draft", True) is not False
+         with self.lock:
+@@ -318,18 +419,32 @@ class App:
+         reasoning, answer = visible(True)
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+-            final["reasoning_content"] = reasoning[sent["reasoning"]:]
++            final.update(reasoning_fields(reasoning[sent["reasoning"]:]))
+         raw_answer = split_thinking(self.tok.decode([t for t in out if t not in self.engine.eos],
+                                                     skip_special_tokens=False), finished=True)[1] \
+             if chat and thinking else self.tok.decode([t for t in out if t not in self.engine.eos],
+                                                       skip_special_tokens=False)
++        stopped_at = -1
++        if stops:                                   # patches/0160: cut the answer (and the raw text) at a stop
++            shown, spans = _visible_spans(raw_answer, finished=True) if tools else (raw_answer, [(0, 0)])
++            stopped_at = find_stop(shown, stops)
++            if stopped_at >= 0:
++                raw_answer = raw_answer[:_raw_index(spans, stopped_at)]
++                cut = find_stop(answer, stops)
++                answer = answer[:cut] if cut >= 0 else answer
+         content, calls = parse_tool_calls(raw_answer, tools) if tools else (answer, None)
+         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
+         if tail:
+             final["content"] = tail
+-        finish = "tool_calls" if calls else ("stop" if out and out[-1] in self.engine.eos else "length")
++        if calls:
++            finish = "tool_calls"
++        elif stopped_at >= 0 or (out and out[-1] in self.engine.eos):
++            finish = "stop"
++        else:
++            finish = "length"
++        used = hit["at"] if stopped_at >= 0 and hit["stop"] else len(out)
+         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
+-                "prompt_tokens": len(prompt), "completion_tokens": len(out), "stats": stats}
++                "prompt_tokens": len(prompt), "completion_tokens": used, "stats": stats}
+ 
+ 
+ def make_handler(app: App):
+@@ -424,7 +539,7 @@ def make_handler(app: App):
+             if chat:
+                 message: dict[str, Any] = {"role": "assistant", "content": result["content"] or None}
+                 if result["reasoning"]:
+-                    message["reasoning_content"] = result["reasoning"]
++                    message.update(reasoning_fields(result["reasoning"]))      # patches/0160
+                 if result["calls"]:
+                     message["tool_calls"] = result["calls"]
+                 payload = {"id": rid, "object": "chat.completion", "created": created, "model": app.served,

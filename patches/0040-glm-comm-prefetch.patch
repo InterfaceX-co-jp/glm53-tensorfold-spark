@@ -1,0 +1,368 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/comm.py w/src/tensorfold/families/glm5_next/cuda/comm.py
+index 47339a1..f80011c 100644
+--- i/src/tensorfold/families/glm5_next/cuda/comm.py
++++ w/src/tensorfold/families/glm5_next/cuda/comm.py
+@@ -46,6 +46,9 @@ class NCCL:
+ 
+         from torch.distributed import TCPStore
+ 
++        from .overlap import nccl_env
++
++        nccl_env()                       # GLM53_TF_COMM=ll|ll128: NCCL_PROTO, before NCCL reads its environment
+         self.rank, self.world = rank, world
+         self.lib = _library()
+         lib = self.lib
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index b6e66a7..d9b9845 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -99,6 +99,9 @@ class Engine:
+         self.last_hidden: torch.Tensor | None = None
+         self.draft_n = w.head.n
+         self.graphs = None
++        from .overlap import install
++
++        install(w)                       # GLM53_TF_COMM (default: nothing); before any graph is captured
+         if graphs:
+             from .graphs import Graphs
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/forward.py w/src/tensorfold/families/glm5_next/cuda/forward.py
+index 9568da3..03bb25b 100644
+--- i/src/tensorfold/families/glm5_next/cuda/forward.py
++++ w/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -104,6 +104,7 @@ class Buffers:
+         # rank partials
+         self.part = torch.empty((rows, D), dtype=f32, device=dev)
+         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
++        self.site = None                 # the all-gather site the next ``gather`` serves (GLM53_TF_COMM=prefetch)
+         self.sk = torch.empty((8 * rows * 16384,), dtype=f32, device=dev)
+         # final
+         self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
+@@ -229,8 +230,12 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     """Every rank's fp32 partial b.part[:R] in rank order: [world, R, D] (summed rank 0 first by the consumer)."""
+ 
+     d = b.part.shape[1]
++    site, b.site = b.site, None
+     if w.comm is None:
+         return b.part[:R].view(1, R, d)
++    pf = w.meta.get("prefetch")
++    if pf is not None and site is not None:
++        pf.launch(site)                  # the next kernels' weights into L2 while the exchange waits on the link
+     out = b.gath[:b.world * R * d]
+     w.comm.all_gather(b.part[:R].reshape(-1), out)
+     if profile.ON:
+@@ -332,15 +337,25 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
+         from . import exl3_mm
+ 
++        s = m.shared
++        # GLM53_TF_COMM=prefetch: the shared expert first (its gate/up was prefetched into L2 during the attention
++        # all-gather); it shares no buffer with the routed slots, so the order changes no bits
++        shared_first = w.meta.get("prefetch") is not None
++        if shared_first:
++            qmm.matmul(b.normed[:R], s.gu, b.xs[:R], out=b.sgu[:R], part=b.sk)
++            glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
++            qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=b.sy[:R], f32=True, part=b.sk)
++            if profile.ON:
++                profile.lap("moe.shared")
+         exl3_mm.routed(b.normed[:R], b.pick, grp, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
+         if profile.ON:
+             profile.lap("moe.routed")
+-        s = m.shared
+-        qmm.matmul(b.normed[:R], s.gu, b.xs[:R], out=b.sgu[:R], part=b.sk)
+-        glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+-        qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=b.sy[:R], f32=True, part=b.sk)
++        if not shared_first:
++            qmm.matmul(b.normed[:R], s.gu, b.xs[:R], out=b.sgu[:R], part=b.sk)
++            glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
++            qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=b.sy[:R], f32=True, part=b.sk)
+         b.ey[:R, c.top_k].copy_(b.sy[:R])
+-        if profile.ON:
++        if profile.ON and not shared_first:
+             profile.lap("moe.shared")
+         glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+         if profile.ON:
+@@ -365,6 +380,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+     if profile.ON:
+         profile.lap("hc")
++    b.site = (layer.index, "a")
+     if layer.kind == "kda":
+         g = kda_block(layer, w, st, b, R)
+     else:
+@@ -377,6 +393,7 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
+     if profile.ON:
+         profile.lap("hc")
++    b.site = (layer.index, "f")
+     g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+     if profile.ON:
+@@ -423,14 +440,25 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+     if profile.ON:
+         profile.lap("hc")
+     if not logits:
++        _join(w)
+         return None
+     glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
+     out = qmm.matmul(b.fnormed[:R], w.head, b.fxs[:R], out=b.logits[:R], part=b.sk)
+     if profile.ON:
+         profile.lap("head")
++    _join(w)
+     return out
+ 
+ 
++def _join(w: Weights) -> None:
++    """GLM53_TF_COMM=prefetch: the current stream waits for the prefetch side stream (a forward, eager or
++    captured, ends with no open fork)."""
++
++    pf = w.meta.get("prefetch")
++    if pf is not None:
++        pf.join()
++
++
+ def chunks_for(st: State, R: int) -> int:
+     from .attention import CHUNK
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/mtp.py w/src/tensorfold/families/glm5_next/cuda/mtp.py
+index 298188e..11599d1 100644
+--- i/src/tensorfold/families/glm5_next/cuda/mtp.py
++++ w/src/tensorfold/families/glm5_next/cuda/mtp.py
+@@ -21,7 +21,7 @@ from typing import Sequence
+ import torch
+ 
+ from . import glue, profile, qmm
+-from .forward import Buffers, State, check_room, dsa_block, moe_block
++from .forward import Buffers, State, _join, check_room, dsa_block, moe_block
+ from .weights import Weights
+ 
+ 
+@@ -57,10 +57,12 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool =
+     glue.rmsnorm(b.mx[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
+     if profile.ON:
+         profile.lap("misc")
++    b.site = ("mtp", "a")
+     g = dsa_block(layer, w, st.mtp_kc, st.mtp_vc, st.mtp_pos_dev, b, n, nch,
+                   st.index[-1] if st.index is not None else None, host_pos)
+     glue.residual_add(b.mx[:n], b.mx[:n], g)
+     glue.rmsnorm(b.mx[:n], layer.post_norm, c.eps, b.normed[:n], b.xs[:n])
++    b.site = ("mtp", "f")
+     g = moe_block(layer, w, b, n)
+     glue.residual_add(b.mx[:n], b.mx[:n], g)
+     lo = n - 1 if last_only else 0
+@@ -70,6 +72,7 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool =
+     out = qmm.matmul(b.fnormed[:k], head, b.fxs[:k], out=b.logits[:k, :w.head.n], part=b.sk)
+     if profile.ON:
+         profile.lap("head")
++    _join(w)
+     return out
+ 
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/overlap.py w/src/tensorfold/families/glm5_next/cuda/overlap.py
+new file mode 100644
+index 0000000..317304d
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/overlap.py
+@@ -0,0 +1,202 @@
++"""GLM53_TF_COMM: what the engine does around its cross-rank all-gathers (default: nothing, upstream behaviour).
++
++Every block of a layer ends in an all-gather of fp32 partials (``forward.gather``), and the next kernel needs the
++gathered row: the hyper-connection epilogue, the next mix and RMSNorm read the whole row, so no work of the model
++can run beside the exchange and no two exchanges can be merged. At one to eight rows an exchange carries 16 to
++128 KiB a rank and takes about 28 us inside a CUDA graph, almost all of it latency, while the GPU's memory system
++sits idle. The variants use that time, or shorten it, without changing a bit of any result:
++
++- ``prefetch[:MB]``: while the all-gather runs, a side stream reads the first MB (default 4) of the weights the
++  next kernels read (the next mix's ``fn``, the router, the shared expert's gate/up, the next layer's attention
++  projection, the head) into L2, so those kernels find them there. Loads only, into a dummy sink: every kernel
++  of the model runs unchanged, on the same inputs, in the same order (the EXL3 shared expert, independent of the
++  routed ones, is computed before them so its prefetched rows are still in L2). Captured in the step's CUDA
++  graph like the all-gather.
++- ``ll`` / ``ll128``: NCCL_PROTO=LL or LL128 for the communicator (unless NCCL_PROTO is set already). The
++  protocol only changes how bytes travel; an all-gather is a copy. Both ranks must use the same value.
++
++Variants combine with commas: ``GLM53_TF_COMM=prefetch:4,ll``. ``nccl`` or empty is upstream.
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++
++import torch
++import triton
++import triton.language as tl
++
++ENV = "GLM53_TF_COMM"
++DEFAULT_PREFETCH_MB = 4.0
++
++
++@dataclass(frozen=True)
++class Variant:
++    prefetch_mb: float = 0.0          # 0: no prefetch
++    proto: str | None = None          # NCCL_PROTO to set, if any
++
++
++def variant(value: str | None = None) -> Variant:
++    raw = os.environ.get(ENV, "") if value is None else value
++    prefetch, proto = 0.0, None
++    for tok in (t.strip().lower() for t in raw.split(",")):
++        if tok in ("", "nccl", "default"):
++            continue
++        name, _, arg = tok.partition(":")
++        if name == "prefetch":
++            try:
++                prefetch = float(arg) if arg else DEFAULT_PREFETCH_MB
++            except ValueError:
++                raise ValueError(f"{ENV}: bad prefetch size {arg!r} (MB)") from None
++            if not 0 < prefetch <= 64:
++                raise ValueError(f"{ENV}: prefetch size must be in (0, 64] MB, got {arg}")
++        elif name in ("ll", "ll128") and not arg:
++            proto = "LL" if name == "ll" else "LL128"
++        else:
++            raise ValueError(f"{ENV}: unknown variant {tok!r} (nccl, prefetch[:MB], ll, ll128; comma-separated)")
++    return Variant(prefetch, proto)
++
++
++def nccl_env(v: Variant | None = None) -> None:
++    """Before the communicator is created (NCCL reads its environment once)."""
++
++    v = variant() if v is None else v
++    if v.proto is not None:
++        os.environ.setdefault("NCCL_PROTO", v.proto)
++
++
++# -- L2 prefetch ----------------------------------------------------------------------------------------------
++@triton.jit
++def _touch(P, SINK, n, BLOCK: tl.constexpr, PROGS: tl.constexpr):
++    """Read n int32 words (PROGS programs, BLOCK words at a time, strided) through L2; the sum goes to a sink so
++    the loads are kept. Writes nothing the model reads. ``.cg`` caches the lines in L2 only (bypassing L1); no
++    eviction hint: Triton's evict_last is an L1 hint, which ptxas rejects with ``.cg`` on sm_121a."""
++
++    pid = tl.program_id(0)
++    offs = tl.arange(0, BLOCK)
++    acc = tl.zeros((BLOCK,), dtype=tl.int32)
++    for start in range(pid * BLOCK, n, PROGS * BLOCK):
++        i = start + offs
++        acc += tl.load(P + i, mask=i < n, other=0, cache_modifier=".cg")
++    tl.store(SINK + pid, tl.sum(acc, axis=0))
++
++
++def _words(t: torch.Tensor, nbytes: int) -> torch.Tensor | None:
++    """The first nbytes of t (whole int32 words) as an int32 view of the same memory, or None."""
++
++    if not isinstance(t, torch.Tensor) or not t.is_cuda or not t.is_contiguous() or t.data_ptr() % 16:
++        return None
++    nbytes = min(nbytes, t.numel() * t.element_size()) // 16 * 16
++    if nbytes <= 0:
++        return None
++    return t.reshape(-1).view(torch.uint8)[:nbytes].view(torch.int32)
++
++
++def _mat(q) -> list[torch.Tensor]:
++    """A matrix's tensors in the order worth prefetching: the small per-group scales first, then the words."""
++
++    if q is None:
++        return []
++    if hasattr(q, "scales"):                        # qmm.Q4
++        return [q.scales, q.biases, q.weight]
++    return [q.weight]                               # qmm.B16
++
++
++def _take(tensors: list, budget: int) -> list[torch.Tensor]:
++    out, left = [], budget
++    for t in tensors:
++        if left < 16:
++            break
++        v = _words(t, left)
++        if v is not None:
++            out.append(v)
++            left -= v.numel() * 4
++    return out
++
++
++def _ffn_reads(layer, with_hc: bool) -> list:
++    reads = [layer.ffn_hc.fn] if with_hc and layer.ffn_hc is not None else []
++    reads.append(layer.post_norm)
++    if layer.mlp is not None:
++        reads += _mat(layer.mlp.gu)
++    elif layer.moe is not None:
++        reads += [layer.moe.router, layer.moe.bias]
++        if layer.moe.shared is not None:
++            reads += _mat(layer.moe.shared.gu)
++    return reads
++
++
++def _attn_reads(layer) -> list:
++    reads = [layer.attn_hc.fn] if layer.attn_hc is not None else []
++    reads.append(layer.in_norm)
++    reads += _mat(layer.kda.proj if layer.kind == "kda" else layer.dsa.proj)
++    return reads
++
++
++def plans(w, budget: int) -> dict:
++    """Per all-gather site ((layer index, "a" | "f") and ("mtp", "a" | "f")): the int32 views to prefetch, the
++    weights the kernels after that all-gather read first, up to ``budget`` bytes."""
++
++    out = {}
++    layers = w.layers
++    for i, layer in enumerate(layers):
++        out[(layer.index, "a")] = _take(_ffn_reads(layer, True), budget)
++        nxt = _attn_reads(layers[i + 1]) if i + 1 < len(layers) else [w.norm] + _mat(w.head)
++        out[(layer.index, "f")] = _take(nxt, budget)
++    if w.mtp is not None:
++        out[("mtp", "a")] = _take(_ffn_reads(w.mtp.layer, False), budget)
++        head = w.draft_head if w.draft_head is not None else w.head
++        out[("mtp", "f")] = _take([w.mtp.norm] + _mat(head), budget)
++    return out
++
++
++class Prefetcher:
++    """Launches a site's prefetch on a side stream forked from the current stream (before the all-gather is
++    queued); ``join`` makes the current stream wait for the side stream (end of every forward, so a captured
++    graph has no open fork)."""
++
++    BLOCK = 2048
++
++    def __init__(self, w, mb: float) -> None:
++        dev = w.device
++        props = torch.cuda.get_device_properties(dev)
++        budget = int(mb * 2**20)
++        l2 = int(getattr(props, "L2_cache_size", 0) or 0)
++        if l2:
++            budget = min(budget, l2 // 2)            # leave room for what the kernels themselves keep in L2
++        self.budget = budget
++        self.progs = max(1, props.multi_processor_count // 2)   # the other half stays free for the all-gather
++        self.sink = torch.zeros((self.progs,), dtype=torch.int32, device=dev)
++        self.side = torch.cuda.Stream(device=dev)
++        self.plans = plans(w, budget)
++        self.pending = False
++        self.launches = 0
++
++    def launch(self, site) -> None:
++        segs = self.plans.get(site)
++        if not segs:
++            return
++        self.side.wait_stream(torch.cuda.current_stream())      # after the block's partials, beside the all-gather
++        with torch.cuda.stream(self.side):
++            for s in segs:
++                _touch[(self.progs,)](s, self.sink, s.numel(), BLOCK=self.BLOCK, PROGS=self.progs, num_warps=4)
++        self.pending = True
++        self.launches += 1
++
++    def join(self) -> None:
++        if self.pending:
++            torch.cuda.current_stream().wait_stream(self.side)
++            self.pending = False
++
++
++def install(w) -> Prefetcher | None:
++    """At engine build (before graph capture): the prefetcher on ``w.meta["prefetch"]`` when the variant asks
++    for one and there is a second rank to wait for."""
++
++    v = variant()
++    pf = None
++    if v.prefetch_mb > 0 and w.world > 1 and w.comm is not None and torch.cuda.is_available():
++        pf = Prefetcher(w, v.prefetch_mb)
++    w.meta["prefetch"] = pf
++    return pf

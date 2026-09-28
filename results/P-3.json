@@ -1,0 +1,445 @@
+{
+ "label": "P-3",
+ "base": "http://127.0.0.1:8080",
+ "model": "GLM-5.3-Flash-Uncensored@3",
+ "started": "2026-09-27T12:19:30+0700",
+ "args": {
+  "base": "http://127.0.0.1:8080",
+  "model": "GLM-5.3-Flash-Uncensored@3",
+  "key": "",
+  "suites": "tf,kit",
+  "reps": 5,
+  "long_tokens": 512,
+  "ctx": "2000,8000,32000",
+  "extra": "{}",
+  "label": "P-3",
+  "out": "results/P-3.json"
+ },
+ "suites": {
+  "tf": [
+   {
+    "prompt": "code",
+    "temperature": 1.0,
+    "tokens": 64,
+    "runs": [
+     {
+      "ttft_s": 0.11453431600057229,
+      "decode_s": 1.4399111329985317,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 43.75270011893452,
+      "sha256": "fd2cbd8108e02a8a",
+      "text_head": " Also, write a function that returns the sum of all elements in a list and test it.\n\nSolution\n\nFibonacci function\n\n`Copy`\n\n```\ndef fib(n):\n    \"\"\"Compute the n-"
+     },
+     {
+      "ttft_s": 0.11467783599982795,
+      "decode_s": 1.6655951739994634,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 37.82431708704044,
+      "sha256": "b0fee4115ead3264",
+      "text_head": " A... - HomeworkLib\n\nAnswer #1\n\nProgram:\n\nShort Program\n\ndef fibo(n):\n\n\"\"\"Computes Fibonacci sequence upto n\"\"\"\n\nresult = []\n\na, b = 0, 1\n\nwhile a < n:\n\nresult."
+     },
+     {
+      "ttft_s": 0.11091253400081769,
+      "decode_s": 1.7493007150005724,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 36.01439104195381,
+      "sha256": "42fe22f6436fef4a",
+      "text_head": " Explain your reasoning briefly before the final answer. Keep the explanation to a few sentences and make the answer direct.\n\nThinking:\n\nThe user wants a short "
+     },
+     {
+      "ttft_s": 0.11411559600128385,
+      "decode_s": 1.1057039419993089,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 56.9772771959959,
+      "sha256": "efed57b53933e2ba",
+      "text_head": " Write a short Python function that computes the Fibonacci sequence and explain it.\n\nFilo tutor solution\n\nStudents who ask this question also asked\n\nQuestion Te"
+     },
+     {
+      "ttft_s": 0.10866301200076123,
+      "decode_s": 1.4656363609992695,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 42.984741424569094,
+      "sha256": "f974c1acf90f5daa",
+      "text_head": " Write a short Python function that takes an integer n and returns the sum of the squares of all the positive integers smaller than n. The Fibonacci sequence be"
+     }
+    ],
+    "median_tps": 42.98,
+    "min_tps": 36.01,
+    "max_tps": 56.98
+   },
+   {
+    "prompt": "chat",
+    "temperature": 1.0,
+    "tokens": 64,
+    "runs": [
+     {
+      "ttft_s": 0.16288088699911896,
+      "decode_s": 1.4778933790003066,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 42.62824429365478,
+      "sha256": "2e57f50220acf57b",
+      "text_head": "# Matrix Multiplication on a GPU, Explained Simply\n\n## The Big Idea\n\nImagine you need to multiply two grids of numbers. The key insight is that **none of the mu"
+     },
+     {
+      "ttft_s": 0.16111992500009364,
+      "decode_s": 1.7329922369990527,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 36.35330768076282,
+      "sha256": "271e256945b5e3b9",
+      "text_head": "# How GPUs Do Matrix Multiplication\n\n## The Plain-English Version\n\n**The problem:** Multiplying two big matrices means computing a huge number of independent li"
+     },
+     {
+      "ttft_s": 0.16682001400113222,
+      "decode_s": 1.6693054269999266,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 37.74024751912747,
+      "sha256": "6f82a5143b03b77d",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## The Plain-English Explanation\n\nImagine you have to multiply two big grids of numbers \u2014 say a 1000\u00d71000 matrix times another"
+     },
+     {
+      "ttft_s": 0.16167370399853098,
+      "decode_s": 1.7281200510005874,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 36.455800604548735,
+      "sha256": "8cdaed1ae7d892a0",
+      "text_head": "# How GPUs Multiply Matrices\n\n## The Big Idea\n\nImagine you run a warehouse where the job is: take a number from one list, multiply it by a number from another l"
+     },
+     {
+      "ttft_s": 0.16259804099900066,
+      "decode_s": 1.7366667759997654,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 36.276389270896324,
+      "sha256": "c001264f676caf03",
+      "text_head": "# How GPUs Do Matrix Multiplication\n\n## The Plain-English Explanation\n\nImagine you need to multiply two grids of numbers. Each result cell requires taking a row"
+     }
+    ],
+    "median_tps": 36.46,
+    "min_tps": 36.28,
+    "max_tps": 42.63
+   },
+   {
+    "prompt": "code",
+    "temperature": 0.0,
+    "tokens": 64,
+    "runs": [
+     {
+      "ttft_s": 0.11109700300039549,
+      "decode_s": 1.0918112319995998,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 57.70228236672243,
+      "sha256": "c0538b2467a7aeda",
+      "text_head": " The Fibonacci sequence is a series of numbers where each number is the sum of the two preceding ones, usually starting with 0 and 1. The sequence goes: 0, 1, 1"
+     },
+     {
+      "ttft_s": 0.10761299799924018,
+      "decode_s": 1.095884857000783,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 57.48779134736687,
+      "sha256": "c0538b2467a7aeda",
+      "text_head": " The Fibonacci sequence is a series of numbers where each number is the sum of the two preceding ones, usually starting with 0 and 1. The sequence goes: 0, 1, 1"
+     },
+     {
+      "ttft_s": 0.1093558970005688,
+      "decode_s": 1.0949664099989604,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 57.5360115385273,
+      "sha256": "c0538b2467a7aeda",
+      "text_head": " The Fibonacci sequence is a series of numbers where each number is the sum of the two preceding ones, usually starting with 0 and 1. The sequence goes: 0, 1, 1"
+     },
+     {
+      "ttft_s": 0.10798640699977113,
+      "decode_s": 1.0986852030000591,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 57.34126556721872,
+      "sha256": "c0538b2467a7aeda",
+      "text_head": " The Fibonacci sequence is a series of numbers where each number is the sum of the two preceding ones, usually starting with 0 and 1. The sequence goes: 0, 1, 1"
+     },
+     {
+      "ttft_s": 0.10742399100126931,
+      "decode_s": 1.095617904999017,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 57.501798494299464,
+      "sha256": "c0538b2467a7aeda",
+      "text_head": " The Fibonacci sequence is a series of numbers where each number is the sum of the two preceding ones, usually starting with 0 and 1. The sequence goes: 0, 1, 1"
+     }
+    ],
+    "median_tps": 57.5,
+    "min_tps": 57.34,
+    "max_tps": 57.7
+   },
+   {
+    "prompt": "chat",
+    "temperature": 0.0,
+    "tokens": 64,
+    "runs": [
+     {
+      "ttft_s": 0.16198839500066242,
+      "decode_s": 1.3542931440006214,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 46.51873213645324,
+      "sha256": "7a0ad42649d7138f",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, and each problem is completely independe"
+     },
+     {
+      "ttft_s": 0.16059937000136415,
+      "decode_s": 1.3529389220002486,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 46.565294985273866,
+      "sha256": "7a0ad42649d7138f",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, and each problem is completely independe"
+     },
+     {
+      "ttft_s": 0.16085354700044263,
+      "decode_s": 1.3487929029997758,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 46.70843081979834,
+      "sha256": "7a0ad42649d7138f",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, and each problem is completely independe"
+     },
+     {
+      "ttft_s": 0.15745294900079898,
+      "decode_s": 1.3459451599992462,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 46.80725624811882,
+      "sha256": "7a0ad42649d7138f",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, and each problem is completely independe"
+     },
+     {
+      "ttft_s": 0.16226111799915088,
+      "decode_s": 1.3477088620002178,
+      "prompt_tokens": 25,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 46.74600114040789,
+      "sha256": "7a0ad42649d7138f",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, and each problem is completely independe"
+     }
+    ],
+    "median_tps": 46.71,
+    "min_tps": 46.52,
+    "max_tps": 46.81
+   }
+  ],
+  "kit": [
+   {
+    "prompt": "hashmap",
+    "temperature": 0.0,
+    "tokens": 200,
+    "runs": [
+     {
+      "ttft_s": 0.1860344039996562,
+      "decode_s": 4.697372724000161,
+      "prompt_tokens": 33,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 42.364106851315974,
+      "sha256": "36bd1b90ecdd9d4a",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table or dictionary) is a data structure that stores key-value pairs and provides near-"
+     },
+     {
+      "ttft_s": 0.18328934599958302,
+      "decode_s": 4.711629929000992,
+      "prompt_tokens": 33,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 42.23591474685153,
+      "sha256": "36bd1b90ecdd9d4a",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table or dictionary) is a data structure that stores key-value pairs and provides near-"
+     },
+     {
+      "ttft_s": 0.1833913799982838,
+      "decode_s": 4.704682429000968,
+      "prompt_tokens": 33,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 42.29828537911693,
+      "sha256": "36bd1b90ecdd9d4a",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table or dictionary) is a data structure that stores key-value pairs and provides near-"
+     },
+     {
+      "ttft_s": 0.18372581400035415,
+      "decode_s": 4.7206024849983805,
+      "prompt_tokens": 33,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 42.155635987652595,
+      "sha256": "36bd1b90ecdd9d4a",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table or dictionary) is a data structure that stores key-value pairs and provides near-"
+     },
+     {
+      "ttft_s": 0.18385219999981928,
+      "decode_s": 4.71115283600011,
+      "prompt_tokens": 33,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 42.2401919291067,
+      "sha256": "36bd1b90ecdd9d4a",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table or dictionary) is a data structure that stores key-value pairs and provides near-"
+     }
+    ],
+    "median_tps": 42.24,
+    "min_tps": 42.16,
+    "max_tps": 42.36
+   },
+   {
+    "prompt": "structured",
+    "temperature": 0.0,
+    "tokens": 200,
+    "runs": [
+     {
+      "ttft_s": 0.15983205100019404,
+      "decode_s": 3.105320225000469,
+      "prompt_tokens": 27,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 64.08356806421469,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     },
+     {
+      "ttft_s": 0.16045856499840738,
+      "decode_s": 3.104392771001585,
+      "prompt_tokens": 27,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 64.10271337405405,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     },
+     {
+      "ttft_s": 0.15995422899868572,
+      "decode_s": 3.0957366320017172,
+      "prompt_tokens": 27,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 64.28195407285848,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     },
+     {
+      "ttft_s": 0.16211930499957816,
+      "decode_s": 3.0991171860005124,
+      "prompt_tokens": 27,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 64.21183455047546,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     },
+     {
+      "ttft_s": 0.16034341600061452,
+      "decode_s": 3.098253603999183,
+      "prompt_tokens": 27,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 64.2297324347928,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     }
+    ],
+    "median_tps": 64.21,
+    "min_tps": 64.08,
+    "max_tps": 64.28
+   },
+   {
+    "prompt": "essay",
+    "temperature": 0.0,
+    "tokens": 200,
+    "runs": [
+     {
+      "ttft_s": 0.24762567300058436,
+      "decode_s": 5.08494622499893,
+      "prompt_tokens": 54,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 39.135123793770674,
+      "sha256": "8d2f8fd88051eaac",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nAutoregr"
+     },
+     {
+      "ttft_s": 0.24956022300102632,
+      "decode_s": 5.059243241999866,
+      "prompt_tokens": 54,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 39.333945904790575,
+      "sha256": "8d2f8fd88051eaac",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nAutoregr"
+     },
+     {
+      "ttft_s": 0.24905344000035257,
+      "decode_s": 5.073529620000045,
+      "prompt_tokens": 54,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 39.22318679594074,
+      "sha256": "8d2f8fd88051eaac",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nAutoregr"
+     },
+     {
+      "ttft_s": 0.2496735400000034,
+      "decode_s": 5.082158420000269,
+      "prompt_tokens": 54,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 39.15659126580109,
+      "sha256": "8d2f8fd88051eaac",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nAutoregr"
+     },
+     {
+      "ttft_s": 0.247618130999399,
+      "decode_s": 5.042482834000111,
+      "prompt_tokens": 54,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 39.464685662030675,
+      "sha256": "8d2f8fd88051eaac",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nAutoregr"
+     }
+    ],
+    "median_tps": 39.22,
+    "min_tps": 39.14,
+    "max_tps": 39.46
+   }
+  ]
+ },
+ "finished": "2026-09-27T12:21:14+0700"
+}

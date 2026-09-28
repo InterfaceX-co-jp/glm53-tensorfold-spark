@@ -1,0 +1,32 @@
+{
+ "label": "",
+ "args": {
+  "base": "http://127.0.0.1:8000",
+  "model": "GLM-5.3-Flash-EXL3",
+  "modes": "stall",
+  "doc": 28000,
+  "system": 2000,
+  "append": 2000,
+  "tokens": 64,
+  "long_tokens": 1024,
+  "streams": "4",
+  "reps": 2,
+  "delay": 4.0,
+  "extra": "{}",
+  "label": "",
+  "out": "results/Y1/stall.json"
+ },
+ "stall": {
+  "decoders": 3,
+  "prefill_tokens": 34806,
+  "prefill_ttft_s": 62.31451293700229,
+  "max_gap_during_prefill_s": 2.376029484003084,
+  "sum_gaps_during_prefill_s": 187.5299292950076,
+  "median_gap_outside_s": 0.07624279850278981,
+  "decode_tps": [
+   14.254943162101695,
+   14.370939047207017,
+   14.315860756039324
+  ]
+ }
+}

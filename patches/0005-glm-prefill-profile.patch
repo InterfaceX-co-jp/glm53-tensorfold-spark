@@ -1,0 +1,420 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index 77053d5..c18a780 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -19,6 +19,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
++from . import profile
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .weights import Weights
+@@ -243,6 +244,23 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+ @torch.no_grad()
+ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
+             resume: Snapshot | None = None) -> int:
++    """``_prefill``; with GLM53_TF_PROFILE set, timed by component (``profile``: CUDA events only, same bits)."""
++
++    if not profile.ON:
++        return _prefill(e, prompt, sampling, mtp=mtp, drafter=drafter, resume=resume)
++    profile.P.begin()
++    try:
++        first = _prefill(e, prompt, sampling, mtp=mtp, drafter=drafter, resume=resume)
++    except BaseException:
++        profile.P.active = False
++        raise
++    profile.P.end(len(prompt), len(resume.ids) if resume is not None else 0, e.w.rank)
++    return first
++
++
++@torch.no_grad()
++def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
++             resume: Snapshot | None = None) -> int:
+     """Commit the prompt in chains of up to ``prefill_rows`` rows (the MTP cache absorbing every position whose
+     next token is known; a DFlash2 ``drafter`` taking every position's taps), sample the first output token, and
+     keep the last hidden row for the first draft. ``resume``: start from that snapshot, whose ids begin the prompt
+@@ -267,21 +285,43 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
+         if use_mtp:
+             k = resume.pending.shape[0]
+             absorb(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
++    prof = profile.ON
++    if prof:
++        profile.lap("resume")
+     last = None
+     for start in range(begin, len(prompt), e.prefill_rows):
+         chunk = list(prompt[start:start + e.prefill_rows])
+         R = len(chunk)
+-        logits = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos)
++        staged = stage(w, st, b, chunk)
++        if prof:
++            profile.lap("stage")
++            profile.P.chunks += 1
++            profile.P.rows += R
++        logits = compute(w, st, b, staged, nch=chunks_for(st, R), host_pos=st.pos)
+         last = logits[R - 1:R].clone()
+         e.last_hidden = e.main_hidden(slice(R - 1, R)).clone()
++        if prof:
++            profile.lap("head")
+         if use_mtp:
+             nxt = list(prompt[start + 1:start + R + 1])
+             if nxt:
++                if prof:
++                    profile.P.prefix = "mtp."
+                 absorb(e, e.main_hidden(slice(0, len(nxt))), nxt)
++                if prof:
++                    profile.lap("other")
++                    profile.P.prefix = ""
+         if drafter is not None:
+             drafter.add_taps(e.tap_rows(R))
++            if prof:
++                profile.lap("drafter")
+         commit(w, st, b, R, R)
+-    return e.sample(last, [len(prompt)], sampling)[0]
++        if prof:
++            profile.lap("commit")
++    first = e.sample(last, [len(prompt)], sampling)[0]
++    if prof:
++        profile.lap("sample")
++    return first
+ 
+ 
+ # -- decode loops -----------------------------------------------------------------------------------------------
+diff --git i/src/tensorfold/families/glm5_next/cuda/forward.py w/src/tensorfold/families/glm5_next/cuda/forward.py
+index 52e33f8..9568da3 100644
+--- i/src/tensorfold/families/glm5_next/cuda/forward.py
++++ w/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -27,7 +27,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from . import glue, kda as kda_mod, qmm, sparse
++from . import glue, kda as kda_mod, profile, qmm, sparse
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -233,11 +233,16 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+         return b.part[:R].view(1, R, d)
+     out = b.gath[:b.world * R * d]
+     w.comm.all_gather(b.part[:R].reshape(-1), out)
++    if profile.ON:
++        profile.lap("allgather")
+     return out.view(b.world, R, d)
+ 
+ 
+-def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int) -> torch.Tensor:
++def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int,
++             name: str = "o_proj") -> torch.Tensor:
+     qmm.matmul(x, q, xs, out=b.part[:R], f32=True, part=b.sk)
++    if profile.ON:
++        profile.lap(name)
+     return gather(w, b, R)
+ 
+ 
+@@ -251,10 +256,14 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+     ga = p[:, k.ga_off:k.ga_off + 128]
+     qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), out=b.ka[:R], part=b.sk)
+     qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), out=b.kg[:R], part=b.sk)
++    if profile.ON:
++        profile.lap("kda.proj")
+     cur = st.cur[li]
+     out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log, k.dt_bias,
+                         k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
+-    return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R)
++    if profile.ON:
++        profile.lap("kda.chain")
++    return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R, "kda.o_proj")
+ 
+ 
+ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
+@@ -273,6 +282,8 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+     qmm.matmul(b.lat[:R], a.kv_k, b.xs_lat[:R], out=b.kn[:R].view(R, HL * c.qk_dim), part=b.sk)
+     qmm.matmul(b.lat[:R], a.kv_v, b.xs_lat[:R], out=b.vn[:R].view(R, HL * c.v_dim), part=b.sk)
+     kv_write(b.kn[:R], b.vn[:R], kc, vc, pos_dev)
++    if profile.ON:
++        profile.lap("dsa.proj")
+     sparse_rows = index is not None and host_pos is not None and host_pos + R - 1 >= c.dense_limit
+     if index is not None:
+         ik, ig, pk = index
+@@ -280,24 +291,32 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+         qmm.matmul(b.normed[:R], ix.kw, b.xs[:R], out=b.ikr[:R], part=b.sk)
+         glue.router(b.normed[:R], ix.gate, b.igr[:R])
+         sparse.index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
++        if profile.ON:
++            profile.lap("dsa.indexer")
+     if sparse_rows and host_pos >= c.dense_limit:
+         o = b.attn.out[:R]                     # every row sparse: the dense pass is skipped
+     else:
+         o = attention(b.q[:R], kc, vc, pos_dev, b.attn, scale=c.qk_dim ** -0.5, nch=nch)
++        if profile.ON:
++            profile.lap("dsa.attn")
+     if sparse_rows:
+         qmm.matmul(b.qr[:R], ix.qb, b.xs_qr[:R], out=b.qi[:R], part=b.sk)
+         tokens, counts = sparse.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, host_pos, R,
+                                               pk.shape[0] - 2, pos_dev)
++        if profile.ON:
++            profile.lap("dsa.indexer")
+         sparse.sparse_attention(b.q[:R], kc, vc, tokens, counts, o, c.qk_dim ** -0.5)
++        if profile.ON:
++            profile.lap("dsa.sparse_attn")
+     o = o.view(R, HL * c.v_dim)
+-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R)
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, "dsa.o_proj")
+ 
+ 
+ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     m = layer.mlp
+     qmm.matmul(b.normed[:R], m.gu, b.xs[:R], out=b.gu[:R], part=b.sk)
+     glue.swiglu(b.gu[:R], b.act[:R], b.xs_act[:R], w.cfg.limit)
+-    return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R)
++    return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R, "mlp.dense")
+ 
+ 
+ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+@@ -307,21 +326,33 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     glue.router(b.normed[:R], m.router, b.mlog[:R])
+     glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], grp.ids, grp.count, grp.members, c.top_k, c.experts,
+                 c.routed_scale, c.norm_topk)
++    if profile.ON:
++        profile.lap("moe.router")
+     if m.shared is not None:
+         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
+         from . import exl3_mm
+ 
+         exl3_mm.routed(b.normed[:R], b.pick, grp, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
++        if profile.ON:
++            profile.lap("moe.routed")
+         s = m.shared
+         qmm.matmul(b.normed[:R], s.gu, b.xs[:R], out=b.sgu[:R], part=b.sk)
+         glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+         qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=b.sy[:R], f32=True, part=b.sk)
+         b.ey[:R, c.top_k].copy_(b.sy[:R])
++        if profile.ON:
++            profile.lap("moe.shared")
+         glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
++        if profile.ON:
++            profile.lap("moe.combine")
+         return gather(w, b, R)
+     qmm.moe_gateup(b.normed[:R], b.xs[:R], m.experts, grp, b.eact, b.eaxs, c.limit)
+     qmm.moe_down(b.eact, b.eaxs, m.experts, grp, b.ey)
++    if profile.ON:
++        profile.lap("moe.routed")
+     glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
++    if profile.ON:
++        profile.lap("moe.combine")
+     return gather(w, b, R)
+ 
+ 
+@@ -332,6 +363,8 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+     h = layer.attn_hc
+     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
++    if profile.ON:
++        profile.lap("hc")
+     if layer.kind == "kda":
+         g = kda_block(layer, w, st, b, R)
+     else:
+@@ -342,8 +375,12 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+     h = layer.ffn_hc
+     glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
++    if profile.ON:
++        profile.lap("hc")
+     g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
++    if profile.ON:
++        profile.lap("hc")
+ 
+ 
+ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
+@@ -376,15 +413,22 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+ 
+     c = w.cfg
+     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
++    if profile.ON:
++        profile.lap("embed")
+     for layer in w.layers:
+         layer_forward(layer, w, st, b, R, nch, host_pos)
+         for slot in b.tap_at.get(layer.index, ()):
+             glue.stream_mean(b.x[:R], b.taps[slot][:R])
+     glue.stream_mean(b.x[:R], b.hidden[:R])
++    if profile.ON:
++        profile.lap("hc")
+     if not logits:
+         return None
+     glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
+-    return qmm.matmul(b.fnormed[:R], w.head, b.fxs[:R], out=b.logits[:R], part=b.sk)
++    out = qmm.matmul(b.fnormed[:R], w.head, b.fxs[:R], out=b.logits[:R], part=b.sk)
++    if profile.ON:
++        profile.lap("head")
++    return out
+ 
+ 
+ def chunks_for(st: State, R: int) -> int:
+diff --git i/src/tensorfold/families/glm5_next/cuda/mtp.py w/src/tensorfold/families/glm5_next/cuda/mtp.py
+index d8710d7..298188e 100644
+--- i/src/tensorfold/families/glm5_next/cuda/mtp.py
++++ w/src/tensorfold/families/glm5_next/cuda/mtp.py
+@@ -20,7 +20,7 @@ from typing import Sequence
+ 
+ import torch
+ 
+-from . import glue, qmm
++from . import glue, profile, qmm
+ from .forward import Buffers, State, check_room, dsa_block, moe_block
+ from .weights import Weights
+ 
+@@ -55,6 +55,8 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool =
+     qmm.matmul(b.mcat[:n], m.eh, qmm.group_sums(b.mcat[:n], b.mxs[:n]), out=b.mx[:n], part=b.sk)
+     layer = m.layer
+     glue.rmsnorm(b.mx[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
++    if profile.ON:
++        profile.lap("misc")
+     g = dsa_block(layer, w, st.mtp_kc, st.mtp_vc, st.mtp_pos_dev, b, n, nch,
+                   st.index[-1] if st.index is not None else None, host_pos)
+     glue.residual_add(b.mx[:n], b.mx[:n], g)
+@@ -65,7 +67,10 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool =
+     k = n - lo
+     glue.rmsnorm(b.mx[lo:n], m.norm, c.eps, b.fnormed[:k], b.fxs[:k])
+     head = w.draft_head if w.draft_head is not None else w.head        # the head's logits only draft
+-    return qmm.matmul(b.fnormed[:k], head, b.fxs[:k], out=b.logits[:k, :w.head.n], part=b.sk)
++    out = qmm.matmul(b.fnormed[:k], head, b.fxs[:k], out=b.logits[:k, :w.head.n], part=b.sk)
++    if profile.ON:
++        profile.lap("head")
++    return out
+ 
+ 
+ @torch.no_grad()
+diff --git i/src/tensorfold/families/glm5_next/cuda/profile.py w/src/tensorfold/families/glm5_next/cuda/profile.py
+new file mode 100644
+index 0000000..7b897bd
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/profile.py
+@@ -0,0 +1,127 @@
++"""Prefill timing probe for GLM-5.3-Flash (GLM53_TF_PROFILE=1): where a prompt's GPU time goes, by component.
++
++Off (the default), every probe site is one ``if profile.ON`` test and nothing else runs. On, ``prefill`` opens a
++session and each site records one CUDA event on the current stream ("the work enqueued since the previous mark was
++<name>"); the whole forward runs on one stream, NCCL's all-gathers included, so the intervals add up to the GPU
++time of the prefill. Nothing waits on an event until the session ends (one synchronize after the first token is
++sampled, which synchronizes anyway), no tensor is read or written, so no result changes. Rank 0 prints a table
++and one ``GLM53_TF_PROFILE {json}`` line to stderr per prefill.
++
++Names: ``kda.proj`` (projections, f_b/g_b), ``kda.chain`` (the recurrence kernel), ``kda.o_proj``; ``dsa.proj``
++(q/kv projections, norms, cache write), ``dsa.attn`` (dense attention), ``dsa.indexer`` (index keys, pools, query,
++scores, top-k), ``dsa.sparse_attn``, ``dsa.o_proj``; ``mlp.dense``; ``moe.router`` (router, top-k, grouping),
++``moe.routed`` (routed experts), ``moe.shared`` (shared expert), ``moe.combine``; ``allgather``; ``hc``
++(hyper-connections, taps); ``embed``; ``head`` (final norm, lm_head over the chunk); ``mtp.*`` (the MTP head's
++absorb, same names); ``drafter`` (DFlash2 taps); ``commit``; ``stage``/``resume``/``sample``. An all-gather's time
++includes waiting for the other rank.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++import time
++
++import torch
++
++ON = os.environ.get("GLM53_TF_PROFILE", "").strip().lower() not in ("", "0", "false", "no", "off")
++
++GROUPS = {
++    "kda.proj": "KDA block", "kda.chain": "KDA block", "kda.o_proj": "KDA block",
++    "dsa.proj": "DSA attention", "dsa.attn": "DSA attention", "dsa.sparse_attn": "DSA attention",
++    "dsa.o_proj": "DSA attention", "dsa.indexer": "DSA indexer/top-k",
++    "moe.routed": "MoE routed experts", "moe.router": "MoE router/grouping",
++    "moe.shared": "shared expert + dense MLP", "moe.combine": "shared expert + dense MLP",
++    "mlp.dense": "shared expert + dense MLP", "allgather": "all-gathers",
++    "hc": "hyper-connections", "embed": "hyper-connections", "head": "head (all chunk rows)",
++}
++
++
++class Probe:
++    """One prefill's marks: (event, name of the work since the previous mark)."""
++
++    def __init__(self) -> None:
++        self.active = False
++        self.prefix = ""
++        self.pool: list[torch.cuda.Event] = []
++        self.marks: list[tuple[torch.cuda.Event, str | None]] = []
++        self.chunks = 0
++        self.rows = 0
++        self.t0 = 0.0
++
++    def _event(self) -> torch.cuda.Event:
++        i = len(self.marks)
++        if i == len(self.pool):
++            self.pool.append(torch.cuda.Event(enable_timing=True))
++        ev = self.pool[i]
++        ev.record()
++        return ev
++
++    def begin(self) -> None:
++        self.active = True
++        self.prefix = ""
++        self.marks = []
++        self.chunks = 0
++        self.rows = 0
++        self.t0 = time.perf_counter()
++        self.marks.append((self._event(), None))
++
++    def lap(self, name: str) -> None:
++        self.marks.append((self._event(), self.prefix + name))
++
++    def end(self, tokens: int, cached: int, rank: int) -> dict | None:
++        """Close the session: per-name GPU milliseconds (rank 0 prints them)."""
++
++        if not self.active:
++            return None
++        self.active = False
++        self.prefix = ""
++        torch.cuda.synchronize()
++        wall = time.perf_counter() - self.t0
++        totals: dict[str, float] = {}
++        for (a, _), (b, name) in zip(self.marks, self.marks[1:]):
++            totals[name] = totals.get(name, 0.0) + a.elapsed_time(b)
++        self.marks = []
++        report = {"tokens": tokens, "cached": cached, "rows": self.rows, "chunks": self.chunks,
++                  "wall_s": round(wall, 4), "gpu_ms": round(sum(totals.values()), 3),
++                  "ms": {k: round(v, 3) for k, v in sorted(totals.items(), key=lambda kv: -kv[1])}}
++        if rank == 0:
++            _print(report)
++        return report
++
++
++def _group_of(name: str) -> str:
++    if name.startswith("mtp."):
++        return "MTP head absorb"
++    return GROUPS.get(name, f"other ({name})")
++
++
++def _print(report: dict) -> None:
++    ms = report["ms"]
++    total = max(report["gpu_ms"], 1e-9)
++    n = max(report["chunks"], 1)
++    rows = report["rows"]
++    groups: dict[str, float] = {}
++    for name, v in ms.items():
++        g = _group_of(name)
++        groups[g] = groups.get(g, 0.0) + v
++    out = [f"[GLM53_TF_PROFILE] prefill {report['tokens']} tokens ({report['cached']} resumed, {rows} computed in "
++           f"{report['chunks']} chunks): GPU {total:.1f} ms, wall {report['wall_s'] * 1e3:.1f} ms, "
++           f"{rows / max(report['wall_s'], 1e-9):.1f} tok/s"]
++    out.append(f"  {'component':<34}{'ms':>11}{'ms/chunk':>11}{'%':>7}")
++    for g, v in sorted(groups.items(), key=lambda kv: -kv[1]):
++        out.append(f"  {g:<34}{v:>11.1f}{v / n:>11.2f}{100 * v / total:>7.1f}")
++    out.append("  detail: " + ", ".join(f"{k} {v:.1f}" for k, v in ms.items()))
++    print("\n".join(out), file=sys.stderr, flush=True)
++    print("GLM53_TF_PROFILE " + json.dumps(report), file=sys.stderr, flush=True)
++
++
++P = Probe()
++
++
++def lap(name: str) -> None:
++    """A probe site: the work enqueued since the previous mark was ``name`` (call only under ``if profile.ON``)."""
++
++    if P.active:
++        P.lap(name)

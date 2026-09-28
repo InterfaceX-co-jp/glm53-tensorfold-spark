@@ -1,0 +1,103 @@
+{
+ "label": "",
+ "args": {
+  "base": "http://127.0.0.1:8080",
+  "model": "GLM-5.3-Flash-Uncensored",
+  "modes": "concurrent",
+  "doc": 30000,
+  "system": 2000,
+  "append": 2000,
+  "tokens": 64,
+  "long_tokens": 256,
+  "streams": "1,2,4",
+  "reps": 2,
+  "delay": 3.0,
+  "extra": "{}",
+  "label": "",
+  "out": "results/B1/concurrent.json"
+ },
+ "concurrent": [
+  {
+   "streams": 1,
+   "rep": 0,
+   "aggregate_tps": 65.59781708213097,
+   "per_stream_tps": [
+    65.34157560915389
+   ],
+   "tokens": [
+    256
+   ]
+  },
+  {
+   "streams": 1,
+   "rep": 1,
+   "aggregate_tps": 46.40280760711216,
+   "per_stream_tps": [
+    46.22154663989687
+   ],
+   "tokens": [
+    256
+   ]
+  },
+  {
+   "streams": 2,
+   "rep": 0,
+   "aggregate_tps": 53.816675708654785,
+   "per_stream_tps": [
+    66.63597819413626,
+    46.42383240834318
+   ],
+   "tokens": [
+    256,
+    256
+   ]
+  },
+  {
+   "streams": 2,
+   "rep": 1,
+   "aggregate_tps": 46.06431597702848,
+   "per_stream_tps": [
+    46.17797916693323,
+    47.2408976338803
+   ],
+   "tokens": [
+    256,
+    256
+   ]
+  },
+  {
+   "streams": 4,
+   "rep": 0,
+   "aggregate_tps": 57.275773588336456,
+   "per_stream_tps": [
+    66.42715703084484,
+    46.3675046022236,
+    47.120227731851095,
+    97.86839353577734
+   ],
+   "tokens": [
+    256,
+    256,
+    256,
+    256
+   ]
+  },
+  {
+   "streams": 4,
+   "rep": 1,
+   "aggregate_tps": 50.95270529938911,
+   "per_stream_tps": [
+    46.11238715339551,
+    47.32569581588714,
+    98.14240833488616,
+    42.92201920060422
+   ],
+   "tokens": [
+    256,
+    256,
+    256,
+    256
+   ]
+  }
+ ]
+}

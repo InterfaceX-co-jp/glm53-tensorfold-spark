@@ -1,0 +1,518 @@
+diff --git i/docs/recipes/glm-5.3-flash.md w/docs/recipes/glm-5.3-flash.md
+index b3c5262..339880d 100644
+--- i/docs/recipes/glm-5.3-flash.md
++++ w/docs/recipes/glm-5.3-flash.md
+@@ -70,6 +70,19 @@ model name, for example `"model": "GLM-5.3-Flash-MLX-4bit-MTP@c3:0.35"`:
+ | `a` or `a:LOW:HIGH` | 1 to 3 MTP drafts: 1 while the running acceptance is under LOW, 2 under HIGH, else 3 |
+ | `cN:P` | up to N MTP drafts while the product of the drafts' own probabilities stays at or above P |
+ | `fN`, `fcN:P`, `fa:...` | the same with DFlash2 drafts (needs the draft model on both Sparks) |
++| `lN` or `lN:M` | prompt-lookup drafts (patches/0020): when the text so far ends with a span of at least M tokens (default 3) that occurred earlier in the prompt or reply, up to N (1 to 7) of the tokens that followed it; other rounds draft as `auto`'s MTP arm |
++
++Prompt lookup (patches/0020, `cuda/lookup.py`). Agent traffic repeats long spans of its context: file contents
++it edits, tool-call arguments, JSON, code it quotes. Each round the engine finds the longest earlier occurrence
++of the text's suffix (prompt plus reply, an n-gram index kept up to date as tokens commit) and can verify the
++tokens that followed it, with no drafter step at all. `auto` does this when `GLM53_TF_LOOKUP=1` (the default)
++and the match is at least `GLM53_TF_LOOKUP_MIN` tokens long (default 4), and only when the lookup's expected
++committed tokens per millisecond (the timed verify windows and a running acceptance per match length, from a
++cautious prior) beat those of the request's recent MTP / DFlash2 rounds; otherwise the round drafts as before.
++The lookup's drafts go through the same verify window, keyed sampler and commit as every other draft, so the
++reply stays byte-identical to serial decoding, sampled requests included; the settings travel in the request
++header from rank 0, so both Sparks make the same choice. Not applied where `auto` runs `fc5:0.3` alone (EXL3
++checkpoint with BF16 non-expert weights) or on a checkpoint without the MTP head (`lN` then runs `fc5:0.3`).
+ 
+ `--mtp-drafts N` sets a fixed default, `--no-drafts` serves serially, and `"draft": false` in a request decodes
+ that one serially (the reference the drafted replies equal). `"ignore_eos": true` decodes `max_tokens` tokens
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index 77053d5..bb2006c 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -295,7 +295,7 @@ class DecodeResult:
+     stages: dict[str, float] = field(default_factory=dict)
+     depths: list[int] = field(default_factory=list)
+     keeps: list[int] = field(default_factory=list)
+-    arms: str = ""                          # auto_decode: the drafter of each round, "m" (MTP) or "f" (DFlash2)
++    arms: str = ""                          # auto_decode: each round's drafter, "m" MTP, "f" DFlash2, "l" lookup
+     pending: torch.Tensor | None = None     # auto_decode: MTP input rows of committed positions not absorbed yet
+ 
+     @property
+@@ -549,13 +549,17 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+     keeps: list[int] = []
+     arms: list[str] = []
+     last = {"m": (0, 0), "f": (0, 0)}
++    lookup = getattr(e, "lookup", None)     # patches/0020: prompt-lookup drafts (lookup.py), set per request
+     _sync(w)
+     start = time.perf_counter()
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+-        arm = choice.pick() if choice is not None else "m"
+         room = count - len(out)
+         t0 = time.perf_counter()
+-        if arm == "m":
++        look = lookup.plan(out, room) if lookup is not None else None      # patches/0020
++        arm = "l" if look else choice.pick() if choice is not None else "m"
++        if arm == "l":                      # patches/0020: the history's tokens, no drafter step
++            backlog, depth, drafts, steps = 0, len(look), look, 0
++        elif arm == "m":
+             backlog = len(m_next)
+             depth = max(1, min(m_policy.next(*last["m"]), room))
+             drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence)
+@@ -597,8 +601,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+             f_taps[n_f:n_f + keep].copy_(e.tap_rows(keep))
+             n_f += keep
+         t5 = time.perf_counter()
+-        if choice is not None:
++        if choice is not None and arm != "l":
+             choice.record(arm, R, steps, backlog, keep)
++        if lookup is not None:              # patches/0020
++            lookup.record(arm, R, steps, backlog, keep)
+         last[arm] = (len(drafts), keep - 1)
+         rounds += 1
+         drafted += len(drafts)
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index 68358af..a2b1c19 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -28,6 +28,12 @@ A request's draft policy is a spec (the engine's default, or the request's throu
+     auto:E:EVERY:MARGIN
+                   the same choice with E rounds of each first, a probe every EVERY rounds and a MARGIN to switch,
+                   for sampled requests too (MTP a:0.6:0.85 against DFlash2 there)
++    lN[:M]        (patches/0020, ``lookup.py``) prompt-lookup drafts: each round whose history (prompt and reply)
++                  ends with a span of at least M tokens (default 3) that occurred before verifies up to N (1 to
++                  7) of the tokens that followed it, with no drafter step; other rounds draft as auto's MTP arm.
++                  ``auto`` (kinds 4, 5) also drafts from the history when GLM53_TF_LOOKUP=1 (the default): a
++                  round with a match of at least GLM53_TF_LOOKUP_MIN tokens (default 4) verifies the lookup's
++                  tokens instead when their expected tokens a millisecond beat the request's MTP / DFlash2 rounds
+ """
+ 
+ from __future__ import annotations
+@@ -42,6 +48,8 @@ import time
+ from pathlib import Path
+ from typing import Any, Callable
+ 
++from .lookup import LOOKUP_KIND, lookup_for, parse_policy, with_lookup     # patches/0020
++
+ DEFAULT_POLICY = "auto"
+ DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
+ EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
+@@ -57,6 +65,10 @@ def encode_policy(spec: str) -> list[int]:
+     spec = str(spec).strip()
+     bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, or one of "
+                      f"these after f (N from 1 to {MAX_ROWS - 1})")
++    if spec.startswith("fl"):
++        raise bad
++    if spec.startswith("l"):                        # patches/0020: lN[:M], prompt-lookup drafts
++        return parse_policy(spec)
+     try:
+         if spec == "auto" or spec.startswith("auto:"):
+             parts = spec.split(":")
+@@ -95,7 +107,9 @@ def decode_policy(code: list[int]):
+ 
+     from .decode import DepthPolicy
+ 
+-    kind, most, a, b = code
++    kind, most, a, b = code[:4]                     # patches/0020: auto codes carry lookup settings after these
++    if kind == LOOKUP_KIND:
++        return ("lookup", most, a)
+     if kind in (4, 5):
+         return ("auto", most, a, b / 1e6, kind == 5)
+     kind %= 10
+@@ -339,8 +353,15 @@ class GlmEngine:
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+         policy = decode_policy(code)
++        # patches/0020: the request's lookup drafter (lookup.py), read by auto_decode; None: no lookup drafts
++        self.e.lookup = lookup_for(code, prompt, self.costs, eos=self.eos, stop_eos=stop_eos)
+         if policy is None:
+             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
++        elif code[0] == LOOKUP_KIND:        # patches/0020: lookup drafts, MTP drafts in the rounds without a match
++            greedy = sampling is None or sampling.temperature <= 0
++            m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
++            res = auto_decode(self.e, None, first, max_tokens, sampling, choice=None, m_policy=m_policy,
++                              f_policy=m_policy, stop_eos=stop_eos, on_tokens=on_tokens)
+         elif auto:
+             greedy = sampling is None or sampling.temperature <= 0
+             m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
+@@ -360,7 +381,7 @@ class GlmEngine:
+                              on_tokens=on_tokens)
+         if draft and policy is not None and res.keeps:
+             committed = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
+-            if auto:
++            if auto or code[0] == LOOKUP_KIND:     # patches/0020: lN runs auto_decode too
+                 pending = res.pending
+             else:
+                 pending = None if use_dflash else self.e.main_hidden(slice(0, res.keeps[-1]))
+@@ -388,6 +409,8 @@ class GlmEngine:
+         else:
+             spec = getattr(self.request, "policy", None) or self.policy
+         code = self._effective(encode_policy(spec))
++        # patches/0020: lookup settings travel in the header, so both ranks draft alike whatever their environment
++        code = with_lookup(code, self.w.mtp is not None, encode_policy(DFLASH_POLICY))
+         stop_eos = bool(getattr(self.request, "stop_eos", True))
+         hit = self._resume(list(prompt), code) if draft else None
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+diff --git i/src/tensorfold/families/glm5_next/cuda/lookup.py w/src/tensorfold/families/glm5_next/cuda/lookup.py
+new file mode 100644
+index 0000000..d7850cb
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/lookup.py
+@@ -0,0 +1,339 @@
++"""Prompt-lookup drafts for GLM-5.3-Flash (patches/0020): continue the longest earlier occurrence of the text's
++suffix, with no model forward.
++
++Agent traffic (file edits, tool calls, JSON, code quoting the context) repeats long spans of what is already in
++the prompt or the reply. ``SuffixIndex`` keeps every ``n``-gram of the request's history (prompt, then every
++committed token) and, each round, finds the earlier occurrence whose backward match with the history's end is
++longest (ties to the most recent); the tokens that followed it are the drafts (``copy``: a match that overlaps the
++end continues periodically, as an LZ77 copy does). The Nemotron lanes' ``SuffixLookupProposer`` and Qwen's
++``CopyIndex`` draw from the context the same way.
++
++``Lookup`` decides each round whether to spend a verify window on those tokens and how many: the drafts are
++verified by the same window, keyed sampler and commit as every other draft, so a draft is kept exactly when it
++equals the token serial decoding produces there (greedy or sampled), and the reply is byte-identical to serial
++decoding whatever is proposed. The decision only changes the speed:
++
++- forced (policy ``lN[:M]``): every round with a match of at least M tokens verifies up to N of its tokens; the
++  other rounds draft with the MTP head as ``auto`` does.
++- gated (``auto`` with GLM53_TF_LOOKUP=1, the default): a round with a match of at least GLM53_TF_LOOKUP_MIN
++  tokens verifies the k tokens (0 to 7) with the most expected committed tokens per millisecond,
++  (1 + p + ... + p^k) / (verify window of k + 1 rows + the catch-up of the rows the drafters missed), and only
++  when that beats the tokens a millisecond this request's MTP / DFlash2 rounds have committed (their recent
++  rounds, priced as ``decode.DrafterChoice`` prices them). ``p``, the chance a lookup draft is kept given the
++  one before it was, is a running estimate per match-length band, starting from a cautious prior: a short match
++  in prose is often a coincidence, a match of dozens of tokens is usually a copy. A band of matches of 16 tokens
++  or more that the gate skipped 8 times is tried once, so its estimate can recover.
++
++Everything here is a function of the committed tokens, the load-time costs (the slower rank's, the same on
++both) and the policy code rank 0 sends in the request header, so both ranks make the same decision every round
++without exchanging anything. Pure Python (no torch): the unit tests run anywhere.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Sequence
++
++LOOKUP_KIND = 20                  # policy code kind of ``lN[:M]``: [20, N, M, 0]
++DEFAULT_MIN = 3                   # ``lN``'s match threshold when M is not given
++MAX_DRAFTS = 7                    # a verify window holds the pending token and up to 7 drafts
++CANDIDATES = 64                   # earlier occurrences of the suffix's n-gram examined a round (most recent first)
++EXTEND = 64                       # a backward match is not measured past this many tokens
++# (shortest match of the band, prior p): the chance a lookup draft is kept after a kept one, before this request
++# has evidence. Cautious for short matches, which prose makes by chance.
++BANDS = ((0, 0.45), (8, 0.7), (16, 0.8), (32, 0.9))
++PRIOR_WEIGHT = 2.0                # trials the prior counts for
++DECAY = 0.85                      # a band's evidence fades by this a round that updates it
++ALT_WINDOW = 8                    # the other drafters' rate: their last 8 rounds
++PROBE_EVERY = 8                   # a band of matches of 16+ tokens the gate skipped this many times is tried once
++PROBE_MATCH = 16
++
++
++def env_settings() -> tuple[int, int]:
++    """(on, min match) for ``auto`` from GLM53_TF_LOOKUP (default 1) and GLM53_TF_LOOKUP_MIN (default 4). Read on
++    rank 0 only: the values travel in the request header."""
++
++    on = os.environ.get("GLM53_TF_LOOKUP", "1").strip().lower() not in ("0", "false", "off", "no", "")
++    least = int(os.environ.get("GLM53_TF_LOOKUP_MIN", "4"))
++    if not 1 <= least <= 64:
++        raise ValueError(f"GLM53_TF_LOOKUP_MIN={least}: expected 1 to 64")
++    return int(on), least
++
++
++def parse_policy(spec: str) -> list[int] | None:
++    """``lN`` or ``lN:M`` -> [LOOKUP_KIND, N, M, 0]; None when ``spec`` is not a lookup spec. N from 1 to 7 (the
++    most drafts a round), M from 1 to 64 (the shortest match that drafts)."""
++
++    spec = str(spec).strip()
++    if not spec.startswith("l"):
++        return None
++    parts = spec[1:].split(":")
++    bad = ValueError(f"draft policy {spec!r}: expected lN or lN:M (N from 1 to {MAX_DRAFTS}, M from 1 to 64)")
++    if len(parts) not in (1, 2):
++        raise bad
++    try:
++        most = int(parts[0])
++        least = int(parts[1]) if len(parts) == 2 else DEFAULT_MIN
++    except ValueError:
++        raise bad from None
++    if not 1 <= most <= MAX_DRAFTS or not 1 <= least <= 64:
++        raise bad
++    return [LOOKUP_KIND, most, least, 0]
++
++
++def with_lookup(code: list[int], has_mtp: bool, dflash_code: list[int]) -> list[int]:
++    """Rank 0: the policy code a request runs, lookup settings included. ``auto`` codes (kind 4, 5) gain
++    [on, min match] from the environment; ``lN`` needs the MTP head for the rounds without a match, so on a
++    checkpoint without it the request runs ``dflash_code`` (DFlash2 drafts, no lookup)."""
++
++    if code[0] == LOOKUP_KIND and not has_mtp:
++        return list(dflash_code)
++    if code[0] in (4, 5) and len(code) == 4:
++        return list(code) + list(env_settings())
++    return list(code)
++
++
++def lookup_for(code: Sequence[int], prompt: Sequence[int], costs: dict, *, eos: Sequence[int] = (),
++               stop_eos: bool = True) -> "Lookup | None":
++    """The request's ``Lookup`` for its policy code, or None when it drafts none."""
++
++    if code[0] == LOOKUP_KIND:
++        return Lookup(prompt, costs, most=code[1], min_match=code[2], gated=False, eos=eos, stop_eos=stop_eos)
++    if code[0] in (4, 5) and len(code) >= 6 and code[4]:
++        return Lookup(prompt, costs, most=MAX_DRAFTS, min_match=code[5], gated=True, eos=eos, stop_eos=stop_eos)
++    return None
++
++
++# -- the matcher ----------------------------------------------------------------------------------------------------
++class SuffixIndex:
++    """Where every ``n``-gram of a growing token history ends, for the longest earlier match of its suffix.
++
++    ``extend`` appends tokens (O(1) each); ``match`` returns (length, end): ``history[end - length:end]`` equals
++    the last ``length`` tokens, ``end < len(history)``, the longest such match among the ``candidates`` most
++    recent occurrences of the last ``n`` tokens (ties to the most recent), measured up to ``extend_to`` tokens;
++    (0, -1) when the last n-gram never occurred before."""
++
++    def __init__(self, n: int = 3, *, candidates: int = CANDIDATES, extend_to: int = EXTEND) -> None:
++        if n < 1:
++            raise ValueError("n must be positive")
++        self.n = n
++        self.candidates = candidates
++        self.extend_to = max(extend_to, n)
++        self.tokens: list[int] = []
++        self.ends: dict[tuple[int, ...], list[int]] = {}
++        self.indexed = 0            # n-grams ending at or before this many tokens are in ``ends``
++        self.owner: object = None   # the ``Lookup`` extending it (``reuse_index`` hands it to the next request)
++
++    def __len__(self) -> int:
++        return len(self.tokens)
++
++    def extend(self, tokens: Sequence[int]) -> None:
++        self.tokens.extend(int(t) for t in tokens)
++
++    def _index(self) -> None:
++        # the n-gram ending at the history's end is the query itself: it joins once a token follows it, so a match
++        # always has a continuation
++        n, t = self.n, self.tokens
++        first, last = max(self.indexed, n), len(t)          # new n-grams end at first .. last - 1
++        if first < last:
++            ends = self.ends
++            grams = zip(*(t[first - n + i:last - n + i] for i in range(n)))
++            for end, key in zip(range(first, last), grams):
++                got = ends.get(key)
++                if got is None:
++                    ends[key] = [end]
++                else:
++                    got.append(end)
++        self.indexed = max(self.indexed, last)
++
++    def match(self) -> tuple[int, int]:
++        t = self.tokens
++        L = len(t)
++        if L <= self.n:
++            return 0, -1
++        self._index()
++        ends = self.ends.get(tuple(t[L - self.n:]))
++        if not ends:
++            return 0, -1
++        best_len, best_end = 0, -1
++        for end in reversed(ends[-self.candidates:]):
++            length = self.n                     # the n-gram matches by construction
++            limit = min(self.extend_to, end)
++            while length < limit and t[end - 1 - length] == t[L - 1 - length]:
++                length += 1
++            if length > best_len:
++                best_len, best_end = length, end
++                if length >= self.extend_to:
++                    break
++        return best_len, best_end
++
++    def copy(self, end: int, count: int) -> list[int]:
++        """The ``count`` tokens that follow position ``end`` if the history repeats from there: past the history's
++        end the copy reads its own output (an overlapping match continues with its period)."""
++
++        t = self.tokens
++        L = len(t)
++        out: list[int] = []
++        for i in range(count):
++            j = end + i
++            out.append(t[j] if j < L else out[j - L])
++        return out
++
++    def propose(self, count: int, min_match: int = 1) -> tuple[list[int], int]:
++        """(up to ``count`` drafts, match length) from the longest match of at least ``min_match`` tokens."""
++
++        length, end = self.match()
++        if end < 0 or length < min_match or count <= 0:
++            return [], length
++        return self.copy(end, count), length
++
++
++_last: list[SuffixIndex] = []         # the previous request's index (prompt and reply), for the next turn
++
++
++def reuse_index(n: int, prompt: Sequence[int]) -> SuffixIndex:
++    """An index of ``prompt``: the previous request's, extended, when ``prompt`` begins with its whole history
++    (the next turn of a conversation: indexing a 100k-token prompt from scratch takes ~0.1 s), else a new one.
++    Matches are a function of the tokens alone, so reuse never changes a proposal."""
++
++    prompt = [int(t) for t in prompt]
++    idx = _last[0] if _last else None
++    if idx is None or idx.n != n or len(idx.tokens) > len(prompt) or prompt[:len(idx.tokens)] != idx.tokens:
++        idx = SuffixIndex(n)
++    idx.extend(prompt[len(idx.tokens):])
++    _last[:] = [idx]
++    return idx
++
++
++# -- per-round decision -------------------------------------------------------------------------------------------
++def round_ms(costs: dict, arm: str, rows: int, steps: int, backlog: int) -> float:
++    """Model ms of a round, as ``decode.DrafterChoice.cost`` prices it (``arm`` "m" MTP, "f" DFlash2, "l" lookup:
++    the window only)."""
++
++    verify = costs["verify"][min(rows, len(costs["verify"])) - 1]
++    if arm == "l":
++        return verify
++    if arm == "m":
++        return (verify + costs.get("mtp", 0.0) + costs.get("mtp_step", 0.0) * max(steps - 1, 0)
++                + costs.get("mtp_row", 0.0) * max(backlog - 1, 0))
++    return verify + costs.get("block", 0.0) + costs.get("taps_row", 0.0) * backlog
++
++
++def best_depth(p: float, costs: dict, most: int, row_ms: float = 0.0) -> tuple[int, float]:
++    """(k, rate): the number of drafts (1 to ``most``) whose expected committed tokens, 1 + p + ... + p^k, per
++    ms of a (k + 1)-row window (plus ``row_ms`` a committed row for the drafters' catch-up) is highest."""
++
++    best, best_rate = 0, 0.0
++    expected = run = 1.0
++    verify = costs["verify"]
++    for k in range(1, min(most, len(verify) - 1) + 1):
++        run *= p
++        expected += run
++        rate = expected / (verify[k] + row_ms * expected)
++        if rate > best_rate:
++            best, best_rate = k, rate
++    return best, best_rate
++
++
++class Lookup:
++    """A request's lookup drafter: ``plan`` before each round (the drafts, or [] to let the other drafters draft),
++    ``record`` after it."""
++
++    def __init__(self, prompt: Sequence[int], costs: dict, *, most: int = MAX_DRAFTS, min_match: int = 4,
++                 gated: bool = True, eos: Sequence[int] = (), stop_eos: bool = True) -> None:
++        self.costs = costs
++        self.most = max(1, min(int(most), MAX_DRAFTS, len(costs["verify"]) - 1))
++        self.min_match = max(1, int(min_match))
++        self.gated = gated
++        self.eos = frozenset(int(t) for t in eos) if stop_eos else frozenset()
++        self.prompt = [int(t) for t in prompt]
++        self.index = reuse_index(min(self.min_match, 8), self.prompt)
++        self.index.owner = self
++        self.prompt_len = len(prompt)
++        self.synced = 0                           # tokens of the decode loop's ``out`` in the index
++        self.acc = [0.0] * len(BANDS)             # decayed kept drafts, trials per band
++        self.tri = [0.0] * len(BANDS)
++        self.alt: list[tuple[int, float]] = []    # (tokens committed, model ms) of recent non-lookup rounds
++        # a committed row is later taken by the drafter that drafts next (an MTP row or DFlash2's taps)
++        self.row_ms = max(costs.get("mtp_row", 0.0), costs.get("taps_row", 0.0))
++        self.skipped = [0] * len(BANDS)          # gated-out rounds per band since its last lookup round
++        self.band = 0
++        self.rounds = self.drafted = self.accepted = 0
++
++    def _band(self, length: int) -> int:
++        b = 0
++        for i, (least, _) in enumerate(BANDS):
++            if length >= least:
++                b = i
++        return b
++
++    def p(self, band: int) -> float:
++        prior = BANDS[band][1]
++        return (self.acc[band] + prior * PRIOR_WEIGHT) / (self.tri[band] + PRIOR_WEIGHT)
++
++    def alt_rate(self) -> float:
++        """Tokens a model ms of this request's recent MTP / DFlash2 rounds; before any, an MTP round keeping one
++        draft."""
++
++        if self.alt:
++            return sum(k for k, _ in self.alt) / sum(ms for _, ms in self.alt)
++        c = self.costs
++        return 2.0 / (c["verify"][min(2, len(c["verify"])) - 1] + c.get("mtp", 0.0))
++
++    def sync(self, out: Sequence[int]) -> None:
++        """The history is the prompt then ``out`` (the decode loop's tokens: every committed one and the pending
++        token, which is already the exact sample for its position)."""
++
++        if self.index.owner is not self:          # a later request took the shared index: a private one
++            self.index = SuffixIndex(self.index.n)
++            self.index.extend(self.prompt + [int(t) for t in out[:self.synced]])
++            self.index.owner = self
++        if self.synced < len(out):
++            self.index.extend(out[self.synced:])
++            self.synced = len(out)
++
++    def plan(self, out: Sequence[int], room: int) -> list[int]:
++        """The drafts for the positions after ``out[-1]`` (at most ``room``), or [] for a round of the other
++        drafters."""
++
++        self.sync(out)
++        most = min(self.most, room)
++        if most <= 0:
++            return []
++        drafts, length = self.index.propose(most, self.min_match)
++        if self.eos:                       # a draft past the end of the reply is never kept
++            for i, d in enumerate(drafts):
++                if d in self.eos:
++                    drafts = drafts[:i]
++                    break
++        if not drafts:
++            return []
++        self.band = self._band(length)
++        if self.gated:
++            b = self.band
++            k, rate = best_depth(self.p(b), self.costs, len(drafts), self.row_ms)
++            if k == 0 or rate <= self.alt_rate():
++                # a long match's acceptance is learned only by trying it: once in a while, it is
++                self.skipped[b] += 1
++                if k == 0 or BANDS[b][0] < PROBE_MATCH or self.skipped[b] < PROBE_EVERY:
++                    return []
++            self.skipped[b] = 0
++            drafts = drafts[:k]
++        return drafts
++
++    def record(self, arm: str, rows: int, steps: int, backlog: int, keep: int) -> None:
++        """After a round: ``arm`` "l" updates the band's acceptance; another arm's committed tokens and model ms
++        join the rate lookup rounds must beat."""
++
++        if arm == "l":
++            drafts = rows - 1
++            kept = keep - 1
++            b = self.band
++            self.acc[b] = self.acc[b] * DECAY + kept
++            self.tri[b] = self.tri[b] * DECAY + kept + (1 if kept < drafts else 0)
++            self.rounds += 1
++            self.drafted += drafts
++            self.accepted += kept
++            return
++        self.alt.append((keep, round_ms(self.costs, arm, rows, steps, backlog)))
++        del self.alt[:-ALT_WINDOW]
+diff --git i/tests/cuda/test_glm_engine.py w/tests/cuda/test_glm_engine.py
+index 052e0d4..7492b25 100644
+--- i/tests/cuda/test_glm_engine.py
++++ w/tests/cuda/test_glm_engine.py
+@@ -276,7 +276,7 @@ def test_drafter_choice_equals_serial(engine_f, sampling):
+         drafted, stats = _generate(engine_f, prompt, sampling, policy=policy, tokens=40)
+         assert drafted == serial, policy
+         seen.update(stats.get("drafters", ""))
+-    assert seen == {"m", "f"}
++    assert seen - {"l"} == {"m", "f"}          # "l": a prompt-lookup round (patches/0020), when the reply repeats
+ 
+ 
+ def test_drafter_choice_resumes(engine_f):
+@@ -287,7 +287,7 @@ def test_drafter_choice_resumes(engine_f):
+     first = list(rng.integers(0, 1000, size=30))
+     unrelated = list(rng.integers(0, 1000, size=9))
+     reply, stats = _generate(engine_f, first, sampling, policy="auto:1:1:0", tokens=30)
+-    assert set(stats["drafters"]) == {"m", "f"}
++    assert set(stats["drafters"]) - {"l"} == {"m", "f"}
+     after = first + reply + [21, 22]
+     for policy in ("auto:1:1:0", "auto", "2", "f3"):
+         warm, stats = _generate(engine_f, after, sampling, policy=policy)

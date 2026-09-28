@@ -1,0 +1,615 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 8ef5d7c..7fd2685 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -20,7 +20,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+-from . import fastpf, profile
++from . import fastpf, lean as lean_mod, profile
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .weights import Weights
+@@ -96,9 +96,16 @@ class Engine:
+         from .latent import enabled as latent_kv
+ 
+         w.meta["latent_kv"] = latent_kv()        # GLM53_TF_LATENT_KV (patches/0060): before any State or Buffers
++        # patches/0082 (GLM53_TF_LEAN_PREFILL=1): past GLM53_TF_LEAN_BLOCK rows, the window buffers stay at the block
++        # and fast-prefill chunks of up to ``prefill_rows`` rows run through the lean set (``lean.py``: sub-blocks
++        # on these buffers, the routed experts over the whole chunk; the same bits)
++        chunk_rows = prefill_rows
++        lean_rows = 0
++        if lean_mod.enabled() and prefill_rows > lean_mod.block():
++            lean_rows, prefill_rows = prefill_rows, lean_mod.block()
+         rows = max(max_rows, prefill_rows)
+         self.rows = rows
+-        self.prefill_rows = prefill_rows
++        self.prefill_rows = chunk_rows
+         self.buf = Buffers(w, rows, capacity)
+         if taps:
+             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
+@@ -112,6 +119,12 @@ class Engine:
+                     bb.lc = LongScratch(max_rows, capacity, c.heads // w.world, c.qk_dim, w.device)
+         self.long_rows = tuple(range(1, max_rows + 1)) if self.longctx else ()
+         self.st = State(w, capacity, rows)
++        self.lean = lean_mod.LeanBuffers(w, lean_rows, rows, len(taps)) if lean_rows > rows else None
++        self.rows_from = None            # the lean set when the last main-model forward was a lean chunk
++        self.prefill_max = max(rows, lean_rows)      # the largest prefill chunk (patches/0090: tf_knobs.prefill_rows)
++        if self.lean is not None and w.rank == 0:
++            print(f"[tensorfold] lean prefill: window buffers of {rows} rows, fast chunks of up to {lean_rows} rows "
++                  f"in sub-blocks of {rows} ({self.lean.nbytes() / 2**30:.2f} GiB of chunk rows)", flush=True)
+         # patches/0080: prefill chunks through the fast kernels (``fastpf``: chunks and snapshots on the chunk grid);
+         # ``fast_snap``: the grid snapshot the last fast prefill left (None: none)
+         self.fast_prefill = fastpf.enabled()
+@@ -142,6 +155,7 @@ class Engine:
+         """A step's forward (a CUDA graph when one was captured for its shape): logits [R, V/world]."""
+ 
+         R = stage(self.w, self.st, self.buf, tokens)
++        self.rows_from = None
+         dense = self.st.pos + R <= self.w.cfg.dense_limit
+         g = self.graphs.main.get((R, self.st.parity)) if self.graphs is not None and dense else None
+         if g is not None:
+@@ -191,12 +205,16 @@ class Engine:
+     def tap_rows(self, n: int) -> torch.Tensor:
+         """The last forward's first n rows of DFlash2 taps, concatenated in layer order: [n, taps * D]."""
+ 
++        if getattr(self, "rows_from", None) is not None:        # patches/0082: after a lean chunk
++            return self.rows_from.tapcat[:n]
+         return torch.cat([t[:n] for t in self.buf.taps], dim=1)
+ 
+     def main_hidden(self, rows: slice) -> torch.Tensor:
+         """The main model's rows the MTP head reads (after a forward that computed logits): the final-normed rows,
+         as vLLM's GLM-5.3 MTP reads them."""
+ 
++        if getattr(self, "rows_from", None) is not None:        # patches/0082: after a lean chunk
++            return self.rows_from.fnormed[rows]
+         return self.buf.fnormed[rows]
+ 
+     def draft_hidden(self, row: int) -> torch.Tensor:
+@@ -353,9 +371,13 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     w, st, b = e.w, e.st, e.buf
+     use_mtp = mtp and w.mtp is not None
+     fast = bool(getattr(e, "fast_prefill", False))
+-    step = fastpf.grid(e.prefill_rows) if fast else e.prefill_rows
+-    if fast and step > e.rows:
+-        raise ValueError(f"fast prefill: a {step}-row chunk grid, the buffers hold {e.rows} rows")
++    # patches/0082: fast chunks through the lean set when there is one; an exact chunk never needs more than the main
++    # buffers' rows (its rows never depend on their chunk-mates, so a smaller chunk gives the same bits)
++    lean = getattr(e, "lean", None) if fast else None
++    step = fastpf.grid(e.prefill_rows) if fast else min(e.prefill_rows, e.rows)
++    cap = lean.rows if lean is not None else e.rows
++    if fast and step > cap:
++        raise ValueError(f"fast prefill: a {step}-row chunk grid, the buffers hold {cap} rows")
+     e.fast_snap = None
+     begin = 0
+     if resume is None:
+@@ -388,14 +410,22 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+         if start == edge and start > begin:         # patches/0080: the state at B, before the partial chunk [B, n)
+             e.fast_snap = take_snapshot(e, prompt[:start], e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                         drafter=drafter, grid=step, mtp_len=start - 1)
+-        staged = stage(w, st, b, chunk)
++        if lean is not None:                        # patches/0082: the same bits in less memory
++            staged = lean_mod.stage(w, st, lean, chunk)
++        else:
++            staged = stage(w, st, b, chunk)
+         if prof:
+             profile.lap("stage")
+             profile.P.chunks += 1
+             profile.P.rows += R
+-        logits = compute(w, st, b, staged, nch=chunks_for(st, R), host_pos=st.pos, fast=fast,
+-                         head=start + R == n)
+-        last = logits[R - 1:R].clone()
++        if lean is not None:
++            logits = lean_mod.compute(w, st, b, lean, staged, head=start + R == n)
++        else:
++            logits = compute(w, st, b, staged, nch=chunks_for(st, R), host_pos=st.pos, fast=fast,
++                             head=start + R == n)
++        if hasattr(e, "rows_from"):
++            e.rows_from = lean                      # patches/0082: main_hidden / tap_rows read the lean rows
++        last = logits[-1:].clone()
+         e.last_hidden = e.main_hidden(slice(R - 1, R)).clone()
+         if prof:
+             profile.lap("head")
+@@ -412,7 +442,10 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+             drafter.add_taps(e.tap_rows(R))
+             if prof:
+                 profile.lap("drafter")
+-        commit(w, st, b, R, R)
++        if lean is not None:
++            lean_mod.commit(w, st, lean, R)
++        else:
++            commit(w, st, b, R, R)
+         if prof:
+             profile.lap("commit")
+     if fast and edge == n and n > begin:            # patches/0080: the prompt ends on the grid
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 802e093..cdbf894 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -230,6 +230,13 @@ class GlmEngine:
+             print(f"[tensorfold] fast prefill on: chunk grid {fastpf.grid(rows)}, "
+                   f"{'bf16' if fastpf.gather16() else 'fp32'} gathers"
+                   + (f"; row-invariant kernels for {gone}" if gone else ""), flush=True)
++        # patches/0082: GLM53_TF_LEAN_PREFILL / GLM53_TF_LEAN_BLOCK decide how many all-gathers a lean chunk makes
++        from . import lean as lean_mod
++
++        ln_both = self._gather_ints(lean_mod.settings())
++        if ln_both[0] != ln_both[1]:
++            raise RuntimeError("the two ranks were started with different lean-prefill settings "
++                               f"(GLM53_TF_LEAN_PREFILL, GLM53_TF_LEAN_BLOCK): {ln_both[0]}, {ln_both[1]}")
+         self.drafter = None
+         if drafter is not None:
+             from .dflash2 import Drafter
+@@ -269,6 +276,10 @@ class GlmEngine:
+                 print("[tensorfold] GLM53_TF_FAST_PREFILL is ignored with GLM53_TF_BATCH > 1 (batched slots keep exact "
+                       "snapshots after replies)", flush=True)
+             self.e.fast_prefill = False      # patches/0080: the batch scheduler's snapshots are exact ones
++            if self.e.lean is not None:      # patches/0082: only fast chunks use the lean set
++                self.e.lean = self.e.rows_from = None
++                self.e.prefill_max = self.e.rows
++                torch.cuda.empty_cache()
+         # patches/0070: GLM53_TF_CALIB_ONLINE=1, rank 0 refines the verify windows' costs from the windows rounds
+         # run and sends the table in each request's header (calib.py); both ranks use the header's table
+         from . import calib
+diff --git a/src/tensorfold/families/glm5_next/cuda/lean.py b/src/tensorfold/families/glm5_next/cuda/lean.py
+new file mode 100644
+index 0000000..6f1a242
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/lean.py
+@@ -0,0 +1,455 @@
++"""Lean fast prefill for GLM-5.3-Flash on CUDA (patches/0082, GLM53_TF_LEAN_PREFILL=1): fast-prefill chunks of up to
++GLM53_TF_PREFILL_ROWS_MAX rows (e.g. 8192) without window buffers sized for them.
++
++Why big chunks
++--------------
++Past ~1k rows every routed expert is touched by every chunk, and the fused expert kernels (patches/0080) read each
++expert's weights once per chunk: ~1.8 GB a MoE layer a rank, ~8.4 ms at the measured read rate, whatever the rows
++(the kernels' own time grows more slowly than the rows: 14.5 ms a layer at 1024 rows, 19.7 at 2048). That is the
++one cost of a prefill chunk that does not grow with its rows, so the way to cut it per token is more rows a chunk
++(vLLM prefills in big chunks too). But a ``forward.Buffers`` set costs ~3 MB a row at 1024 rows (and
++more per row past that: the latent partials grow with the rows), there are two (the model's and the MTP head's), and
++the ``State`` adds its KDA replay scratch and projection rows (~2.4 MB a row): 8.5 GiB a rank at 1024 rows, 17.5 at
++2048, ~82 at 8192 (``docs/PREFILL-ANALYSIS.md``).
++
++What is lean about it
++---------------------
++Most of that per-row memory is scratch that only has to hold the rows one kernel works on: the EXL3 split-K
++partials (``exl3_mm.Scratch.z``, 1.2 MB a row, not even used by the fused kernels), qmm's split-K partials (``sk``,
++0.5 MB a row), the latent attention partials (0.55 MB a row), the head's logits (0.15 MB a row: a fast chunk needs
++one row), the KDA replay scratch (1.6 MB a row: a prefill chunk keeps all its rows) and projection rows. A lean chunk
++of R rows (``compute``) therefore runs every block but one in ROW SUB-BLOCKS of ``block`` rows (the main
++``Buffers``' rows, GLM53_TF_LEAN_BLOCK, default 1024) on the main buffers, and keeps at full chunk size only what
++must span the chunk (``LeanBuffers``, ~397 KiB a row on the real model: 3.1 GiB at 8192 rows):
++
++- the residual streams ``x`` [R, 4 x D] bf16, and the FFN half's normed rows and hyper-connection mixes;
++- the routed experts, run ONCE over the whole chunk (the point: each expert's weights are read once per chunk):
++  router, top-k and grouping over all R rows, ``exl3_fast.cu``'s rotated inputs Xg/Xu and Xd (fp16), and the
++  experts' outputs ``ey`` [R, 9, D] fp32, which the per-sub-block combine reads;
++- the final-normed rows (the MTP head absorbs them after the chunk) and the DFlash2 taps.
++
++Per sub-block [a, a + r) of a chunk at position pos: the attention half of a layer (hc_pre, KDA or DSA, the o_proj
++all-gather, hc_post) runs on the main buffers with the sub-block at position pos + a, exactly like a window of r rows
++at pos + a whose predecessors are uncommitted rows of the same forward: DSA writes its keys (and index keys) at
++pos + a.. before it attends, so later sub-blocks see them; KDA continues from the state and conv window the previous
++sub-block left (``tail``: the last 3 projection rows, ``rec``: the state, kept in the layer's output state buffer).
++The FFN half's hc_pre also runs per sub-block, then the routed experts on all R rows, then per sub-block the shared
++expert, the combine, the all-gather and hc_post. The head runs on the chunk's last row only (as in 0080), and
++``commit`` installs the carried conv windows instead of shifting them from projection rows.
++
++Bits
++----
++The same as patches/0080's fast chunk of R rows (``forward.compute(fast=True)``), bit for bit, because every kernel a
++sub-block runs is row-independent and its sub-block boundaries fall on multiples of 64:
++
++- ``qmm`` / ``fast_qmm`` (qmm's bits, split-K fixed by the matrix, not the rows), ``glue`` (per row), the latent /
++  expanded attention and the sparse selection (a row's result depends on its position and the cache below it,
++  patches/0003, 0060, 0065), the bf16 all-gather (a copy): per row;
++- the fused expert kernels: run on the same full chunk with the same grouping as 0080 (and are row-independent);
++- ``fast_kda``: a prompt cut at multiples of 64 gets the same bits whatever the call sizes (patches/0081), given the
++  state and conv window entering each call, which the carry provides; the row-invariant ``kda.chain`` fallback is
++  row-invariant.
++
++So GLM53_TF_LEAN_PREFILL changes memory, not replies (``tests/cuda/test_lean_patches.py`` checks the states equal).
++The fast path's rule (``fastpf``: chunks and snapshots on the grid C) is unchanged; a larger C is a different
++(deterministic) fast prefill, as before. Both ranks must agree on the lean settings: sub-blocks decide how many
++all-gathers a chunk makes.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++
++import torch
++
++from . import fastpf, glue, profile, qmm
++from .forward import Buffers, State, _join, check_room, dsa_block, gather, mlp_block, out_proj
++from .weights import LayerW, Weights
++
++
++def enabled() -> bool:
++    """GLM53_TF_LEAN_PREFILL (default 0): fast-prefill chunks past the main buffers' rows through ``LeanBuffers``."""
++
++    return os.environ.get("GLM53_TF_LEAN_PREFILL", "0").strip().lower() in ("1", "true", "yes", "on")
++
++
++def block() -> int:
++    """GLM53_TF_LEAN_BLOCK (default 1024): the sub-block rows (a multiple of 64), which are also the main buffers'
++    rows (and so the largest exact prefill chunk) when lean prefill is on."""
++
++    v = int(os.environ.get("GLM53_TF_LEAN_BLOCK", "1024") or 1024)
++    if v < 64 or v % fastpf.GRID:
++        raise ValueError(f"GLM53_TF_LEAN_BLOCK={v}: expected a multiple of {fastpf.GRID}")
++    return v
++
++
++def settings() -> list[int]:
++    """This rank's lean settings (both ranks must agree: they decide a chunk's collectives)."""
++
++    return [int(enabled()), block()]
++
++
++class LeanBuffers:
++    """Full-chunk rows of a lean fast chunk of up to ``rows`` rows (sub-blocks of ``block`` rows run on the main
++    ``Buffers``). ``taps``: the DFlash2 tap layers' count (their rows are kept for the whole chunk)."""
++
++    def __init__(self, w: Weights, rows: int, block: int, taps: int = 0) -> None:
++        c = w.cfg
++        dev = w.device
++        bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
++        D, S = c.hidden, c.streams
++        if block % fastpf.GRID:
++            raise ValueError(f"lean prefill: sub-blocks of {block} rows, expected a multiple of {fastpf.GRID}")
++        self.rows, self.block, self.world = rows, block, w.world
++        self.ids = torch.zeros((rows,), dtype=i32, device=dev)
++        self.ids_host = torch.zeros((rows,), dtype=i32, pin_memory=torch.cuda.is_available())
++        self.staged = torch.cuda.Event() if torch.cuda.is_available() else None
++        self.pos_dev = torch.zeros((1,), dtype=i32, device=dev)        # a sub-block's position (DSA kernels)
++        self.x = torch.empty((rows, S * D), dtype=bf, device=dev)
++        # the FFN half's hc_pre outputs (the routed experts read every row's normed input at once)
++        self.normed = torch.empty((rows, D), dtype=bf, device=dev)
++        self.xs = torch.empty((rows, D // 64), dtype=f32, device=dev)
++        self.post = torch.empty((rows, S), dtype=f32, device=dev)
++        self.comb = torch.empty((rows, S * S), dtype=f32, device=dev)
++        # routing of the whole chunk
++        slots = c.top_k + 1
++        self.slots = slots
++        self.mlog = torch.empty((rows, c.experts), dtype=f32, device=dev)
++        self.pick = torch.empty((rows, slots), dtype=i32, device=dev)
++        self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
++        self.maxu = c.experts + 1
++        self.gids = torch.zeros((self.maxu,), dtype=i32, device=dev)
++        self.gcount = torch.zeros((1,), dtype=i32, device=dev)
++        self.gmem = torch.full((self.maxu * rows,), -1, dtype=i32, device=dev)
++        self.experts, self.top_k = c.experts, c.top_k
++        ml = c.moe_width // w.world
++        self.ey = torch.empty((rows, slots, D), dtype=f32, device=dev)     # every slot's output (combine input)
++        self.exl3 = None
++        self.eact = self.eaxs = None
++        if c.quant == "exl3":
++            # exl3_fast.cu's inputs: rotated rows per (row, slot) pair, fp16; no split-K partials (``Scratch.z``)
++            self.exl3 = _Exl3Rows(rows, slots, D, ml, dev)
++        else:
++            self.eact = torch.empty((rows, slots, ml), dtype=bf, device=dev)
++            self.eaxs = torch.empty((rows, slots, ml // 64), dtype=f32, device=dev)
++        # what the chunk hands on: final-normed rows (MTP absorb), DFlash2 taps in ``Engine.tap_rows``' layout
++        self.fnormed = torch.empty((rows, D), dtype=bf, device=dev)
++        self.tapcat = torch.empty((rows, taps * D), dtype=bf, device=dev) if taps else None
++        # KDA carries between sub-blocks: the last 3 projection rows' conv channels, and a state copy
++        kda = [l for l in w.layers if l.kind == "kda"]
++        LL = c.lin_heads // w.world
++        C = 3 * LL * 128
++        self.tail = torch.zeros((len(kda), c.conv - 1, C), dtype=bf, device=dev)
++        self.rec_tmp = torch.zeros((LL, 128, 128), dtype=f32, device=dev) if kda else None
++        self.D = D
++
++    def nbytes(self) -> int:
++        """Device bytes this set holds."""
++
++        return sum(t.numel() * t.element_size() for t in self._tensors() if t.device.type != "cpu")
++
++    def _tensors(self):
++        for v in vars(self).values():
++            if isinstance(v, torch.Tensor):
++                yield v
++            elif isinstance(v, _Exl3Rows):
++                yield from (v.xg, v.xu, v.xd)
++
++    def group(self, R: int) -> qmm.Group:
++        """The chunk's expert grouping (``Buffers.group``'s layout: members [maxu, R], row stride R), as views of one
++        allocation sized for ``rows`` (no buffer per chunk length)."""
++
++        maxu = min(R * self.top_k, self.experts) + 1
++        return qmm.Group(self.gids[:maxu], self.gcount, self.gmem[:maxu * R].view(maxu, R))
++
++    def sub_blocks(self, R: int) -> list[tuple[int, int]]:
++        """(first row, rows) of each sub-block of an R-row chunk: multiples of ``block``, the last one partial."""
++
++        return [(a, min(self.block, R - a)) for a in range(0, R, self.block)]
++
++
++class _Exl3Rows:
++    """``exl3_mm.Scratch`` without ``z`` (the fused kernels keep no split-K partials): Xg, Xu, Xd per pair."""
++
++    def __init__(self, rows: int, slots: int, dims: int, width: int, device) -> None:
++        P = rows * slots
++        self.xg = torch.zeros((P, dims), dtype=torch.float16, device=device)
++        self.xu = torch.zeros((P, dims), dtype=torch.float16, device=device)
++        self.xd = torch.zeros((P, width), dtype=torch.float16, device=device)
++        self.z = None
++        self.rows, self.slots = rows, slots
++
++
++def stage(w: Weights, st: State, lb: LeanBuffers, tokens) -> int:
++    """``forward.stage`` into the lean set's ids."""
++
++    R = len(tokens)
++    if R > lb.rows:
++        raise ValueError(f"lean chunk of {R} rows, the lean buffers hold {lb.rows}")
++    check_room(w, st, R)
++    if lb.staged is not None:
++        lb.staged.synchronize()
++    lb.ids_host[:R].numpy()[:] = list(tokens)
++    lb.ids[:R].copy_(lb.ids_host[:R], non_blocking=True)
++    if lb.staged is not None:
++        lb.staged.record()
++    return R
++
++
++# -- blocks on a sub-block ------------------------------------------------------------------------------------------
++def _carry(lb: LeanBuffers, li: int, conv: torch.Tensor, p: torch.Tensor, r: int) -> None:
++    """The conv window after a sub-block: the last 3 rows of [window before it; its projection rows' conv channels]
++    (what ``forward.commit``'s shift keeps)."""
++
++    t = lb.tail[li]
++    taps, C = t.shape
++    if r >= taps:
++        t.copy_(p[r - taps:r, :C])
++    else:
++        t.copy_(torch.cat([conv[r:], p[:r, :C]], 0))
++
++
++def _kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, lb: LeanBuffers, a: int, r: int,
++               pos: int) -> torch.Tensor:
++    """``forward.kda_block`` for sub-block [a, a + r) at absolute position ``pos``: from the committed state for the
++    first sub-block, else from the state and conv window the previous one left."""
++
++    c = w.cfg
++    k = layer.kda
++    li = st.kda_index[layer.index]
++    p = st.proj[li, :r]
++    qmm.matmul(b.normed[:r], k.proj, b.xs[:r], out=p, part=b.sk)
++    fa = p[:, k.fa_off:k.fa_off + 128]
++    ga = p[:, k.ga_off:k.ga_off + 128]
++    qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:r]), out=b.ka[:r], part=b.sk)
++    qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:r]), out=b.kg[:r], part=b.sk)
++    if profile.ON:
++        profile.lap("kda.proj")
++    cur = st.cur[li]
++    s_out = st.rec[1 - cur, li]
++    if a == 0:
++        conv, s_in = st.conv[li], st.rec[cur, li]
++    else:
++        lb.rec_tmp.copy_(s_out)
++        conv, s_in = lb.tail[li], lb.rec_tmp
++    out = fastpf.kda_chain(p, k.b_off, b.ka[:r], b.kg[:r], conv, k.conv, s_in, k.a_log, k.dt_bias, k.norm, c.eps,
++                           c.lower, r, st.scratch[li], s_out, pos=pos)
++    _carry(lb, li, conv, p, r)
++    if profile.ON:
++        profile.lap("kda.chain")
++    return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:r]), r, "kda.o_proj")
++
++
++def _attn_half(layer: LayerW, w: Weights, st: State, b: Buffers, lb: LeanBuffers, a: int, r: int, pos: int) -> None:
++    c = w.cfg
++    x = lb.x[a:a + r]
++    h = layer.attn_hc
++    glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:r], b.xs[:r], b.post[:r], b.comb[:r],
++                b.hcpart[:r], c.eps, c.hc_eps, c.hc_iters)
++    if profile.ON:
++        profile.lap("hc")
++    b.site = (layer.index, "a")
++    if layer.kind == "kda":
++        g = _kda_block(layer, w, st, b, lb, a, r, pos)
++    else:
++        from .attention import CHUNK
++
++        di = st.dsa_index[layer.index]
++        lb.pos_dev.fill_(pos)
++        g = dsa_block(layer, w, st.kc[di], st.vc[di], lb.pos_dev, b, r, -(-(pos + r) // CHUNK),
++                      st.index[di] if st.index is not None else None, pos, None)
++    glue.hc_post(x, x, g, b.post[:r], b.comb[:r])
++    if profile.ON:
++        profile.lap("hc")
++
++
++def _ffn_dense(layer: LayerW, w: Weights, b: Buffers, lb: LeanBuffers, a: int, r: int) -> None:
++    c = w.cfg
++    x = lb.x[a:a + r]
++    h = layer.ffn_hc
++    glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:r], b.xs[:r], b.post[:r], b.comb[:r],
++                b.hcpart[:r], c.eps, c.hc_eps, c.hc_iters)
++    if profile.ON:
++        profile.lap("hc")
++    b.site = (layer.index, "f")
++    g = mlp_block(layer, w, b, r)
++    glue.hc_post(x, x, g, b.post[:r], b.comb[:r])
++    if profile.ON:
++        profile.lap("hc")
++
++
++def _ffn_moe(layer: LayerW, w: Weights, b: Buffers, lb: LeanBuffers, R: int) -> None:
++    """The MoE half: hc_pre per sub-block into the chunk's rows, routing and the routed experts once over all R rows
++    (each expert's weights read once per chunk), then per sub-block the shared expert, combine, gather, hc_post."""
++
++    c = w.cfg
++    m = layer.moe
++    h = layer.ffn_hc
++    blocks = lb.sub_blocks(R)
++    for a, r in blocks:
++        glue.hc_pre(lb.x[a:a + r], h.fn, h.base, h.scale, layer.post_norm, lb.normed[a:a + r], lb.xs[a:a + r],
++                    lb.post[a:a + r], lb.comb[a:a + r], b.hcpart[:r], c.eps, c.hc_eps, c.hc_iters)
++    if profile.ON:
++        profile.lap("hc")
++    grp = lb.group(R)
++    glue.router(lb.normed[:R], m.router, lb.mlog[:R])
++    glue.select(lb.mlog[:R], m.bias, lb.pick[:R], lb.wts[:R], grp.ids, grp.count, grp.members, c.top_k, c.experts,
++                c.routed_scale, c.norm_topk)
++    if profile.ON:
++        profile.lap("moe.router")
++    if m.shared is not None:
++        from . import exl3_mm
++
++        exl3_mm.routed(lb.normed[:R], lb.pick, grp, m.experts, lb.exl3, lb.ey.view(-1, c.hidden), R, c.limit,
++                       fast=True)
++    else:
++        qmm.moe_gateup(lb.normed[:R], lb.xs[:R], m.experts, grp, lb.eact, lb.eaxs, c.limit)
++        qmm.moe_down(lb.eact, lb.eaxs, m.experts, grp, lb.ey)
++    if profile.ON:
++        profile.lap("moe.routed")
++    for a, r in blocks:
++        if m.shared is not None:
++            s = m.shared
++            qmm.matmul(lb.normed[a:a + r], s.gu, lb.xs[a:a + r], out=b.sgu[:r], part=b.sk)
++            glue.swiglu(b.sgu[:r], b.sact[:r], b.sxs[:r], c.limit)
++            qmm.matmul(b.sact[:r], s.down, b.sxs[:r], out=b.sy[:r], f32=True, part=b.sk)
++            lb.ey[a:a + r, c.top_k].copy_(b.sy[:r])
++            if profile.ON:
++                profile.lap("moe.shared")
++        glue.combine(lb.ey[a:a + r], lb.wts[a:a + r], b.part[:r])
++        if profile.ON:
++            profile.lap("moe.combine")
++        b.site = (layer.index, "f")
++        g = gather(w, b, r)
++        x = lb.x[a:a + r]
++        glue.hc_post(x, x, g, lb.post[a:a + r], lb.comb[a:a + r])
++        if profile.ON:
++            profile.lap("hc")
++
++
++# -- the chunk ------------------------------------------------------------------------------------------------------
++@contextlib.contextmanager
++def chunk_rows(w: Weights, R: int):
++    """Within a lean chunk of R rows, a fast matmul picks its kernel as for the whole chunk, not for its sub-block.
++
++    ``fast_qmm`` sends calls of fewer than ``MIN_ROWS`` (64) rows to ``qmm.matmul`` (and FP8 to the bf16 fast kernel),
++    whose bits differ from the fast kernels'; every other choice it makes by row count (tiles) leaves a row's bits
++    alone. A chunk of R >= MIN_ROWS rows runs all its matmuls on the fast kernels, so a sub-block of fewer rows (the
++    chunk's partial last one) must too: for its duration ``MIN_ROWS`` is 1. The head is the exception: the whole-chunk
++    path runs it on the last row alone, which goes to ``qmm.matmul``, so calls on ``w.head`` keep the threshold.
++    Installed through ``fast_qmm.matmul_fast``, which ``fastpf.chunk`` reads on entry (so it also covers chunk
++    entries inside this scope)."""
++
++    fq = fastpf.fast_qmm
++    lo = getattr(fq, "MIN_ROWS", None)
++    inner = getattr(fq, "matmul_fast", None)
++    if lo is None or inner is None or R < lo:
++        yield
++        return
++    head = w.head
++
++    def matmul_fast(x, q, xs=None, *, out=None, f32=False, part=None):
++        if x.shape[0] >= lo or q is head:
++            return inner(x, q, xs, out=out, f32=f32, part=part)
++        fq.MIN_ROWS = 1
++        try:
++            return inner(x, q, xs, out=out, f32=f32, part=part)
++        finally:
++            fq.MIN_ROWS = lo
++
++    fq.matmul_fast = matmul_fast
++    try:
++        yield
++    finally:
++        fq.matmul_fast = inner
++        fq.MIN_ROWS = lo
++
++
++def compute(w: Weights, st: State, b: Buffers, lb: LeanBuffers, R: int, *, head: bool = True) -> torch.Tensor:
++    """``_compute`` with the whole chunk's kernel choice in every sub-block (``chunk_rows``)."""
++
++    with chunk_rows(w, R):
++        return _compute(w, st, b, lb, R, head=head)
++
++
++def _compute(w: Weights, st: State, b: Buffers, lb: LeanBuffers, R: int, *, head: bool = True) -> torch.Tensor:
++    """A fast prefill chunk of R staged rows (``stage``) at st.pos: the bits of ``forward.compute(..., fast=True,
++    head=head)`` on R-row buffers. Returns the last row's logits [1, V/world] (stale unless ``head``); the chunk's
++    final-normed rows are in ``lb.fnormed[:R]`` and its DFlash2 taps in ``lb.tapcat[:R]``. The committed state is
++    unchanged until ``commit``."""
++
++    if R > lb.rows:
++        raise ValueError(f"lean chunk of {R} rows, the lean buffers hold {lb.rows}")
++    if lb.block > b.rows:
++        raise ValueError(f"lean sub-blocks of {lb.block} rows, the main buffers hold {b.rows}")
++    c = w.cfg
++    pos0 = st.pos
++    blocks = lb.sub_blocks(R)
++    with fastpf.chunk(b):
++        glue.embed(lb.ids[:R], w.embed, c.hidden, c.streams, lb.x[:R])
++        if profile.ON:
++            profile.lap("embed")
++        for layer in w.layers:
++            for a, r in blocks:
++                _attn_half(layer, w, st, b, lb, a, r, pos0 + a)
++            if layer.mlp is not None:
++                for a, r in blocks:
++                    _ffn_dense(layer, w, b, lb, a, r)
++            else:
++                _ffn_moe(layer, w, b, lb, R)
++            for slot in b.tap_at.get(layer.index, ()):
++                for a, r in blocks:
++                    glue.stream_mean(lb.x[a:a + r], b.taps[slot][:r])
++                    lb.tapcat[a:a + r, slot * lb.D:(slot + 1) * lb.D].copy_(b.taps[slot][:r])
++        for a, r in blocks:
++            glue.stream_mean(lb.x[a:a + r], b.hidden[:r])
++            glue.rmsnorm(b.hidden[:r], w.norm, c.eps, lb.fnormed[a:a + r], b.fxs[:r])
++        if profile.ON:
++            profile.lap("hc")
++        r = blocks[-1][1]
++        if head:                         # patches/0080: prefill samples the last row only
++            qmm.matmul(lb.fnormed[R - 1:R], w.head, b.fxs[r - 1:r], out=b.logits[:1], part=b.sk)
++        if profile.ON:
++            profile.lap("head")
++        _join(w)
++    return b.logits[:1]
++
++
++@torch.no_grad()
++def commit(w: Weights, st: State, lb: LeanBuffers, R: int) -> None:
++    """``forward.commit(w, st, b, R, R)`` after a lean chunk: every KDA layer's state is in its other buffer and its
++    conv window in ``lb.tail`` (the carry), the committed length advances by R."""
++
++    n = len(st.cur)
++    if n:
++        st.cur = [1 - st.cur[0]] * n
++        st.conv[:n].copy_(lb.tail)
++    st.set_pos(st.pos + R, committed=True)
++    if st.index_ring:
++        st.save_index_tail()             # patches/0065
++
++
++def budget(w: Weights, rows: int, block: int, taps: int = 0) -> dict[str, int]:
++    """Bytes a rank of the lean set at ``rows`` rows (for the memory table / tests), by part."""
++
++    c = w.cfg
++    D, S, slots = c.hidden, c.streams, c.top_k + 1
++    ml = c.moe_width // w.world
++    LL = c.lin_heads // w.world
++    nk = sum(1 for l in c.kinds if l == "kda")
++    out = {
++        "x (streams)": rows * S * D * 2,
++        "ffn normed/xs/post/comb": rows * (D * 2 + D // 64 * 4 + S * 4 + S * S * 4),
++        "routing (mlog, pick, wts, members)": rows * (c.experts * 4 + slots * 8 + (c.experts + 1) * 4),
++        "expert outputs ey (fp32)": rows * slots * D * 4,
++        "fnormed": rows * D * 2,
++        "taps": rows * taps * D * 2,
++        "kda carry": nk * (c.conv - 1) * 3 * LL * 128 * 2 + LL * 128 * 128 * 4,
++        "ids, expert ids, positions": rows * 4 + (c.experts + 1) * 4 + 8,
++    }
++    if c.quant == "exl3":
++        out["expert inputs Xg/Xu/Xd (fp16)"] = rows * slots * (2 * D + ml) * 2
++    else:
++        out["expert activations"] = rows * slots * (ml * 2 + ml // 64 * 4)
++    return out

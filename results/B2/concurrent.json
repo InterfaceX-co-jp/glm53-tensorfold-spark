@@ -1,0 +1,111 @@
+{
+ "label": "",
+ "args": {
+  "base": "http://127.0.0.1:8080",
+  "model": "GLM-5.3-Flash-Uncensored",
+  "modes": "batchexact,concurrent",
+  "doc": 30000,
+  "system": 2000,
+  "append": 2000,
+  "tokens": 64,
+  "long_tokens": 256,
+  "streams": "1,2,4",
+  "reps": 2,
+  "delay": 3.0,
+  "extra": "{}",
+  "label": "",
+  "out": "results/B2/concurrent.json"
+ },
+ "batchexact": {
+  "same": [
+   true,
+   true,
+   true,
+   true
+  ]
+ },
+ "concurrent": [
+  {
+   "streams": 1,
+   "rep": 0,
+   "aggregate_tps": 71.78173029133987,
+   "per_stream_tps": [
+    71.50133290738933
+   ],
+   "tokens": [
+    256
+   ]
+  },
+  {
+   "streams": 1,
+   "rep": 1,
+   "aggregate_tps": 46.29418608310487,
+   "per_stream_tps": [
+    46.11334941871774
+   ],
+   "tokens": [
+    256
+   ]
+  },
+  {
+   "streams": 2,
+   "rep": 0,
+   "aggregate_tps": 60.50856930372165,
+   "per_stream_tps": [
+    48.47397284930294,
+    30.136103852439494
+   ],
+   "tokens": [
+    256,
+    256
+   ]
+  },
+  {
+   "streams": 2,
+   "rep": 1,
+   "aggregate_tps": 55.90568070151235,
+   "per_stream_tps": [
+    27.843649568136033,
+    31.74302270112076
+   ],
+   "tokens": [
+    256,
+    256
+   ]
+  },
+  {
+   "streams": 4,
+   "rep": 0,
+   "aggregate_tps": 73.91005170466757,
+   "per_stream_tps": [
+    41.77999913323926,
+    28.22077718112347,
+    33.75670432818328,
+    61.883633068872264
+   ],
+   "tokens": [
+    256,
+    256,
+    256,
+    256
+   ]
+  },
+  {
+   "streams": 4,
+   "rep": 1,
+   "aggregate_tps": 61.32428677280429,
+   "per_stream_tps": [
+    27.294079530393184,
+    32.90204608341826,
+    64.24791276279905,
+    35.89150317814621
+   ],
+   "tokens": [
+    256,
+    256,
+    256,
+    256
+   ]
+  }
+ ]
+}

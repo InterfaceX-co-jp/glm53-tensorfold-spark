@@ -1,0 +1,1025 @@
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index b86552f..135487b 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -405,7 +405,8 @@ def make_handler(app: App):
+                                                            "arguments": call["function"]["arguments"]}}]})
+                 end = chunk({}, result["finish"])
+                 usage = {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
+-                         "total_tokens": result["prompt_tokens"] + result["completion_tokens"]}
++                         "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
++                         "prompt_tokens_details": _cached(result)}          # patches/0110
+                 if (body.get("stream_options") or {}).get("include_usage"):
+                     end["usage"] = usage
+                 end["tensorfold"] = result["stats"]      # patches/0090: the engine's stats (effective tf_knobs)
+@@ -418,7 +419,8 @@ def make_handler(app: App):
+                 return
+             result = app.run(body, chat, lambda delta: True)
+             usage = {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
+-                     "total_tokens": result["prompt_tokens"] + result["completion_tokens"]}
++                     "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
++                     "prompt_tokens_details": _cached(result)}              # patches/0110
+             if chat:
+                 message: dict[str, Any] = {"role": "assistant", "content": result["content"] or None}
+                 if result["reasoning"]:
+@@ -437,6 +439,13 @@ def make_handler(app: App):
+     return Handler
+ 
+ 
++def _cached(result: dict[str, Any]) -> dict[str, int]:
++    """patches/0110: OpenAI's ``usage.prompt_tokens_details``: the prompt tokens the engine resumed from a kept
++    state instead of prefilling (its stats' ``cached``)."""
++
++    return {"cached_tokens": int((result.get("stats") or {}).get("cached", 0) or 0)}
++
++
+ def serve(app: App, host: str, port: int) -> None:
+     """Serve until interrupted (SIGTERM included)."""
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 21b8fb3..ae8e3aa 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -299,7 +299,9 @@ class Snapshot:
+     positions the head has not absorbed yet (their next tokens come from the new prompt). ``mtp_len`` and
+     ``drafter_end``: how far the MTP and DFlash2 caches are valid, -1 when they are not usable. ``grid``
+     (patches/0080): 0 for a state the row-invariant kernels built (resumable at any length), C for a fast-prefill
+-    snapshot on the chunk grid C (``fastpf``: only fast requests with the same grid resume from it)."""
++    snapshot on the chunk grid C (``fastpf``: only fast requests with the same grid resume from it). ``window``
++    (patches/0110, with the session store on): the DFlash2 drafter's context rows in its sliding window
++    (``sessions.capture_window``), so a session restored after other sessions ran drafts as it did."""
+ 
+     ids: list[int]
+     rec: torch.Tensor
+@@ -308,6 +310,7 @@ class Snapshot:
+     mtp_len: int
+     drafter_end: int
+     grid: int = 0
++    window: dict | None = None
+ 
+ 
+ def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
+@@ -319,9 +322,11 @@ def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *
+     rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
+     if mtp_len is None:
+         mtp_len = st.mtp_len - st.mtp_drafted
++    capture = getattr(e, "snap_window", None)       # patches/0110: set by the session store
+     return Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
+                     mtp_len if mtp and pending is not None else -1,
+-                    drafter.context_end if drafter is not None else -1, grid)
++                    drafter.context_end if drafter is not None else -1, grid,
++                    capture(drafter) if capture is not None and drafter is not None else None)
+ 
+ 
+ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+@@ -462,6 +478,17 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     return first
+ 
+ 
++def _spans(begin: int, n: int, step: int, marks: Sequence[int]):
++    """Prefill chunks [start, stop) of up to ``step`` rows from ``begin``, also cut at every mark (patches/0110)."""
++
++    start = begin
++    for q in [*marks, n]:
++        while start < q:
++            stop = min(start + step, q)
++            yield start, stop
++            start = stop
++
++
+ # -- decode loops -----------------------------------------------------------------------------------------------
+ @dataclass
+ class DecodeResult:
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 775e730..fc6da8b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -15,6 +15,12 @@ row-invariant, at absolute multiples of a chunk grid C; the only state kept is t
+ (no snapshot after the reply), and fast requests resume only from such snapshots of their own grid, which keeps
+ resumed == fresh and drafted == serial (the proof is in ``fastpf``).
+ 
++Sessions (patches/0110, GLM53_TF_SESSION_GIB > 0, ``sessions.py``): besides those two snapshots, a store of many
++sessions' snapshots and attention rows (paged, shared prefixes stored once, least recently used evicted) that a
++request resumes from by copying them into the live caches, when that resumes more of its prompt; rank 0 decides and
++sends the plan after the prompt. ``cached`` in the stats (``usage.prompt_tokens_details.cached_tokens``) is the
++prompt prefix a request resumed from either.
++
+ A request's draft policy is a spec (the engine's default, or the request's through ``app.GlmApp``):
+ 
+     0             serial: one token a round
+@@ -319,6 +325,42 @@ class GlmEngine:
+         self.online = (calib.OnlineCosts(self.costs["verify"]) if calib.online() and rank == 0 and self.batch is None
+                        else None)
+         self.calib_on = calib.online()      # patches/0090: the default of ``tf_knobs.calib_online``
++        self.store = self._sessions()       # patches/0110
++
++    def _sessions(self):
++        """patches/0110: the session store (``sessions.py``), or None (GLM53_TF_SESSION_GIB=0, the default, or
++        GLM53_TF_BATCH > 1, whose slots keep their own states). Both ranks must agree on its settings."""
++
++        from . import sessions
++
++        mine = sessions.settings()
++        both = self._gather_ints(mine)
++        if both[0] != both[1]:
++            raise RuntimeError("the two ranks were started with different session settings (GLM53_TF_SESSION_GIB, "
++                               f"GLM53_TF_SESSION_EVERY, GLM53_TF_SESSION_FORK_MIN): {both[0]}, {both[1]}")
++        if not mine[0] or self.batch is not None:
++            if mine[0] and self.rank == 0:
++                print("[tensorfold] GLM53_TF_SESSION_GIB is ignored with GLM53_TF_BATCH > 1", flush=True)
++            return None
++        store = sessions.SessionStore(self.e, self.drafter, sessions.budget_bytes())
++        if self.rank == 0:
++            ix = store.index
++            print(f"[tensorfold] session store: {ix.budget / 2 ** 30:.1f} GiB, pages of {sessions.PAGE} tokens "
++                  f"({ix.page_bytes / 2 ** 20:.2f} MiB, {ix.page_bytes / sessions.PAGE / 1024:.2f} KB a token), "
++                  f"marks every {store.every} tokens and at forks of {store.fork_min}+", flush=True)
++        return store
++
++    def _store_save(self, snaps: list) -> None:
++        """patches/0110: store snapshots of the live state; rank 0 decides (stored or not, evictions), rank 1
++        applies its decisions."""
++
++        snaps = [s for s in snaps if s is not None]
++        if getattr(self, "store", None) is None or not snaps:
++            return
++        if self.rank == 0:
++            self._share(self.store.save_all(snaps))
++        else:
++            self.store.save_all(snaps, forced=self._share(None))
+ 
+     # -- patches/0090: per-request knobs ---------------------------------------------------------------------------
+     def parse_knobs(self, raw) -> dict:
+@@ -582,25 +624,43 @@ class GlmEngine:
+         self.cache = self.cache[-1:] + [snap]
+ 
+     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
+-             code: list[int], hit, draft: bool) -> dict[str, Any]:
++             code: list[int], hit, draft: bool, sess=None) -> dict[str, Any]:
+         from .decode import (DepthPolicy, DrafterChoice, auto_decode, dflash_decode, mtp_decode, prefill,
+                              serial_decode, take_snapshot)
+ 
+         auto, use_mtp, use_dflash = self._drafters(code)
+         drafter = self.drafter if use_dflash else None
+         t0 = time.perf_counter()
++        store = getattr(self, "store", None)        # patches/0110
++        if store is not None and sess is not None and sess.entry is not None:
++            # a stored session into the live caches; the live snapshots no longer match them
++            hit = store.restore(sess.entry, drafter)
++            self.cache = []
+         # a request writes the attention caches from its resume point on: every longer snapshot is overwritten
+         cut = len(hit.ids) if hit is not None else 0
+         self.cache = [c for c in self.cache if len(c.ids) <= cut]
+-        first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit)
++        if store is not None:                       # patches/0110
++            store.begin(hit, cut)
++            self.e.checkpoints = sess.marks if sess is not None and draft else ()
++        try:
++            first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit)
++        finally:
++            self.e.checkpoints = ()
+         prefill_s = time.perf_counter() - t0
+         grid = self._grid()                 # patches/0080: 0, or the fast chunk grid this prefill ran on
++        saves = list(getattr(self.e, "mark_snaps", ())) if draft else []       # patches/0110
+         if draft and grid:
+             if self.e.fast_snap is not None:        # the state at the prompt's last grid point, nothing later
+                 self._remember(self.e.fast_snap)
++                saves.append(self.e.fast_snap)
+         elif draft:
+-            self._remember(take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+-                                         drafter=drafter))
++            snap = take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                 drafter=drafter)
++            self._remember(snap)
++            saves.append(snap)
++        self.e.mark_snaps = []
++        if store is not None:
++            self._store_save(saves)                 # patches/0110
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
+         if grid:
+             stats["fast_prefill"] = grid - grid % 64            # patches/0083: the chunk grid C of the tag
+@@ -653,7 +713,10 @@ class GlmEngine:
+                 pending = res.pending
+             else:
+                 pending = None if use_dflash else self.e.main_hidden(slice(0, res.keeps[-1]))
+-            self._remember(take_snapshot(self.e, committed, pending, mtp=use_mtp, drafter=drafter))
++            snap = take_snapshot(self.e, committed, pending, mtp=use_mtp, drafter=drafter)
++            self._remember(snap)
++            if store is not None:
++                self._store_save([snap])            # patches/0110
+         elif policy is None:
+             self.cache = [c for c in self.cache if len(c.ids) <= len(prompt)]   # the reply's rows are not kept
+         stats.update(decode_s=res.seconds, rounds=res.rounds, min_rows=1 + min(res.depths, default=0),
+@@ -709,6 +772,13 @@ class GlmEngine:
+         # patches/0091: a snapshot made by the request's own prefill mode (exact, or fast on the request's grid)
+         grid = self._grid(bool(values["fast_prefill"]), values["prefill_rows"], bool(values["fp8_prefill"]))
+         hit = self._resume(list(prompt), code, grid) if draft else None
++        sess = None
++        if self.store is not None:          # patches/0110: a stored session that resumes more, and the marks
++            _, need_mtp, need_f = self._drafters(code)
++            sess = self.store.plan(list(prompt), grid, need_mtp, need_f and self.drafter is not None,
++                                   len(hit.ids) if hit is not None else 0, draft)
++            if sess.entry is not None:
++                hit = sess.entry.payload[0]
+         # patches/0070: frozen for the request; patches/0090: only while its calib_online is on
+         table = self.online.table() if self.online is not None and values["calib_online"] else []
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+@@ -719,11 +789,15 @@ class GlmEngine:
+                   *knobs_mod.encode(values)] + code          # patches/0090: the knobs rank 1 applies
+         self._share(header)
+         self._share(list(prompt))
++        if self.store is not None:          # patches/0110: the plan, and rank 0's store digest for rank 1 to check
++            self._share(sess.encode(self.store.index.digest()))
+         self._adopt(table)
+         self.depth_cost = cost
+         with self._knobs(values):
+-            stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
++            stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, sess)
+         stats.update(policy=spec, drafts=draft)
++        if self.store is not None:          # patches/0110
++            stats["sessions"] = self.store.describe()
+         stats["tf_knobs"] = dict(values, lookup=look[0], lookup_min=look[1],
+                                  depth="cost" if depth_cost else "threshold")
+         if table:
+@@ -744,14 +818,20 @@ class GlmEngine:
+             self.depth_cost, code = code[0], code[1:]  # patches/0071: rank 0's cost-depth flag
+             values, code = knobs_mod.decode(code)       # patches/0090: rank 0's knobs for this request
+             prompt = self._share(None)
++            sess = self.store.follow(self._share(None)) if self.store is not None else None     # patches/0110
+             self._adopt(table)
+             temperature = _ints_f64(t_lo, t_hi)
+             seed = (s_top << 62) | (s_hi << 31) | s_lo
+             sampling = Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi)) if temperature > 0 else None
+             hit = None
+-            if cached:
++            if cached and sess is not None and sess.entry is not None:          # patches/0110
++                hit = sess.entry.payload[0]
++                if len(hit.ids) != cached or prompt[:cached] != hit.ids:
++                    raise RuntimeError(f"rank 1's session entry does not hold the {cached} tokens rank 0 resumes from")
++            elif cached:
+                 hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
+                 if hit is None:
+                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
+             with self._knobs(values):
+-                self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft))
++                self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
++                          sess)
+diff --git a/src/tensorfold/families/glm5_next/cuda/sessions.py b/src/tensorfold/families/glm5_next/cuda/sessions.py
+new file mode 100644
+index 0000000..5ef4a12
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/sessions.py
+@@ -0,0 +1,753 @@
++"""Multi-session state cache for GLM-5.3-Flash (patches/0110, GLM53_TF_SESSION_GIB > 0).
++
++Without it the engine keeps the committed state of the LAST request only (``engine.GlmEngine.cache``: the snapshots
++after its prompt and after its reply, in place over the live caches), so an agent that switches between sessions
++(subagents, parallel tool loops) re-prefills the whole context on every switch. This module keeps many sessions
++resident per rank, within a byte budget, and restores any of them into the live ``State`` by copying.
++
++What a session entry holds
++--------------------------
++An entry is one ``decode.Snapshot`` (token ids; KDA recurrent states and conv windows, which also carry patches/0065's
++index-ring tail; the pending MTP rows; ``mtp_len``, ``drafter_end``, the grid tag) plus every per-position row of the
++attention caches below ``len(ids)``: the DSA layers' KV rows (latent with patches/0060, or expanded), the indexer's
++full-size keys and gates (none for the model layers when patches/0065's index ring is on: a ring row is read only by
++the window that completes its pool, so the tail in ``conv`` is all a resumed prefill needs), the pool keys (one row
++per 4 positions), and the MTP head's rows (KV, index keys / gates / pool keys) below ``mtp_len``. With a DFlash2
++drafter, the snapshot also carries the drafter's context rows in its sliding window (``Snapshot.window``,
++positions [end - window, end)): the drafter attends only there, so after a restore it drafts exactly as it would
++have (patches/0065's ring alone would mask whatever another session overwrote: drafts, never replies, would differ).
++
++Pages and sharing
++-----------------
++Rows are stored in pages of ``PAGE`` = 256 positions (``PAGE / 4`` pool rows), in slabs of ``EXTENT`` pages per cache
++tensor. A page is immutable and shared between entries by a key that determines its bits:
++
++- exact snapshots (grid 0): every row is a row-invariant function of its prefix, and an MTP row t also reads token
++  t + 1, so page p's key covers tokens [0, 256 (p + 1) + 1);
++- fast snapshots (grid C, patches/0080; C + 1 for FP8, patches/0083): a row's bits depend on its whole chunk
++  [kC, (k + 1) C), so the key covers every token up to the end of the chunk holding the page's last row (and the
++  one after the page, for its MTP rows);
++- the key also carries the tag and whether the MTP rows are valid.
++
++An entry's pages are the full ones whose key tokens it holds and whose MTP rows are below its ``mtp_len``; the rest
++(at most the last partial page, plus the MTP backlog of a reply snapshot) is its private tail. A shared system
++prompt is stored once however many subagents fork from it.
++
++Restore = copy-in
++-----------------
++``restore`` copies an entry's pages and tail into the live caches at their positions (``live`` remembers which
++page each live range already holds, so pages the live caches share with the entry are not copied), and its drafter
++window into the drafter's ring; ``decode.prefill`` then restores the KDA state from the snapshot as for any resume.
++A restored state holds the same bits as the state the snapshot was taken from, which (by the engine's rules: exact
++snapshots anywhere, fast ones on their grid) is the fresh prefill's state at that position: resumed == fresh holds.
++
++Checkpoints ("marks")
++---------------------
++The KDA state cannot be rebuilt from the attention rows, so a prompt that FORKS from a stored one (a subagent with
++the same system prompt and a different task) can only resume at a snapshot. Rank 0 asks the request's prefill for
++snapshots at extra positions (``decode._prefill`` splits an exact chunk there, which changes no bit; fast marks
++sit on the grid): at the page (exact) or grid point (fast) at or before the longest common prefix with any stored
++entry, when that is at least GLM53_TF_SESSION_FORK_MIN (512) tokens past the resume point, and every
++GLM53_TF_SESSION_EVERY (16,384) tokens of a long prompt (0: none). A mark is an entry like any other.
++
++Two ranks
++---------
++Rank 0 decides which entry a request restores and which marks its prefill takes (sent after the prompt, with a
++digest of its store that rank 1 checks), and, for every save, whether it is stored and which entries are evicted
++first (``GlmEngine._store_save``); rank 1 applies exactly those decisions (``forced``) and fails loudly if its store
++disagrees. Both ranks hold the same entries: the latent rows are replicated and the KDA heads split evenly, so sizes
++match; GLM53_TF_SESSION_* must be equal (checked at load).
++
++Eviction: least recently used entry first (restored, resumed or saved again = used), until the new entry fits the
++budget; a page goes when no entry references it; empty slabs are released. An entry larger than the whole budget is
++not stored. The snapshots the engine keeps for the live sequence (``GlmEngine.cache``, at most two) are the same
++objects, so an evicted one lives until the engine drops it.
++
++This module imports no torch at load: ``SessionIndex`` (keys, lookup, LRU, reference counts, budget) is plain
++Python and tested on the host; ``SessionStore`` moves the tensors.
++"""
++
++from __future__ import annotations
++
++import bisect
++import hashlib
++import os
++import zlib
++from array import array
++from collections.abc import Sequence
++from dataclasses import dataclass, field
++from typing import Any
++
++PAGE = 256                 # positions a page
++POOL = 4                   # positions a pool key (``sparse.POOL``)
++EXTENT = 16                # pages a slab
++SAVED, SKIPPED, DUPLICATE = 1, 0, 2
++
++
++# -- settings -------------------------------------------------------------------------------------------------------
++def budget_bytes() -> int:
++    """GLM53_TF_SESSION_GIB: bytes a rank may hold in session entries (pages, snapshots, tails); 0 (default): off."""
++
++    gib = float(os.environ.get("GLM53_TF_SESSION_GIB", "0") or 0)
++    if gib < 0:
++        raise ValueError(f"GLM53_TF_SESSION_GIB={gib}: expected >= 0")
++    return int(gib * 2 ** 30)
++
++
++def every() -> int:
++    """GLM53_TF_SESSION_EVERY: a mark every this many tokens of a long prompt (0: none)."""
++
++    n = int(os.environ.get("GLM53_TF_SESSION_EVERY", "16384") or 0)
++    if n < 0:
++        raise ValueError(f"GLM53_TF_SESSION_EVERY={n}: expected >= 0")
++    return n
++
++
++def fork_min() -> int:
++    """GLM53_TF_SESSION_FORK_MIN: the fewest tokens a mark must save over the resume point."""
++
++    n = int(os.environ.get("GLM53_TF_SESSION_FORK_MIN", "512") or 0)
++    if n < 1:
++        raise ValueError(f"GLM53_TF_SESSION_FORK_MIN={n}: expected >= 1")
++    return n
++
++
++def reserve_bytes() -> int:
++    """GLM53_TF_SESSION_RESERVE_GIB (default 2): rank 0 stores nothing that would leave less device memory free."""
++
++    return int(float(os.environ.get("GLM53_TF_SESSION_RESERVE_GIB", "2") or 0) * 2 ** 30)
++
++
++def settings() -> list[int]:
++    """What both ranks must agree on (MiB, tokens, tokens)."""
++
++    return [budget_bytes() >> 20, every(), fork_min()]
++
++
++def snapshot_grid(tag: int) -> int:
++    """THE rule every decision here takes a snapshot tag through: 0 for an exact snapshot (row-invariant rows, a
++    snapshot may sit anywhere), else the absolute grid G a fast snapshot sits on, which is also the block a fast
++    row's bits depend on (rows of [kG, (k + 1) G) depend on every token before (k + 1) G). patches/0080 / 0083:
++    G = the tag's chunk grid C (as ``fp8pf.grid_of``: the tag is C, or C + 1 for FP8), without importing torch. A
++    prefill rule with another grid (e.g. an absolute 64-token grid for every chunk size) changes only this function
++    (``decode._prefill`` places the marks by it too)."""
++
++    return tag - tag % 64 if tag else 0
++
++
++# -- hashing --------------------------------------------------------------------------------------------------------
++def _bytes(ids: Sequence[int]) -> bytes:
++    return array("i", [int(t) for t in ids]).tobytes()
++
++
++def _h(*parts: bytes) -> bytes:
++    h = hashlib.blake2b(digest_size=16)
++    for p in parts:
++        h.update(p)
++    return h.digest()
++
++
++def chain(ids: Sequence[int], blocks: int | None = None) -> list[bytes]:
++    """Chained digests of the full PAGE-token blocks of ``ids``: chain[j] determines ids[:PAGE (j + 1)]."""
++
++    n = len(ids) // PAGE if blocks is None else min(blocks, len(ids) // PAGE)
++    out: list[bytes] = []
++    prev = b""
++    for j in range(n):
++        prev = _h(prev, _bytes(ids[j * PAGE:(j + 1) * PAGE]))
++        out.append(prev)
++    return out
++
++
++def ids_key(tag: int, ids: Sequence[int], has_mtp: bool, drafter: bool) -> bytes:
++    """An entry's identity: two snapshots with the same key hold the same state."""
++
++    return _h(b"entry", tag.to_bytes(4, "little"), bytes([int(has_mtp), int(drafter)]),
++              len(ids).to_bytes(8, "little"), _bytes(ids))
++
++
++def key_end(tag: int, p: int) -> int:
++    """The tokens page p's rows depend on: [0, key_end). Exact rows: their prefix, and an MTP row the next token too;
++    fast rows (grid C): their whole chunk."""
++
++    end = PAGE * (p + 1) + 1
++    g = snapshot_grid(tag)
++    if g:
++        end = max(end, -(-PAGE * (p + 1) // g) * g)
++    return end
++
++
++def page_count(tag: int, length: int, mtp_len: int) -> int:
++    """How many leading full pages an entry of ``length`` tokens (MTP rows valid below ``mtp_len``; < 0: none) shares:
++    every page whose key tokens it holds and whose MTP rows are all valid."""
++
++    p = length // PAGE
++    while p > 0 and (key_end(tag, p - 1) > length or (mtp_len >= 0 and PAGE * p > mtp_len)):
++        p -= 1
++    return p
++
++
++def page_keys(tag: int, ids: Sequence[int], blocks: list[bytes], count: int, has_mtp: bool) -> list[bytes]:
++    head = tag.to_bytes(4, "little") + bytes([int(has_mtp)])
++    return [_h(b"page", head, blocks[p], _bytes(ids[PAGE * (p + 1):key_end(tag, p)])) for p in range(count)]
++
++
++# -- the index (host only) -------------------------------------------------------------------------------------------
++@dataclass
++class Entry:
++    id: int
++    tag: int
++    ids: list[int]
++    mtp_len: int
++    drafter: bool
++    key: bytes
++    chain: list[bytes]
++    pages: list[bytes]
++    private: int
++    kind: str
++    used: int
++    payload: Any = None          # SessionStore: (Snapshot, tail tensors)
++
++    @property
++    def has_mtp(self) -> bool:
++        return self.mtp_len >= 0
++
++
++@dataclass
++class Page:
++    key: bytes
++    phys: int
++    refs: int = 1
++
++
++@dataclass
++class Saved:
++    status: int
++    entry: Entry | None = None
++    evicted: list[int] = field(default_factory=list)
++    new: list[tuple[int, int]] = field(default_factory=list)       # (page index in the entry, physical page)
++
++    def encode(self) -> list[int]:
++        return [self.status, len(self.evicted), *self.evicted]
++
++
++class SessionIndex:
++    """Entries, pages and the budget, without tensors. Deterministic: the same calls give the same state."""
++
++    def __init__(self, budget: int, row_bytes: Sequence[int], extent: int = EXTENT) -> None:
++        """``row_bytes``: bytes a position of (main rows, main pool rows, MTP rows, MTP pool rows) takes."""
++
++        self.budget = int(budget)
++        self.row_bytes = tuple(int(b) for b in row_bytes)
++        mr, mp, tr, tp = self.row_bytes
++        self.page_bytes = PAGE * (mr + tr) + PAGE // POOL * (mp + tp)
++        self.extent = extent
++        self.extent_bytes = self.page_bytes * extent
++        self.entries: dict[int, Entry] = {}
++        self.by_key: dict[bytes, int] = {}
++        self.pages: dict[bytes, Page] = {}
++        self.extents: dict[int, int] = {}        # extent -> pages in use
++        self.free: list[int] = []                # free physical pages in open extents, ascending
++        self.private = 0
++        self.clock = 0
++        self.next_id = 1
++        self.counters = {"saved": 0, "skipped": 0, "duplicate": 0, "evicted": 0}
++
++    # -- accounting ------------------------------------------------------------------------------------------------
++    @property
++    def used(self) -> int:
++        return len(self.extents) * self.extent_bytes + self.private
++
++    def tail_bytes(self, tag: int, length: int, mtp_len: int, count: int) -> int:
++        mr, mp, tr, tp = self.row_bytes
++        lo = PAGE * count
++        n = (length - lo) * mr + max(0, length // POOL - lo // POOL) * mp
++        if mtp_len >= 0:
++            n += max(0, mtp_len - lo) * tr + max(0, mtp_len // POOL - lo // POOL) * tp
++        return n
++
++    def _need(self, new_pages: int, private: int) -> int:
++        short = max(0, new_pages - len(self.free))
++        return private + -(-short // self.extent) * self.extent_bytes
++
++    def _tick(self) -> int:
++        self.clock += 1
++        return self.clock
++
++    def touch(self, entry: Entry) -> None:
++        entry.used = self._tick()
++
++    def digest(self) -> int:
++        items = sorted((e.id, e.tag, len(e.ids), e.mtp_len, int(e.drafter), len(e.pages))
++                       for e in self.entries.values())
++        text = repr((items, len(self.pages), sorted(self.extents), self.private, self.next_id))
++        return zlib.crc32(text.encode()) & 0x7FFFFFFF
++
++    # -- lookups ---------------------------------------------------------------------------------------------------
++    def _prefix(self, e: Entry, prompt: Sequence[int], blocks: list[bytes]) -> bool:
++        n = len(e.ids)
++        full = n // PAGE
++        if full and (len(blocks) < full or blocks[full - 1] != e.chain[full - 1]):
++            return False
++        return list(prompt[full * PAGE:n]) == e.ids[full * PAGE:]
++
++    def find(self, prompt: Sequence[int], tag: int, need_mtp: bool, need_drafter: bool,
++             blocks: list[bytes] | None = None) -> Entry | None:
++        """The longest entry of a strict prefix of ``prompt`` made by the request's prefill mode (``tag``) whose draft
++        caches fit the request (ties: the most recently used)."""
++
++        blocks = chain(prompt) if blocks is None else blocks
++        best = None
++        for e in self.entries.values():
++            if e.tag != tag or len(e.ids) >= len(prompt) or (need_mtp and not e.has_mtp) \
++                    or (need_drafter and not e.drafter):
++                continue
++            if best is not None and (len(e.ids), e.used) <= (len(best.ids), best.used):
++                continue
++            if self._prefix(e, prompt, blocks):
++                best = e
++        return best
++
++    def lcp(self, prompt: Sequence[int], blocks: list[bytes] | None = None) -> int:
++        """The longest common prefix of ``prompt`` with any entry's tokens."""
++
++        blocks = chain(prompt) if blocks is None else blocks
++        best = 0
++        for e in self.entries.values():
++            lo, hi = 0, min(len(blocks), len(e.chain))
++            while lo < hi:                  # chained digests: equal at j means equal before j too
++                mid = (lo + hi + 1) // 2
++                if blocks[mid - 1] == e.chain[mid - 1]:
++                    lo = mid
++                else:
++                    hi = mid - 1
++            k = lo * PAGE
++            if k + PAGE <= best:
++                continue
++            end = min(len(prompt), len(e.ids), k + PAGE)
++            while k < end and prompt[k] == e.ids[k]:
++                k += 1
++            best = max(best, k)
++        return best
++
++    def has(self, tag: int, ids: Sequence[int], has_mtp: bool, drafter: bool) -> Entry | None:
++        i = self.by_key.get(ids_key(tag, ids, has_mtp, drafter))
++        return self.entries.get(i) if i is not None else None
++
++    def marks(self, prompt: Sequence[int], tag: int, resume: int, *, has_mtp: bool, drafter: bool, every: int,
++              fork_min: int, blocks: list[bytes] | None = None) -> list[int]:
++        """Positions where the request's prefill should also snapshot: the fork point (the page or grid point at or
++        before the longest common prefix with a stored entry) and every ``every`` tokens, each at least
++        ``fork_min`` past the resume point, before the prompt's own snapshot (exact: ``len(prompt)``; fast: its last
++        grid point), and not stored already."""
++
++        n = len(prompt)
++        g = snapshot_grid(tag)
++        step = g or PAGE
++        limit = (n // g) * g if g else n
++        blocks = chain(prompt) if blocks is None else blocks
++        want = set()
++        d = self.lcp(prompt, blocks)
++        q = min(d, limit) // step * step
++        if q >= resume + fork_min and 0 < q < limit:
++            want.add(q)
++        if every:
++            gap = max(step, every // step * step)
++            m = (resume // gap + 1) * gap
++            while m < limit:
++                if m >= resume + fork_min:
++                    want.add(m)
++                m += gap
++        return sorted(m for m in want if self.has(tag, prompt[:m], has_mtp, drafter) is None)
++
++    # -- saving and evicting ---------------------------------------------------------------------------------------
++    def _victim(self) -> Entry | None:
++        return min(self.entries.values(), key=lambda e: (e.used, e.id), default=None)
++
++    def evict(self, entry_id: int) -> Entry:
++        e = self.entries.pop(entry_id)
++        self.by_key.pop(e.key, None)
++        self.private -= e.private
++        for k in e.pages:
++            self._unref(k)
++        self.counters["evicted"] += 1
++        return e
++
++    def _unref(self, key: bytes) -> None:
++        pg = self.pages[key]
++        pg.refs -= 1
++        if pg.refs:
++            return
++        del self.pages[key]
++        ext = pg.phys // self.extent
++        self.extents[ext] -= 1
++        bisect.insort(self.free, pg.phys)
++        if self.extents[ext] == 0:            # an empty slab goes back
++            del self.extents[ext]
++            self.free = [f for f in self.free if f // self.extent != ext]
++
++    def _alloc(self) -> int:
++        if not self.free:
++            ext = next(i for i in range(len(self.extents) + 1) if i not in self.extents)
++            self.extents[ext] = 0
++            self.free = sorted(self.free + list(range(ext * self.extent, (ext + 1) * self.extent)))
++        phys = self.free.pop(0)
++        self.extents[phys // self.extent] += 1
++        return phys
++
++    def save(self, *, tag: int, ids: Sequence[int], mtp_len: int, drafter: bool, snap_bytes: int, kind: str = "turn",
++             forced: tuple[int, list[int]] | None = None, can_grow=None) -> Saved:
++        """Store an entry for a snapshot of ``ids`` (its rows are the live caches' rows, copied by the caller for
++        ``Saved.new``). ``forced`` (rank 1): rank 0's (status, evicted ids), applied as they are. ``can_grow(bytes)``
++        (rank 0): whether the device has the memory for that many more bytes."""
++
++        ids = [int(t) for t in ids]
++        has_mtp = mtp_len >= 0
++        key = ids_key(tag, ids, has_mtp, drafter)
++        dup = self.by_key.get(key)
++        if forced is not None:
++            status, evict = forced
++            if (status == DUPLICATE) != (dup is not None):
++                raise RuntimeError("session stores diverged: rank 0 and rank 1 disagree on a duplicate entry")
++        if dup is not None:
++            self.touch(self.entries[dup])
++            self.counters["duplicate"] += 1
++            return Saved(DUPLICATE, self.entries[dup])
++        blocks = chain(ids)
++        count = page_count(tag, len(ids), mtp_len)
++        keys = page_keys(tag, ids, blocks, count, has_mtp)
++        private = snap_bytes + self.tail_bytes(tag, len(ids), mtp_len, count)
++        shared = [k for k in keys if k in self.pages]
++        for k in shared:                          # pinned: evictions below must not free them
++            self.pages[k].refs += 1
++        new = len(keys) - len(shared)
++        evicted: list[int] = []
++        if forced is not None:
++            for i in evict:
++                if i not in self.entries:
++                    raise RuntimeError(f"session stores diverged: rank 0 evicted entry {i}, which rank 1 lacks")
++                self.evict(i)
++                evicted.append(i)
++            ok = status == SAVED
++            if ok and self.used + self._need(new, private) > self.budget:
++                raise RuntimeError("session stores diverged: rank 1 has no room for an entry rank 0 stored")
++        else:
++            floor = private + -(-new // self.extent) * self.extent_bytes    # with every other page gone
++            ok = floor <= self.budget
++            while ok and self.used + self._need(new, private) > self.budget:
++                v = self._victim()
++                if v is None:
++                    ok = False
++                    break
++                self.evict(v.id)
++                evicted.append(v.id)
++            if ok and can_grow is not None and not can_grow(self._need(new, private)):
++                ok = False
++        if not ok:
++            for k in shared:
++                self._unref(k)
++            self.counters["skipped"] += 1
++            return Saved(SKIPPED, None, evicted)
++        placed: list[tuple[int, int]] = []
++        for p, k in enumerate(keys):
++            if k not in self.pages:
++                phys = self._alloc()
++                self.pages[k] = Page(k, phys)
++                placed.append((p, phys))
++        e = Entry(self.next_id, tag, ids, mtp_len, drafter, key, blocks, keys, private, kind, self._tick())
++        self.next_id += 1
++        self.entries[e.id] = e
++        self.by_key[key] = e.id
++        self.private += private
++        self.counters["saved"] += 1
++        return Saved(SAVED, e, evicted, placed)
++
++
++# -- the plan rank 0 sends ------------------------------------------------------------------------------------------
++@dataclass
++class Plan:
++    entry: Entry | None
++    marks: list[int]
++
++    def encode(self, digest: int) -> list[int]:
++        e = self.entry
++        return [int(e is not None), e.id if e else 0, len(e.ids) if e else 0, len(self.marks), *self.marks, digest]
++
++
++def decode_saves(flat: list[int], count: int) -> list[tuple[int, list[int]]]:
++    out, i = [], 0
++    for _ in range(count):
++        status, n = flat[i], flat[i + 1]
++        out.append((status, list(flat[i + 2:i + 2 + n])))
++        i += 2 + n
++    if i != len(flat):
++        raise RuntimeError("session save decisions: malformed message from rank 0")
++    return out
++
++
++# -- the tensors -----------------------------------------------------------------------------------------------------
++@dataclass
++class Comp:
++    live: Any            # the live cache tensor, rows by position (or by pool)
++    per: int             # rows a page (PAGE, or PAGE / POOL for pool keys)
++    mtp: bool            # indexed by the MTP head's positions
++
++    def rows(self, length: int) -> int:
++        return length if self.per == PAGE else length // POOL
++
++
++def layout(st) -> list[Comp]:
++    """Every per-position cache tensor of a ``forward.State``, once (latent keys = values)."""
++
++    cap = st.capacity
++    seen: set[int] = set()
++    comps: list[Comp] = []
++
++    def add(t, per: int, mtp: bool) -> None:
++        if t is None or t.data_ptr() in seen:
++            return
++        seen.add(t.data_ptr())
++        comps.append(Comp(t, per, mtp))
++
++    for t in list(st.kc) + list(st.vc):
++        if t.shape[0] >= cap:
++            add(t, PAGE, False)
++    if st.index is not None:
++        n_dsa = len(st.dsa_index)
++        for i, (ik, ig, pk) in enumerate(st.index):
++            mtp = i >= n_dsa
++            if ik.shape[0] >= cap:              # patches/0065's rings: only the tail in ``conv`` matters
++                add(ik, PAGE, mtp)
++                add(ig, PAGE, mtp)
++            add(pk, PAGE // POOL, mtp)
++    if hasattr(st, "mtp_kc"):
++        add(st.mtp_kc, PAGE, True)
++        add(st.mtp_vc, PAGE, True)
++    return comps
++
++
++def _nbytes(t) -> int:
++    return int(t.numel() * t.element_size()) if t is not None else 0
++
++
++def row_bytes(comps: list[Comp]) -> tuple[int, int, int, int]:
++    out = [0, 0, 0, 0]
++    for c in comps:
++        out[(2 if c.mtp else 0) + (0 if c.per == PAGE else 1)] += _nbytes(c.live[0])
++    return tuple(out)
++
++
++def capture_window(drafter) -> dict:
++    """The DFlash2 drafter's context rows it can still see at its committed end: positions [lo, end) with
++    lo = max(end - window, the ring's first intact position), K and V of every layer."""
++
++    import torch
++
++    end = int(drafter.context_end)
++    lo = min(max(int(getattr(drafter, "_lo", 0)), end - int(drafter.window), 0), end)
++    if lo >= end:
++        return {"end": end, "lo": end, "k": None, "v": None}
++    idx = torch.arange(lo, end, device=drafter.kc[0].device) % drafter.cap
++    k = torch.stack([t.index_select(1, idx) for t in drafter.kc])
++    v = torch.stack([t.index_select(1, idx) for t in drafter.vc])
++    return {"end": end, "lo": lo, "k": k, "v": v}
++
++
++def restore_window(drafter, win: dict) -> None:
++    """Put a captured window back: the drafter's context ends at ``end`` and sees [lo, end), as when captured."""
++
++    import torch
++
++    end, lo = int(win["end"]), int(win["lo"])
++    if win["k"] is not None:
++        idx = torch.arange(lo, end, device=drafter.kc[0].device) % drafter.cap
++        for i in range(len(drafter.kc)):
++            drafter.kc[i].index_copy_(1, idx, win["k"][i])
++            drafter.vc[i].index_copy_(1, idx, win["v"][i])
++    # patches/0065's ring bookkeeping (``Drafter.context_end``): written up to end + block, intact from lo on
++    drafter._end = end
++    drafter._hi = end + drafter.block
++    drafter._lo = lo
++    drafter.lo_dev.fill_(lo)
++    drafter.pos_dev.fill_(end)
++
++
++def snap_bytes(snap) -> int:
++    n = _nbytes(snap.rec) + _nbytes(snap.conv) + _nbytes(snap.pending)
++    win = getattr(snap, "window", None)
++    if win is not None:
++        n += _nbytes(win["k"]) + _nbytes(win["v"])
++    return n
++
++
++class SessionStore:
++    """The resident sessions of one rank: an index, the page slabs, and what the live caches hold."""
++
++    def __init__(self, e, drafter, budget: int, *, every_tokens: int | None = None,
++                 fork_tokens: int | None = None) -> None:
++        self.e = e
++        self.drafter = drafter
++        self.comps = layout(e.st)
++        self.index = SessionIndex(budget, row_bytes(self.comps))
++        self.every = every() if every_tokens is None else every_tokens
++        self.fork_min = fork_min() if fork_tokens is None else fork_tokens
++        self.reserve = reserve_bytes()
++        self.slabs: dict[int, list] = {}
++        self.live: dict[int, bytes] = {}         # page index -> key of the page the live caches hold there
++        self.stats = {"copied": 0, "skipped": 0, "restores": 0}
++        if drafter is not None:
++            e.snap_window = capture_window       # ``decode.take_snapshot`` keeps the drafter's window
++
++    # -- rank 0's decisions ----------------------------------------------------------------------------------------
++    def plan(self, prompt: list[int], tag: int, need_mtp: bool, need_drafter: bool, cached: int,
++             draft: bool) -> Plan:
++        """The entry to restore (when it resumes more than the live snapshot of ``cached`` tokens) and the marks."""
++
++        if not draft:
++            return Plan(None, [])
++        blocks = chain(prompt)
++        best = self.index.find(prompt, tag, need_mtp, need_drafter, blocks)
++        entry = best if best is not None and len(best.ids) > cached else None
++        resume = max(cached, len(entry.ids) if entry is not None else 0)
++        marks = self.index.marks(prompt, tag, resume, has_mtp=need_mtp and self.e.w.mtp is not None,
++                                 drafter=need_drafter, every=self.every, fork_min=self.fork_min, blocks=blocks)
++        return Plan(entry, marks)
++
++    def follow(self, msg: list[int]) -> Plan:
++        """Rank 1: rank 0's plan, after checking both stores agree."""
++
++        src, entry_id, length, n, *rest = msg
++        marks, digest = rest[:n], rest[n]
++        mine = self.index.digest()
++        if mine != digest:
++            raise RuntimeError(f"session stores diverged: rank 0 digest {digest}, rank 1 {mine}")
++        entry = None
++        if src:
++            entry = self.index.entries.get(entry_id)
++            if entry is None or len(entry.ids) != length:
++                raise RuntimeError(f"rank 1 has no session entry {entry_id} of {length} tokens")
++        return Plan(entry, list(marks))
++
++    def _can_grow(self, n: int) -> bool:
++        import torch
++
++        if not self.comps or not self.comps[0].live.is_cuda:
++            return True
++        free, _ = torch.cuda.mem_get_info()
++        cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
++        return free + cached - n >= self.reserve
++
++    # -- both ranks -------------------------------------------------------------------------------------------------
++    def begin(self, hit, cut: int) -> None:
++        """A request resumes from ``hit`` (None: a fresh prefill) and writes the caches from ``cut`` on (the MTP rows
++        from ``cut`` minus its pending rows): the live pages past that are gone."""
++
++        if hit is not None:
++            e = self.entry_of(hit)
++            if e is not None:
++                self.index.touch(e)
++            if hit.pending is not None:
++                cut -= hit.pending.shape[0]
++        keep = max(cut, 0) // PAGE
++        self.live = {p: k for p, k in self.live.items() if p < keep}
++
++    def _runs(self, pairs: list[tuple[int, int]]):
++        """(page index, physical page) pairs -> runs (first page, extent, first slot, pages) of consecutive both."""
++
++        runs: list[list[int]] = []
++        for p, phys in sorted(pairs):
++            ext, slot = divmod(phys, self.index.extent)
++            if runs and runs[-1][0] + runs[-1][3] == p and runs[-1][1] == ext and runs[-1][2] + runs[-1][3] == slot:
++                runs[-1][3] += 1
++            else:
++                runs.append([p, ext, slot, 1])
++        return runs
++
++    def _copy(self, pairs: list[tuple[int, int]], has_mtp: bool, to_live: bool) -> None:
++        for p, ext, slot, k in self._runs(pairs):
++            slabs = self.slabs[ext]
++            for c, slab in zip(self.comps, slabs):
++                if c.mtp and not has_mtp:
++                    continue
++                live = c.live[p * c.per:(p + k) * c.per]
++                kept = slab[slot * c.per:(slot + k) * c.per]
++                (live if to_live else kept).copy_(kept if to_live else live)
++
++    def _sync_slabs(self) -> None:
++        import torch
++
++        for ext in [x for x in self.slabs if x not in self.index.extents]:
++            del self.slabs[ext]
++        for ext in self.index.extents:
++            if ext not in self.slabs:
++                self.slabs[ext] = [torch.empty((self.index.extent * c.per, *c.live.shape[1:]), dtype=c.live.dtype,
++                                               device=c.live.device) for c in self.comps]
++
++    def save_all(self, snaps: list, forced: list[int] | None = None) -> list[int]:
++        """Store snapshots of the live state (rank 0 decides, rank 1 passes rank 0's decisions)."""
++
++        decisions = decode_saves(forced, len(snaps)) if forced is not None else [None] * len(snaps)
++        out: list[int] = []
++        for snap, dec in zip(snaps, decisions):
++            out += self.save(snap, dec).encode()
++        return out
++
++    def save(self, snap, forced=None, kind: str = "turn") -> Saved:
++        tag = int(snap.grid)
++        drafter = snap.drafter_end == len(snap.ids) and getattr(snap, "window", None) is not None
++        res = self.index.save(tag=tag, ids=snap.ids, mtp_len=snap.mtp_len, drafter=drafter,
++                              snap_bytes=snap_bytes(snap), kind=kind, forced=forced,
++                              can_grow=self._can_grow if forced is None else None)
++        self._sync_slabs()
++        if res.status != SAVED:
++            if res.status == DUPLICATE:
++                snap.session_entry = res.entry.id     # entry ids are never reused
++            return res
++        e = res.entry
++        self._copy(res.new, e.has_mtp, to_live=False)
++        lo = PAGE * len(e.pages)
++        tail = []
++        for c in self.comps:
++            end = len(e.ids) if not c.mtp else (e.mtp_len if e.has_mtp else -1)
++            a, b = c.rows(lo), c.rows(end) if end >= 0 else 0
++            tail.append(c.live[a:b].clone() if b > a else None)
++        e.payload = (snap, tail)
++        snap.session_entry = e.id
++        for p, k in enumerate(e.pages):
++            self.live[p] = k
++        return res
++
++    def restore(self, entry: Entry, drafter=None):
++        """Copy an entry into the live caches (pages the live caches do not hold already, the tail, the drafter's
++        window when the request drafts with it); returns its snapshot for ``decode.prefill(resume=...)``."""
++
++        snap, tail = entry.payload
++        todo = []
++        for p, k in enumerate(entry.pages):
++            if self.live.get(p) != k:
++                todo.append((p, self.index.pages[k].phys))
++        self._copy(todo, entry.has_mtp, to_live=True)
++        lo = PAGE * len(entry.pages)
++        for c, t in zip(self.comps, tail):
++            if t is not None:
++                a = c.rows(lo)
++                c.live[a:a + t.shape[0]].copy_(t)
++        self.stats["copied"] += len(todo)
++        self.stats["skipped"] += len(entry.pages) - len(todo)
++        self.stats["restores"] += 1
++        self.live = {p: k for p, k in enumerate(entry.pages)}
++        if drafter is not None and snap.window is not None:
++            restore_window(drafter, snap.window)
++        self.index.touch(entry)
++        return snap
++
++    def entry_of(self, snap) -> Entry | None:
++        """The stored entry of a snapshot (saved, or found a duplicate of one), if it is still stored."""
++
++        i = getattr(snap, "session_entry", None)
++        return self.index.entries.get(i) if i is not None else None
++
++    def describe(self) -> str:
++        ix = self.index
++        return (f"{len(ix.entries)} entries, {len(ix.pages)} pages, {ix.used / 2 ** 30:.2f} of "
++                f"{ix.budget / 2 ** 30:.2f} GiB")

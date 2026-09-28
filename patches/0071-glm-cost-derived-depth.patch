@@ -1,0 +1,606 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index acb885c..72bb9f3 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -176,16 +176,34 @@ def absorb(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int]) -> torch
+ 
+ 
+ def draft(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
+-          sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
++          sampling: Sampling | None, confidence: float = 0.0, opt=None) -> list[int]:
+     """Absorb the kept positions, then chain up to ``count`` drafts for positions position, position + 1, ...
+     ``confidence`` > 0: stop once the product of the drafts' own probabilities falls below it (the first draft is
+-    always kept), so a verify row is spent only on a draft likely to be accepted."""
++    always kept), so a verify row is spent only on a draft likely to be accepted. ``opt`` (patches/0071, a
++    ``depth.DepthOptimizer``): instead, each draft joins the window and the chain goes on while that pays at the
++    request's rate."""
+ 
+     st = e.st
+     logits = absorb(e, hidden, next_tokens)
+     drafts: list[int] = []
+     n = len(next_tokens)
+     chain = 1.0
++    if opt is not None:                                         # patches/0071
++        opt.mtp_begin()
++        for j in range(count):
++            probs: list[float] = []
++            d = e.sample(logits[:1], [position + j], sampling, draft=True, probs=probs)[0]
++            take, more = opt.mtp_next(j, probs[0], count)
++            if not take:
++                break
++            drafts.append(d)
++            if not more:
++                break
++            prev = e.draft_hidden(n - 1 if j == 0 else 0)
++            logits = e.mtp([d], prev)
++            st.set_mtp_len(st.mtp_len + 1)
++            st.mtp_drafted += 1
++        return drafts
+     for j in range(count):
+         probs: list[float] = []
+         d = e.sample(logits[:1], [position + j], sampling, draft=True, probs=probs if confidence > 0 else None)[0]
+@@ -404,6 +422,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+ 
+     w, st, b = e.w, e.st, e.buf
+     policy = policy or DepthPolicy()
++    opt = getattr(e, "depth", None)         # patches/0071 (``om``): cost-derived depths, up to policy.most
+     out = [pending]
+     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+     rounds = drafted = accepted = 0
+@@ -413,7 +432,9 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+     start = time.perf_counter()
+     t0 = time.perf_counter()
+     depth = min(policy.next(0, 0), count - len(out))
+-    drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
++    drafts = (draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence, opt=opt)
++              if depth > 0 else [])
++    steps, backlog = 1 + st.mtp_drafted, 1
+     stages["draft"] += time.perf_counter() - t0
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+         t0 = time.perf_counter()
+@@ -431,6 +452,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         t2 = time.perf_counter()
+         commit(w, st, b, R, keep)
+         t3 = time.perf_counter()
++        if opt is not None:                 # patches/0071
++            opt.record("m", R, steps, backlog, keep)
+         rounds += 1
+         drafted += len(drafts)
+         accepted += keep - 1
+@@ -447,7 +470,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         t4 = time.perf_counter()
+         depth = min(policy.next(len(drafts), keep - 1), count - len(out))
+         drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
+-                        policy.confidence) if depth > 0 else [])
++                        policy.confidence, opt=opt) if depth > 0 else [])
++        steps, backlog = 1 + st.mtp_drafted, keep
+         stages["draft"] += time.perf_counter() - t4
+     _sync(w)
+     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+@@ -462,6 +486,8 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+ 
+     w, st, b = e.w, e.st, e.buf
+     policy = policy or DepthPolicy(3, fixed=True)
++    opt = getattr(e, "depth", None)         # patches/0071 (``of``): cost-derived depths, up to policy.most
++    backlog = 0
+     out = [pending]
+     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+     rounds = drafted = accepted = 0
+@@ -472,7 +498,13 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+     depth = min(policy.next(0, 0), count - len(out))
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+         t0 = time.perf_counter()
+-        drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
++        if opt is not None and depth > 0:   # patches/0071: every pick with its probability, then the best depth
++            f_probs: list[float] = []
++            drafts = drafter.propose(out[-1], depth, sampling, 0.0, probs=f_probs)
++            if drafts:
++                drafts = drafts[:opt.f_depth(f_probs[:len(drafts)])]
++        else:
++            drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
+         t1 = time.perf_counter()
+         tokens = [out[-1]] + drafts
+         R = len(tokens)
+@@ -490,6 +522,9 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+         t4 = time.perf_counter()
+         drafter.add_taps(e.tap_rows(keep))
+         t5 = time.perf_counter()
++        if opt is not None:                 # patches/0071
++            opt.record("f", R, 0, backlog, keep)
++            backlog = keep
+         rounds += 1
+         drafted += len(drafts)
+         accepted += keep - 1
+@@ -594,6 +629,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+     last = {"m": (0, 0), "f": (0, 0)}
+     lookup = getattr(e, "lookup", None)     # patches/0020: prompt-lookup drafts (lookup.py), set per request
+     timer = getattr(e, "calib", None)       # patches/0070: rank 0's online window costs (calib.py), or None
++    opt = getattr(e, "depth", None)         # patches/0071: cost-derived depths (depth.py); None: the policies
+     _sync(w)
+     start = time.perf_counter()
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+@@ -605,8 +641,8 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+             backlog, depth, drafts, steps = 0, len(look), look, 0
+         elif arm == "m":
+             backlog = len(m_next)
+-            depth = max(1, min(m_policy.next(*last["m"]), room))
+-            drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence)
++            depth = max(1, min(m_policy.next(*last["m"]) if opt is None else opt.most_m, room))
++            drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence, opt=opt)
+             steps = 1 + st.mtp_drafted
+             m_next = []
+         else:
+@@ -614,8 +650,14 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+             if n_f:
+                 drafter.add_taps(f_taps[:n_f])
+                 n_f = 0
+-            depth = max(1, min(f_policy.next(*last["f"]), room))
+-            drafts = drafter.propose(out[-1], depth, sampling, f_policy.confidence)
++            if opt is None:
++                depth = max(1, min(f_policy.next(*last["f"]), room))
++                drafts = drafter.propose(out[-1], depth, sampling, f_policy.confidence)
++            else:                           # patches/0071: every pick with its probability, then the best depth
++                f_probs: list[float] = []
++                drafts = drafter.propose(out[-1], max(1, min(opt.most_f, room)), sampling, 0.0, probs=f_probs)
++                if drafts:
++                    drafts = drafts[:opt.f_depth(f_probs[:len(drafts)])]
+             steps = 0
+         t1 = time.perf_counter()
+         tokens = [out[-1]] + drafts
+@@ -651,6 +693,8 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+             choice.record(arm, R, steps, backlog, keep)
+         if lookup is not None:              # patches/0020
+             lookup.record(arm, R, steps, backlog, keep)
++        if opt is not None:                 # patches/0071
++            opt.record(arm, R, steps, backlog, keep)
+         last[arm] = (len(drafts), keep - 1)
+         rounds += 1
+         drafted += len(drafts)
+diff --git i/src/tensorfold/families/glm5_next/cuda/depth.py w/src/tensorfold/families/glm5_next/cuda/depth.py
+new file mode 100644
+index 0000000..e285806
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/depth.py
+@@ -0,0 +1,254 @@
++"""Cost-derived draft depth (patches/0071): each round verifies the number of drafts that pays best, priced with
++the load-time costs, instead of cutting the chain at a fixed probability product (c3:0.35, fcN:0.3) or gating
++lookup drafts on a ratio.
++
++The model. A round that verifies k drafts commits
++
++    E(k) = 1 + q_1 + q_1 q_2 + ... + q_1 ... q_k
++
++tokens on average, where q_j is the chance draft j is kept given drafts 1..j-1 were, and costs
++
++    C(k) = draft ms(k) + verify[k]       (a window of k + 1 rows; ``calib`` / ``GlmEngine._calibrate``)
++
++The drafters' own probabilities of their picks (the numbers cN:P and fcN:P already multiply) are miscalibrated, so
++q_j = clip(p_j x f_j) with f_j a running correction per draft position and drafter: (kept drafts at position j) /
++(sum of the drafter's p over the drafts verified at position j), both decayed each round and seeded with a prior
++of f = 1 (``Calibration``).
++
++The choice. With lambda the request's running rate (committed tokens per model ms over its recent rounds, all
++drafters), the depth maximizes the round's surplus E(k) - lambda C(k): a draft is worth verifying when the tokens
++it adds on average buy more than the time it costs at the rate the request already runs at. At the fixed point
++(lambda = the rate the policy achieves) this is the depth that maximizes the long-run tokens per ms (a renewal
++argument), and unlike maximizing E(k) / C(k) round by round it does not let one cheap round's ratio decide.
++
++- DFlash2 (one block pass proposes up to 7 picks with their probabilities; the pass is paid whatever k is):
++  k = argmax over 1..K of E(k) - lambda verify[k].
++- MTP (a chain: each further draft costs an MTP step): draft j joins the window when q_1..q_j (its marginal
++  expected token) >= lambda x its row's marginal verify ms; the chain runs another step only when the next
++  draft's expected token, P_j x (the next position's running acceptance), pays for the step plus its row.
++- Lookup (patches/0020, gated in ``auto``): the band's running acceptance p for every position, k as for DFlash2
++  with the drafters' catch-up of the committed rows, and the round is a lookup round only when its best surplus is
++  positive at the request's rate.
++
++The first draft of an MTP or DFlash2 round is always verified (as upstream: the drafter already ran).
++
++Rank consistency. Every input is the same on both ranks: the probabilities come from all-gathered candidates
++(the values cN:P / fcN:P already branch on), the kept counts from committed tokens, the costs from the request's
++table (the slower rank's at load, or rank 0's frozen table in the header with patches/0070), and the arithmetic
++is the same Python float operations in the same order. Nothing here reads a clock. Drafts only propose: the
++window, keyed sampler and commit decide every token, so replies equal serial decoding whatever k is.
++
++No torch here: the unit tests run anywhere.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Sequence
++
++MAX_DRAFTS = 7            # a verify window holds the pending token and up to 7 drafts
++PRIOR = 2.0               # the correction's prior weight (in units of summed probability)
++DECAY = 0.97              # evidence at a position fades by this each round that verifies it
++AHEAD_PRIOR = 0.8         # an unseen position's acceptance before evidence: optimistic, so the chain explores it
++AHEAD_WEIGHT = 2.0        # (a position the chain rarely reaches keeps being tried until its evidence says no)
++RATE_WINDOW = 16          # rounds in the running rate
++F_MIN, F_MAX = 0.2, 3.0   # the correction factor's range
++Q_MAX = 0.995             # a calibrated probability never reaches 1 (a draft can always be rejected)
++
++
++def env_cost() -> bool:
++    """GLM53_TF_DEPTH: ``cost`` makes plain ``auto`` choose depths here; anything else (default ``threshold``)
++    keeps upstream's thresholds. Read on rank 0 only: the choice travels in the request header."""
++
++    v = os.environ.get("GLM53_TF_DEPTH", "threshold").strip().lower() or "threshold"
++    if v not in ("cost", "threshold"):
++        raise ValueError(f"GLM53_TF_DEPTH={v!r}: expected cost or threshold")
++    return v == "cost"
++
++
++# -- the depth arithmetic -----------------------------------------------------------------------------------------
++def expected_tokens(qs: Sequence[float]) -> list[float]:
++    """[E(0), E(1), ..., E(len(qs))]: tokens a round verifying k drafts commits on average."""
++
++    out, run, e = [1.0], 1.0, 1.0
++    for q in qs:
++        run *= q
++        e += run
++        out.append(e)
++    return out
++
++
++def best_k(qs: Sequence[float], verify: Sequence[float], rate: float, *, fixed_ms: float = 0.0,
++           row_ms: float = 0.0, least: int = 1) -> tuple[int, float]:
++    """(k, surplus): the k from ``least`` to len(qs) (bounded by the window table) maximizing
++    E(k) - rate x (fixed_ms + verify[k] + row_ms x E(k)); ``row_ms``: the catch-up each committed row costs later.
++    Ties go to the smaller k. (0, -inf) when no k is allowed."""
++
++    es = expected_tokens(qs)
++    top = min(len(qs), len(verify) - 1)
++    best, best_s = 0, float("-inf")
++    for k in range(max(least, 0), top + 1):
++        s = es[k] - rate * (fixed_ms + verify[k] + row_ms * es[k])
++        if s > best_s + 1e-12:
++            best, best_s = k, s
++    return best, best_s
++
++
++class Calibration:
++    """Per drafter and draft position: decayed kept drafts, summed drafter probabilities and trials."""
++
++    def __init__(self, positions: int = MAX_DRAFTS) -> None:
++        self.kept = {a: [0.0] * positions for a in "mf"}
++        self.prob = {a: [0.0] * positions for a in "mf"}
++        self.tried = {a: [0.0] * positions for a in "mf"}
++
++    def factor(self, arm: str, j: int) -> float:
++        j = min(j, len(self.kept[arm]) - 1)
++        f = (self.kept[arm][j] + PRIOR) / (self.prob[arm][j] + PRIOR)
++        return min(max(f, F_MIN), F_MAX)
++
++    def q(self, arm: str, j: int, p: float) -> float:
++        """Draft j's (0-based) chance to be kept given the ones before it were, from the drafter's probability."""
++
++        return min(max(float(p), 0.0) * self.factor(arm, j), Q_MAX)
++
++    def ahead(self, arm: str, j: int) -> float:
++        """The running acceptance at position j, before its draft exists (the MTP chain's look-ahead)."""
++
++        j = min(j, len(self.kept[arm]) - 1)
++        return min((self.kept[arm][j] + AHEAD_PRIOR * AHEAD_WEIGHT) / (self.tried[arm][j] + AHEAD_WEIGHT), Q_MAX)
++
++    def record(self, arm: str, probs: Sequence[float], keep: int) -> None:
++        """A verified round: ``probs`` its drafts' own probabilities, ``keep`` the rows committed (1 + drafts
++        kept). Draft j was reached when j < keep and kept when j < keep - 1."""
++
++        for j, p in enumerate(probs[:len(self.kept[arm])]):
++            if j >= keep:
++                break
++            self.kept[arm][j] = self.kept[arm][j] * DECAY + (1.0 if j < keep - 1 else 0.0)
++            self.prob[arm][j] = self.prob[arm][j] * DECAY + max(float(p), 0.0)
++            self.tried[arm][j] = self.tried[arm][j] * DECAY + 1.0
++
++
++def _round_ms(costs: dict, arm: str, rows: int, steps: int, backlog: int) -> float:
++    from .lookup import round_ms
++
++    return round_ms(costs, arm, rows, steps, backlog)
++
++
++class DepthOptimizer:
++    """A request's depth choices (``decode.auto_decode``, through ``decode.draft`` and the DFlash2 branch, and the
++    lookup gate). A function of the request's costs, the drafters' probabilities and the committed tokens."""
++
++    def __init__(self, costs: dict, *, most_m: int = MAX_DRAFTS, most_f: int = MAX_DRAFTS) -> None:
++        self.costs = costs
++        self.verify = list(costs["verify"])
++        self.most_m = max(1, min(int(most_m), len(self.verify) - 1))
++        self.most_f = max(1, min(int(most_f), len(self.verify) - 1))
++        self.cal = Calibration()
++        self.rounds: list[tuple[int, float]] = []     # (tokens committed, model ms) of recent rounds
++        self.used: list[float] = []                   # the drafter probabilities of this round's drafts
++        self._chain = 1.0
++        self._rate = self.rate()
++
++    # the running rate lambda
++    def rate(self) -> float:
++        if self.rounds:
++            return sum(k for k, _ in self.rounds) / sum(ms for _, ms in self.rounds)
++        c = self.costs
++        first = c.get("mtp", 0.0) or c.get("block", 0.0)
++        return 2.0 / (self.verify[min(1, len(self.verify) - 1)] + first)
++
++    def _dv(self, j: int) -> float:
++        """The marginal verify ms of draft j (1-based): window of j + 1 rows against j rows."""
++
++        j = min(j, len(self.verify) - 1)
++        return self.verify[j] - self.verify[j - 1]
++
++    # MTP: decided draft by draft inside ``decode.draft``
++    def mtp_begin(self) -> None:
++        self.used = []
++        self._chain = 1.0
++        self._rate = self.rate()
++
++    def mtp_next(self, j: int, p: float, count: int) -> tuple[bool, bool]:
++        """Draft j (0-based) was sampled with probability ``p``: (verify it, run the MTP step for draft j + 1)."""
++
++        q = self.cal.q("m", j, p)
++        chain = self._chain * q
++        lam = self._rate
++        take = j == 0 or chain >= lam * self._dv(j + 1)
++        if not take:
++            return False, False
++        self._chain = chain
++        self.used.append(float(p))
++        if j + 1 >= count or j + 2 > len(self.verify) - 1:
++            return True, False
++        # the next draft's chance: its position's running acceptance, pulled toward this draft's (drafter
++        # confidence runs in streaks: a sure draft is usually followed by a sure one)
++        gain = chain * 0.5 * (self.cal.ahead("m", j + 1) + q)
++        return True, gain >= lam * (self.costs.get("mtp_step", 0.0) + self._dv(j + 2))
++
++    # DFlash2: one block, all picks known
++    def f_depth(self, probs: Sequence[float]) -> int:
++        qs = [self.cal.q("f", j, p) for j, p in enumerate(probs[:self.most_f])]
++        k, _ = best_k(qs, self.verify, self.rate(), least=1)
++        k = max(1, min(k, len(probs)))
++        self.used = [float(p) for p in probs[:k]]
++        return k
++
++    # lookup: a band's running acceptance p for every draft
++    def lookup_depth(self, p: float, most: int, row_ms: float) -> tuple[int, float]:
++        return best_k([min(max(p, 0.0), Q_MAX)] * most, self.verify, self.rate(), row_ms=row_ms, least=1)
++
++    def record(self, arm: str, rows: int, steps: int, backlog: int, keep: int) -> None:
++        """After a verified round of any drafter: the calibration (MTP, DFlash2) and the running rate."""
++
++        if arm in ("m", "f"):
++            self.cal.record(arm, self.used, keep)
++        self.used = []
++        self.rounds.append((keep, _round_ms(self.costs, arm, rows, steps, backlog)))
++        del self.rounds[:-RATE_WINDOW]
++
++
++class Always:
++    """A ``decode.DrafterChoice`` stand-in that always picks one drafter (``om`` / ``of``)."""
++
++    def __init__(self, arm: str) -> None:
++        self.arm = arm
++
++    def pick(self) -> str:
++        return self.arm
++
++    def record(self, *args) -> None:
++        pass
++
++
++# -- policy specs ---------------------------------------------------------------------------------------------------
++OPT_KIND = 6              # [6, most drafts, drafter (0 MTP, 1 DFlash2), 0]
++
++
++def parse_policy(spec: str) -> list[int] | None:
++    """``om[N]`` / ``of[N]`` -> [OPT_KIND, N, 0 or 1, 0] (N from 1 to 7, default 7); ``o`` is ``auto`` with cost
++    depths (``engine.encode_policy``). None for other specs."""
++
++    spec = str(spec).strip()
++    if spec[:2] not in ("om", "of"):
++        return None
++    rest = spec[2:]
++    try:
++        most = int(rest) if rest else MAX_DRAFTS
++    except ValueError:
++        most = -1
++    if not 1 <= most <= MAX_DRAFTS:
++        raise ValueError(f"draft policy {spec!r}: expected o, om[N] or of[N] (N from 1 to {MAX_DRAFTS})")
++    return [OPT_KIND, most, int(spec[1] == "f"), 0]
++
++
++def as_cost(code: list[int]) -> list[int]:
++    """The cost-depth version of a code ``o`` resolved to: auto codes stay (the header's flag marks them); a fixed
++    drafter code (``engine._effective`` maps ``auto`` to DFlash2 on some checkpoints) becomes ``of`` / ``om``."""
++
++    if code[0] in (4, 5, OPT_KIND) or code[0] == 0:
++        return list(code)
++    return [OPT_KIND, max(1, min(int(code[1]), MAX_DRAFTS)), int(code[0] // 10 == 1), 0]
+diff --git i/src/tensorfold/families/glm5_next/cuda/dflash2.py w/src/tensorfold/families/glm5_next/cuda/dflash2.py
+index fd88e17..c090d22 100644
+--- i/src/tensorfold/families/glm5_next/cuda/dflash2.py
++++ w/src/tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -446,7 +446,7 @@ class Drafter:
+         return tokens, values, self.proj[:depth].cpu().numpy().astype(np.float64)
+ 
+     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
+-              sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
++              sampling: Sampling | None, confidence: float = 0.0, probs: list[float] | None = None) -> list[int]:
+         """One candidate a position: logits plus the selector's edge from the previous pick, plus the target's
+         keyed noise at that position when sampling. ``confidence`` > 0: stop once the product of the picks'
+         probabilities (softmax over the candidates) falls below it; the first draft is always kept."""
+@@ -464,6 +464,9 @@ class Drafter:
+             score = (values[d] + EDGE * edge) / temp
+             pick = score + NOISE * noise[d] if noise is not None else score
+             j = int(np.argmax(pick))
++            if probs is not None:           # patches/0071: each pick's probability, for depth.DepthOptimizer
++                p = np.exp(score - score.max())
++                probs.append(float(p[j] / p.sum()))
+             if confidence > 0:
+                 p = np.exp(score - score.max())
+                 chain *= float(p[j] / p.sum())
+@@ -473,11 +476,12 @@ class Drafter:
+             out.append(prev)
+         return out
+ 
+-    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
++    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0,
++                probs: list[float] | None = None) -> list[int]:
+         """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end)."""
+ 
+         depth = min(depth, self.block - 1)
+         if depth < 1 or self.context_end == 0:
+             return []
+         tokens, values, proj = self.candidates(pending, depth)
+-        return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)
++        return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence, probs)
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index 99ed0d4..7dcbcec 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -35,6 +35,12 @@ A request's draft policy is a spec (the engine's default, or the request's throu
+                   ``auto`` (kinds 4, 5) also drafts from the history when GLM53_TF_LOOKUP=1 (the default): a
+                   round with a match of at least GLM53_TF_LOOKUP_MIN tokens (default 4) verifies the lookup's
+                   tokens instead when their expected tokens a millisecond beat the request's MTP / DFlash2 rounds
++    o             (patches/0071, ``depth.py``) auto with cost-derived depths: each round verifies the number of drafts
++                  that maximizes expected committed tokens less the request's running rate times their ms (verify
++                  window, draft steps), from the drafters' probabilities corrected per position by their running
++                  acceptance; the lookup gate the same way. ``auto`` does this when GLM53_TF_DEPTH=cost (rank 0's
++                  setting travels in the header; default: the thresholds above)
++    om[N], of[N]  the same depths with MTP drafts only / DFlash2 drafts only, up to N (default 7)
+ """
+ 
+ from __future__ import annotations
+@@ -50,6 +56,7 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ from .lookup import LOOKUP_KIND, lookup_for, parse_policy, with_lookup     # patches/0020
++from . import depth as depth_mod                                            # patches/0071
+ 
+ DEFAULT_POLICY = "auto"
+ DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
+@@ -81,6 +88,13 @@ def encode_policy(spec: str) -> list[int]:
+                      f"these after f (N from 1 to {MAX_ROWS - 1})")
+     if spec.startswith("fl"):
+         raise bad
++    if spec == "o":                                 # patches/0071: auto with cost-derived depths (header flag)
++        return encode_policy("auto")
++    if spec.startswith("o"):                        # patches/0071: om[N], of[N]
++        code = depth_mod.parse_policy(spec)
++        if code is None:
++            raise bad
++        return code
+     if spec.startswith("l"):                        # patches/0020: lN[:M], prompt-lookup drafts
+         return parse_policy(spec)
+     try:
+@@ -122,6 +136,9 @@ def decode_policy(code: list[int]):
+     from .decode import DepthPolicy
+ 
+     kind, most, a, b = code[:4]                     # patches/0020: auto codes carry lookup settings after these
++    if kind == depth_mod.OPT_KIND:                  # patches/0071: om / of; the depths come from depth.py, and this
++        # threshold policy (the drafter's usual one) only where no optimizer runs (GLM53_TF_BATCH rounds)
++        return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True, confidence=0.3 if a else 0.35)
+     if kind == LOOKUP_KIND:
+         return ("lookup", most, a)
+     if kind in (4, 5):
+@@ -369,6 +386,8 @@ class GlmEngine:
+         if code[0] == 4 and self.drafter is not None and self.w.cfg.quant == "exl3" \
+                 and os.environ.get("GLM53_TF_NONEXPERT", "bf16").strip().lower() == "bf16":
+             return encode_policy(EXL3_AUTO)
++        if self.w.mtp is None and code[0] == depth_mod.OPT_KIND:       # patches/0071: om runs as of
++            return [code[0], code[1], 1, 0]
+         if self.w.mtp is None and code[0] in (1, 2, 3, 4, 5):
+             return encode_policy(DFLASH_POLICY) if code[0] in (4, 5) else [code[0] + 10] + code[1:]
+         return code
+@@ -377,6 +396,9 @@ class GlmEngine:
+         """(auto, MTP drafts, DFlash2 drafts) for a policy code."""
+ 
+         auto = code[0] in (4, 5)
++        if code[0] == depth_mod.OPT_KIND:           # patches/0071: om / of
++            dflash = bool(code[2]) and self.drafter is not None
++            return False, not dflash, dflash
+         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
+         return auto, auto or not dflash, dflash
+ 
+@@ -420,6 +442,14 @@ class GlmEngine:
+         # patches/0020: the request's lookup drafter (lookup.py), read by auto_decode; None: no lookup drafts
+         self.e.lookup = lookup_for(code, prompt, self.costs, eos=self.eos, stop_eos=stop_eos)
+         self.e.calib = self.online.observe if self.online is not None else None     # patches/0070: rank 0 only
++        # patches/0071: cost-derived depths for om / of, and for auto when the header's flag says so
++        self.e.depth = None
++        if policy is not None and (code[0] == depth_mod.OPT_KIND or (auto and getattr(self, "depth_cost", 0))):
++            most_m = code[1] if code[0] == depth_mod.OPT_KIND else MAX_ROWS - 1
++            most_f = code[1] if code[0] == depth_mod.OPT_KIND else self.f_most
++            self.e.depth = depth_mod.DepthOptimizer(self.costs, most_m=most_m, most_f=most_f)
++            if self.e.lookup is not None:
++                self.e.lookup.opt = self.e.depth
+         if policy is None:
+             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+         elif code[0] == LOOKUP_KIND:        # patches/0020: lookup drafts, MTP drafts in the rounds without a match
+@@ -444,6 +474,7 @@ class GlmEngine:
+         else:
+             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+                              on_tokens=on_tokens)
++        self.e.depth = None                 # patches/0071: the optimizer is the request's
+         if draft and policy is not None and res.keeps:
+             committed = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
+             if auto or code[0] == LOOKUP_KIND:     # patches/0020: lN runs auto_decode too
+@@ -475,7 +506,13 @@ class GlmEngine:
+             spec = "0"
+         else:
+             spec = getattr(self.request, "policy", None) or self.policy
+-        code = self._effective(encode_policy(spec))
++        code = encode_policy(spec)
++        # patches/0071: ``o``, ``om`` / ``of``, or ``auto`` with GLM53_TF_DEPTH=cost choose depths from the costs
++        cost = int(str(spec).strip() == "o" or code[0] == depth_mod.OPT_KIND
++                   or (code[0] in (4, 5) and depth_mod.env_cost()))
++        code = self._effective(code)
++        if cost:
++            code = depth_mod.as_cost(code)
+         # patches/0020: lookup settings travel in the header, so both ranks draft alike whatever their environment
+         code = with_lookup(code, self.w.mtp is not None, encode_policy(DFLASH_POLICY))
+         stop_eos = bool(getattr(self.request, "stop_eos", True))
+@@ -485,10 +522,11 @@ class GlmEngine:
+         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
+                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
+                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
+-                  *_f64_ints(sampling.top_p if sampling else 1.0), len(table), *table] + code
++                  *_f64_ints(sampling.top_p if sampling else 1.0), len(table), *table, cost] + code
+         self._share(header)
+         self._share(list(prompt))
+         self._adopt(table)
++        self.depth_cost = cost
+         stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
+         stats.update(policy=spec, drafts=draft)
+         if table:
+@@ -506,6 +544,7 @@ class GlmEngine:
+             max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, n, *rest = \
+                 self._share(None)
+             table, code = rest[:n], rest[n:]            # patches/0070: rank 0's cost table, then the policy code
++            self.depth_cost, code = code[0], code[1:]  # patches/0071: rank 0's cost-depth flag
+             prompt = self._share(None)
+             self._adopt(table)
+             temperature = _ints_f64(t_lo, t_hi)
+diff --git i/src/tensorfold/families/glm5_next/cuda/lookup.py w/src/tensorfold/families/glm5_next/cuda/lookup.py
+index d7850cb..1289c02 100644
+--- i/src/tensorfold/families/glm5_next/cuda/lookup.py
++++ w/src/tensorfold/families/glm5_next/cuda/lookup.py
+@@ -309,7 +309,17 @@ class Lookup:
+         if not drafts:
+             return []
+         self.band = self._band(length)
+-        if self.gated:
++        opt = getattr(self, "opt", None)          # patches/0071: surplus at the request's running rate
++        if self.gated and opt is not None:
++            b = self.band
++            k, surplus = opt.lookup_depth(self.p(b), len(drafts), self.row_ms)
++            if k == 0 or surplus <= 0.0:
++                self.skipped[b] += 1
++                if k == 0 or BANDS[b][0] < PROBE_MATCH or self.skipped[b] < PROBE_EVERY:
++                    return []
++            self.skipped[b] = 0
++            drafts = drafts[:k]
++        elif self.gated:
+             b = self.band
+             k, rate = best_depth(self.p(b), self.costs, len(drafts), self.row_ms)
+             if k == 0 or rate <= self.alt_rate():

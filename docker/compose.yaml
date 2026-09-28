@@ -1,0 +1,109 @@
+# One TensorFold rank per node, as an alternative to scripts/serve.sh (the primary path, which also ships the
+# image to the worker, starts both ranks in order and waits for the API). Same image, flags and environment.
+#
+# Values come from the same config file serve.sh reads, via --env-file (paths are relative to the repo root):
+#
+#   worker (rank 1) first:  docker compose --env-file config/tensorfold.env -f docker/compose.yaml --profile rank1 up -d
+#   head   (rank 0):        docker compose --env-file config/tensorfold.env -f docker/compose.yaml --profile rank0 up -d
+#   stop (each node):       docker compose --env-file config/tensorfold.env -f docker/compose.yaml --profile rank0 --profile rank1 down
+#
+# Each node needs the image (docker compose ... build, or scripts/serve.sh build) and the weights in its own HF cache.
+# Container and volume names match serve.sh, so `scripts/serve.sh status|logs|stop` work on either path.
+
+name: glm53-tf
+
+x-rank: &rank
+  image: ${IMAGE:-glm53-tensorfold:dev}
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  network_mode: host
+  ipc: host
+  devices:
+    - /dev/infiniband:/dev/infiniband
+  ulimits:
+    memlock: -1
+  cap_add:
+    - IPC_LOCK
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  restart: "no"
+
+x-env: &env
+  MASTER: ${HEAD_IP:?set HEAD_IP (rank 0 address on the CX7 link)}
+  MASTER_PORT: ${MASTER_PORT:-29551}
+  MODEL_PATH: ${MODEL_PATH:?set MODEL_PATH (checkpoint dir inside the container)}
+  DRAFTER: ${DRAFTER:-}
+  CONTEXT: ${CONTEXT:-}
+  SERVED_NAME: ${SERVED_NAME:-}
+  MAX_TOKENS: ${MAX_TOKENS:-}
+  MTP_DRAFTS: ${MTP_DRAFTS:-}
+  NO_DRAFTS: ${NO_DRAFTS:-0}
+  HOST: ${HOST:-127.0.0.1}
+  PORT: ${PORT:-8080}
+  EXTRA_ARGS: ${EXTRA_ARGS:-}
+  GLM53_TF_NONEXPERT: ${GLM53_TF_NONEXPERT:-bf16}
+  GLM53_TF_PREFILL_ROWS: ${GLM53_TF_PREFILL_ROWS:-auto}
+  GLM53_TF_AUTO_FDRAFTS: ${GLM53_TF_AUTO_FDRAFTS:-7}
+  GLM53_TF_CALIB: ${GLM53_TF_CALIB:-cached}
+  # patches/0140: prepared rank folders at /prepared (scripts/prepare.sh), written after a start that had to build
+  GLM53_TF_PREPARED: ${GLM53_TF_PREPARED:-/prepared}
+  GLM53_TF_PREPARED_WRITE: ${GLM53_TF_PREPARED_WRITE:-1}
+  GLM53_TF_CALIB_ONLINE: ${GLM53_TF_CALIB_ONLINE:-0}
+  GLM53_TF_DEPTH: ${GLM53_TF_DEPTH:-threshold}
+  GLM53_TF_PROFILE: ${GLM53_TF_PROFILE:-0}
+  GLM53_TF_EXPERT_LOOP: ${GLM53_TF_EXPERT_LOOP:-1}
+  GLM53_TF_EXPERT_LOOP_CFG: ${GLM53_TF_EXPERT_LOOP_CFG:-4,2}
+  GLM53_TF_COMM: ${GLM53_TF_COMM:-}
+  GLM53_TF_FAST_PREFILL: ${GLM53_TF_FAST_PREFILL:-0}
+  GLM53_TF_FAST_GATHER: ${GLM53_TF_FAST_GATHER:-bf16}
+  GLM53_TF_SESSION_GIB: ${GLM53_TF_SESSION_GIB:-12}
+  GLM53_TF_DECODE_KERNELS: ${GLM53_TF_DECODE_KERNELS:-}
+  GLM53_TF_DEC_EXL3_NT: ${GLM53_TF_DEC_EXL3_NT:-8,8}
+  GLM53_TF_DEC_PF_KB: ${GLM53_TF_DEC_PF_KB:-16}
+  GLM53_TF_HEALTH: ${GLM53_TF_HEALTH:-basic}
+  GLM53_TF_STALL_S: ${GLM53_TF_STALL_S:-0}
+  GLM53_TF_STALL_PREFILL_TPS: ${GLM53_TF_STALL_PREFILL_TPS:-200}
+  GLM53_TF_EFFORT_FIELD: ${GLM53_TF_EFFORT_FIELD:-0}
+  GLM53_TF_DEFAULT_EFFORT: ${GLM53_TF_DEFAULT_EFFORT:-}
+  NCCL_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME:?set NCCL_SOCKET_IFNAME (CX7 netdev)}
+  NCCL_IB_HCA: ${NCCL_IB_HCA:?set NCCL_IB_HCA (CX7 RDMA device)}
+  GLOO_SOCKET_IFNAME: ${NCCL_SOCKET_IFNAME}
+
+services:
+  rank0:
+    <<: *rank
+    profiles: [rank0]
+    container_name: ${NAME:-glm53-tf}-r0
+    environment:
+      <<: *env
+      RANK: "0"
+    volumes:
+      - ${HEAD_HF:?set HEAD_HF (head node HF cache)}:/root/.cache/huggingface
+      - cache:/cache
+      - ${HEAD_PREPARED:-prepared}:/prepared
+
+  rank1:
+    <<: *rank
+    profiles: [rank1]
+    container_name: ${NAME:-glm53-tf}-r1
+    environment:
+      <<: *env
+      RANK: "1"
+    volumes:
+      - ${WORKER_HF:?set WORKER_HF (worker node HF cache)}:/root/.cache/huggingface
+      - cache:/cache
+      - ${WORKER_PREPARED:-prepared}:/prepared
+
+volumes:
+  cache:
+    # kernel build caches (torch extensions, Triton, the CUDA JIT cache) and calibration tables; shared with serve.sh's volume of the same name
+    name: ${NAME:-glm53-tf}-cache
+  prepared:
+    # patches/0140: prepared rank folders when HEAD_PREPARED / WORKER_PREPARED are not set (~83 GB a key a rank)
+    name: ${NAME:-glm53-tf}-prepared

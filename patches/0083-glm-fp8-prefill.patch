@@ -1,0 +1,675 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 7fd2685..ccdaa4f 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -20,7 +20,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+-from . import fastpf, lean as lean_mod, profile
++from . import fastpf, fp8pf, lean as lean_mod, profile
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .weights import Weights
+@@ -128,6 +128,7 @@ class Engine:
+         # patches/0080: prefill chunks through the fast kernels (``fastpf``: chunks and snapshots on the chunk grid);
+         # ``fast_snap``: the grid snapshot the last fast prefill left (None: none)
+         self.fast_prefill = fastpf.enabled()
++        self.fp8_prefill = fp8pf.default()          # patches/0083: fast chunks on the FP8 kernels (fp8pf)
+         self.fast_snap: "Snapshot | None" = None
+         w.meta["fast_gather16"] = fastpf.gather16()
+         if w.rank == 0 and w.meta["latent_kv"]:          # patches/0060
+@@ -375,6 +376,9 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     # buffers' rows (its rows never depend on their chunk-mates, so a smaller chunk gives the same bits)
+     lean = getattr(e, "lean", None) if fast else None
+     step = fastpf.grid(e.prefill_rows) if fast else min(e.prefill_rows, e.rows)
++    # patches/0083: an FP8 fast prefill runs other kernels, so its snapshots carry their own tag (C + 1)
++    fp8pf.ON = fast and bool(getattr(e, "fp8_prefill", False))
++    tag = fp8pf.tag(step, fp8pf.ON) if fast else 0
+     cap = lean.rows if lean is not None else e.rows
+     if fast and step > cap:
+         raise ValueError(f"fast prefill: a {step}-row chunk grid, the buffers hold {cap} rows")
+@@ -390,8 +394,8 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+             raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt")
+         if (use_mtp and resume.mtp_len < 0) or (drafter is not None and resume.drafter_end != begin):
+             raise ValueError("this snapshot's draft caches do not fit the request")
+-        if resume.grid != (step if fast else 0) or begin % max(resume.grid, 1):
+-            raise ValueError(f"a snapshot of grid {resume.grid} cannot resume a prefill of grid {step if fast else 0}")
++        if resume.grid != tag or begin % max(fp8pf.grid_of(resume.grid), 1):
++            raise ValueError(f"a snapshot of grid {resume.grid} cannot resume a prefill of grid {tag}")
+         restore(e, resume, drafter)
+         if use_mtp:
+             k = resume.pending.shape[0]
+@@ -409,7 +413,7 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+         R = len(chunk)
+         if start == edge and start > begin:         # patches/0080: the state at B, before the partial chunk [B, n)
+             e.fast_snap = take_snapshot(e, prompt[:start], e.last_hidden if use_mtp else None, mtp=use_mtp,
+-                                        drafter=drafter, grid=step, mtp_len=start - 1)
++                                        drafter=drafter, grid=tag, mtp_len=start - 1)
+         if lean is not None:                        # patches/0082: the same bits in less memory
+             staged = lean_mod.stage(w, st, lean, chunk)
+         else:
+@@ -450,7 +454,7 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+             profile.lap("commit")
+     if fast and edge == n and n > begin:            # patches/0080: the prompt ends on the grid
+         e.fast_snap = take_snapshot(e, prompt, e.last_hidden if use_mtp else None, mtp=use_mtp, drafter=drafter,
+-                                    grid=step)
++                                    grid=tag)
+     first = e.sample(last, [len(prompt)], sampling)[0]
+     if prof:
+         profile.lap("sample")
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index cdbf894..d5b9475 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -230,6 +230,17 @@ class GlmEngine:
+             print(f"[tensorfold] fast prefill on: chunk grid {fastpf.grid(rows)}, "
+                   f"{'bf16' if fastpf.gather16() else 'fp32'} gathers"
+                   + (f"; row-invariant kernels for {gone}" if gone else ""), flush=True)
++        # patches/0083: GLM53_TF_FP8_PREFILL (the default of the FP8 kernels in fast chunks) and whether they can run
++        from . import fp8pf
++
++        f8_both = self._gather_ints(fp8pf.settings())
++        if f8_both[0] != f8_both[1]:
++            raise RuntimeError("the two ranks were started with different FP8 prefill settings (GLM53_TF_FP8_PREFILL, "
++                               f"FP8 tensor cores available): {f8_both[0]}, {f8_both[1]}")
++        if fp8pf.enabled() and rank == 0:
++            print("[tensorfold] FP8 prefill: " + ("on in fast prefill chunks" if fp8pf.available() else
++                                                  "requested, but no FP8 tensor cores / Triton float8e4nv: off"),
++                  flush=True)
+         # patches/0082: GLM53_TF_LEAN_PREFILL / GLM53_TF_LEAN_BLOCK decide how many all-gathers a lean chunk makes
+         from . import lean as lean_mod
+ 
+@@ -446,13 +457,15 @@ class GlmEngine:
+         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
+         return auto, auto or not dflash, dflash
+ 
+-    def _grid(self, fast: bool | None = None, rows: int | None = None) -> int:
+-        """patches/0080: the snapshot grid a request uses: 0 (exact prefill), or its fast chunk grid."""
++    def _grid(self, fast: bool | None = None, rows: int | None = None, fp8: bool | None = None) -> int:
++        """patches/0080: the snapshot grid a request uses: 0 (exact prefill), or its fast chunk grid (patches/0083:
++        + 1 for an FP8 fast prefill, ``fp8pf.tag``)."""
+ 
+-        from . import fastpf
++        from . import fastpf, fp8pf
+ 
+         fast = self.e.fast_prefill if fast is None else fast
+-        return fastpf.grid(self.e.prefill_rows if rows is None else rows) if fast else 0
++        fp8 = bool(getattr(self.e, "fp8_prefill", False)) if fp8 is None else fp8
++        return fp8pf.tag(fastpf.grid(self.e.prefill_rows if rows is None else rows), fp8) if fast else 0
+ 
+     def _resume(self, prompt: list[int], code: list[int], grid: int | None = None):
+         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters (and,
+@@ -495,7 +508,9 @@ class GlmEngine:
+                                          drafter=drafter))
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
+         if grid:
+-            stats["fast_prefill"] = grid
++            stats["fast_prefill"] = grid - grid % 64            # patches/0083: the chunk grid C of the tag
++            if grid % 64:
++                stats["fp8_prefill"] = 1
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+diff --git a/src/tensorfold/families/glm5_next/cuda/fast_qmm.py b/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+index 7f8dea1..846cf2b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
++++ b/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+@@ -27,6 +27,10 @@ What changes against ``qmm._qmm`` / ``qmm._bmm`` (tuned for 1-16 row decode step
+ ``matmul_fast`` (what fast-prefill chunks run): ``exact=False``, one accumulator over K and a 128 x 64 tile at 4
+ warps (``LOOSE``), 1.1-1.7x faster than the exact tiles; deterministic and row-independent, not qmm's bits.
+ 
++``matmul_fp8`` (patches/0083, what fast chunks run when an FP8 prefill is on, ``fp8pf``): x rounded to e4m3 per row
++(power-of-two scales), the exact 4-bit weights as e4m3, fp8 tensor-core dots per 64-input group, fp32 group sums;
++deterministic and row-independent.
++
+ ``hc_partial``: ``glue.hc_pre``'s 24 mixing dots for fast chunks, 64 rows a program sharing each fn tile (bf16
+ tensor-core dots, fp32 sums; not ``glue``'s bits, row-independent).
+ 
+@@ -40,7 +44,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from . import qmm
++from . import fp8pf, qmm
+ from .qmm import B16, GS, Q4
+ 
+ # Per rank of GLM-5.3-Flash at TP=2 (N x K):
+@@ -263,11 +267,242 @@ def matmul_prefill(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None,
+ def matmul_fast(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
+                 f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor:
+     """What fast-prefill chunks run behind ``qmm.matmul`` (``fastpf.chunk``): ``matmul_prefill(exact=False)``, one
+-    accumulator over K (not qmm's bits; deterministic and row-independent)."""
++    accumulator over K (not qmm's bits; deterministic and row-independent). patches/0083: ``matmul_fp8`` while an
++    FP8 prefill runs (``fp8pf.ON``)."""
+ 
++    if fp8pf.ON:
++        return matmul_fp8(x, q, xs, out=out, f32=f32, part=part)
+     return matmul_prefill(x, q, xs, out=out, f32=f32, part=part, exact=False)
+ 
+ 
++# -- patches/0083: FP8 (e4m3) tensor-core prefill matmuls -----------------------------------------------------------
++# A row of x is scaled by its own power of two s_x, the smallest with amax / s_x <= 448 (e4m3's largest finite value),
++# and rounded to e4m3 (RTNE) by ``_fp8_rows``, which also writes the fp32 sums of each 64-input group of the ROUNDED
++# row. A power of two makes x / s_x exact (no division, no double rounding: the host model ``fp8_reference`` gets
++# the same bits) and costs nothing in precision: e4m3's relative step is the same anywhere in its normal range, the
++# row only uses at most one binade less of it (its largest value lands in (224, 448]). A 4-bit
++# weight value q in 0..15 is an exact e4m3 number (``FP8_WENC = "cvt"``: 1..15 are normal numbers), or, with
++# ``"bits"``, the nibble itself read as an e4m3 bit pattern, which is exactly q * 2^-9 (0..7 subnormal, 8..15 in the
++# first normal binade; the 2^9 goes into the scale): no conversion instruction, but it relies on the tensor cores
++# keeping e4m3 subnormals. Per 64-input group g, ``_f8q4`` computes P = x8 . q8 on the fp8 tensor cores from zero
++# (fp32 result: the group's products are exact and at most 64 are summed, so the tensor cores' accumulator width does
++# not matter), then acc += P * s[n, g] + X8[m, g] * b[n, g] in fp32, in group order, and finally y = s_x[m] * acc.
++# That is "x rounded to e4m3 per row, times the exact 4-bit weights", the bias term taken on the rounded sums so the
++# rounding error is sum((x8 - x) * w), not sum((x8 - x) * (w - b)).
++#
++# Row-independent and deterministic: a row's scale, its groups' sums and its dots never see another row; the tile
++# (FP8_TILE) is fixed for every shape and row count; no atomics. So lean sub-blocks (patches/0082) and any row
++# grouping give a row the same bits.
++FP8_MAX = 448.0
++FP8_MIN_NK = 4 * 1024 * 1024     # smaller weights (4096x128, 160x4096) stay on the bf16 kernel: the prologue dominates
++FP8_WENC = "cvt"                 # "cvt" | "bits" (see above); both exact, same bits
++# (BM, BN, warps, stages) for every Q4 / B16 shape: 128 rows share each unpacked weight group, 64 columns share each
++# e4m3 row tile. Swept on GB10 over the real shapes at 2048 and 8192 rows: 128,64,4,2 is the fastest or within 2% at
++# every shape (1.0-1.27x the bf16 fast kernel; 128,128,8,3 was 0.8-0.9x). GLM53_TF_FP8_TILE=bm,bn,warps,stages
++# overrides it (the tile never changes which fp32 operations a row sees, only which program runs them: same bits).
++FP8_TILE = (128, 64, 4, 2)
++
++
++def fp8_tile() -> tuple[int, int, int, int]:
++    import os
++
++    v = os.environ.get("GLM53_TF_FP8_TILE", "").strip()
++    if not v:
++        return FP8_TILE
++    t = tuple(int(p) for p in v.split(","))
++    if len(t) != 4 or t[0] not in (16, 32, 64, 128, 256) or t[1] not in (32, 64, 128, 256):
++        raise ValueError(f"GLM53_TF_FP8_TILE={v!r}: expected bm,bn,warps,stages (bm 16-256, bn 32-256, powers of 2)")
++    return t
++
++
++@triton.jit
++def _fp8_rows(X, x_stride, X8, SX, XS8, K: tl.constexpr, KP: tl.constexpr, KG: tl.constexpr):
++    """Program r: row r of x (bf16) -> X8[r] e4m3 (x / s_x), SX[r] = s_x (a power of two: amax / s_x in (224, 448]),
++    XS8[r, g] = fp32 sum of group g of the e4m3 values (unscaled)."""
++
++    r = tl.program_id(0).to(tl.int64)
++    k = tl.arange(0, KP)
++    ok = k < K
++    x = tl.load(X + r * x_stride + k, mask=ok, other=0.0).to(tl.float32)
++    amax = tl.max(tl.abs(x), 0)
++    # amax = 1.m * 2^E; 448 = 1.75 * 2^8: s = E - 8, or E - 7 when 1.m > 1.75 (clamped for rows of ~0 or inf)
++    bits = amax.to(tl.int32, bitcast=True)
++    e = ((bits >> 23) & 0xFF) - 127
++    sh = e - 8 + ((bits & 0x7FFFFF) > 0x600000).to(tl.int32)
++    sh = tl.minimum(tl.maximum(sh, -100), 100)
++    inv = ((127 - sh) << 23).to(tl.float32, bitcast=True)
++    sx = ((127 + sh) << 23).to(tl.float32, bitcast=True)
++    y = tl.minimum(tl.maximum(x * inv, -448.0), 448.0)
++    y8 = y.to(tl.float8e4nv)
++    tl.store(X8 + r * K + k, y8, mask=ok)
++    gs = tl.sum(tl.reshape(y8.to(tl.float32), (KP // 64, 64)), 1)
++    g = tl.arange(0, KP // 64)
++    tl.store(XS8 + r * KG + g, gs, mask=g < KG)
++    tl.store(SX + r, sx)
++
++
++def fp8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """x (M, K) bf16, unit column stride -> (x8 (M, K) e4m3, s_x (M,) fp32, group sums of x8 (M, K/64) fp32)."""
++
++    m, k = x.shape
++    if x.stride(1) != 1 or k % GS:
++        raise ValueError("fp8_rows: rows of unit column stride and a multiple of 64 wide expected")
++    x8 = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
++    sx = torch.empty((m,), dtype=torch.float32, device=x.device)
++    xs8 = torch.empty((m, k // GS), dtype=torch.float32, device=x.device)
++    if m:
++        kp = triton.next_power_of_2(k)
++        _fp8_rows[(m,)](x, x.stride(0), x8, sx, xs8, K=k, KP=kp, KG=k // GS, num_warps=8 if kp >= 4096 else 4)
++    return x8, sx, xs8
++
++
++@triton.jit
++def _f8q4(X8, SX, XS8, W, S, B, OUT, M, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
++          TN: tl.constexpr, F32: tl.constexpr, BITS: tl.constexpr):
++    """Program (M tile fastest, column tile): out[BM, BN] = s_x * sum over groups in order of (P s + X8 b), P the
++    group's fp8 tensor-core dot."""
++
++    KG: tl.constexpr = K // 64
++    pid_m, pid_n = _tile(tl.program_id(0), M, N, BM, BN, GROUP_M)      # grouped order (0081's ``_tile``)
++    rm = pid_m * BM + tl.arange(0, BM)
++    rn = pid_n * BN + tl.arange(0, BN)
++    rk = tl.arange(0, 64)
++    rw = tl.arange(0, 8)
++    shifts = tl.arange(0, 8) * 4
++    m_ok = rm < M
++    n_ok = rn < N
++    wrow = (rn // TN).to(tl.int64) * (KG * TN * 8) + (rn % TN) * 8
++    xrow = rm.to(tl.int64) * K
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    for g in range(KG):
++        words = tl.load(W + wrow[:, None] + g * (TN * 8) + rw[None, :], mask=n_ok[:, None], other=0)
++        q = tl.reshape((words[:, :, None] >> shifts[None, None, :]) & 0xF, (BN, 64))
++        if BITS:
++            q8 = q.to(tl.int8).to(tl.float8e4nv, bitcast=True)          # q * 2^-9, exactly
++        else:
++            q8 = q.to(tl.float16).to(tl.float8e4nv)                     # q, exactly
++        x8 = tl.load(X8 + xrow[:, None] + (g * 64 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++        p = tl.dot(x8, tl.trans(q8))
++        s = tl.load(S + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
++        if BITS:
++            s = s * 512.0
++        b = tl.load(B + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
++        xs = tl.load(XS8 + rm * KG + g, mask=m_ok, other=0.0)
++        acc = acc + p * s[None, :] + xs[:, None] * b[None, :]
++    sx = tl.load(SX + rm, mask=m_ok, other=0.0)
++    total = acc * sx[:, None]
++    out_mask = m_ok[:, None] & n_ok[None, :]
++    optr = OUT + rm[:, None].to(tl.int64) * N + rn[None, :]
++    if F32:
++        tl.store(optr, total, mask=out_mask)
++    else:
++        tl.store(optr, total.to(tl.bfloat16), mask=out_mask)
++
++
++@triton.jit
++def _f8b16(X8, SX, W, WINV, WS, OUT, M, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
++           F32: tl.constexpr):
++    """BF16 weights: each 64-input step rounds the weight tile to e4m3 with its row's scale (WINV = 448 / amax),
++    one fp8 dot from zero, added in fp32 in K order; out = s_x * s_w * acc."""
++
++    pid_m, pid_n = _tile(tl.program_id(0), M, N, BM, BN, GROUP_M)      # grouped order (0081's ``_tile``)
++    rm = pid_m * BM + tl.arange(0, BM)
++    rn = pid_n * BN + tl.arange(0, BN)
++    rk = tl.arange(0, 64)
++    m_ok = rm < M
++    n_ok = rn < N
++    winv = tl.load(WINV + rn, mask=n_ok, other=0.0)
++    xrow = rm.to(tl.int64) * K
++    wrow = rn.to(tl.int64) * K
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    for k0 in range(0, K, 64):
++        x8 = tl.load(X8 + xrow[:, None] + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++        w = tl.load(W + wrow[:, None] + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0).to(tl.float32)
++        w8 = tl.minimum(tl.maximum(w * winv[:, None], -448.0), 448.0).to(tl.float8e4nv)
++        acc = acc + tl.dot(x8, tl.trans(w8))
++    sx = tl.load(SX + rm, mask=m_ok, other=0.0)
++    ws = tl.load(WS + rn, mask=n_ok, other=0.0)
++    total = acc * sx[:, None] * ws[None, :]
++    out_mask = m_ok[:, None] & n_ok[None, :]
++    optr = OUT + rm[:, None].to(tl.int64) * N + rn[None, :]
++    if F32:
++        tl.store(optr, total, mask=out_mask)
++    else:
++        tl.store(optr, total.to(tl.bfloat16), mask=out_mask)
++
++
++def b16_fp8_scales(q: B16) -> tuple[torch.Tensor, torch.Tensor]:
++    """Per-output-channel e4m3 scales of a BF16 weight (s_w = amax / 448, and 448 / amax; 0 for an all-zero row),
++    computed once and kept on the matrix (the same weights always give the same scales)."""
++
++    got = q.__dict__.get("_fp8_scales")
++    if got is None:
++        amax = q.weight.float().abs().amax(dim=1)
++        ws = (amax / FP8_MAX).contiguous()
++        winv = torch.where(amax > 0, FP8_MAX / amax, torch.zeros_like(amax)).contiguous()
++        got = (winv, ws)
++        q.__dict__["_fp8_scales"] = got
++    return got
++
++
++def fp8_eligible(m: int, q: Q4 | B16) -> bool:
++    """The shapes and row counts ``matmul_fp8`` runs in fp8 (the rest go to ``matmul_prefill(exact=False)``)."""
++
++    return m >= MIN_ROWS and q.n * q.k >= FP8_MIN_NK and q.k % GS == 0
++
++
++def matmul_fp8(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
++               f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor:
++    """``qmm.matmul``'s contract on FP8 tensor cores (patches/0083): x (M, K) bf16 (rows may be strided) @ q.T with
++    x rounded to e4m3 per row. ``xs`` is not used (the kernel needs the sums of the rounded rows). Shapes below
++    ``FP8_MIN_NK`` weights and calls below ``MIN_ROWS`` rows run ``matmul_prefill(exact=False)`` (the bf16 fast
++    kernel; qmm below 64 rows) instead. Deterministic and row-independent; not the bf16 kernels' bits."""
++
++    m, k = x.shape
++    if not fp8_eligible(m, q):
++        return matmul_prefill(x, q, xs, out=out, f32=f32, part=part, exact=False)
++    if k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
++        raise ValueError(f"matmul_fp8: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
++    out = _out(x, q.n, out, f32)
++    x8, sx, xs8 = fp8_rows(x)
++    bm, bn, warps, stages = fp8_tile()
++    grid = (triton.cdiv(m, bm) * triton.cdiv(q.n, bn),)
++    if isinstance(q, B16):
++        winv, ws = b16_fp8_scales(q)
++        _f8b16[grid](x8, sx, q.weight, winv, ws, out, m, N=q.n, K=k, BM=bm, BN=bn, F32=f32, num_warps=warps,
++                     num_stages=stages)
++        return out
++    _f8q4[grid](x8, sx, xs8, q.weight, q.scales, q.biases, out, m, N=q.n, K=k, BM=bm, BN=bn, TN=BN_STORED, F32=f32,
++                BITS=FP8_WENC == "bits", num_warps=warps, num_stages=stages)
++    return out
++
++
++def fp8_row_values(xf: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """Host model of ``_fp8_rows``: (the e4m3 values of x / s_x as fp32, s_x [M, 1])."""
++
++    bits = xf.abs().amax(dim=1, keepdim=True).view(torch.int32)
++    sh = ((bits >> 23) & 0xFF) - 127 - 8 + ((bits & 0x7FFFFF) > 0x600000).to(torch.int32)
++    sh = sh.clamp(-100, 100)
++    inv = ((127 - sh) << 23).view(torch.float32)
++    sx = ((127 + sh) << 23).view(torch.float32)
++    return (xf * inv).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float(), sx
++
++
++def fp8_reference(x: torch.Tensor, q: Q4 | B16) -> torch.Tensor:
++    """Host-side model of ``matmul_fp8`` for tests (torch, fp32; RTNE e4m3 rounding as on the GPU): x rounded to e4m3
++    per row with ``_fp8_rows``' power-of-two scale (the same e4m3 values), times the exact 4-bit weights (BF16: the
++    weights rounded to e4m3 per output channel)."""
++
++    xf = x.float()
++    x8, sx = fp8_row_values(xf)
++    x8 = x8 * sx
++    if isinstance(q, B16):
++        winv, ws = b16_fp8_scales(q)
++        w8 = (q.weight.float() * winv[:, None]).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float() * ws[:, None]
++        return x8 @ w8.T
++    return x8 @ qmm.dequantize_q4(q).T
++
++
+ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
+            f32: bool = False, part: torch.Tensor | None = None, min_rows: int = 256) -> torch.Tensor:
+     """Dispatch helper for callers: ``matmul_prefill`` from ``min_rows`` rows up, ``qmm.matmul`` below (the decode
+diff --git a/src/tensorfold/families/glm5_next/cuda/fp8pf.py b/src/tensorfold/families/glm5_next/cuda/fp8pf.py
+new file mode 100644
+index 0000000..332cf23
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/fp8pf.py
+@@ -0,0 +1,101 @@
++"""FP8 fast prefill for GLM-5.3-Flash on CUDA (patches/0083, GLM53_TF_FP8_PREFILL=1 or ``tf_knobs.fp8_prefill``).
++
++A variant of patches/0080's fast prefill: the same chunk grid, the same kernels for everything but the parts below,
++which run on FP8 (e4m3) tensor cores or on tensor-core tiles that the row-invariant kernels cannot use. Only the main
++model's fast chunks change; decode, verify, the MTP head, DFlash2 and exact (``fast_prefill: 0``) prefills never
++run any of it.
++
++What changes in a fast chunk when it is on
++------------------------------------------
++- Non-expert 4-bit matmuls with at least ``fast_qmm.FP8_MIN_NK`` weights (KDA q|k|v|f_a|g_a|b and o_proj, DSA
++  q_a|kv_a, q_b and o_proj, the indexer's q_b, the dense MLP, the shared expert): ``fast_qmm.matmul_fp8``. Each row
++  of x is scaled by its own power of two s_x (the smallest with amax / s_x <= 448) and rounded to e4m3 (RTNE); a
++  4-bit weight value q (0..15) is an exact e4m3 number; each 64-input group is one fp8 tensor-core dot from zero (fp32 result), then
++
++      acc[m, n] += P[m, n, g] * s[n, g] + X8[m, g] * b[n, g]        (X8: the group's sum of the e4m3 inputs)
++      y[m, n]    = s_x[m] * acc[m, n]
++
++  i.e. exactly "round the row to e4m3 with a per-row scale, then the exact 4-bit matmul", summed in fp32 in group
++  order. BF16 weights: per-output-channel e4m3 scales (amax / 448 of the row), fp32 accumulation in 64-input steps.
++  The tiny shapes (f_b / g_b 4096 x 128, the indexer's k|w 160 x 4096) stay on ``matmul_fast``: the quantization
++  prologue would cost more than it saves.
++- Latent MLA (patches/0060, GLM53_TF_LATENT_KV=1): ``absorb`` and ``expand`` run as bf16 tensor-core GEMMs over
++  64-row tiles (the row-invariant versions dequantize kv_b in fp32 and multiply on the FMA pipes, 16 rows a tile),
++  and dense / sparse latent attention uses 32 (row, head) queries a tile (``latent.FAST_BM``) instead of 16: one
++  gather of the selected latent rows serves all 32 heads of a row. Attention itself stays bf16 (see
++  ``docs/PATCHES.md``, 0083: it is not bound by the MMA rate, so fp8 there would add error for no speed).
++
++Exactness
++---------
++New arithmetic, like 0080's fast mode: a prefill's tokens change with the switch. Everything above is deterministic
++and ROW-INDEPENDENT (a row's scale is its own amax; tile shapes are fixed per weight shape, never by the row count;
++no atomics; fixed summation order), so every argument of ``fastpf`` holds unchanged: drafted == serial (the prefill
++is deterministic; decode windows stay on the row-invariant kernels) and resumed == fresh (chunks on the grid C).
++Snapshots of an FP8 prefill are tagged ``grid = C + 1`` (C is a multiple of 64): only FP8 fast requests of the same
++grid resume from them, and they never resume from bf16 fast or exact snapshots. Lean prefill (0082) keeps its
++"same bits as 0080's chunk" property within the FP8 mode for the same reason (row-independent kernels).
++
++Quality: e4m3 keeps 3 mantissa bits (relative rounding error at most 2^-4, ~1.8% rms per activation), per row; each
++projection output then carries ~1-2% relative noise, below the 4-bit weights' own quantization error, and the
++residual streams, norms, KDA recurrence and attention softmax stay bf16/fp32. Expected effect: within noise on
++MMLU-style evaluations (W8A8-FP8 with per-token scales is lossless-to-0.5-point on published LLM evaluations);
++check with the MMLU suite on hardware before making it a default.
++"""
++
++from __future__ import annotations
++
++import os
++
++TAG = 1                  # added to the chunk grid C (a multiple of 64) in an FP8 prefill's snapshots
++
++ON = False               # the running prefill's setting (``decode._prefill`` sets it); read by fast_qmm / latent
++
++
++def enabled() -> bool:
++    """GLM53_TF_FP8_PREFILL (default 0): fast prefills run the FP8 kernels by default (``tf_knobs.fp8_prefill``
++    per request). Has no effect on exact (non-fast) prefills."""
++
++    v = os.environ.get("GLM53_TF_FP8_PREFILL", "0").strip().lower()
++    if v not in ("", "0", "1", "true", "false", "yes", "no", "on", "off"):
++        raise ValueError(f"GLM53_TF_FP8_PREFILL={v!r}: expected 0 or 1")
++    return v in ("1", "true", "yes", "on")
++
++
++def available() -> bool:
++    """FP8 e4m3 tensor-core dots are there: Triton's float8e4nv, torch's float8_e4m3fn and a GPU of compute
++    capability 8.9 or later (GB10 is 12.1); Triton's CPU interpreter counts (tests)."""
++
++    try:
++        import torch
++        import triton.language as tl
++    except ImportError:
++        return False
++    if not hasattr(tl, "float8e4nv") or not hasattr(torch, "float8_e4m3fn"):
++        return False
++    if os.environ.get("TRITON_INTERPRET") == "1":
++        return True
++    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
++
++
++def default() -> bool:
++    """The load-time default of the switch: GLM53_TF_FP8_PREFILL, when the kernels can run here."""
++
++    return enabled() and available()
++
++
++def tag(grid: int, on: bool) -> int:
++    """The snapshot grid tag of a prefill: 0 (exact), C (bf16 fast) or C + TAG (FP8 fast)."""
++
++    return grid + TAG if grid and on else grid
++
++
++def grid_of(t: int) -> int:
++    """The chunk grid C of a snapshot tag."""
++
++    return t - (t % 64)
++
++
++def settings() -> list[int]:
++    """This rank's FP8 prefill settings (both ranks must agree: they decide the prefill's bits)."""
++
++    return [int(enabled()), int(available())]
+diff --git a/src/tensorfold/families/glm5_next/cuda/latent.py b/src/tensorfold/families/glm5_next/cuda/latent.py
+index 5c1f690..90e2087 100644
+--- a/src/tensorfold/families/glm5_next/cuda/latent.py
++++ b/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -39,7 +39,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from . import glue, profile, qmm, sparse
++from . import fp8pf, glue, profile, qmm, sparse
+ from .qmm import B16, Q4
+ 
+ CHUNK = 512              # keys a program visits (the expanded kernel's chunk: the same chunk counts serve both)
+@@ -47,6 +47,19 @@ SPARSE_ROWS = 8          # rows whose sparse partials are preallocated (decode/v
+ KT = 32                  # latent rows a tile step reads (32 x 512 bf16 = 32 KB)
+ BM = 16                  # (row, head) queries a tensor-core tile holds
+ ATTN_WARPS = 8           # a tile's [16, 512] fp32 accumulator and [32, 512] latent rows need the registers of 8 warps
++# patches/0083: fast FP8 prefill chunks (``fp8pf``; never decode, verify, MTP or exact prefill): 32 (row, head) queries
++# a tile (one gather of a row's selected latent rows serves 32 heads; measured 11.2 -> 8.5 ms a layer for 1024 sparse
++# rows on GB10, 0060's table) and the tensor-core absorb / expand (``absorb_tc`` / ``expand_tc``, 64-row tiles).
++# ``FAST_STAGES``: software-pipelining depth of the attention's key loop (1 = none; never changes a bit).
++FAST_BM = 32
++FAST_STAGES = 1
++TC_ROWS = 64
++
++
++def fast8(b) -> bool:
++    """patches/0083: ``b`` is running a fast chunk of an FP8 prefill (``fp8pf``)."""
++
++    return fp8pf.ON and bool(getattr(b, "fast", False))
+ 
+ 
+ def enabled() -> bool:
+@@ -233,6 +246,73 @@ def expand(u: torch.Tensor, kv_v: Q4 | B16, out: torch.Tensor) -> torch.Tensor:
+     return out
+ 
+ 
++# -- patches/0083: tensor-core absorb / expand for FP8 fast prefill chunks ---------------------------------------------
++@triton.jit
++def _absorb_tc(Q, W, S, B, QA, M, H: tl.constexpr, DQ: tl.constexpr, L: tl.constexpr, N: tl.constexpr,
++               IS_Q4: tl.constexpr, BMR: tl.constexpr):
++    """``_absorb`` on bf16 tensor cores: the kv_b key tile dequantized exactly in fp32 then rounded to bf16, BMR rows a
++    program; fp32 sums over the head's inputs in 64-wide steps, in order."""
++
++    rm = tl.program_id(0) * BMR + tl.arange(0, BMR)
++    h = tl.program_id(1)
++    g = tl.program_id(2)
++    ok = rm < M
++    k = tl.arange(0, 64)
++    acc = tl.zeros((BMR, 64), dtype=tl.float32)
++    for it in range(DQ // 64):
++        x = tl.load(Q + (rm[:, None] * H + h) * DQ + it * 64 + k[None, :], mask=ok[:, None], other=0.0)
++        wt = _wtile(W, S, B, h * DQ + it * 64, g, N, L, IS_Q4).to(tl.bfloat16)      # [64 inputs i, 64 latent j]
++        acc = tl.dot(x.to(tl.bfloat16), wt, acc)
++    tl.store(QA + (rm[:, None] * H + h) * L + g * 64 + k[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
++def absorb_tc(q: torch.Tensor, kv_k: Q4 | B16, out: torch.Tensor) -> torch.Tensor:
++    """``absorb`` for FP8 fast prefill chunks (patches/0083): bf16 tensor cores, 64-row tiles. Row-independent and
++    deterministic; not ``absorb``'s bits."""
++
++    R, H, DQ = q.shape
++    L = out.shape[2]
++    W, S, B, is_q4 = _parts(kv_k)
++    if kv_k.n != H * DQ or kv_k.k != L or DQ % 64 or L % 64 or not q.is_contiguous() or not out.is_contiguous():
++        raise ValueError("latent absorb: shapes do not match kv_b's key rows")
++    _absorb_tc[(triton.cdiv(R, TC_ROWS), H, L // 64)](q, W, S, B, out, R, H=H, DQ=DQ, L=L, N=kv_k.n, IS_Q4=is_q4,
++                                                      BMR=TC_ROWS, num_warps=4, num_stages=2)
++    return out
++
++
++@triton.jit
++def _expand_tc(U, W, S, B, OUT, M, H: tl.constexpr, DV: tl.constexpr, L: tl.constexpr, N: tl.constexpr,
++               IS_Q4: tl.constexpr, BMR: tl.constexpr):
++    """``_expand`` on bf16 tensor cores: u rounded to bf16, the kv_b value tile dequantized in fp32 then rounded to
++    bf16, BMR rows a program; fp32 sums over the latent in 64-wide groups, in order."""
++
++    rm = tl.program_id(0) * BMR + tl.arange(0, BMR)
++    n0 = tl.program_id(1) * 64
++    h = n0 // DV
++    ok = rm < M
++    j = tl.arange(0, 64)
++    acc = tl.zeros((BMR, 64), dtype=tl.float32)
++    for g in range(L // 64):
++        x = tl.load(U + (rm[:, None] * H + h) * L + g * 64 + j[None, :], mask=ok[:, None], other=0.0)
++        wt = _wtile(W, S, B, n0, g, N, L, IS_Q4).to(tl.bfloat16)                      # [64 outputs n, 64 latent j]
++        acc = tl.dot(x.to(tl.bfloat16), tl.trans(wt), acc)
++    tl.store(OUT + rm[:, None] * N + n0 + j[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
++def expand_tc(u: torch.Tensor, kv_v: Q4 | B16, out: torch.Tensor) -> torch.Tensor:
++    """``expand`` for FP8 fast prefill chunks (patches/0083): bf16 tensor cores, 64-row tiles. Row-independent and
++    deterministic; not ``expand``'s bits."""
++
++    R, H, L = u.shape
++    W, S, B, is_q4 = _parts(kv_v)
++    DV = kv_v.n // H
++    if kv_v.k != L or DV * H != kv_v.n or DV % 64 or out.shape != (R, kv_v.n) or not out.is_contiguous():
++        raise ValueError("latent expand: shapes do not match kv_b's value rows")
++    _expand_tc[(triton.cdiv(R, TC_ROWS), kv_v.n // 64)](u, W, S, B, out, R, H=H, DV=DV, L=L, N=kv_v.n, IS_Q4=is_q4,
++                                                       BMR=TC_ROWS, num_warps=4, num_stages=2)
++    return out
++
++
+ # -- the latent cache ---------------------------------------------------------------------------------------------
+ @triton.jit
+ def _lwrite(LAT, LC, POS, L: tl.constexpr):
+@@ -325,7 +405,8 @@ def _lmerge(PO, PM, PL, OUT, RH, L: tl.constexpr, NCH: tl.constexpr):
+ 
+ 
+ def attention_latent(qa: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor, scratch: Scratch, *, scale: float,
+-                     nch: int | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
++                     nch: int | None = None, out: torch.Tensor | None = None, bm: int = BM,
++                     stages: int = 1) -> torch.Tensor:
+     """qa [R, H, L] bf16 (rows at positions pos .. pos + R - 1), lc [capacity, L] holding latents through
+     pos + R - 1 -> [R, H, L] fp32 (``out``, default scratch.u[:R]). ``nch``: chunks to visit (default: every chunk
+     the scratch holds, which covers every dense context; captured graphs use that)."""
+@@ -342,8 +423,8 @@ def attention_latent(qa: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor, scra
+     po = scratch.po[:nch * RH * L]
+     pm = scratch.pm[:nch * RH]
+     pl = scratch.pl[:nch * RH]
+-    _lchunks[(triton.cdiv(RH, BM), nch)](qa, lc, pos, po, pm, pl, R, H=H, L=L, CH=CHUNK, KTS=KT, SCALE=scale,
+-                                         BMQ=BM, num_warps=ATTN_WARPS, num_stages=1)
++    _lchunks[(triton.cdiv(RH, bm), nch)](qa, lc, pos, po, pm, pl, R, H=H, L=L, CH=CHUNK, KTS=KT, SCALE=scale,
++                                         BMQ=bm, num_warps=ATTN_WARPS, num_stages=stages)
+     if out is None:
+         out = scratch.u[:R]
+     elif out.shape != (R, H, L) or out.dtype != torch.float32 or not out.is_contiguous():
+@@ -411,7 +492,7 @@ def _lsparse_merge(PO, PM, PL, OUT, CNT, RS, H: tl.constexpr, L: tl.constexpr, N
+ 
+ 
+ def sparse_latent(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, out: torch.Tensor,
+-                  scale: float, part=None) -> None:
++                  scale: float, part=None, *, bm: int = BM, stages: int = 1) -> None:
+     """Rows with counts > 0: latent attention over their selected tokens (``sparse.select_tokens``), written into
+     ``out`` [R, H, L] fp32 (other rows untouched). ``part``: preallocated partials (``Scratch.sparse_part``)."""
+ 
+@@ -424,8 +505,9 @@ def sparse_latent(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, coun
+         po = torch.empty((nch * R * H * L,), dtype=torch.float32, device=qa.device)
+         pm = torch.empty((nch * R * H,), dtype=torch.float32, device=qa.device)
+         pl = torch.empty((nch * R * H,), dtype=torch.float32, device=qa.device)
+-    _lsparse_chunks[(R, triton.cdiv(H, BM), nch)](qa, lc, tokens, counts, po, pm, pl, R, W=W, H=H, L=L, CH=CHUNK,
+-                                                  KTS=KT, SCALE=scale, BMQ=BM, num_warps=ATTN_WARPS, num_stages=1)
++    _lsparse_chunks[(R, triton.cdiv(H, bm), nch)](qa, lc, tokens, counts, po, pm, pl, R, W=W, H=H, L=L, CH=CHUNK,
++                                                  KTS=KT, SCALE=scale, BMQ=bm, num_warps=ATTN_WARPS,
++                                                  num_stages=stages)
+     _lsparse_merge[(R, H)](po, pm, pl, out, counts, R, H=H, L=L, NCH=nch, CH=CHUNK, num_warps=4)
+ 
+ 
+@@ -440,7 +522,7 @@ def _project(layer, w, b, T: int) -> None:
+     glue.rmsnorm(b.dp[:T, :c.q_lora], a.q_norm, c.eps, b.qr[:T], b.xs_qr[:T])
+     glue.rmsnorm(b.dp[:T, c.q_lora:], a.kv_norm, c.eps, b.lat[:T], b.xs_lat[:T])
+     qmm.matmul(b.qr[:T], a.q_b, b.xs_qr[:T], out=b.q[:T].view(T, a.heads * c.qk_dim), part=b.sk)
+-    absorb(b.q[:T], a.kv_k, s.qa[:T])
++    (absorb_tc if fast8(b) else absorb)(b.q[:T], a.kv_k, s.qa[:T])            # patches/0083
+ 
+ 
+ def _attend(layer, w, lc, pos_dev, b, o: int, R: int, nch, index, host_pos, npb=None) -> None:
+@@ -467,8 +549,9 @@ def _attend(layer, w, lc, pos_dev, b, o: int, R: int, nch, index, host_pos, npb=
+         if profile.ON:
+             profile.lap("dsa.indexer")
+     u = s.u[o:o + R]
++    tile = dict(bm=FAST_BM, stages=FAST_STAGES) if fast8(b) else {}           # patches/0083
+     if not every_sparse:                                           # every row sparse: the dense pass is skipped
+-        attention_latent(s.qa[o:o + R], lc, pos_dev, s, scale=scale, nch=nch, out=u)
++        attention_latent(s.qa[o:o + R], lc, pos_dev, s, scale=scale, nch=nch, out=u, **tile)
+         if profile.ON:
+             profile.lap("dsa.attn")
+     if sparse_rows:
+@@ -484,7 +567,7 @@ def _attend(layer, w, lc, pos_dev, b, o: int, R: int, nch, index, host_pos, npb=
+                                                   np_max, pos_dev)
+         if profile.ON:
+             profile.lap("dsa.indexer")
+-        sparse_latent(s.qa[o:o + R], lc, tokens, counts, u, scale, s.sparse_part(R))
++        sparse_latent(s.qa[o:o + R], lc, tokens, counts, u, scale, s.sparse_part(R), **tile)
+         if profile.ON:
+             profile.lap("dsa.sparse_attn")
+ 
+@@ -501,7 +584,7 @@ def _output(layer, w, b, T: int) -> torch.Tensor:
+ 
+     a = layer.dsa
+     s = b.attn
+-    o = expand(s.u[:T], a.kv_v, s.o[:T])
++    o = (expand_tc if fast8(b) else expand)(s.u[:T], a.kv_v, s.o[:T])          # patches/0083
+     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:T]), T, "dsa.o_proj")
+ 
+ 

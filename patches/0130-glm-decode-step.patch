@@ -1,0 +1,1372 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py i/src/tensorfold/families/glm5_next/cuda/batch.py
+index f799854..55e9d7b 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ i/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -76,7 +76,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, choose_rows
+ 
+-from . import batchplan, glue, kda as kda_mod, latent, qmm, sparse
++from . import batchplan, decode_v2 as dv2, glue, kda as kda_mod, latent, qmm, sparse
+ from .attention import attention, kv_write
+ from .forward import State, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+ 
+@@ -106,8 +106,9 @@ def _kda(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+     qmm.matmul(b.normed[:T], k.proj, b.xs[:T], out=p, part=b.sk)
+     fa = p[:, k.fa_off:k.fa_off + 128]
+     ga = p[:, k.ga_off:k.ga_off + 128]
+-    qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:T]), out=b.ka[:T], part=b.sk)
+-    qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:T]), out=b.kg[:T], part=b.sk)
++    if not dv2.kda_gates(p, k, b, T):                  # patches/0130, as in ``forward.kda_block``
++        qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:T]), out=b.ka[:T], part=b.sk)
++        qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:T]), out=b.kg[:T], part=b.sk)
+     for st, R, o in zip(sts, Rs, offs):
+         sp = st.proj[li, :R]                 # the slot's window rows: its chain reads them, its commit shifts them
+         sp.copy_(p[o:o + R])
+@@ -142,8 +143,10 @@ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+     glue.rmsnorm(b.dp[:T, c.q_lora:], a.kv_norm, c.eps, b.lat[:T], b.xs_lat[:T])
+     HL = a.heads
+     qmm.matmul(b.qr[:T], a.q_b, b.xs_qr[:T], out=b.q[:T].view(T, HL * c.qk_dim), part=b.sk)
+-    qmm.matmul(b.lat[:T], a.kv_k, b.xs_lat[:T], out=b.kn[:T].view(T, HL * c.qk_dim), part=b.sk)
+-    qmm.matmul(b.lat[:T], a.kv_v, b.xs_lat[:T], out=b.vn[:T].view(T, HL * c.v_dim), part=b.sk)
++    kn, vn = b.kn[:T].view(T, HL * c.qk_dim), b.vn[:T].view(T, HL * c.v_dim)
++    if not dv2.kv_pair(b.lat[:T], b.xs_lat[:T], a.kv_k, a.kv_v, kn, vn, b.sk):     # patches/0130, as in forward.py
++        qmm.matmul(b.lat[:T], a.kv_k, b.xs_lat[:T], out=kn, part=b.sk)
++        qmm.matmul(b.lat[:T], a.kv_v, b.xs_lat[:T], out=vn, part=b.sk)
+     ix = a.index
+     if indexed:
+         qmm.matmul(b.normed[:T], ix.kw, b.xs[:T], out=b.ikr[:T], part=b.sk)
+diff --git c/src/tensorfold/families/glm5_next/cuda/decode_v2.py i/src/tensorfold/families/glm5_next/cuda/decode_v2.py
+new file mode 100644
+index 0000000..c81d45b
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/decode_v2.py
+@@ -0,0 +1,740 @@
++"""Decode-step kernels v2 for GLM-5.3-Flash (patches/0130, ``GLM53_TF_DECODE_KERNELS=v2``): fewer kernel launches
++and hidden launch latency for windows of 1-16 rows (serial steps, verify windows, MTP steps), with the bits of the
++kernels they replace.
++
++A 1-row step launches about 1,560 kernels a rank (90 of them NCCL all-gathers), most of them small or short: every
++split-K matmul is two kernels (the slices, then ``qmm._reduce``), the router four (slices, their sum, top-k,
++grouping), the EXL3 experts five, and the shared expert's result is copied into its slot. In a CUDA graph each
++boundary costs the launch gap plus the drain of the kernel before it. The features (comma list after ``v2``;
++``-name`` drops one, ``+name`` or ``name`` adds one; ``v2`` alone is every feature but ``pdl``):
++
++``fixup``      split-K matmuls (``qmm.matmul``, 4-bit, <= 16 rows) in one kernel: every K slice stores its fp32 partial
++               as before, then takes a ticket on its column tile; the last slice to arrive adds the slices in slice
++               order (``_reduce``'s sum, loads through L2) and stores the result. Also takes strided outputs and
++               group sums (``pairs``, ``sharedout``).
++``route``      the MoE router in one kernel (<= 16 rows): the router's K slices as before; the last program adds them
++               in order, runs every row's top-k (``glue._topk``'s arithmetic on a [rows, experts] tile) and groups
++               the window's experts (``glue._group``'s code).
++``exl3``       the EXL3 routed experts in three kernels instead of five (<= 16 rows): the grouped trellis GEMV with
++               its weight words and input fragments loaded one k tile ahead (registers; the same mma sequence), and
++               the gate/up and down epilogues run by the last of a Hadamard block's programs (``exl3_dec.cu``).
++``pairs``      KDA: the forget/output gate inputs' group sums in one launch, and their two 128-wide matmuls in one;
++               DSA: the key and value projections of the latent in one launch.
++``sharedout``  the EXL3 shared expert's down projection writes straight into its slot of the expert outputs (no copy).
++``hc``         the hyper-connection mix's partial dots (``glue._hc_partial``) with their K loop unrolled: the 8
++               blocks of weights and streams are loaded at once instead of one DRAM round trip after another; the
++               same dots and squares added in the same order.
++``pdl``        programmatic dependent launch: every v2 kernel and the glue kernels are launched with the programmatic
++               stream serialization attribute and wait (``griddepcontrol.wait``) before touching anything an earlier
++               kernel wrote, so a kernel's blocks become resident and prefetch their weights into L2 while the
++               previous kernel drains. Needs sm_90+ and a Triton with ``gdc_wait``; opt in with ``v2,pdl``.
++
++Exactness: every feature keeps the per-element arithmetic, the K slices and the summation order of the kernel it
++replaces (the fixup adds the same fp32 partials in the same order as ``_reduce``; the top-k picks and weights are
++the same float operations per row; the EXL3 kernels run the same mma sequence and the same epilogue code; unrolling
++reorders loads, never adds). Tickets decide which program adds, not what is added. So v2 gives the v1 bits for every
++row count, which keeps the three guarantees: rows of a window equal serial steps, drafted replies equal serial ones,
++and a state left by decoding resumes like a fresh (exact, 64-row-chunk) prefill -- prefill chunks of more than 16 rows
++still run the v1 kernels, with the same bits. Ranks may even differ in the knob without changing a bit.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import sys
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++import triton
++import triton.language as tl
++
++from . import exl3_mm, glue, qmm
++
++try:                                     # Triton >= 3.3: grid dependency control (programmatic dependent launch)
++    from triton.language.extra.cuda import gdc_launch_dependents as _gdc_launch, gdc_wait as _gdc_wait
++    GDC = True
++except Exception:  # noqa: BLE001
++    GDC = False
++
++    @triton.jit
++    def _gdc_wait():
++        pass
++
++    @triton.jit
++    def _gdc_launch():
++        pass
++
++ENV = "GLM53_TF_DECODE_KERNELS"
++FEATURES = ("fixup", "route", "exl3", "pairs", "sharedout", "hc", "pdl")
++DEFAULT_V2 = ("fixup", "route", "exl3", "pairs", "sharedout", "hc")
++MAX_ROWS = 16                           # route / exl3: windows up to this many rows (one 16-row member tile)
++MM_ROWS = 32                            # fixup / pairs / sharedout: calls up to this many rows (batched windows)
++# weight bytes a PDL-launched matmul program prefetches into L2 before it waits (GLM53_TF_DEC_PF_KB, 0 = none)
++PF_KB = int(os.environ.get("GLM53_TF_DEC_PF_KB", "16"))
++# the decode EXL3 kernels' column tiles (gate/up, down): they place work, the warps and K splits of
++# exl3_mm.GATEUP_CFG / DOWN_CFG define the sums (GLM53_TF_DEC_EXL3_NT="8,8"; each of 2, 4, 8)
++EXL3_NT = tuple(int(v) for v in os.environ.get("GLM53_TF_DEC_EXL3_NT", "8,8").split(","))
++
++SPEC: frozenset[str] = frozenset()
++PDL = False
++
++
++def parse(value: str | None) -> frozenset[str]:
++    """``GLM53_TF_DECODE_KERNELS``: '' / v1 / off (upstream kernels), v2, or v2 with a comma list of changes."""
++
++    raw = (value or "").strip().lower()
++    if raw in ("", "0", "v1", "off", "none"):
++        return frozenset()
++    toks = [t.strip() for t in raw.split(",") if t.strip()]
++    if toks[0] != "v2":
++        raise ValueError(f"{ENV} must be v1 or v2[,feature,-feature...], not {value!r}")
++    feats = set(DEFAULT_V2)
++    for t in toks[1:]:
++        name = t[1:] if t[0] in "+-" else t
++        if name not in FEATURES:
++            raise ValueError(f"{ENV}: unknown feature {name!r} (one of {', '.join(FEATURES)})")
++        if t[0] == "-":
++            feats.discard(name)
++        else:
++            feats.add(name)
++    return frozenset(feats)
++
++
++def pdl_supported() -> bool:
++    if not GDC or not torch.cuda.is_available():
++        return False
++    return torch.cuda.get_device_capability()[0] >= 9
++
++
++def has(feature: str) -> bool:
++    return feature in SPEC
++
++
++def configure(value: str | None = None) -> frozenset[str]:
++    """Read the knob (or ``value``) and install the kernels. CUDA graphs keep the kernels they captured."""
++
++    return _apply(parse(os.environ.get(ENV) if value is None else value))
++
++
++def _apply(spec: frozenset[str]) -> frozenset[str]:
++    global SPEC, PDL
++    if "pdl" in spec and not pdl_supported():
++        print(f"[tensorfold] {ENV}: programmatic dependent launch needs sm_90+ and Triton's gdc_wait; pdl is off",
++              file=sys.stderr, flush=True)
++        spec = spec - {"pdl"}
++    SPEC = spec
++    PDL = "pdl" in spec
++    qmm.V2 = sys.modules[__name__] if "fixup" in spec else None
++    exl3_mm.V2 = sys.modules[__name__] if "exl3" in spec else None
++    _install_glue()
++    return spec
++
++
++@contextlib.contextmanager
++def using(value: str | None):
++    """Tests: run with ``value`` (eager kernels; graphs already captured keep theirs), then restore."""
++
++    saved = SPEC
++    configure(value or "")
++    try:
++        yield SPEC
++    finally:
++        _apply(saved)
++
++
++# -- launch helpers ---------------------------------------------------------------------------------------------
++class _Launch:
++    """``kernel[grid](...)`` with extra launch arguments (the PDL flag and attribute): stands in for a glue kernel."""
++
++    def __init__(self, kernel, **extra) -> None:
++        self.kernel, self.extra = kernel, extra
++
++    def __getitem__(self, grid):
++        run = self.kernel[grid]
++        extra = self.extra
++        return lambda *args, **kw: run(*args, **kw, **extra)
++
++
++def _pdl_kw() -> dict:
++    return {"launch_pdl": True} if PDL else {}
++
++
++@triton.jit
++def _enter(PDL: tl.constexpr):
++    """PDL: wait for the previous kernel (all its writes visible), then let the next one launch."""
++
++    if PDL:
++        _gdc_wait()
++        _gdc_launch()
++
++
++@triton.jit
++def _l2_prefetch(ptrs):
++    tl.inline_asm_elementwise("prefetch.global.L2::evict_last [$1];\n\tmov.u32 $0, 0;", "=r,l", [ptrs],
++                              dtype=tl.int32, is_pure=False, pack=1)
++
++
++# -- split-K matmuls with the reduction in the kernel (``fixup``) --------------------------------------------------
++@triton.jit
++def _qmm_acc(X, XS, W, S, B, M, x_stride, xs_stride, pid_m, pid_n, pid_s,
++             N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr, BLOCK_N: tl.constexpr,
++             GPI: tl.constexpr):
++    """``qmm._qmm``'s sums for one (row tile, column tile, K slice), line for line (group sums may be strided)."""
++
++    KG: tl.constexpr = K // 64
++    PER: tl.constexpr = KG // SK
++    rm = pid_m * BM + tl.arange(0, BM)
++    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    rk = tl.arange(0, 64)
++    rw = tl.arange(0, 8)
++    shifts = tl.arange(0, 8) * 4
++    m_ok = rm < M
++    n_ok = rn < N
++    tile = W + pid_n * (KG * BLOCK_N * 8)
++    local = tl.arange(0, BLOCK_N)
++    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++    for i in range(PER // GPI):
++        for j in tl.static_range(GPI):
++            g = pid_s * PER + i * GPI + j
++            words = tl.load(tile + g * (BLOCK_N * 8) + local[:, None] * 8 + rw[None, :])
++            x = tl.load(X + rm[:, None] * x_stride + (g * 64 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++            q = (words[:, :, None] >> shifts[None, None, :]) & 0xF
++            q = tl.reshape(q, (BLOCK_N, 64)).to(tl.bfloat16)
++            p = tl.dot(x, tl.trans(q))
++            s = tl.load(S + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
++            b = tl.load(B + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
++            xs = tl.load(XS + rm * xs_stride + g, mask=m_ok, other=0.0)
++            acc = acc + p * s[None, :] + xs[:, None] * b[None, :]
++    return acc
++
++
++@triton.jit
++def _qmm_prefetch(W, pid_n, pid_s, K: tl.constexpr, SK: tl.constexpr, BLOCK_N: tl.constexpr, PFL: tl.constexpr):
++    """The first PFL 128-byte lines of this program's weight words (one contiguous run) into L2."""
++
++    KG: tl.constexpr = K // 64
++    PER: tl.constexpr = KG // SK
++    LINES: tl.constexpr = PER * BLOCK_N * 8 // 32                   # 32 words a line
++    base = W + pid_n * (KG * BLOCK_N * 8) + pid_s * (PER * BLOCK_N * 8)
++    line = tl.minimum(tl.arange(0, PFL), LINES - 1)
++    _l2_prefetch(base + line * 32)
++
++
++@triton.jit
++def _qmm_out(acc, OUT, PART, CNT, M, out_stride, pid_m, pid_n, pid_s, cidx,
++             N: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr, BLOCK_N: tl.constexpr, F32: tl.constexpr):
++    """SK == 1: the store of ``qmm._qmm``. Else this slice's partial as ``_qmm`` stores it, then a ticket on the
++    column tile; the last slice adds the SK partials in slice order (``qmm._reduce``'s sum) and stores it."""
++
++    rm = pid_m * BM + tl.arange(0, BM)
++    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    out_mask = (rm < M)[:, None] & (rn < N)[None, :]
++    if SK == 1:
++        if F32:
++            tl.store(OUT + rm[:, None] * out_stride + rn[None, :], acc, mask=out_mask)
++        else:
++            tl.store(OUT + rm[:, None] * out_stride + rn[None, :], acc.to(tl.bfloat16), mask=out_mask)
++    else:
++        tl.store(PART + (pid_s * M + rm[:, None]) * N + rn[None, :], acc, mask=out_mask)
++        tl.debug_barrier()                                          # every thread's partial before the ticket
++        ticket = tl.atomic_add(CNT + cidx, 1, sem="acq_rel", scope="gpu")
++        if ticket == SK - 1:
++            tot = tl.load(PART + rm[:, None] * N + rn[None, :], mask=out_mask, other=0.0, cache_modifier=".cg")
++            for s in tl.static_range(1, SK):
++                tot = tot + tl.load(PART + (s * M + rm[:, None]) * N + rn[None, :], mask=out_mask, other=0.0,
++                                    cache_modifier=".cg")
++            if F32:
++                tl.store(OUT + rm[:, None] * out_stride + rn[None, :], tot, mask=out_mask)
++            else:
++                tl.store(OUT + rm[:, None] * out_stride + rn[None, :], tot.to(tl.bfloat16), mask=out_mask)
++            tl.atomic_xchg(CNT + cidx, 0, sem="relaxed", scope="gpu")     # ready for the next launch
++
++
++@triton.jit
++def _qmm2(X, XS, W, S, B, OUT, PART, CNT, M, x_stride, xs_stride, out_stride,
++          N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr, BLOCK_N: tl.constexpr,
++          GPI: tl.constexpr, F32: tl.constexpr, PDL: tl.constexpr, PFL: tl.constexpr):
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    pid_s = tl.program_id(2)
++    if PDL:
++        if PFL > 0:
++            _qmm_prefetch(W, pid_n, pid_s, K, SK, BLOCK_N, PFL)
++        _enter(PDL)
++    acc = _qmm_acc(X, XS, W, S, B, M, x_stride, xs_stride, pid_m, pid_n, pid_s, N, K, SK, BM, BLOCK_N, GPI)
++    _qmm_out(acc, OUT, PART, CNT, M, out_stride, pid_m, pid_n, pid_s, pid_m * tl.num_programs(1) + pid_n,
++             N, SK, BM, BLOCK_N, F32)
++
++
++@triton.jit
++def _qmm2_pair(X0, XS0, W0, S0, B0, OUT0, X1, XS1, W1, S1, B1, OUT1, PART, CNT, M,
++               x_stride0, xs_stride0, out_stride0, x_stride1, xs_stride1, out_stride1,
++               N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr, BLOCK_N: tl.constexpr,
++               GPI: tl.constexpr, F32: tl.constexpr, PDL: tl.constexpr, PFL: tl.constexpr):
++    """Two matmuls of one shape in one launch: program (row tile, column tile, mat * SK + slice)."""
++
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    mat = tl.program_id(2) // SK
++    pid_s = tl.program_id(2) % SK
++    tiles = tl.num_programs(0) * tl.num_programs(1)
++    cidx = pid_m * tl.num_programs(1) + pid_n
++    if mat == 0:
++        if PDL:
++            if PFL > 0:
++                _qmm_prefetch(W0, pid_n, pid_s, K, SK, BLOCK_N, PFL)
++            _enter(PDL)
++        acc = _qmm_acc(X0, XS0, W0, S0, B0, M, x_stride0, xs_stride0, pid_m, pid_n, pid_s, N, K, SK, BM, BLOCK_N,
++                       GPI)
++        _qmm_out(acc, OUT0, PART, CNT, M, out_stride0, pid_m, pid_n, pid_s, cidx, N, SK, BM, BLOCK_N, F32)
++    else:
++        if PDL:
++            if PFL > 0:
++                _qmm_prefetch(W1, pid_n, pid_s, K, SK, BLOCK_N, PFL)
++            _enter(PDL)
++        acc = _qmm_acc(X1, XS1, W1, S1, B1, M, x_stride1, xs_stride1, pid_m, pid_n, pid_s, N, K, SK, BM, BLOCK_N,
++                       GPI)
++        _qmm_out(acc, OUT1, PART + SK * M * N, CNT + tiles, M, out_stride1, pid_m, pid_n, pid_s, cidx, N, SK, BM,
++                 BLOCK_N, F32)
++
++
++_COUNTERS: dict[tuple, torch.Tensor] = {}
++COUNTER_SLOTS = 8192
++
++
++def counters(key: torch.Tensor, n: int = COUNTER_SLOTS) -> torch.Tensor:
++    """Zeroed int32 tickets owned by the scratch tensor ``key`` (one set per partial buffer, so two windows that
++    run concurrently on different buffers never share one). Every launch leaves them at zero. Allocated on the
++    first (eager) use, before any graph capture."""
++
++    k = (key.device.index, key.data_ptr(), n)
++    c = _COUNTERS.get(k)
++    if c is None:
++        c = torch.zeros((n,), dtype=torch.int32, device=key.device)
++        _COUNTERS[k] = c
++    return c
++
++
++def _cfg(q: qmm.Q4, m: int) -> tuple[int, int, int, int, int]:
++    """(row tile, K slices, groups a step, warps, stages): ``qmm.matmul``'s choice for ``m`` rows (the row tile and
++    the settings place work; the K slices define the sums)."""
++
++    bm = qmm.bucket(m)
++    c_gpi, warps, stages = qmm.SHAPE_CFG.get(f"{q.n}x{q.k}", qmm.CONFIG[bm]) if bm == 16 else qmm.CONFIG[bm]
++    sk = qmm.split_k(q.n, q.k)
++    return bm, sk, qmm.gpi_for((q.k // qmm.GS) // sk, c_gpi), warps, stages
++
++
++def _pfl(sk: int, k: int) -> int:
++    if not PDL or PF_KB <= 0:
++        return 0
++    lines = (k // qmm.GS) // sk * qmm.BN * 8 // 32
++    return min(triton.next_power_of_2(max(PF_KB * 1024 // 128, 1)), triton.next_power_of_2(lines))
++
++
++def matmul(x: torch.Tensor, q, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
++           f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor | None:
++    """``qmm.matmul`` for 4-bit weights and <= MM_ROWS rows with a partial buffer (the forward's ``b.sk``): one
++    kernel. ``out`` may have strided rows (unit column stride). None: not handled here (the caller runs v1)."""
++
++    if not isinstance(q, qmm.Q4) or part is None:
++        return None
++    m, k = x.shape
++    if m > MM_ROWS or m == 0 or k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
++        return None
++    if xs is None:
++        xs = qmm.group_sums(x)
++    if xs.stride(1) != 1:
++        return None
++    if out is None:
++        out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
++    elif out.shape != (m, q.n) or out.stride(1) != 1:
++        return None
++    bm, sk, gpi, warps, stages = _cfg(q, m)
++    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, qmm.BN), sk)
++    if sk > 1 and (part.numel() < sk * m * q.n or grid[0] * grid[1] > COUNTER_SLOTS):
++        return None
++    _qmm2[grid](x, xs, q.weight, q.scales, q.biases, out, part, counters(part), m, x.stride(0), xs.stride(0),
++                out.stride(0), N=q.n, K=k, SK=sk, BM=bm, BLOCK_N=qmm.BN, GPI=gpi, F32=f32, PDL=PDL,
++                PFL=_pfl(sk, k), num_warps=warps, num_stages=stages, **_pdl_kw())
++    return out
++
++
++def pair(x0: torch.Tensor, xs0: torch.Tensor, q0, out0: torch.Tensor, x1: torch.Tensor, xs1: torch.Tensor, q1,
++         out1: torch.Tensor, part: torch.Tensor) -> bool:
++    """out0 = x0 @ q0.T and out1 = x1 @ q1.T (bf16) in one launch, each with ``qmm.matmul``'s bits. False: not
++    handled (different shapes, BF16 weights, too many rows, or ``pairs`` off)."""
++
++    if "pairs" not in SPEC or "fixup" not in SPEC:
++        return False
++    if not (isinstance(q0, qmm.Q4) and isinstance(q1, qmm.Q4)) or (q0.n, q0.k) != (q1.n, q1.k):
++        return False
++    m, k = x0.shape
++    if m > MM_ROWS or m == 0 or x1.shape != (m, k) or k != q0.k:
++        return False
++    for t in (x0, x1, xs0, xs1, out0, out1):
++        if t.stride(1) != 1:
++            return False
++    if x0.dtype != torch.bfloat16 or x1.dtype != torch.bfloat16 or out0.shape != (m, q0.n) or out1.shape != (m, q0.n):
++        return False
++    bm, sk, gpi, warps, stages = _cfg(q0, m)
++    grid = (triton.cdiv(m, bm), triton.cdiv(q0.n, qmm.BN), 2 * sk)
++    if sk > 1 and (part.numel() < 2 * sk * m * q0.n or 2 * grid[0] * grid[1] > COUNTER_SLOTS):
++        return False
++    _qmm2_pair[grid](x0, xs0, q0.weight, q0.scales, q0.biases, out0,
++                                   x1, xs1, q1.weight, q1.scales, q1.biases, out1, part, counters(part), m,
++                                   x0.stride(0), xs0.stride(0), out0.stride(0), x1.stride(0), xs1.stride(0),
++                                   out1.stride(0), N=q0.n, K=k, SK=sk, BM=bm, BLOCK_N=qmm.BN, GPI=gpi, F32=False,
++                                   PDL=PDL, PFL=_pfl(sk, k), num_warps=warps, num_stages=stages, **_pdl_kw())
++    return True
++
++
++def _scratch(owner, name: str, shape: tuple, dtype, device) -> torch.Tensor:
++    """A buffer kept on ``owner`` (a forward's Buffers, an EXL3 Scratch), allocated once at its full size on the
++    first (eager) use, before any graph capture; zeroed."""
++
++    t = getattr(owner, name, None)
++    if t is None:
++        t = torch.zeros(shape, dtype=dtype, device=device)
++        setattr(owner, name, t)
++    if t.shape != shape:
++        raise RuntimeError(f"decode_v2: scratch {name} is {tuple(t.shape)}, not {shape}")
++    return t
++
++
++def _pairable(q0, q1, m: int) -> bool:
++    return ("pairs" in SPEC and "fixup" in SPEC and 0 < m <= MM_ROWS and isinstance(q0, qmm.Q4)
++            and isinstance(q1, qmm.Q4) and (q0.n, q0.k) == (q1.n, q1.k))
++
++
++def kda_gates(p: torch.Tensor, k, b, R: int) -> bool:
++    """KDA's gate inputs: the 64-group sums of f_a and g_a (adjacent columns of the projection rows) in one launch,
++    then f_b and g_b in one launch (``pairs``). False: run v1."""
++
++    if k.ga_off != k.fa_off + 128 or not _pairable(k.fb, k.gb, R):
++        return False
++    xs4 = _scratch(b, "_v2_kxs4", (b.rows, 4), torch.float32, b.ids.device)[:R]
++    qmm.group_sums(p[:, k.fa_off:k.fa_off + 256], xs4)
++    fa = p[:, k.fa_off:k.fa_off + 128]
++    ga = p[:, k.ga_off:k.ga_off + 128]
++    if not pair(fa, xs4[:, 0:2], k.fb, b.ka[:R], ga, xs4[:, 2:4], k.gb, b.kg[:R], b.sk):
++        raise RuntimeError("decode_v2: KDA gate pair refused after its checks")
++    return True
++
++
++def kv_pair(lat: torch.Tensor, xs: torch.Tensor, kv_k, kv_v, kn: torch.Tensor, vn: torch.Tensor, part) -> bool:
++    """DSA's key and value projections of the latent in one launch (``pairs``). False: run v1."""
++
++    if not _pairable(kv_k, kv_v, lat.shape[0]):
++        return False
++    return pair(lat, xs, kv_k, kn, lat, xs, kv_v, vn, part)
++
++
++def shared_out(b, q, R: int, slot: int) -> torch.Tensor | None:
++    """``sharedout``: the view of the expert outputs' shared slot [R, D] (strided rows) that the shared expert's
++    down projection writes directly, or None (v1: into ``b.sy``, then a copy)."""
++
++    if "sharedout" not in SPEC or "fixup" not in SPEC or not 0 < R <= MM_ROWS or not isinstance(q, qmm.Q4):
++        return None
++    if q.n != b.ey.shape[2] or b.sk.numel() < qmm.split_k(q.n, q.k) * R * q.n:
++        return None
++    if -(-R // qmm.bucket(R)) * -(-q.n // qmm.BN) > COUNTER_SLOTS:
++        return None
++    return b.ey[:R, slot]
++
++
++# -- the MoE router in one kernel (``route``) ----------------------------------------------------------------------
++@triton.jit
++def _route(X, W, BIAS, PART, CNT, MLOG, PICK, WTS, UIDS, UCOUNT, UMEM, M, x_stride, scale,
++           D: tl.constexpr, NE: tl.constexpr, BM: tl.constexpr, BLOCK_E: tl.constexpr, BK: tl.constexpr,
++           KS: tl.constexpr, TOPK: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr, SLOTP: tl.constexpr,
++           NORM: tl.constexpr, MAXU: tl.constexpr, MAXM: tl.constexpr, PDL: tl.constexpr):
++    """Program (0, expert tile, K slice): ``glue._router_part``'s partial; the last program to finish then does
++    ``_router_sum``, ``_topk`` for every row at once, and ``_group``."""
++
++    _enter(PDL)
++    # glue._router_part
++    rm = tl.program_id(0) * BM + tl.arange(0, BM)
++    re = tl.program_id(1) * BLOCK_E + tl.arange(0, BLOCK_E)
++    s = tl.program_id(2)
++    rk = tl.arange(0, BK)
++    m_ok = rm < M
++    e_ok = re < NE
++    acc = tl.zeros((BM, BLOCK_E), dtype=tl.float32)
++    lo = s * (D // KS)
++    for k0 in range(lo, lo + D // KS, BK):
++        x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++        w = tl.load(W + re[:, None] * D + (k0 + rk)[None, :], mask=e_ok[:, None], other=0.0)
++        acc = tl.dot(x, tl.trans(w), acc)
++    tl.store(PART + (s * M + rm[:, None]) * NE + re[None, :], acc, mask=m_ok[:, None] & e_ok[None, :])
++    tl.debug_barrier()
++    ticket = tl.atomic_add(CNT, 1, sem="acq_rel", scope="gpu")
++    if ticket == tl.num_programs(1) * tl.num_programs(2) - 1:
++        rows = tl.arange(0, BM)
++        ar = tl.arange(0, BLOCK)
++        ak = tl.arange(0, SLOTP)
++        r_ok = rows < M
++        ok = ar < NE
++        mk = r_ok[:, None] & ok[None, :]
++        # glue._router_sum: the slices in order
++        lg = tl.load(PART + rows[:, None] * NE + ar[None, :], mask=mk, other=0.0, cache_modifier=".cg")
++        for t in tl.static_range(1, KS):
++            lg = lg + tl.load(PART + (t * M + rows[:, None]) * NE + ar[None, :], mask=mk, other=0.0,
++                              cache_modifier=".cg")
++        tl.store(MLOG + rows[:, None] * NE + ar[None, :], lg, mask=mk)
++        # glue._topk, every row of the tile at once (the same float operations per row)
++        score = 1.0 / (1.0 + tl.exp(-lg))
++        choice = tl.where(ok[None, :], score + tl.load(BIAS + ar, mask=ok, other=0.0)[None, :], float("-inf"))
++        picks = tl.zeros((BM, SLOTP), dtype=tl.int32)
++        wts = tl.zeros((BM, SLOTP), dtype=tl.float32)
++        total = tl.zeros((BM,), dtype=tl.float32)
++        for k in tl.static_range(TOPK):
++            mx = tl.max(choice, axis=1)
++            idx = tl.min(tl.where(choice == mx[:, None], ar[None, :], BLOCK), axis=1)
++            sk = tl.sum(tl.where(ar[None, :] == idx[:, None], score, 0.0), axis=1)
++            picks = tl.where(ak[None, :] == k, idx[:, None], picks)
++            wts = tl.where(ak[None, :] == k, sk[:, None], wts)
++            total += sk
++            choice = tl.where(ar[None, :] == idx[:, None], float("-inf"), choice)
++        if NORM:
++            wts = wts / (total[:, None] + 1e-20)
++        wts = wts * scale
++        picks = tl.where(ak[None, :] == TOPK, NE, picks)
++        wts = tl.where(ak[None, :] == TOPK, 1.0, wts)
++        smask = r_ok[:, None] & (ak < SLOTS)[None, :]
++        tl.store(PICK + rows[:, None] * SLOTS + ak[None, :], picks, mask=smask)
++        tl.store(WTS + rows[:, None] * SLOTS + ak[None, :], wts, mask=smask)
++        tl.debug_barrier()                                          # the picks, read back below by every thread
++        # glue._group
++        counts = tl.zeros((BLOCK,), dtype=tl.int32)
++        for r in range(M):
++            for kk in tl.static_range(SLOTS):
++                e = tl.load(PICK + r * SLOTS + kk, cache_modifier=".cg")
++                counts += tl.where(ar == e, 1, 0)
++        used = counts > 0
++        place = tl.cumsum(used.to(tl.int32), axis=0) - 1
++        n_used = tl.sum(used.to(tl.int32), axis=0)
++        tl.store(UIDS + place, ar, mask=used)
++        tl.store(UCOUNT, n_used)
++        filled = tl.zeros((BLOCK,), dtype=tl.int32)
++        for r in range(M):
++            for kk in tl.static_range(SLOTS):
++                e = tl.load(PICK + r * SLOTS + kk, cache_modifier=".cg")
++                hit = ar == e
++                tl.store(UMEM + place * MAXM + filled, r * 32 + kk, mask=hit)
++                filled += tl.where(hit, 1, 0)
++        for j in range(MAXM):
++            tl.store(UMEM + place * MAXM + j, -1, mask=used & (filled <= j))
++        tail = n_used + ar
++        for j in range(MAXM):
++            tl.store(UMEM + tail * MAXM + j, -1, mask=tail < MAXU)
++        tl.atomic_xchg(CNT, 0, sem="relaxed", scope="gpu")
++
++
++def route(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor, mlog: torch.Tensor, pick: torch.Tensor,
++          wts: torch.Tensor, grp, top_k: int, experts: int, scale: float, norm: bool) -> bool:
++    """``glue.router`` then ``glue.select`` in one kernel, same outputs (mlog too). False: run v1."""
++
++    if "route" not in SPEC:
++        return False
++    m, d = x.shape
++    ne = w.shape[0]
++    ks = glue.ROUTER_KS
++    slots = top_k + 1
++    if m > MAX_ROWS or m == 0 or ks <= 1 or d % (ks * 64) or ne != experts or grp.members.shape[1] != m:
++        return False
++    if not (mlog.is_contiguous() and pick.is_contiguous() and wts.is_contiguous() and x.stride(1) == 1):
++        return False
++    if pick.shape != (m, slots) or wts.shape != (m, slots):
++        return False
++    part = _route_part(mlog, ks * MAX_ROWS * ne)
++    block = triton.next_power_of_2(experts + 1)
++    _route[(1, triton.cdiv(ne, 32), ks)](x, w, bias, part, counters(part, 1), mlog, pick, wts, grp.ids, grp.count,
++                                          grp.members, m, x.stride(0), float(scale), D=d, NE=ne, BM=16, BLOCK_E=32,
++                                          BK=64, KS=ks, TOPK=top_k, SLOTS=slots, BLOCK=block,
++                                          SLOTP=triton.next_power_of_2(slots), NORM=norm, MAXU=grp.ids.shape[0],
++                                          MAXM=grp.members.shape[1], PDL=PDL, num_warps=4, num_stages=3,
++                                          **_pdl_kw())
++    return True
++
++
++_ROUTE_PARTS: dict[tuple, torch.Tensor] = {}
++
++
++def _route_part(owner: torch.Tensor, n: int) -> torch.Tensor:
++    k = (owner.device.index, owner.data_ptr())
++    t = _ROUTE_PARTS.get(k)
++    if t is None or t.numel() < n:
++        t = torch.empty((n,), dtype=torch.float32, device=owner.device)
++        _ROUTE_PARTS[k] = t
++    return t
++
++
++# -- hyper-connection mix (``hc``) ----------------------------------------------------------------------------------
++@triton.jit
++def _hc_partial2(X, FN, PART, WIDE: tl.constexpr, NB: tl.constexpr, SUB: tl.constexpr, PDL: tl.constexpr = False):
++    """``glue._hc_partial`` with its K loop unrolled: the same dots and squares added in the same order."""
++
++    _enter(PDL)
++    r = tl.program_id(0)
++    b = tl.program_id(1)
++    KB: tl.constexpr = WIDE // NB
++    m = tl.arange(0, 32)
++    k = tl.arange(0, SUB)
++    acc = tl.zeros((32,), dtype=tl.float32)
++    ss = tl.zeros((SUB,), dtype=tl.float32)
++    for t in tl.static_range(KB // SUB):
++        base = b * KB + t * SUB
++        x = tl.load(X + r * WIDE + base + k).to(tl.float32)
++        w = tl.load(FN + m[:, None] * WIDE + base + k[None, :], mask=m[:, None] < 24, other=0.0).to(tl.float32)
++        acc += tl.sum(w * x[None, :], axis=1)
++        ss += x * x
++    tl.store(PART + (r * NB + b) * 32 + m, acc, mask=m < 24)
++    tl.store(PART + (r * NB + b) * 32 + 24, tl.sum(ss, axis=0))
++
++
++# -- PDL wrappers of the glue kernels (the originals inlined after the wait) --------------------------------------
++_ORIG = {name: getattr(glue, name) for name in ("_embed", "_embed_b16", "_rmsnorm", "_hc_partial", "_hc_finish",
++                                                "_hc_post", "_residual_add", "_stream_mean", "_swiglu", "_combine")}
++_ORIG_GROUP_SUMS = qmm._group_sums
++_o_embed, _o_embed_b16, _o_rmsnorm = _ORIG["_embed"], _ORIG["_embed_b16"], _ORIG["_rmsnorm"]
++_o_hc_partial, _o_hc_finish, _o_hc_post = _ORIG["_hc_partial"], _ORIG["_hc_finish"], _ORIG["_hc_post"]
++_o_residual_add, _o_stream_mean, _o_swiglu, _o_combine = (_ORIG["_residual_add"], _ORIG["_stream_mean"],
++                                                          _ORIG["_swiglu"], _ORIG["_combine"])
++
++
++@triton.jit
++def _p_embed(IDS, W, S, B, OUT, D: tl.constexpr, COPIES: tl.constexpr):
++    _enter(True)
++    _o_embed(IDS, W, S, B, OUT, D, COPIES)
++
++
++@triton.jit
++def _p_embed_b16(IDS, W, OUT, D: tl.constexpr, COPIES: tl.constexpr):
++    _enter(True)
++    _o_embed_b16(IDS, W, OUT, D, COPIES)
++
++
++@triton.jit
++def _p_rmsnorm(X, x_stride, W, OUT, o_stride, XS, eps, D: tl.constexpr, BLOCK: tl.constexpr, SUMS: tl.constexpr):
++    _enter(True)
++    _o_rmsnorm(X, x_stride, W, OUT, o_stride, XS, eps, D, BLOCK, SUMS)
++
++
++@triton.jit
++def _p_hc_partial(X, FN, PART, WIDE: tl.constexpr, NB: tl.constexpr, SUB: tl.constexpr):
++    _enter(True)
++    _o_hc_partial(X, FN, PART, WIDE, NB, SUB)
++
++
++@triton.jit
++def _p_hc_finish(X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps, D: tl.constexpr, S: tl.constexpr,
++                 NB: tl.constexpr, ITERS: tl.constexpr, BLOCK: tl.constexpr):
++    _enter(True)
++    _o_hc_finish(X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps, D, S, NB, ITERS, BLOCK)
++
++
++@triton.jit
++def _p_hc_post(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, WORLD: tl.constexpr,
++               BLOCK: tl.constexpr):
++    _enter(True)
++    _o_hc_post(X, XOUT, G, POST, COMB, RS, D, S, WORLD, BLOCK)
++
++
++@triton.jit
++def _p_residual_add(X, XOUT, G, RS, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
++    _enter(True)
++    _o_residual_add(X, XOUT, G, RS, D, WORLD, BLOCK)
++
++
++@triton.jit
++def _p_stream_mean(X, OUT, D: tl.constexpr, S: tl.constexpr, BLOCK: tl.constexpr):
++    _enter(True)
++    _o_stream_mean(X, OUT, D, S, BLOCK)
++
++
++@triton.jit
++def _p_swiglu(GU, OUT, XS, LIMIT, W: tl.constexpr, BLOCK: tl.constexpr):
++    _enter(True)
++    _o_swiglu(GU, OUT, XS, LIMIT, W, BLOCK)
++
++
++@triton.jit
++def _p_combine(Y, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr):
++    _enter(True)
++    _o_combine(Y, WTS, OUT, D, SLOTS, BLOCK)
++
++
++@triton.jit
++def _p_group_sums(X, XS, x_stride, K: tl.constexpr, GB: tl.constexpr):
++    _enter(True)
++    _ORIG_GROUP_SUMS(X, XS, x_stride, K, GB)
++
++
++_PDL_WRAPPERS = {"_embed": _p_embed, "_embed_b16": _p_embed_b16, "_rmsnorm": _p_rmsnorm, "_hc_post": _p_hc_post,
++                 "_residual_add": _p_residual_add, "_stream_mean": _p_stream_mean, "_swiglu": _p_swiglu,
++                 "_combine": _p_combine}
++
++
++def _install_glue() -> None:
++    """Point glue's (and qmm's group-sum) kernel names at the v2 / PDL kernels, or back at the originals. The glue
++    functions look their kernels up at call time, so nothing else changes."""
++
++    for name, fn in _ORIG.items():
++        setattr(glue, name, fn)
++    qmm._group_sums = _ORIG_GROUP_SUMS
++    if "hc" in SPEC:
++        glue._hc_partial = _Launch(_hc_partial2, PDL=PDL, **_pdl_kw())
++    elif PDL:
++        glue._hc_partial = _Launch(_p_hc_partial, launch_pdl=True)
++    if PDL:
++        glue._hc_finish = _Launch(_p_hc_finish, launch_pdl=True)
++    if PDL:
++        for name, fn in _PDL_WRAPPERS.items():
++            setattr(glue, name, _Launch(fn, launch_pdl=True))
++        qmm._group_sums = _Launch(_p_group_sums, launch_pdl=True)
++
++
++# -- EXL3 routed experts (``exl3``) ----------------------------------------------------------------------------------
++@lru_cache(maxsize=1)
++def _ext():
++    from torch.utils.cpp_extension import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_exl3_dec_v1", sources=[str(here / "exl3_dec.cpp"), str(here / "exl3_dec.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
++def routed(x: torch.Tensor, pick: torch.Tensor, group, ex, s, y: torch.Tensor, R: int, limit: float) -> bool:
++    """``exl3_mm.routed`` for windows of <= 16 rows in three kernels (rot_in, gate/up + its epilogue, down + its
++    epilogue), the same bits. False: run v1."""
++
++    if "exl3" not in SPEC or R > MAX_ROWS or group.members.shape[1] > 16:
++        return False
++    gnt, gw, gsk = exl3_mm.GATEUP_CFG
++    dnt, dw, dsk = exl3_mm.DOWN_CFG
++    D, NI = ex.dims, ex.width
++    ntg, ntd = EXL3_NT
++    if gw != 4 or dw != 4 or ntg not in (2, 4, 8) or ntd not in (2, 4, 8) or D % 128 or NI % 128:
++        return False
++    if D % (16 * gsk * gw) or NI % (16 * dsk * dw):
++        return False
++    ext = _ext()
++    slots, P = s.slots, s.rows * s.slots
++    maxu = group.ids.shape[0]
++    per = NI // 128 + D // 128
++    cnt = _scratch(s, "_v2_cnt", ((ex.count + 1) * per,), torch.int32, x.device)
++    if maxu > ex.count + 1:
++        return False
++    cg, cd = cnt[:maxu * (NI // 128)], cnt[(ex.count + 1) * (NI // 128):]
++    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, PDL)
++    ext.gateup(s.xg, s.xu, ex.gt, ex.ut, group.ids, group.count, group.members, s.z, ex.svh_g, ex.svh_u, ex.suh_d,
++               s.xd, cg, D, NI, P, gsk, slots, ntg, float(limit), PDL)
++    ext.down(s.xd, ex.dt, group.ids, group.count, group.members, s.z, ex.svh_d, y, cd, NI, D, P, dsk, slots, ntd,
++             PDL)
++    return True
++
++
++configure()
+diff --git c/src/tensorfold/families/glm5_next/cuda/exl3_dec.cpp i/src/tensorfold/families/glm5_next/cuda/exl3_dec.cpp
+new file mode 100644
+index 0000000..8aac139
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/exl3_dec.cpp
+@@ -0,0 +1,80 @@
++// patches/0130: bindings of exl3_dec.cu (the decode-window EXL3 expert kernels, GLM53_TF_DECODE_KERNELS=v2).
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void exl3_dec_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                          at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, bool);
++void exl3_dec_gateup_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                          const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, const at::Tensor&,
++                          const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t,
++                          int64_t, int64_t, int64_t, double, bool);
++void exl3_dec_down_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                        at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
++                        int64_t, int64_t, bool);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
++                ": expected a contiguous CUDA tensor of the right dtype");
++}
++
++void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
++            const at::Tensor& suh1, at::Tensor out0, at::Tensor out1, int64_t rows, int64_t K, int64_t slots,
++            bool pdl) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16, "x: bf16 CUDA");
++    check(pick, at::kInt, "pick");
++    check(suh0, at::kHalf, "suh0");
++    check(suh1, at::kHalf, "suh1");
++    check(out0, at::kHalf, "out0");
++    check(out1, at::kHalf, "out1");
++    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
++    c10::cuda::CUDAGuard guard(x.device());
++    exl3_dec_rot_in_cuda(x, x_stride, pick, suh0, suh1, out0, out1, rows, K, slots, pdl);
++}
++
++void gateup(const at::Tensor& XG, const at::Tensor& XU, const at::Tensor& TG, const at::Tensor& TU,
++            const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, at::Tensor Z,
++            const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor xd, at::Tensor cnt,
++            int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t nt, double limit, bool pdl) {
++    check(XG, at::kHalf, "XG");
++    check(XU, at::kHalf, "XU");
++    check(TG, at::kInt, "TG");
++    check(TU, at::kInt, "TU");
++    check(uids, at::kInt, "uids");
++    check(ucount, at::kInt, "ucount");
++    check(members, at::kInt, "members");
++    check(Z, at::kFloat, "Z");
++    check(svh_g, at::kHalf, "svh_g");
++    check(svh_u, at::kHalf, "svh_u");
++    check(suh_d, at::kHalf, "suh_d");
++    check(xd, at::kHalf, "xd");
++    check(cnt, at::kInt, "cnt");
++    TORCH_CHECK(Z.numel() >= 2 * SK * P * N, "Z too small");
++    TORCH_CHECK(cnt.numel() >= uids.size(0) * (N / 128), "counters too small");
++    c10::cuda::CUDAGuard guard(XG.device());
++    exl3_dec_gateup_cuda(XG, XU, TG, TU, uids, ucount, members, Z, svh_g, svh_u, suh_d, xd, cnt, K, N, P, SK, slots,
++                         nt, limit, pdl);
++}
++
++void down(const at::Tensor& XD, const at::Tensor& TD, const at::Tensor& uids, const at::Tensor& ucount,
++          const at::Tensor& members, at::Tensor Z, const at::Tensor& svh_d, at::Tensor y, at::Tensor cnt, int64_t K,
++          int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t nt, bool pdl) {
++    check(XD, at::kHalf, "XD");
++    check(TD, at::kInt, "TD");
++    check(uids, at::kInt, "uids");
++    check(ucount, at::kInt, "ucount");
++    check(members, at::kInt, "members");
++    check(Z, at::kFloat, "Z");
++    check(svh_d, at::kHalf, "svh_d");
++    check(y, at::kFloat, "y");
++    check(cnt, at::kInt, "cnt");
++    TORCH_CHECK(Z.numel() >= SK * P * N, "Z too small");
++    TORCH_CHECK(cnt.numel() >= uids.size(0) * (N / 128), "counters too small");
++    c10::cuda::CUDAGuard guard(XD.device());
++    exl3_dec_down_cuda(XD, TD, uids, ucount, members, Z, svh_d, y, cnt, K, N, P, SK, slots, nt, pdl);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("rot_in", &rot_in);
++    m.def("gateup", &gateup);
++    m.def("down", &down);
++}
+diff --git c/src/tensorfold/families/glm5_next/cuda/exl3_dec.cu i/src/tensorfold/families/glm5_next/cuda/exl3_dec.cu
+new file mode 100644
+index 0000000..b96eef2
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/exl3_dec.cu
+@@ -0,0 +1,367 @@
++// patches/0130 (GLM53_TF_DECODE_KERNELS=v2, feature ``exl3``): GLM-5.3-Flash's EXL3 routed experts for decode
++// windows (<= 16 rows, so every distinct expert has at most one 16-row member tile) in three kernels instead of
++// exl3.cu's five, with exl3.cu's bits:
++//
++//   rot_in        exl3.cu's rot_in_kernel, verbatim
++//   gateup        exl3.cu's grouped_kernel for the gate and up trellises (same work item: the same warps' K ranges,
++//                 the same mma sequence, warps added in order into Z), with the trellis words and the A fragments
++//                 of the next k tile loaded before the current one is decoded (registers only). Then the last of
++//                 the programs that write one 128-column Hadamard block of an expert (every K split of gate and
++//                 up) runs exl3.cu's gateup_epilogue on the block for the expert's members: Z summed over the
++//                 splits in order, the same code.
++//   down          the same for the down trellis and down_epilogue.
++//
++// Which program runs an epilogue is decided by a ticket (atomicAdd after a fence), never what it adds. The counters
++// are left at zero. With ``pdl`` every kernel is launched with programmatic stream serialization and waits
++// (griddepcontrol.wait) before its first read of anything the previous kernels wrote.
++//
++// The shared device code (codebook, tile decode, mma, Hadamard transform, epilogue arithmetic) is exl3.cu's, copied
++// character for character inside the same build flags (-O3), so the compiler sees the same expressions.
++
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++
++namespace {
++
++constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
++
++__device__ __forceinline__ void pdl_enter() {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++    asm volatile("griddepcontrol.wait;" ::: "memory");
++    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++#endif
++}
++
++// ---- exl3.cu, verbatim -------------------------------------------------------------------------------------------
++__device__ __forceinline__ uint32_t mcg2(uint32_t s0, uint32_t s1) {
++    uint32_t x0 = s0 * 0xCBAC1FEDu;
++    uint32_t x1 = s1 * 0xCBAC1FEDu;
++    x0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    x1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    uint32_t lo = __byte_perm(x0, x1, 0x5410);
++    uint32_t hi = __byte_perm(x0, x1, 0x7632);
++    half2 r = __hadd2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<half2*>(&hi));
++    return *reinterpret_cast<uint32_t*>(&r);
++}
++
++__device__ __forceinline__ void decode_tile(uint32_t w, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
++    uint32_t p = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
++    uint32_t s = __funnelshift_r(w, p, 20);
++    b0[0] = mcg2((s >> 8) & 0xffffu, (s >> 4) & 0xffffu);
++    b0[1] = mcg2(s & 0xffffu, w >> 16);
++    b1[0] = mcg2((w >> 12) & 0xffffu, (w >> 8) & 0xffffu);
++    b1[1] = mcg2((w >> 4) & 0xffffu, w & 0xffffu);
++}
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++}
++
++__device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
++    return ok ? *reinterpret_cast<const uint32_t*>(x) : 0u;
++}
++
++__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++
++__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++__global__ void rot_in_kernel(const __nv_bfloat16* __restrict__ x, int x_stride, const int* __restrict__ pick,
++                              const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ out0,
++                              half* __restrict__ out1, int K, int slots) {
++    pdl_enter();
++    const int p = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
++    const int row = p / slots, slot = p % slots;
++    if (slot == slots - 1) return;
++    const int lane = threadIdx.x;
++    const int e = pick[row * slots + slot];
++    const half* suh = (mat ? suh1 : suh0) + (size_t)e * K + blk * 128 + 4 * lane;
++    const __nv_bfloat16* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) v[j] = __bfloat162float(xr[j]) * __half2float(suh[j]);
++    fwht128(v, lane);
++    half* o = (mat ? out1 : out0) + (size_t)p * K + blk * 128 + 4 * lane;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
++}
++
++// exl3.cu's gateup_epilogue_kernel body for member row p (Z row) and Hadamard block blk of expert e; Z through L2
++__device__ __forceinline__ void gateup_epilogue(const float* __restrict__ Z, int e, const half* __restrict__ svh_g,
++                                                const half* __restrict__ svh_u, const half* __restrict__ suh_d,
++                                                half* __restrict__ xd, int p, int blk, int lane, int P, int N, int SK,
++                                                float limit) {
++    const int n = blk * 128 + 4 * lane;
++    float gv[4], uv[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        float sg = 0.f, su = 0.f;
++        for (int s = 0; s < SK; ++s) {
++            sg += __ldcg(&Z[((size_t)(0 * SK + s) * P + p) * N + n + j]);
++            su += __ldcg(&Z[((size_t)(1 * SK + s) * P + p) * N + n + j]);
++        }
++        gv[j] = sg;
++        uv[j] = su;
++    }
++    fwht128(gv, lane);
++    fwht128(uv, lane);
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        float gg = fminf(bf16r(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j])), limit);
++        float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j])), -limit), limit);
++        float act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++        v[j] = act * __half2float(suh_d[(size_t)e * N + n + j]);
++    }
++    fwht128(v, lane);
++    half* o = xd + (size_t)p * N + n;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
++}
++
++// exl3.cu's down_epilogue_kernel body for member row p and Hadamard block blk of expert e; Z through L2
++__device__ __forceinline__ void down_epilogue(const float* __restrict__ Z, int e, const half* __restrict__ svh_d,
++                                              float* __restrict__ y, int p, int blk, int lane, int P, int D, int SK) {
++    const int n = blk * 128 + 4 * lane;
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        float s = 0.f;
++        for (int k = 0; k < SK; ++k) s += __ldcg(&Z[((size_t)k * P + p) * D + n + j]);
++        v[j] = s;
++    }
++    fwht128(v, lane);
++    float* o = y + (size_t)p * D + n;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * __half2float(svh_d[(size_t)e * D + n + j]);
++}
++
++// ---- the grouped GEMV with loads one k tile ahead ----------------------------------------------------------------
++template <int NT>
++__device__ __forceinline__ void load_step(const uint32_t* tile, const half* x0, const half* x1, bool ok0, bool ok1,
++                                          int k, uint32_t (&words)[NT], uint32_t (&a)[4]) {
++#pragma unroll
++    for (int i = 0; i < NT; ++i) words[i] = __ldg(tile + i * 32);
++    a[0] = load_pair(x0 + k, ok0);
++    a[1] = load_pair(x1 + k, ok1);
++    a[2] = load_pair(x0 + k + 8, ok0);
++    a[3] = load_pair(x1 + k + 8, ok1);
++}
++
++template <int NT>
++__device__ __forceinline__ void mma_step(const uint32_t (&words)[NT], const uint32_t (&a)[4], int lane,
++                                         float (&acc)[NT][2][4]) {
++#pragma unroll
++    for (int i = 0; i < NT; ++i) {
++        uint32_t b0[2], b1[2];
++        decode_tile(words[i], lane, b0, b1);
++        mma16816(acc[i][0], a, b0);
++        mma16816(acc[i][1], a, b1);
++    }
++}
++
++// exl3.cu's member_tiles<NT, W, 1>: 16 member rows (rows_sh) of expert e times W_q of one matrix over one K split,
++// for NT column tiles from nt0, into Z[mat][split][row][n]; the k tiles in the same order through the same mma,
++// the next tile's words and A fragments loaded before the current tile is decoded.
++template <int NT, int W>
++__device__ __forceinline__ void member_tile(const half* __restrict__ X, const uint32_t* __restrict__ T, int e,
++                                            const int* rows_sh, float (*red)[16][NT * 16], float* __restrict__ Z,
++                                            int K, int N, int P, int SK, int split, int mat, int nt0) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int KT = K >> 4, NTILES = N >> 4;
++    const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
++    const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
++    const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
++    const bool ok0 = r0 >= 0, ok1 = r1 >= 0;
++
++    const int per_split = KT / SK, per_warp = per_split / W;
++    const int kt0 = split * per_split + warp * per_warp;
++    const uint32_t* tile = T + (((size_t)e * KT + kt0) * NTILES + nt0) * 32 + lane;
++    const size_t step = (size_t)NTILES * 32;
++
++    float acc[NT][2][4];
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h)
++#pragma unroll
++            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
++
++    uint32_t words[NT], a[4];
++    load_step<NT>(tile, x0, x1, ok0, ok1, kt0 * 16, words, a);
++    for (int it = 0; it + 1 < per_warp; ++it) {
++        uint32_t nwords[NT], na[4];
++        load_step<NT>(tile + (size_t)(it + 1) * step, x0, x1, ok0, ok1, (kt0 + it + 1) * 16, nwords, na);
++        mma_step<NT>(words, a, lane, acc);
++#pragma unroll
++        for (int i = 0; i < NT; ++i) words[i] = nwords[i];
++#pragma unroll
++        for (int c = 0; c < 4; ++c) a[c] = na[c];
++    }
++    mma_step<NT>(words, a, lane, acc);
++
++    // warps' partial sums through shared memory, added in warp order (member_tiles, MG = 1)
++#pragma unroll
++    for (int i = 0; i < NT; ++i)
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int col = i * 16 + h * 8 + 2 * t;
++            red[warp][g][col] = acc[i][h][0];
++            red[warp][g][col + 1] = acc[i][h][1];
++            red[warp][g + 8][col] = acc[i][h][2];
++            red[warp][g + 8][col + 1] = acc[i][h][3];
++        }
++    __syncthreads();
++    for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
++        const int row = idx / (NT * 16), col = idx % (NT * 16);
++        const int r = rows_sh[row];
++        if (r < 0) continue;
++        float s = red[0][row][col];
++#pragma unroll
++        for (int w = 1; w < W; ++w) s += red[w][row][col];
++        Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
++    }
++}
++
++// Program (u, n block, mat * SK + split): grouped_kernel's work item (one member tile), then a ticket on the
++// (expert, 128-column block); the last of its mats * SK * (128 / (16 NT)) programs runs the block's epilogue for
++// every member (MODE 0: gate/up -> Xd; MODE 1: down -> Y).
++template <int NT, int W, int MODE>
++__global__ void __launch_bounds__(W * 32) grouped_epi_kernel(
++    const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
++    const uint32_t* __restrict__ T1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int E,
++    int mats, const half* __restrict__ sv0, const half* __restrict__ sv1, const half* __restrict__ su_next,
++    half* __restrict__ xd, float* __restrict__ y, int* __restrict__ cnt, float limit) {
++    pdl_enter();
++    const int u = blockIdx.x;
++    if (u >= ucount[0] || uids[u] >= E) return;          // the shared expert (id E) is not EXL3
++    const int split = blockIdx.z % SK;
++    const int mat = blockIdx.z / SK;
++    const half* X = mat ? X1 : X0;
++    const uint32_t* T = mat ? T1 : T0;
++    const int e = uids[u];
++
++    __shared__ int rows_sh[16];
++    __shared__ int last;
++    if (threadIdx.x < 16) {
++        int code = (int)threadIdx.x < maxm ? members[u * maxm + threadIdx.x] : -1;
++        rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
++    }
++    __syncthreads();
++    if (rows_sh[0] < 0) return;                           // members come first (a live expert always has one)
++    __shared__ float red[W][16][NT * 16];
++    member_tile<NT, W>(X, T, e, rows_sh, red, Z, K, N, P, SK, split, mat, blockIdx.y * NT);
++
++    constexpr int PER_HB = 128 / (NT * 16);
++    const int hb = blockIdx.y / PER_HB;
++    const int expected = mats * SK * PER_HB;
++    const int ci = u * (N / 128) + hb;
++    __threadfence();                                      // this block's Z rows, visible device-wide
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        const int prev = expected > 1 ? atomicAdd(cnt + ci, 1) : 0;
++        last = prev == expected - 1;
++        if (last && expected > 1) cnt[ci] = 0;            // every program of the block has arrived
++    }
++    __syncthreads();
++    if (!last) return;
++    __threadfence();
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    for (int m = warp; m < 16; m += W) {
++        const int p = rows_sh[m];
++        if (p < 0) continue;
++        if (MODE == 0) gateup_epilogue(Z, e, sv0, sv1, su_next, xd, p, hb, lane, P, N, SK, limit);
++        else down_epilogue(Z, e, sv0, y, p, hb, lane, P, N, SK);
++    }
++}
++
++template <typename... KArgs, typename... Args>
++void launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, bool pdl, Args... args) {
++    cudaLaunchConfig_t cfg = {};
++    cfg.gridDim = grid;
++    cfg.blockDim = block;
++    cfg.dynamicSmemBytes = 0;
++    cfg.stream = at::cuda::getCurrentCUDAStream();
++    cudaLaunchAttribute attr[1];
++    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++    attr[0].val.programmaticStreamSerializationAllowed = 1;
++    cfg.attrs = attr;
++    cfg.numAttrs = pdl ? 1 : 0;
++    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
++}
++
++template <int MODE>
++void grouped_epi(int nt, const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
++                 const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z,
++                 int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, const half* sv0,
++                 const half* sv1, const half* su_next, half* xd, float* y, at::Tensor& cnt, double limit, bool pdl) {
++    constexpr int W = 4;
++    const int maxm = (int)members.size(1);
++    const int E = (int)T0.size(0);
++    TORCH_CHECK(maxm <= 16, "decode kernels: at most 16 members an expert");
++    TORCH_CHECK(K % (16 * SK * W) == 0 && N % 128 == 0, "K and N must split evenly");
++    dim3 grid((unsigned)uids.size(0), (unsigned)(N / (16 * nt)), (unsigned)(mats * SK));
++    auto x0 = reinterpret_cast<const half*>(X0.data_ptr());
++    auto x1 = reinterpret_cast<const half*>(X1.data_ptr());
++    auto t0 = reinterpret_cast<const uint32_t*>(T0.data_ptr());
++    auto t1 = reinterpret_cast<const uint32_t*>(T1.data_ptr());
++#define LAUNCH(NT_)                                                                                               \
++    launch(grouped_epi_kernel<NT_, W, MODE>, grid, dim3(W * 32), pdl, x0, x1, t0, t1, uids.data_ptr<int>(),      \
++           ucount.data_ptr<int>(), members.data_ptr<int>(), Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, \
++           maxm, (int)slots, E, (int)mats, sv0, sv1, su_next, xd, y, cnt.data_ptr<int>(), (float)limit)
++    if (nt == 8) LAUNCH(8);
++    else if (nt == 4) LAUNCH(4);
++    else if (nt == 2) LAUNCH(2);
++    else TORCH_CHECK(false, "unsupported column tiles");
++#undef LAUNCH
++}
++
++}  // namespace
++
++void exl3_dec_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
++                          const at::Tensor& suh1, at::Tensor& out0, at::Tensor& out1, int64_t rows, int64_t K,
++                          int64_t slots, bool pdl) {
++    dim3 grid((unsigned)(rows * slots), (unsigned)(K / 128), 2);
++    launch(rot_in_kernel, grid, dim3(32), pdl, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x_stride,
++           pick.data_ptr<int>(), reinterpret_cast<const half*>(suh0.data_ptr()),
++           reinterpret_cast<const half*>(suh1.data_ptr()), reinterpret_cast<half*>(out0.data_ptr()),
++           reinterpret_cast<half*>(out1.data_ptr()), (int)K, (int)slots);
++}
++
++void exl3_dec_gateup_cuda(const at::Tensor& XG, const at::Tensor& XU, const at::Tensor& TG, const at::Tensor& TU,
++                          const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z,
++                          const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor& xd,
++                          at::Tensor& cnt, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t nt,
++                          double limit, bool pdl) {
++    grouped_epi<0>((int)nt, XG, XU, TG, TU, uids, ucount, members, Z, 2, K, N, P, SK, slots,
++                   reinterpret_cast<const half*>(svh_g.data_ptr()), reinterpret_cast<const half*>(svh_u.data_ptr()),
++                   reinterpret_cast<const half*>(suh_d.data_ptr()), reinterpret_cast<half*>(xd.data_ptr()), nullptr,
++                   cnt, limit, pdl);
++}
++
++void exl3_dec_down_cuda(const at::Tensor& XD, const at::Tensor& TD, const at::Tensor& uids, const at::Tensor& ucount,
++                        const at::Tensor& members, at::Tensor& Z, const at::Tensor& svh_d, at::Tensor& y,
++                        at::Tensor& cnt, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t nt,
++                        bool pdl) {
++    grouped_epi<1>((int)nt, XD, XD, TD, TD, uids, ucount, members, Z, 1, K, N, P, SK, slots,
++                   reinterpret_cast<const half*>(svh_d.data_ptr()), nullptr, nullptr, nullptr, y.data_ptr<float>(),
++                   cnt, 0.0, pdl);
++}
+diff --git c/src/tensorfold/families/glm5_next/cuda/exl3_mm.py i/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+index 429c6a1..c549dd5 100644
+--- c/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ i/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -44,6 +44,10 @@ DOWN_CFG = (8, 4, 1)
+ LOOP = os.environ.get("GLM53_TF_EXPERT_LOOP", "1").strip() not in ("0", "", "false", "no", "off")
+ LOOP_CFG = tuple(int(v) for v in os.environ.get("GLM53_TF_EXPERT_LOOP_CFG", "4,2").split(","))
+ 
++# patches/0130: ``decode_v2`` while GLM53_TF_DECODE_KERNELS=v2 has ``exl3`` (windows of <= 16 rows through exl3_dec.cu:
++# three kernels, the same bits); None otherwise
++V2 = None
++
+ 
+ @lru_cache(maxsize=1)
+ def _ext():
+@@ -113,6 +117,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, group, ex: Exl3Experts, s: Scrat
+     """Y[row * slots + slot] for every routed slot of rows 0..R-1 (fp32, [.., D]); x: the normed rows (bf16).
+     ``fast`` (patches/0080, fast-prefill chunks): the fused kernels of exl3_fast.cu after the same input rotation."""
+ 
++    if V2 is not None and not fast and V2.routed(x, pick, group, ex, s, y, R, limit):     # patches/0130
++        return
+     ext = _ext()
+     slots, P = s.slots, s.rows * s.slots
+     D, NI = ex.dims, ex.width
+diff --git c/src/tensorfold/families/glm5_next/cuda/forward.py i/src/tensorfold/families/glm5_next/cuda/forward.py
+index 4eae29e..9e7b472 100644
+--- c/src/tensorfold/families/glm5_next/cuda/forward.py
++++ i/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -27,7 +27,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from . import fastpf, glue, kda as kda_mod, latent, profile, qmm, sparse
++from . import decode_v2 as dv2, fastpf, glue, kda as kda_mod, latent, profile, qmm, sparse
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -358,8 +358,9 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+     qmm.matmul(b.normed[:R], k.proj, b.xs[:R], out=p, part=b.sk)
+     fa = p[:, k.fa_off:k.fa_off + 128]
+     ga = p[:, k.ga_off:k.ga_off + 128]
+-    qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), out=b.ka[:R], part=b.sk)
+-    qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), out=b.kg[:R], part=b.sk)
++    if b.fast or not dv2.kda_gates(p, k, b, R):          # patches/0130: v2 sums and matmuls both gates at once
++        qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), out=b.ka[:R], part=b.sk)
++        qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), out=b.kg[:R], part=b.sk)
+     if profile.ON:
+         profile.lap("kda.proj")
+     cur = st.cur[li]
+@@ -391,8 +392,10 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+     glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
+     HL = a.heads
+     qmm.matmul(b.qr[:R], a.q_b, b.xs_qr[:R], out=b.q[:R].view(R, HL * c.qk_dim), part=b.sk)
+-    qmm.matmul(b.lat[:R], a.kv_k, b.xs_lat[:R], out=b.kn[:R].view(R, HL * c.qk_dim), part=b.sk)
+-    qmm.matmul(b.lat[:R], a.kv_v, b.xs_lat[:R], out=b.vn[:R].view(R, HL * c.v_dim), part=b.sk)
++    kn, vn = b.kn[:R].view(R, HL * c.qk_dim), b.vn[:R].view(R, HL * c.v_dim)
++    if b.fast or not dv2.kv_pair(b.lat[:R], b.xs_lat[:R], a.kv_k, a.kv_v, kn, vn, b.sk):     # patches/0130
++        qmm.matmul(b.lat[:R], a.kv_k, b.xs_lat[:R], out=kn, part=b.sk)
++        qmm.matmul(b.lat[:R], a.kv_v, b.xs_lat[:R], out=vn, part=b.sk)
+     kv_write(b.kn[:R], b.vn[:R], kc, vc, pos_dev)
+     if profile.ON:
+         profile.lap("dsa.proj")
+@@ -448,9 +451,11 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     c = w.cfg
+     m = layer.moe
+     grp = b.group(R)
+-    glue.router(b.normed[:R], m.router, b.mlog[:R])
+-    glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], grp.ids, grp.count, grp.members, c.top_k, c.experts,
+-                c.routed_scale, c.norm_topk)
++    if b.fast or not dv2.route(b.normed[:R], m.router, m.bias, b.mlog[:R], b.pick[:R], b.wts[:R], grp, c.top_k,
++                               c.experts, c.routed_scale, c.norm_topk):     # patches/0130: v2 routes in one kernel
++        glue.router(b.normed[:R], m.router, b.mlog[:R])
++        glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], grp.ids, grp.count, grp.members, c.top_k, c.experts,
++                    c.routed_scale, c.norm_topk)
+     if profile.ON:
+         profile.lap("moe.router")
+     if m.shared is not None:
+@@ -461,10 +466,13 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+         # GLM53_TF_COMM=prefetch: the shared expert first (its gate/up was prefetched into L2 during the attention
+         # all-gather); it shares no buffer with the routed slots, so the order changes no bits
+         shared_first = w.meta.get("prefetch") is not None
++        # patches/0130 (v2 ``sharedout``): the shared down projection writes its slot of ey directly (no copy)
++        sy = None if b.fast else dv2.shared_out(b, s.down, R, c.top_k)
++        sy_out = b.sy[:R] if sy is None else sy
+         if shared_first:
+             qmm.matmul(b.normed[:R], s.gu, b.xs[:R], out=b.sgu[:R], part=b.sk)
+             glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+-            qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=b.sy[:R], f32=True, part=b.sk)
++            qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=sy_out, f32=True, part=b.sk)
+             if profile.ON:
+                 profile.lap("moe.shared")
+         exl3_mm.routed(b.normed[:R], b.pick, grp, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit,
+@@ -474,8 +482,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+         if not shared_first:
+             qmm.matmul(b.normed[:R], s.gu, b.xs[:R], out=b.sgu[:R], part=b.sk)
+             glue.swiglu(b.sgu[:R], b.sact[:R], b.sxs[:R], c.limit)
+-            qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=b.sy[:R], f32=True, part=b.sk)
+-        b.ey[:R, c.top_k].copy_(b.sy[:R])
++            qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=sy_out, f32=True, part=b.sk)
++        if sy is None:
++            b.ey[:R, c.top_k].copy_(b.sy[:R])
+         if profile.ON and not shared_first:
+             profile.lap("moe.shared")
+         glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+diff --git c/src/tensorfold/families/glm5_next/cuda/qmm.py i/src/tensorfold/families/glm5_next/cuda/qmm.py
+index 9c4ab91..f5b21d2 100644
+--- c/src/tensorfold/families/glm5_next/cuda/qmm.py
++++ i/src/tensorfold/families/glm5_next/cuda/qmm.py
+@@ -339,6 +339,9 @@ B16_CONFIG = {16: (4, 3), 32: (4, 3), 64: (4, 2), 128: (8, 2)}
+ # patches/0080: the fast-prefill matmul (``fast_qmm.matmul_prefill``, same signature), installed by ``fastpf.chunk``
+ # only while a fast prefill chunk of the main model runs; None everywhere else (decode, verify, MTP, DFlash2)
+ FAST_MM = None
++# patches/0130: ``decode_v2`` while GLM53_TF_DECODE_KERNELS=v2 has ``fixup`` (4-bit matmuls of <= 16 rows with a
++# partial buffer in one kernel, the same bits); None otherwise
++V2 = None
+ 
+ 
+ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
+@@ -353,6 +356,10 @@ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out:
+             return fn(x, q, xs, out=out, f32=f32, part=part)
+         finally:
+             FAST_MM = fn
++    if V2 is not None:                   # patches/0130
++        done = V2.matmul(x, q, xs, out=out, f32=f32, part=part)
++        if done is not None:
++            return done
+     if isinstance(q, B16):
+         return _matmul_b16(x, q, out=out, f32=f32, part=part)
+     m, k = x.shape

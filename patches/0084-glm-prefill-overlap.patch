@@ -1,0 +1,692 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index d5b9475..8573c1b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -248,6 +248,13 @@ class GlmEngine:
+         if ln_both[0] != ln_both[1]:
+             raise RuntimeError("the two ranks were started with different lean-prefill settings "
+                                f"(GLM53_TF_LEAN_PREFILL, GLM53_TF_LEAN_BLOCK): {ln_both[0]}, {ln_both[1]}")
++        # patches/0084: GLM53_TF_PREFILL_OVERLAP reorders a lean chunk's work (same kernels, same collectives in the
++        # same order, same bits), so the ranks need not agree; parsed here so a bad value fails at load
++        from . import pfoverlap
++
++        if pfoverlap.DEFAULT.pipe and rank == 0:
++            note = "" if lean_mod.enabled() else " (inactive without GLM53_TF_LEAN_PREFILL=1)"
++            print(f"[tensorfold] prefill overlap: {pfoverlap.describe(pfoverlap.DEFAULT)}{note}", flush=True)
+         self.drafter = None
+         if drafter is not None:
+             from .dflash2 import Drafter
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 70dd276..7439715 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -110,6 +110,7 @@ class Buffers:
+         self.site = None                 # the all-gather site the next ``gather`` serves (GLM53_TF_COMM=prefetch)
+         self.fast = False                # patches/0080: a fast prefill chunk of the main model is running (fastpf)
+         self.part16 = self.gath16 = None     # patches/0080: bf16 partials of fast chunks (allocated on first use)
++        self.defer = None                # patches/0084: a pipelined lean chunk's exchange (``pfoverlap.Pipe``), or None
+         self.sk = torch.empty((8 * rows * 16384,), dtype=f32, device=dev)
+         # final
+         self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
+@@ -311,6 +312,8 @@ class State:
+ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     """Every rank's fp32 partial b.part[:R] in rank order: [world, R, D] (summed rank 0 first by the consumer)."""
+ 
++    if b.defer is not None:              # patches/0084: queued on the pipelined chunk's comm stream, returns a handle
++        return b.defer.issue(w, b, R)
+     d = b.part.shape[1]
+     site, b.site = b.site, None
+     if w.comm is None:
+@@ -338,7 +341,10 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+ 
+ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, R: int,
+              name: str = "o_proj") -> torch.Tensor:
+-    qmm.matmul(x, q, xs, out=b.part[:R], f32=True, part=b.sk)
++    # patches/0084: a pipelined lean chunk writes the partial straight into its exchange slot (bf16 for bf16 gathers:
++    # the fp32 sums rounded once to nearest even in the matmul's store, the bits of ``gather``'s copy)
++    dst = b.part[:R] if b.defer is None else b.defer.slot(R)
++    qmm.matmul(x, q, xs, out=dst, f32=dst.dtype == torch.float32, part=b.sk)
+     if profile.ON:
+         profile.lap(name)
+     return gather(w, b, R)
+diff --git a/src/tensorfold/families/glm5_next/cuda/glue.py b/src/tensorfold/families/glm5_next/cuda/glue.py
+index 292f0e4..8ed4b46 100644
+--- a/src/tensorfold/families/glm5_next/cuda/glue.py
++++ b/src/tensorfold/families/glm5_next/cuda/glue.py
+@@ -199,14 +199,16 @@ def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.T
+ def _hc_post(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, WORLD: tl.constexpr,
+              BLOCK: tl.constexpr):
+     """Program (r, c): X_s[d] = bf16(post_s * branch + (((comb0s X0 + comb1s X1) + comb2s X2) + comb3s X3)),
+-    branch = bf16(partials summed rank 0 first); G is [WORLD, R, D] fp32 (RS = R * D apart)."""
++    branch = bf16(partials summed rank 0 first); G is [WORLD, R, D] fp32 (RS apart; R * D when contiguous), or
++    bf16 (patches/0084: a fast chunk's bf16 partials read as gathered; widening to fp32 is exact, so the sum and
++    everything after it are those of the fp32 copy of the same partials)."""
+ 
+     r = tl.program_id(0)
+     cb = tl.program_id(1)
+     d = cb * BLOCK + tl.arange(0, BLOCK)
+-    acc = tl.load(G + r * D + d)
++    acc = tl.load(G + r * D + d).to(tl.float32)
+     for k in tl.static_range(1, WORLD):
+-        acc = acc + tl.load(G + k * RS + r * D + d)
++        acc = acc + tl.load(G + k * RS + r * D + d).to(tl.float32)
+     branch = acc.to(tl.bfloat16).to(tl.float32)
+     x0 = tl.load(X + r * (S * D) + d).to(tl.float32)
+     x1 = tl.load(X + r * (S * D) + D + d).to(tl.float32)
+@@ -225,13 +227,16 @@ def _hc_post(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, WORLD
+ 
+ def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor,
+             comb: torch.Tensor) -> None:
+-    """gathered: [world, R, D] fp32 partials (contiguous). x and xout may be the same tensor."""
++    """gathered: [world, R, D] fp32 (or bf16, patches/0084) partials, rows contiguous (the rank stride may be
++    larger than R * D: a row slice of a gathered block, patches/0084). x and xout may be the same tensor."""
+ 
+     world, rows, d = gathered.shape
++    if gathered.stride(2) != 1 or gathered.stride(1) != d:
++        raise ValueError("hc_post: the gathered partials' rows must be contiguous")
+     s = x.shape[1] // d
+     block = min(1024, d)
+-    _hc_post[(rows, d // block)](x, xout, gathered, post, comb, rows * d, D=d, S=s, WORLD=world, BLOCK=block,
+-                                 num_warps=4)
++    _hc_post[(rows, d // block)](x, xout, gathered, post, comb, gathered.stride(0), D=d, S=s, WORLD=world,
++                                 BLOCK=block, num_warps=4)
+ 
+ 
+ @triton.jit
+@@ -450,7 +455,9 @@ def select(logits: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor, wts: to
+ 
+ @triton.jit
+ def _combine(Y, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr):
+-    """A rank's MoE share, fp32: sum over slots in order of w_k y_k (the shared expert last, weight 1)."""
++    """A rank's MoE share, fp32: sum over slots in order of w_k y_k (the shared expert last, weight 1). A bf16 OUT
++    (patches/0084: a fast chunk's partial written as it is gathered) gets the fp32 sum rounded once to nearest even,
++    the bits ``copy_`` of the fp32 result gives."""
+ 
+     r = tl.program_id(0)
+     c = tl.program_id(1)
+@@ -458,10 +465,14 @@ def _combine(Y, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.conste
+     acc = tl.zeros((BLOCK,), dtype=tl.float32)
+     for k in tl.static_range(SLOTS):
+         acc = acc + tl.load(Y + (r * SLOTS + k) * D + d) * tl.load(WTS + r * SLOTS + k)
+-    tl.store(OUT + r * D + d, acc)
++    tl.store(OUT + r * D + d, acc.to(OUT.dtype.element_ty))
+ 
+ 
+ def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
++    """out [R, D]: fp32, or bf16 (patches/0084), contiguous."""
++
+     rows, d = out.shape
++    if out.stride(0) != d or out.stride(1) != 1:
++        raise ValueError("combine: out must be a contiguous [R, D]")
+     block = min(1024, d)
+     _combine[(rows, d // block)](y, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
+diff --git a/src/tensorfold/families/glm5_next/cuda/lean.py b/src/tensorfold/families/glm5_next/cuda/lean.py
+index 051234d..7a7b892 100644
+--- a/src/tensorfold/families/glm5_next/cuda/lean.py
++++ b/src/tensorfold/families/glm5_next/cuda/lean.py
+@@ -210,15 +210,19 @@ def _carry(lb: LeanBuffers, li: int, conv: torch.Tensor, p: torch.Tensor, r: int
+ 
+ 
+ def _kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, lb: LeanBuffers, a: int, r: int,
+-               pos: int) -> torch.Tensor:
++               pos: int, normed: torch.Tensor | None = None, xs: torch.Tensor | None = None) -> torch.Tensor:
+     """``forward.kda_block`` for sub-block [a, a + r) at absolute position ``pos``: from the committed state for the
+-    first sub-block, else from the state and conv window the previous one left."""
++    first sub-block, else from the state and conv window the previous one left. ``normed`` / ``xs``: the sub-block's
++    normed input rows and their group sums (default: the window buffers' first r rows; patches/0084 passes the lean
++    set's rows)."""
+ 
+     c = w.cfg
+     k = layer.kda
+     li = st.kda_index[layer.index]
+     p = st.proj[li, :r]
+-    qmm.matmul(b.normed[:r], k.proj, b.xs[:r], out=p, part=b.sk)
++    normed = b.normed[:r] if normed is None else normed
++    xs = b.xs[:r] if xs is None else xs
++    qmm.matmul(normed, k.proj, xs, out=p, part=b.sk)
+     fa = p[:, k.fa_off:k.fa_off + 128]
+     ga = p[:, k.ga_off:k.ga_off + 128]
+     qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:r]), out=b.ka[:r], part=b.sk)
+@@ -283,7 +287,6 @@ def _ffn_moe(layer: LayerW, w: Weights, b: Buffers, lb: LeanBuffers, R: int) ->
+     (each expert's weights read once per chunk), then per sub-block the shared expert, combine, gather, hc_post."""
+ 
+     c = w.cfg
+-    m = layer.moe
+     h = layer.ffn_hc
+     blocks = lb.sub_blocks(R)
+     for a, r in blocks:
+@@ -291,6 +294,23 @@ def _ffn_moe(layer: LayerW, w: Weights, b: Buffers, lb: LeanBuffers, R: int) ->
+                     lb.post[a:a + r], lb.comb[a:a + r], b.hcpart[:r], c.eps, c.hc_eps, c.hc_iters)
+     if profile.ON:
+         profile.lap("hc")
++    _routed(layer, w, lb, R)
++    for a, r in blocks:
++        _shared_combine(layer, w, b, lb, a, r, b.part[:r])
++        b.site = (layer.index, "f")
++        g = gather(w, b, r)
++        x = lb.x[a:a + r]
++        glue.hc_post(x, x, g, lb.post[a:a + r], lb.comb[a:a + r])
++        if profile.ON:
++            profile.lap("hc")
++
++
++def _routed(layer: LayerW, w: Weights, lb: LeanBuffers, R: int) -> None:
++    """Routing (router, top-k, grouping) and the routed experts, once over the chunk's R rows (their normed rows in
++    ``lb.normed``) into ``lb.ey``."""
++
++    c = w.cfg
++    m = layer.moe
+     grp = lb.group(R)
+     glue.router(lb.normed[:R], m.router, lb.mlog[:R])
+     glue.select(lb.mlog[:R], m.bias, lb.pick[:R], lb.wts[:R], grp.ids, grp.count, grp.members, c.top_k, c.experts,
+@@ -307,24 +327,26 @@ def _ffn_moe(layer: LayerW, w: Weights, b: Buffers, lb: LeanBuffers, R: int) ->
+         qmm.moe_down(lb.eact, lb.eaxs, m.experts, grp, lb.ey)
+     if profile.ON:
+         profile.lap("moe.routed")
+-    for a, r in blocks:
+-        if m.shared is not None:
+-            s = m.shared
+-            qmm.matmul(lb.normed[a:a + r], s.gu, lb.xs[a:a + r], out=b.sgu[:r], part=b.sk)
+-            glue.swiglu(b.sgu[:r], b.sact[:r], b.sxs[:r], c.limit)
+-            qmm.matmul(b.sact[:r], s.down, b.sxs[:r], out=b.sy[:r], f32=True, part=b.sk)
+-            lb.ey[a:a + r, c.top_k].copy_(b.sy[:r])
+-            if profile.ON:
+-                profile.lap("moe.shared")
+-        glue.combine(lb.ey[a:a + r], lb.wts[a:a + r], b.part[:r])
++
++
++def _shared_combine(layer: LayerW, w: Weights, b: Buffers, lb: LeanBuffers, a: int, r: int,
++                    out: torch.Tensor) -> None:
++    """Sub-block [a, a + r) of the MoE half after the routed experts: the shared expert (EXL3: BF16 matmuls into its
++    slot of ``lb.ey``), then the rank's combined share into ``out`` [r, D] (fp32; bf16 in patches/0084's pipeline)."""
++
++    c = w.cfg
++    m = layer.moe
++    if m.shared is not None:
++        s = m.shared
++        qmm.matmul(lb.normed[a:a + r], s.gu, lb.xs[a:a + r], out=b.sgu[:r], part=b.sk)
++        glue.swiglu(b.sgu[:r], b.sact[:r], b.sxs[:r], c.limit)
++        qmm.matmul(b.sact[:r], s.down, b.sxs[:r], out=b.sy[:r], f32=True, part=b.sk)
++        lb.ey[a:a + r, c.top_k].copy_(b.sy[:r])
+         if profile.ON:
+-            profile.lap("moe.combine")
+-        b.site = (layer.index, "f")
+-        g = gather(w, b, r)
+-        x = lb.x[a:a + r]
+-        glue.hc_post(x, x, g, lb.post[a:a + r], lb.comb[a:a + r])
+-        if profile.ON:
+-            profile.lap("hc")
++            profile.lap("moe.shared")
++    glue.combine(lb.ey[a:a + r], lb.wts[a:a + r], out)
++    if profile.ON:
++        profile.lap("moe.combine")
+ 
+ 
+ # -- the chunk ------------------------------------------------------------------------------------------------------
+@@ -332,8 +354,16 @@ def compute(w: Weights, st: State, b: Buffers, lb: LeanBuffers, R: int, *, head:
+     """A fast prefill chunk of R staged rows (``stage``) at st.pos: the bits of ``forward.compute(..., fast=True,
+     head=head)`` on R-row buffers. Returns the last row's logits [1, V/world] (stale unless ``head``); the chunk's
+     final-normed rows are in ``lb.fnormed[:R]`` and its DFlash2 taps in ``lb.tapcat[:R]``. The committed state is
+-    unchanged until ``commit``."""
++    unchanged until ``commit``.
+ 
++    With GLM53_TF_PREFILL_OVERLAP (patches/0084, ``pfoverlap``) the same kernels run on the same inputs in another
++    order: each sub-block's all-gather on a comm stream while the next sub-block computes, the partials exchanged as
++    written, and each hc_post followed by the next hc_pre of its rows. Same bits."""
++
++    from . import pfoverlap
++
++    if pfoverlap.on():
++        return pfoverlap.compute(w, st, b, lb, R, head=head)
+     if R > lb.rows:
+         raise ValueError(f"lean chunk of {R} rows, the lean buffers hold {lb.rows}")
+     if lb.block > b.rows:
+diff --git a/src/tensorfold/families/glm5_next/cuda/pfoverlap.py b/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+new file mode 100644
+index 0000000..15c7cff
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+@@ -0,0 +1,443 @@
++"""Pipelined lean prefill for GLM-5.3-Flash on CUDA (patches/0084, GLM53_TF_PREFILL_OVERLAP): patches/0082's lean
++fast chunk with the same kernels on the same inputs, in an order that hides the all-gathers and keeps the
++hyper-connection rows in L2.
++
++Where the time went
++-------------------
++Fast prefill, 2048-row chunks, per token and rank (``docs/PREFILL-ANALYSIS.md``): sparse attention 117 us,
++all-gathers 106, ``kda.proj`` 94, hyper-connections 77, ``dsa.o_proj`` 76, ``kda.chain`` 63, then the experts. The
++all-gathers were serial: every block's partial was exchanged on the compute stream and the next kernel waited for it.
++About a third of the ``allgather`` time was not the link at all but two conversion passes around it (``gather``'s
++fp32 -> bf16 copy of the partial and the bf16 -> fp32 copy of what came back: 88 KB a row a site, 90 sites a token).
++The hyper-connections are memory-bound elementwise work over the [rows, 4 x 4096] bf16 streams: hc_post reads and
++writes them, then the next hc_pre reads them twice more (its mixing dots, then its collapse), each from DRAM because
++a 1024-row sub-block of streams (32 MB) does not fit in L2.
++
++What changes (only the schedule and where two values are stored)
++----------------------------------------------------------------
++A lean chunk is a sequence of PIECES, each (layer, half, sub-block): its "pre" work ends in a rank partial, its "post"
++work consumes the gathered partials. Per layer: the attention pieces of every sub-block, then the FFN pieces.
++
++1. ``gather``: each piece's all-gather goes to a comm stream (``Pipe``, high priority, two partial / gather slots)
++   and the compute stream carries on with the NEXT piece's pre work; the previous piece's post runs after it, once
++   its gather's event is waited for. So the exchange of sub-block i overlaps sub-block i+1's hc work, projections,
++   KDA chain or attention and o_proj (or its shared expert and combine). What may not move is respected:
++   - a piece's pre work never depends on the post of the piece just before it (checked below: the next rows' inputs
++     come from an earlier post; KDA state, conv carry and DSA cache writes happen in pre work, in order);
++   - where it would (one sub-block per chunk, or the MoE's routing, which reads every row's post), the pending
++     exchange is waited for first (``drain``);
++   - a slot is written again only two pieces later, after its exchange was waited for (``Pipe`` checks this);
++   - both ranks issue the collectives in the same order (the piece order), from one stream.
++2. ``direct`` (always on in the pipeline): the producer writes the partial in the dtype that is exchanged (the
++   o_proj / down matmuls store bf16, the MoE combine stores bf16), and hc_post reads the gathered bf16 partials and
++   widens them itself. Rounding an fp32 sum to bf16 in the store is the round-to-nearest-even ``copy_`` did, and
++   widening bf16 to fp32 is exact, so hc_post sums the same fp32 values in the same order: 96 KB a row a site less
++   traffic and two kernels fewer, same bits. (With GLM53_TF_FAST_GATHER=fp32 the slots are fp32, as before.)
++3. ``slab``: a piece's post runs hc_post and the NEXT hc_pre of its rows (the FFN's after attention, the next
++   layer's attention's after the FFN, the final norm after the last layer) in row slabs sized to half the L2
++   (GLM53_TF_PREFILL_HC_SLAB, default auto: 384 rows at 4 x 4096 streams and 24 MB), so hc_pre's two reads of the
++   rows just written hit L2. The hc_pre outputs live in the lean set's rows (``lb.normed``/``xs``/``post``/``comb``,
++   which 0082 already holds for the FFN half) until that half's pre work reads them.
++
++Bits
++----
++Every kernel is the one 0082 runs, on the same values: glue, qmm / fast_qmm (row-independent, patches/0082), the KDA
++and DSA sub-block calls with the same carries and positions, the routed experts once over the chunk. Only the store
++dtype of three producers (fp32 then ``copy_`` to bf16 -> bf16 store, same rounding) and hc_post's load dtype (fp32
++copy of bf16 -> bf16 widened in registers, exact) differ. So the committed state and replies equal 0082's lean
++chunk bit for bit, whichever of ``gather`` / ``slab`` is on (``tests/cuda/test_overlap_patches.py``). Slabs are cut
++at multiples of 64 rows.
++
++Knobs
++-----
++GLM53_TF_PREFILL_OVERLAP = 0 (default: 0082's order) | 1 (= gather,slab) | a comma list of ``gather``, ``slab``,
++``direct`` (the pipeline with neither). Per request: ``tf_knobs.prefill_overlap`` 0 | 1 (patches/0093).
++GLM53_TF_PREFILL_HC_SLAB = rows (a multiple of 64; 0 = the whole sub-block). Only lean chunks
++(GLM53_TF_LEAN_PREFILL=1) are pipelined: the exact path, decode, verify, the MTP head and DFlash2 never are.
++GLM53_TF_COMM=prefetch's L2 prefetch is skipped for pipelined exchanges (its plans are decode-shaped and the compute
++stream is busy anyway).
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++
++import torch
++
++from . import fastpf, glue, lean, profile, qmm
++
++ENV = "GLM53_TF_PREFILL_OVERLAP"
++SLAB_ENV = "GLM53_TF_PREFILL_HC_SLAB"
++
++
++@dataclass(frozen=True)
++class Mode:
++    pipe: bool = False                # the pipelined chunk (direct partials); False: 0082's lean.compute
++    gather: bool = False              # all-gathers on the comm stream, overlapped with the next piece
++    slab: bool = False                # hc_post + the next hc_pre per L2-sized row slab
++
++
++OFF = Mode()
++ALL = Mode(True, True, True)
++
++
++def parse(raw: str | None = None) -> Mode:
++    raw = os.environ.get(ENV, "0") if raw is None else raw
++    v = raw.strip().lower()
++    if v in ("", "0", "off", "false", "no"):
++        return OFF
++    if v in ("1", "on", "true", "yes", "all"):
++        return ALL
++    gather = slab = False
++    for tok in (t.strip() for t in v.split(",")):
++        if tok == "gather":
++            gather = True
++        elif tok == "slab":
++            slab = True
++        elif tok not in ("direct", ""):
++            raise ValueError(f"{ENV}={raw!r}: expected 0, 1 or a comma list of gather, slab, direct")
++    return Mode(True, gather, slab)
++
++
++DEFAULT = parse()                     # the load-time setting (the environment)
++MODE = DEFAULT                        # what the next lean chunk runs (``tf_knobs.prefill_overlap`` switches it)
++
++
++def on() -> bool:
++    return MODE.pipe
++
++
++def set_request(value: bool) -> None:
++    """patches/0093: ``tf_knobs.prefill_overlap`` for one request: 0 = 0082's order, 1 = the environment's variant if
++    it has one, else ``gather,slab``."""
++
++    global MODE
++    MODE = (DEFAULT if DEFAULT.pipe else ALL) if value else OFF
++
++
++def describe(m: Mode | None = None) -> str:
++    m = MODE if m is None else m
++    if not m.pipe:
++        return "off"
++    return ",".join([t for t, f in (("gather", m.gather), ("slab", m.slab)) if f] or ["direct"])
++
++
++_L2: dict[int, int] = {}
++
++
++def slab_rows(w, block: int) -> int:
++    """Rows of an hc slab: GLM53_TF_PREFILL_HC_SLAB (a multiple of 64, 0 = the whole sub-block), or half the L2 over a
++    row of streams, rounded down to 64 (at least 64, at most the sub-block)."""
++
++    raw = os.environ.get(SLAB_ENV, "").strip()
++    if raw:
++        v = int(raw)
++        if v < 0 or v % fastpf.GRID:
++            raise ValueError(f"{SLAB_ENV}={raw}: expected 0 or a multiple of {fastpf.GRID}")
++        return block if v == 0 else min(v, block)
++    dev = w.device
++    l2 = 0
++    if dev.type == "cuda":
++        idx = dev.index if dev.index is not None else torch.cuda.current_device()
++        if idx not in _L2:
++            _L2[idx] = int(getattr(torch.cuda.get_device_properties(idx), "L2_cache_size", 0) or 0)
++        l2 = _L2[idx]
++    per = w.cfg.streams * w.cfg.hidden * 2
++    v = (l2 // 2 // per) // fastpf.GRID * fastpf.GRID if l2 else 256
++    return max(fastpf.GRID, min(v, block))
++
++
++# -- the exchange ---------------------------------------------------------------------------------------------------
++class Pending:
++    """A piece's exchange: ``out`` [world, R, D] once waited for."""
++
++    __slots__ = ("out", "event", "job", "slot")
++
++    def __init__(self, out, event, job, slot):
++        self.out, self.event, self.job, self.slot = out, event, job, slot
++
++
++class Pipe:
++    """Two partial / gather slots of ``rows`` rows and, with ``gather``, the comm stream and its events. Installed
++    as ``Buffers.defer`` during a pipelined chunk: ``forward.out_proj`` writes into ``slot`` and ``forward.gather``
++    calls ``issue``. On the host (tests, no CUDA) a deferred exchange runs when it is waited for, the latest moment
++    the device could run it, so a slot hazard shows up there too."""
++
++    def __init__(self, w, rows: int, dtype: torch.dtype) -> None:
++        dev = w.device
++        self.rows, self.dtype, self.D = rows, dtype, w.cfg.hidden
++        self.world = w.world if w.comm is not None else 1
++        self.part = [torch.empty((rows, self.D), dtype=dtype, device=dev) for _ in range(2)]
++        self.gath = ([torch.empty((self.world * rows * self.D,), dtype=dtype, device=dev) for _ in range(2)]
++                     if w.comm is not None else None)
++        self.cuda = dev.type == "cuda"
++        self.stream = None
++        if self.cuda:
++            # high priority: NCCL's few blocks get the next free SM slots between the compute kernels' blocks
++            self.stream = torch.cuda.Stream(device=dev, priority=-1)
++            self.ready = [torch.cuda.Event() for _ in range(2)]
++            self.done = [torch.cuda.Event() for _ in range(2)]
++        self.queue: list = []
++        self.busy = [False, False]
++        self.k = 0
++        self.overlap = False
++        self.issued = 0
++
++    def fits(self, w, rows: int, dtype: torch.dtype) -> bool:
++        world = w.world if w.comm is not None else 1
++        return (self.rows >= rows and self.dtype == dtype and self.world == world
++                and (self.gath is not None) == (w.comm is not None))
++
++    def begin(self, overlap: bool) -> None:
++        self.overlap = overlap
++        self.k = 0
++
++    def slot(self, R: int) -> torch.Tensor:
++        """Where the next exchange's partial is written: [R, D] of the slot ``issue`` sends next."""
++
++        i = self.k % 2
++        if self.busy[i]:
++            raise RuntimeError("pfoverlap: a partial slot is written while its exchange is pending")
++        return self.part[i][:R]
++
++    def issue(self, w, b, R: int) -> Pending:
++        i = self.k % 2
++        if self.busy[i]:
++            raise RuntimeError("pfoverlap: an exchange is issued on a slot whose last exchange was not waited for")
++        self.k += 1
++        self.issued += 1
++        b.site = None                    # GLM53_TF_COMM=prefetch plans are decode-shaped: not used here
++        send = self.part[i][:R]
++        if w.comm is None:
++            return Pending(send.view(1, R, self.D), None, None, None)
++        recv = self.gath[i][:self.world * R * self.D]
++        out = recv.view(self.world, R, self.D)
++        if not self.overlap:
++            w.comm.all_gather(send.reshape(-1), recv)
++            if profile.ON:
++                profile.lap("allgather")
++            return Pending(out, None, None, None)
++        self.busy[i] = True
++        if not self.cuda:
++            def job(send=send, recv=recv):
++                w.comm.all_gather(send.reshape(-1), recv)
++
++            self.queue.append(job)
++            return Pending(out, None, job, i)
++        ready = self.ready[i]
++        ready.record()                   # on the compute stream, after the partial's producer
++        self.stream.wait_event(ready)
++        with torch.cuda.stream(self.stream):
++            w.comm.all_gather(send.reshape(-1), recv)
++        self.done[i].record(self.stream)
++        return Pending(out, self.done[i], None, i)
++
++    def wait(self, h: Pending) -> torch.Tensor:
++        if h.slot is None:
++            return h.out
++        if h.event is not None:
++            torch.cuda.current_stream().wait_event(h.event)
++        else:
++            while self.queue:
++                job = self.queue.pop(0)
++                job()
++                if job is h.job:
++                    break
++        self.busy[h.slot] = False
++        if profile.ON:
++            profile.lap("allgather")     # the part of the exchange the compute stream still waited for
++        return h.out
++
++    def idle(self) -> bool:
++        return not any(self.busy) and not self.queue
++
++    def abort(self) -> None:
++        """After an error inside a chunk: forget pending exchanges (the host queue), make the compute stream wait for
++        the comm stream (so no later kernel races an exchange still in flight)."""
++
++        self.queue.clear()
++        self.busy = [False, False]
++        if self.cuda and self.stream is not None:
++            torch.cuda.current_stream().wait_stream(self.stream)
++
++
++def _pipe(w, b, lb) -> Pipe:
++    dtype = torch.bfloat16 if (w.comm is not None and w.meta.get("fast_gather16")) else torch.float32
++    p = getattr(lb, "pipe", None)
++    if p is None or not p.fits(w, lb.block, dtype):
++        p = Pipe(w, lb.block, dtype)
++        lb.pipe = p                      # not a tensor attribute: ``LeanBuffers.nbytes`` counts the lean set only
++    return p
++
++
++# -- the chunk ------------------------------------------------------------------------------------------------------
++class _Chunk:
++    """One pipelined lean chunk (``compute``). Pieces run as pre(k), then post(k - 1) (its exchange waited for),
++    so exchange k - 1 overlaps pre(k)."""
++
++    def __init__(self, w, st, b, lb, R: int, pipe: Pipe, slab: int) -> None:
++        self.w, self.st, self.b, self.lb, self.R = w, st, b, lb, R
++        self.c = w.cfg
++        self.pos0 = st.pos
++        self.pipe = pipe
++        self.slab = slab
++        self.pending = None
++        self.fxs_last = None
++        self.order: list[str] = []       # the pieces' pre/post order (tests)
++
++    # scheduling
++    def slabs(self, a: int, r: int):
++        s = self.slab if self.slab > 0 else r
++        return [(a + o, min(s, r - o)) for o in range(0, r, s)]
++
++    def piece(self, name: str, pre, post, drain: bool) -> None:
++        if drain:
++            self.flush()
++        self.order.append("pre " + name)
++        h = pre()
++        prev, self.pending = self.pending, (name, h, post)
++        if prev is not None:
++            self._post(prev)
++
++    def flush(self) -> None:
++        if self.pending is not None:
++            prev, self.pending = self.pending, None
++            self._post(prev)
++
++    def _post(self, item) -> None:
++        name, h, post = item
++        self.order.append("post " + name)
++        post(self.pipe.wait(h))
++
++    # the hyper-connection mix of rows [s0, s0 + n) into the lean set's rows
++    def hc_pre(self, h, norm, s0: int, n: int) -> None:
++        c, lb, b = self.c, self.lb, self.b
++        glue.hc_pre(lb.x[s0:s0 + n], h.fn, h.base, h.scale, norm, lb.normed[s0:s0 + n], lb.xs[s0:s0 + n],
++                    lb.post[s0:s0 + n], lb.comb[s0:s0 + n], b.hcpart[:n], c.eps, c.hc_eps, c.hc_iters)
++        if profile.ON:
++            profile.lap("hc")
++
++    def hc_post(self, g, a: int, s0: int, n: int) -> None:
++        lb = self.lb
++        x = lb.x[s0:s0 + n]
++        glue.hc_post(x, x, g[:, s0 - a:s0 - a + n], lb.post[s0:s0 + n], lb.comb[s0:s0 + n])
++        if profile.ON:
++            profile.lap("hc")
++
++    # pieces
++    def attn_pre(self, layer, a: int, r: int):
++        w, st, b, lb = self.w, self.st, self.b, self.lb
++        pos = self.pos0 + a
++        b.site = (layer.index, "a")
++        if layer.kind == "kda":
++            return lean._kda_block(layer, w, st, b, lb, a, r, pos, lb.normed[a:a + r], lb.xs[a:a + r])
++        from .attention import CHUNK
++
++        # the DSA blocks (expanded and latent) read the window buffers' rows: 8 KB a row, 11 layers
++        b.normed[:r].copy_(lb.normed[a:a + r])
++        b.xs[:r].copy_(lb.xs[a:a + r])
++        di = st.dsa_index[layer.index]
++        lb.pos_dev.fill_(pos)
++        return lean.dsa_block(layer, w, st.kc[di], st.vc[di], lb.pos_dev, b, r, -(-(pos + r) // CHUNK),
++                              st.index[di] if st.index is not None else None, pos, None)
++
++    def attn_post(self, layer, a: int, r: int, g) -> None:
++        for s0, n in self.slabs(a, r):
++            self.hc_post(g, a, s0, n)
++            self.hc_pre(layer.ffn_hc, layer.post_norm, s0, n)
++
++    def ffn_pre(self, layer, a: int, r: int):
++        w, b, lb, c = self.w, self.b, self.lb, self.c
++        b.site = (layer.index, "f")
++        if layer.mlp is not None:
++            m = layer.mlp
++            qmm.matmul(lb.normed[a:a + r], m.gu, lb.xs[a:a + r], out=b.gu[:r], part=b.sk)
++            glue.swiglu(b.gu[:r], b.act[:r], b.xs_act[:r], c.limit)
++            return lean.out_proj(w, b, b.act[:r], m.down, b.xs_act[:r], r, "mlp.dense")
++        lean._shared_combine(layer, w, b, lb, a, r, self.pipe.slot(r))
++        return lean.gather(w, b, r)
++
++    def ffn_post(self, layer, nxt, a: int, r: int, g) -> None:
++        w, b, lb, c = self.w, self.b, self.lb, self.c
++        taps = b.tap_at.get(layer.index, ())
++        for s0, n in self.slabs(a, r):
++            self.hc_post(g, a, s0, n)
++            x = lb.x[s0:s0 + n]
++            for slot in taps:
++                glue.stream_mean(x, b.taps[slot][:n])
++                lb.tapcat[s0:s0 + n, slot * lb.D:(slot + 1) * lb.D].copy_(b.taps[slot][:n])
++            if nxt is not None:
++                self.hc_pre(nxt.attn_hc, nxt.in_norm, s0, n)
++                continue
++            glue.stream_mean(x, b.hidden[:n])
++            glue.rmsnorm(b.hidden[:n], w.norm, c.eps, lb.fnormed[s0:s0 + n], b.fxs[:n])
++            if s0 <= self.R - 1 < s0 + n:
++                self.fxs_last = b.fxs[self.R - 1 - s0:self.R - s0]
++            if profile.ON:
++                profile.lap("hc")
++
++    def run(self) -> None:
++        w, lb, c = self.w, self.lb, self.c
++        R = self.R
++        blocks = lb.sub_blocks(R)
++        one = len(blocks) == 1
++        layers = w.layers
++        first = layers[0]
++        for a, r in blocks:              # slabs within sub-blocks: hc_pre's scratch holds a sub-block's rows
++            for s0, n in self.slabs(a, r):
++                glue.embed(lb.ids[s0:s0 + n], w.embed, c.hidden, c.streams, lb.x[s0:s0 + n])
++                if profile.ON:
++                    profile.lap("embed")
++                self.hc_pre(first.attn_hc, first.in_norm, s0, n)
++        for li, layer in enumerate(layers):
++            nxt = layers[li + 1] if li + 1 < len(layers) else None
++            # attention of sub-block i reads rows i's inputs (the post of this layer's previous FFN piece i, which ran
++            # before unless it is the piece just before: one sub-block) and the KDA state / DSA cache that the pre
++            # work of sub-block i - 1 wrote (compute stream order)
++            for a, r in blocks:
++                self.piece(f"{layer.index}a{a}", lambda a=a, r=r, L=layer: self.attn_pre(L, a, r),
++                           lambda g, a=a, r=r, L=layer: self.attn_post(L, a, r, g), drain=one)
++            if layer.mlp is None:
++                self.flush()             # the routing reads every row's FFN input: the last attention post first
++                lean._routed(layer, w, lb, R)
++            for a, r in blocks:
++                self.piece(f"{layer.index}f{a}", lambda a=a, r=r, L=layer: self.ffn_pre(L, a, r),
++                           lambda g, a=a, r=r, L=layer, N=nxt: self.ffn_post(L, N, a, r, g), drain=one)
++        self.flush()
++
++
++def compute(w, st, b, lb, R: int, *, head: bool = True) -> torch.Tensor:
++    """``lean.compute`` pipelined (``MODE``): the same bits. Returns the last row's logits [1, V/world] (stale unless
++    ``head``); final-normed rows in ``lb.fnormed[:R]``, DFlash2 taps in ``lb.tapcat[:R]``."""
++
++    if R > lb.rows:
++        raise ValueError(f"lean chunk of {R} rows, the lean buffers hold {lb.rows}")
++    if lb.block > b.rows:
++        raise ValueError(f"lean sub-blocks of {lb.block} rows, the main buffers hold {b.rows}")
++    mode = MODE
++    pipe = _pipe(w, b, lb)
++    pipe.begin(mode.gather)
++    run = _Chunk(w, st, b, lb, R, pipe, slab_rows(w, lb.block) if mode.slab else 0)
++    with fastpf.chunk(b):
++        b.defer = pipe
++        ok = False
++        try:
++            run.run()
++            ok = True
++        finally:
++            b.defer = None
++            if not ok:
++                pipe.abort()
++        if not pipe.idle():
++            raise RuntimeError("pfoverlap: exchanges left pending at the end of a chunk")
++        if head:                         # patches/0080: prefill samples the last row only
++            qmm.matmul(lb.fnormed[R - 1:R], w.head, run.fxs_last, out=b.logits[:1], part=b.sk)
++        if profile.ON:
++            profile.lap("head")
++        lean._join(w)
++    compute.last = run                   # tests: the piece order of the last chunk
++    return b.logits[:1]
++
++
++compute.last = None

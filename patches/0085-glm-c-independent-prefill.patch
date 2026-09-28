@@ -1,0 +1,641 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index ccdaa4f..16e936d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -20,7 +20,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+-from . import fastpf, fp8pf, lean as lean_mod, profile
++from . import fastpf, fp8pf, lean as lean_mod, pfgrid, profile
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .weights import Weights
+@@ -130,6 +130,11 @@ class Engine:
+         self.fast_prefill = fastpf.enabled()
+         self.fp8_prefill = fp8pf.default()          # patches/0083: fast chunks on the FP8 kernels (fp8pf)
+         self.fast_snap: "Snapshot | None" = None
++        # patches/0085: where fast snapshots sit (``pfgrid``; both ranks agree, ``fastpf.settings``) and the chunk
++        # size the last fast prefill ran (``prefill_rows`` may be ``pfgrid.AUTO``: chosen per prefill)
++        self.snap_grid, self.snap_tail = pfgrid.snapshot_grid(), pfgrid.snapshot_tail()
++        self.fast_rows = 0
++        self.mark_snaps: list = []
+         w.meta["fast_gather16"] = fastpf.gather16()
+         if w.rank == 0 and w.meta["latent_kv"]:          # patches/0060
+             from .latent import kv_bytes_per_token
+@@ -362,10 +367,14 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     keep the last hidden row for the first draft. ``resume``: start from that snapshot, whose ids begin the prompt
+     (rows never depend on their chunk-mates, so the state ends with the bits of a prefill from the start).
+ 
+-    patches/0080, ``e.fast_prefill``: the main model's chunks run the fast kernels, at absolute multiples of the grid
+-    C = ``fastpf.grid(prefill_rows)``; ``e.fast_snap`` becomes the snapshot at B = floor(n / C) * C (taken before the
+-    last, partial chunk; None when B = 0), the only state of this prefill a later prompt may resume from, and
+-    ``resume`` must be such a snapshot of grid C (``fastpf``: why that keeps resumed == fresh)."""
++    patches/0080, ``e.fast_prefill``: the main model's chunks run the fast kernels. patches/0085 (``pfgrid``): their
++    bits do not depend on the chunking, so the chunks are ``pfgrid.plan``'s: from the resume point, C =
++    ``pfgrid.chunk_rows(prefill_rows)`` rows (``prefill_rows`` may be ``pfgrid.AUTO``), cut at the session marks
++    (``e.checkpoints``, snapshots in ``e.mark_snaps``) and at the snapshot point; ``e.fast_snap`` becomes the
++    snapshot at the prompt's last multiple of ``e.snap_grid`` (or the last chunk's start, ``pfgrid``'s tail rule;
++    None when that is 0), tagged by mode only, and ``resume`` must be a fast snapshot of the same mode at a multiple
++    of 64 (``pfgrid``: why that keeps resumed == fresh whatever C either prefill used). ``e.fast_rows``: the C this
++    prefill ran (0: exact)."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+@@ -375,14 +384,14 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     # patches/0082: fast chunks through the lean set when there is one; an exact chunk never needs more than the main
+     # buffers' rows (its rows never depend on their chunk-mates, so a smaller chunk gives the same bits)
+     lean = getattr(e, "lean", None) if fast else None
+-    step = fastpf.grid(e.prefill_rows) if fast else min(e.prefill_rows, e.rows)
+-    # patches/0083: an FP8 fast prefill runs other kernels, so its snapshots carry their own tag (C + 1)
++    # patches/0083: an FP8 fast prefill runs other kernels, so its snapshots carry their own tag (G + 1)
+     fp8pf.ON = fast and bool(getattr(e, "fp8_prefill", False))
+-    tag = fp8pf.tag(step, fp8pf.ON) if fast else 0
++    # patches/0085: tagged by mode (exact 0, fast G, FP8 G + 1), not by the chunk size
++    grid = getattr(e, "snap_grid", None) or pfgrid.snapshot_grid()
++    tag = pfgrid.tag(fast, fp8pf.ON, grid)
+     cap = lean.rows if lean is not None else e.rows
+-    if fast and step > cap:
+-        raise ValueError(f"fast prefill: a {step}-row chunk grid, the buffers hold {cap} rows")
+     e.fast_snap = None
++    e.mark_snaps = []
+     begin = 0
+     if resume is None:
+         e.reset()
+@@ -394,8 +403,8 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+             raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt")
+         if (use_mtp and resume.mtp_len < 0) or (drafter is not None and resume.drafter_end != begin):
+             raise ValueError("this snapshot's draft caches do not fit the request")
+-        if resume.grid != tag or begin % max(fp8pf.grid_of(resume.grid), 1):
+-            raise ValueError(f"a snapshot of grid {resume.grid} cannot resume a prefill of grid {tag}")
++        if not pfgrid.resumable(resume.grid, tag, begin):            # patches/0085: any C, same mode, 64-aligned
++            raise ValueError(f"a snapshot of grid {resume.grid} at {begin} cannot resume a prefill of grid {tag}")
+         restore(e, resume, drafter)
+         if use_mtp:
+             k = resume.pending.shape[0]
+@@ -405,13 +414,20 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+         profile.lap("resume")
+     last = None
+     n = len(prompt)
+-    edge = (n // step) * step if fast else -1       # patches/0080: the grid point B of the snapshot
+-    if fast and edge == begin and resume is not None:
+-        e.fast_snap = resume                        # no whole chunk past the resume point: it stays the grid state
+-    for start in range(begin, n, step):
+-        chunk = list(prompt[start:start + step])
++    # patches/0085: the chunk size (a speed choice: the bits do not depend on it), the chunks and the snapshot point
++    step = pfgrid.chunk_rows(e.prefill_rows, n - begin, cap, fast)
++    e.fast_rows = step if fast else 0
++    pl = pfgrid.plan(begin, n, step, fast=fast, marks=getattr(e, "checkpoints", ()) or (), grid=grid,
++                     tail=getattr(e, "snap_tail", None))
++    if fast and pl.snap == begin and resume is not None:
++        e.fast_snap = resume                        # nothing new to keep: the resume point stays the prompt's state
++    for start, stop in pl.spans:
++        chunk = list(prompt[start:stop])
+         R = len(chunk)
+-        if start == edge and start > begin:         # patches/0080: the state at B, before the partial chunk [B, n)
++        if start in pl.marks:                       # patches/0085: extra snapshots asked for (patches/0110's marks)
++            e.mark_snaps.append(take_snapshot(e, prompt[:start], e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                              drafter=drafter, grid=tag, mtp_len=start - 1))
++        if fast and start == pl.snap and start > begin:     # the state at the snapshot point, before [snap, ...)
+             e.fast_snap = take_snapshot(e, prompt[:start], e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                         drafter=drafter, grid=tag, mtp_len=start - 1)
+         if lean is not None:                        # patches/0082: the same bits in less memory
+@@ -423,10 +439,9 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+             profile.P.chunks += 1
+             profile.P.rows += R
+         if lean is not None:
+-            logits = lean_mod.compute(w, st, b, lean, staged, head=start + R == n)
++            logits = lean_mod.compute(w, st, b, lean, staged, head=stop == n)
+         else:
+-            logits = compute(w, st, b, staged, nch=chunks_for(st, R), host_pos=st.pos, fast=fast,
+-                             head=start + R == n)
++            logits = compute(w, st, b, staged, nch=chunks_for(st, R), host_pos=st.pos, fast=fast, head=stop == n)
+         if hasattr(e, "rows_from"):
+             e.rows_from = lean                      # patches/0082: main_hidden / tap_rows read the lean rows
+         last = logits[-1:].clone()
+@@ -452,7 +467,7 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+             commit(w, st, b, R, R)
+         if prof:
+             profile.lap("commit")
+-    if fast and edge == n and n > begin:            # patches/0080: the prompt ends on the grid
++    if fast and pl.snap == n:                       # patches/0080: the prompt ends on the grid
+         e.fast_snap = take_snapshot(e, prompt, e.last_hidden if use_mtp else None, mtp=use_mtp, drafter=drafter,
+                                     grid=tag)
+     first = e.sample(last, [len(prompt)], sampling)[0]
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 8573c1b..bfa8454 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -226,9 +226,12 @@ class GlmEngine:
+                                f"{fp_both[0]}, {fp_both[1]}")
+         if fastpf.enabled() and rank == 0:
+             gone = "; ".join(f"{k}: {v}" for k, v in fastpf.MISSING.items())
+-            rows = int(os.environ.get("GLM53_TF_PREFILL_ROWS", "64"))
+-            print(f"[tensorfold] fast prefill on: chunk grid {fastpf.grid(rows)}, "
+-                  f"{'bf16' if fastpf.gather16() else 'fp32'} gathers"
++            from . import pfgrid
++
++            rows = pfgrid.parse_rows(os.environ.get("GLM53_TF_PREFILL_ROWS", "64"))
++            print(f"[tensorfold] fast prefill on: chunks of {pfgrid.show_rows(rows)} rows (patches/0085: the state "
++                  f"does not depend on them), snapshots every {pfgrid.snapshot_grid()} tokens (tail "
++                  f"{pfgrid.snapshot_tail()}), {'bf16' if fastpf.gather16() else 'fp32'} gathers"
+                   + (f"; row-invariant kernels for {gone}" if gone else ""), flush=True)
+         # patches/0083: GLM53_TF_FP8_PREFILL (the default of the FP8 kernels in fast chunks) and whether they can run
+         from . import fp8pf
+@@ -263,10 +266,14 @@ class GlmEngine:
+         # GLM53_TF_PREFILL_ROWS: rows a prefill chunk commits at once (upstream 64). Each chunk reads every weight
+         # once, so larger chunks prefill faster; rows never depend on their chunk-mates, so the committed state
+         # keeps the same bits. Costs about 5 MB of window buffers a row on an EXL3 checkpoint.
+-        prefill_rows = int(os.environ.get("GLM53_TF_PREFILL_ROWS", "64"))
+-        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
++        # patches/0085: or "auto" (``pfgrid.chunk_rows``: the rows to prefill, up to the buffers; 64-row buffers here)
++        from . import pfgrid
++
++        prefill_rows = pfgrid.parse_rows(os.environ.get("GLM53_TF_PREFILL_ROWS", "64"))
++        self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows or 64, graphs=True,
+                         graph_rows=GRAPH_ROWS,
+                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
++        self.e.prefill_rows = prefill_rows
+         if self.drafter is not None:
+             self.drafter.capture()
+         self.costs = self._calibrate()
+@@ -465,14 +472,15 @@ class GlmEngine:
+         return auto, auto or not dflash, dflash
+ 
+     def _grid(self, fast: bool | None = None, rows: int | None = None, fp8: bool | None = None) -> int:
+-        """patches/0080: the snapshot grid a request uses: 0 (exact prefill), or its fast chunk grid (patches/0083:
+-        + 1 for an FP8 fast prefill, ``fp8pf.tag``)."""
++        """patches/0080: the snapshot tag a request uses: 0 (exact prefill), or a fast one (patches/0083: + 1 for an
++        FP8 fast prefill). patches/0085: by mode only (``pfgrid.tag``: the snapshot grid G, G + 1), never by the
++        request's chunk size, so fast requests of any ``prefill_rows`` share their snapshots (``rows`` is ignored)."""
+ 
+-        from . import fastpf, fp8pf
++        from . import pfgrid
+ 
+         fast = self.e.fast_prefill if fast is None else fast
+         fp8 = bool(getattr(self.e, "fp8_prefill", False)) if fp8 is None else fp8
+-        return fp8pf.tag(fastpf.grid(self.e.prefill_rows if rows is None else rows), fp8) if fast else 0
++        return pfgrid.tag(bool(fast), fp8, getattr(self.e, "snap_grid", None))
+ 
+     def _resume(self, prompt: list[int], code: list[int], grid: int | None = None):
+         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters (and,
+@@ -518,6 +526,7 @@ class GlmEngine:
+             stats["fast_prefill"] = grid - grid % 64            # patches/0083: the chunk grid C of the tag
+             if grid % 64:
+                 stats["fp8_prefill"] = 1
++            stats["fast_prefill"] = getattr(self.e, "fast_rows", 0) or stats["fast_prefill"]   # patches/0085: its C
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+diff --git a/src/tensorfold/families/glm5_next/cuda/fast_qmm.py b/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+index 967f1e2..764d1e0 100644
+--- a/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
++++ b/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+@@ -66,6 +66,10 @@ DEFAULT = (128, 64, 8, 3, 1)
+ BN_ONE, BN_SPLIT = 128, 64          # columns per program with one K slice / with several (exact variant)
+ BN_STORED = qmm.BN                  # columns of one stored weight tile (64)
+ MIN_ROWS = 64                       # fewer rows go to qmm.matmul (tuned for 1-128 rows)
++# patches/0085: in a fast-prefill chunk only this matrix (the head, set by ``fastpf.chunk``: one row in every chunk
++# schedule) keeps the qmm fallback below MIN_ROWS; every other call there runs the fast kernels whatever its rows, so
++# a row never gets other bits in a short call (a prompt's last chunk, a lean tail) than in a long one
++FAST_HEAD = None
+ 
+ # Measured on GB10 (tests/cuda/test_fastk_patches.py::test_fast_qmm_timing; every tile config gives qmm's bits, so
+ # the choice is free): per (N x K) and row bucket, (BM, BN, warps, stages) of the fastest config, or None where qmm's
+@@ -227,14 +231,16 @@ def _out(x: torch.Tensor, n: int, out: torch.Tensor | None, f32: bool) -> torch.
+ 
+ 
+ def matmul_prefill(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
+-                   f32: bool = False, part: torch.Tensor | None = None, exact: bool = True) -> torch.Tensor:
++                   f32: bool = False, part: torch.Tensor | None = None, exact: bool = True,
++                   min_rows: int | None = None) -> torch.Tensor:
+     """``qmm.matmul`` for prefill-sized M: x (M, K) bf16 (rows may be strided, unit column stride) @ q.T ->
+     (M, N) bf16, or the unrounded fp32 sums with ``f32``. ``xs``: x's fp32 64-input group sums (Q4 only; computed
+     when None). ``part`` is only used below ``MIN_ROWS`` rows, where ``qmm.matmul`` runs (no split-K partials
+-    here). ``exact``: keep qmm's K-slice summation order (qmm's bits); False sums all of K in one accumulator."""
++    here). ``exact``: keep qmm's K-slice summation order (qmm's bits); False sums all of K in one accumulator.
++    ``min_rows`` (patches/0085): the qmm threshold, ``MIN_ROWS`` by default (fast chunks pass 1)."""
+ 
+     m, k = x.shape
+-    if m < MIN_ROWS:                     # decode-sized (e.g. the last row's logits): qmm's kernels, the same bits
++    if m < (MIN_ROWS if min_rows is None else min_rows):     # decode-sized: qmm's kernels
+         return qmm.matmul(x, q, xs, out=out, f32=f32, part=part)
+     if k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
+         raise ValueError(f"matmul_prefill: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
+@@ -245,7 +251,8 @@ def matmul_prefill(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None,
+         if k % qmm.B16_BK:
+             raise ValueError(f"matmul_prefill: K={k} is not a multiple of {qmm.B16_BK}")
+         sk = qmm.b16_split_k(q.n, q.k) if exact else 1
+-        bm, bn, warps, stages, _ = config(q.n, q.k, m, sk, tuned=False)
++        # patches/0085: one-accumulator tiles by shape only (the row bucket never changed a bit; now it is not read)
++        bm, bn, warps, stages, _ = config(q.n, q.k, m if exact else 512, sk, tuned=False)
+         grid = (triton.cdiv(m, bm) * triton.cdiv(q.n, bn),)
+         _fb16[grid](x, q.weight, out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm, BN=bn, BK=qmm.B16_BK, F32=f32,
+                     num_warps=warps, num_stages=stages)
+@@ -268,11 +275,13 @@ def matmul_fast(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *,
+                 f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor:
+     """What fast-prefill chunks run behind ``qmm.matmul`` (``fastpf.chunk``): ``matmul_prefill(exact=False)``, one
+     accumulator over K (not qmm's bits; deterministic and row-independent). patches/0083: ``matmul_fp8`` while an
+-    FP8 prefill runs (``fp8pf.ON``)."""
++    FP8 prefill runs (``fp8pf.ON``). patches/0085: any row count but the head's (``FAST_HEAD``) stays on these
++    kernels, so a row's bits never depend on the call's size."""
+ 
++    lo = MIN_ROWS if q is FAST_HEAD else 1
+     if fp8pf.ON:
+-        return matmul_fp8(x, q, xs, out=out, f32=f32, part=part)
+-    return matmul_prefill(x, q, xs, out=out, f32=f32, part=part, exact=False)
++        return matmul_fp8(x, q, xs, out=out, f32=f32, part=part, min_rows=lo)
++    return matmul_prefill(x, q, xs, out=out, f32=f32, part=part, exact=False, min_rows=lo)
+ 
+ 
+ # -- patches/0083: FP8 (e4m3) tensor-core prefill matmuls -----------------------------------------------------------
+@@ -444,22 +453,22 @@ def b16_fp8_scales(q: B16) -> tuple[torch.Tensor, torch.Tensor]:
+     return got
+ 
+ 
+-def fp8_eligible(m: int, q: Q4 | B16) -> bool:
++def fp8_eligible(m: int, q: Q4 | B16, min_rows: int | None = None) -> bool:
+     """The shapes and row counts ``matmul_fp8`` runs in fp8 (the rest go to ``matmul_prefill(exact=False)``)."""
+ 
+-    return m >= MIN_ROWS and q.n * q.k >= FP8_MIN_NK and q.k % GS == 0
++    return m >= max(1, MIN_ROWS if min_rows is None else min_rows) and q.n * q.k >= FP8_MIN_NK and q.k % GS == 0
+ 
+ 
+ def matmul_fp8(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
+-               f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor:
++               f32: bool = False, part: torch.Tensor | None = None, min_rows: int | None = None) -> torch.Tensor:
+     """``qmm.matmul``'s contract on FP8 tensor cores (patches/0083): x (M, K) bf16 (rows may be strided) @ q.T with
+     x rounded to e4m3 per row. ``xs`` is not used (the kernel needs the sums of the rounded rows). Shapes below
+     ``FP8_MIN_NK`` weights and calls below ``MIN_ROWS`` rows run ``matmul_prefill(exact=False)`` (the bf16 fast
+     kernel; qmm below 64 rows) instead. Deterministic and row-independent; not the bf16 kernels' bits."""
+ 
+     m, k = x.shape
+-    if not fp8_eligible(m, q):
+-        return matmul_prefill(x, q, xs, out=out, f32=f32, part=part, exact=False)
++    if not fp8_eligible(m, q, min_rows):      # patches/0085: ``min_rows`` as for ``matmul_prefill``
++        return matmul_prefill(x, q, xs, out=out, f32=f32, part=part, exact=False, min_rows=min_rows)
+     if k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
+         raise ValueError(f"matmul_fp8: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
+     out = _out(x, q.n, out, f32)
+diff --git a/src/tensorfold/families/glm5_next/cuda/fastpf.py b/src/tensorfold/families/glm5_next/cuda/fastpf.py
+index 9967d41..2784b9c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/fastpf.py
++++ b/src/tensorfold/families/glm5_next/cuda/fastpf.py
+@@ -64,6 +64,16 @@ old reply through the fast path, then the new tokens. Exact snapshots after a re
+ that, which is why the switch is per request (``tf_knobs.fast_prefill``, patches/0091) and snapshots carry their
+ grid.
+ 
++patches/0085 (``pfgrid``) replaces rules 1-3 with a stronger property of the kernels and a finer grid: every fast
++kernel is row-independent and the KDA scan's blocks sit at absolute multiples of 64, so a fast prefill's state does
++not depend on its chunks at all. Chunks then start anywhere on multiples of 64 (C, even ``auto``, is a speed choice
++per request), the snapshot sits at the prompt's last multiple of 64 (GLM53_TF_SNAPSHOT_GRID) and is tagged by mode
++only (fast / FP8 fast), and any C resumes from it: a next turn re-prefills < 64 tokens of the old prompt plus the
++reply. With GLM53_TF_SNAPSHOT_GRID = C and a fixed C, ``pfgrid.plan`` gives exactly rules 1-3, and the argument above
++still covers kernels that are merely deterministic (the tests' adversarial stand-ins) in that setting. ``chunk``
++enforces the one property the kernels lacked: a call of fewer than 64 rows went to qmm (other bits than the same
++rows in a longer call); in a fast chunk every call but the head's (one row in every schedule) runs the fast kernels.
++
+ What runs fast (only the main model's prefill chunks; decode, verify, the MTP head and DFlash2 never)
+ ------------------------------------------------------------------------------------------------------
+ - routed experts (EXL3): ``exl3_fast.cu`` (fused grouped GEMMs, no Z partials), in-tree;
+@@ -128,22 +138,29 @@ def gather16() -> bool:
+ 
+ 
+ def grid(rows: int) -> int:
+-    """The fast chunk grid C for a chunk size of ``rows``: rows rounded down to a multiple of 64, at least 64."""
++    """The fast chunk size C for ``rows``: rows rounded down to a multiple of 64, at least 64 (patches/0085: a speed
++    choice, ``pfgrid.chunk_rows``; snapshots sit on ``pfgrid``'s grid, not on C's)."""
+ 
+     return max(GRID, (int(rows) // GRID) * GRID)
+ 
+ 
+ def settings() -> list[int]:
+-    """This rank's load-time fast-prefill settings (both ranks must agree: they decide the prefill's bits)."""
++    """This rank's load-time fast-prefill settings (both ranks must agree: they decide the prefill's bits, and
++    patches/0085's snapshot grid and tail decide its chunks)."""
+ 
+-    return [int(enabled()), int(gather16()), int(fast_kda is not None), int(fast_qmm is not None)]
++    from . import pfgrid
++
++    return [int(enabled()), int(gather16()), int(fast_kda is not None), int(fast_qmm is not None),
++            *pfgrid.settings()]
+ 
+ 
+ @contextlib.contextmanager
+-def chunk(b):
++def chunk(b, head=None):
+     """A fast chunk of the main model on buffers ``b``: the blocks see ``b.fast``, ``qmm.matmul`` runs
+     ``fast_qmm.matmul_fast`` and ``glue.hc_pre`` its dots through ``fast_qmm.hc_partial`` (when present) until the
+-    chunk's forward returns."""
++    chunk's forward returns. patches/0085: ``head`` (the model's head weight) is the one matrix a fast chunk still
++    sends to qmm below 64 rows (``fast_qmm.FAST_HEAD``); every other call runs the fast kernels whatever its rows,
++    so a row's bits never depend on the size of the call it is in."""
+ 
+     from . import glue, qmm
+ 
+@@ -152,10 +169,16 @@ def chunk(b):
+     mm = None if fast_qmm is None else getattr(fast_qmm, "matmul_fast", None) or fast_qmm.matmul_prefill
+     qmm.FAST_MM = mm
+     glue.FAST_HC = getattr(fast_qmm, "hc_partial", None)
++    keeps = fast_qmm is not None and hasattr(fast_qmm, "FAST_HEAD")
++    prev_head = fast_qmm.FAST_HEAD if keeps else None
++    if keeps:
++        fast_qmm.FAST_HEAD = head
+     try:
+         yield
+     finally:
+         qmm.FAST_MM, glue.FAST_HC = prev, prev_hc
++        if keeps:
++            fast_qmm.FAST_HEAD = prev_head
+         b.fast = False
+ 
+ 
+@@ -168,8 +191,11 @@ def kda_chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm
+     """KDA for a fast chunk starting at absolute position ``pos`` (a multiple of 64): ``fast_kda`` when present,
+     else the row-invariant chain. Same inputs, outputs and state layout as ``kda.chain`` (state [H, 128 (v), 128 (k)]
+     fp32; the conv window is shifted by ``forward.commit`` from the projection rows, as always). The replay inputs in
+-    ``scratch`` are not needed: a prefill chunk keeps all its rows."""
++    ``scratch`` are not needed: a prefill chunk keeps all its rows. patches/0085: ``pos`` must be a multiple of 64
++    (a call starting mid-block would split the block into two partial ones: other bits than any aligned schedule)."""
+ 
++    if pos % GRID:
++        raise ValueError(f"fast KDA at position {pos}: fast calls start at multiples of {GRID} (patches/0085)")
+     if fast_kda is not None:
+         return fast_kda.kda_prefill_chunked(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps,
+                                             lower, rows, scratch, state_out, pos=pos)
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 7439715..ee4ec20 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -554,7 +554,7 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+ 
+     if not fast:
+         return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, npb=npb)
+-    with fastpf.chunk(b):
++    with fastpf.chunk(b, w.head):           # patches/0085: the head keeps qmm below 64 rows
+         return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, npb=npb, head_rows=1 if head else 0)
+ 
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/fp8pf.py b/src/tensorfold/families/glm5_next/cuda/fp8pf.py
+index 332cf23..759246d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/fp8pf.py
++++ b/src/tensorfold/families/glm5_next/cuda/fp8pf.py
+@@ -32,7 +32,8 @@ and ROW-INDEPENDENT (a row's scale is its own amax; tile shapes are fixed per we
+ no atomics; fixed summation order), so every argument of ``fastpf`` holds unchanged: drafted == serial (the prefill
+ is deterministic; decode windows stay on the row-invariant kernels) and resumed == fresh (chunks on the grid C).
+ Snapshots of an FP8 prefill are tagged ``grid = C + 1`` (C is a multiple of 64): only FP8 fast requests of the same
+-grid resume from them, and they never resume from bf16 fast or exact snapshots. Lean prefill (0082) keeps its
++grid resume from them, and they never resume from bf16 fast or exact snapshots. patches/0085: the tag is G + 1, G the
++snapshot grid (``pfgrid.tag``), whatever the chunk size; FP8 requests of any C share them. Lean prefill (0082) keeps its
+ "same bits as 0080's chunk" property within the FP8 mode for the same reason (row-independent kernels).
+ 
+ Quality: e4m3 keeps 3 mantissa bits (relative rounding error at most 2^-4, ~1.8% rms per activation), per row; each
+diff --git a/src/tensorfold/families/glm5_next/cuda/lean.py b/src/tensorfold/families/glm5_next/cuda/lean.py
+index 6e65f23..59fe691 100644
+--- a/src/tensorfold/families/glm5_next/cuda/lean.py
++++ b/src/tensorfold/families/glm5_next/cuda/lean.py
+@@ -416,7 +416,7 @@ def _compute(w: Weights, st: State, b: Buffers, lb: LeanBuffers, R: int, *, head
+     c = w.cfg
+     pos0 = st.pos
+     blocks = lb.sub_blocks(R)
+-    with fastpf.chunk(b):
++    with fastpf.chunk(b, w.head):           # patches/0085: the head keeps qmm below 64 rows
+         glue.embed(lb.ids[:R], w.embed, c.hidden, c.streams, lb.x[:R])
+         if profile.ON:
+             profile.lap("embed")
+diff --git a/src/tensorfold/families/glm5_next/cuda/pfgrid.py b/src/tensorfold/families/glm5_next/cuda/pfgrid.py
+new file mode 100644
+index 0000000..d5eebd5
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/pfgrid.py
+@@ -0,0 +1,217 @@
++"""Chunk plans, snapshot positions and snapshot tags of GLM-5.3-Flash prefills (patches/0085).
++
++Why a fast prefill's state does not depend on its chunk size
++------------------------------------------------------------
++patches/0080 kept resumed == fresh for fast (not row-invariant) prefills by putting chunks and snapshots on an
++absolute grid of the chunk size C: a request resumed only from a snapshot of its own C, and re-prefilled up to C - 1
++tokens of the old prompt on every turn. patches/0085 removes the need for that: every kernel a fast chunk runs is
++ROW-INDEPENDENT (a row's bits never depend on which other rows share the call, nor on how many there are) and the
++one kernel that couples rows, the chunked KDA scan, couples them only inside 64-row blocks at ABSOLUTE multiples of
++``ALIGN`` = 64:
++
++- ``fast_qmm.matmul_fast`` / ``matmul_fp8`` / ``hc_partial``, the latent ``absorb_tc`` / ``expand_tc``: tiles fixed
++  by the weight's shape, one accumulator walking K in a fixed order, per-row FP8 scales, no split-K, no atomics; and
++  (patches/0085) every call of a fast chunk runs them whatever its row count (``fastpf.chunk``: the < 64-row qmm
++  fallback, which gave a chunk's short tail other bits than the same rows inside a longer chunk, is gone; the head,
++  one row in every schedule, keeps qmm);
++- ``exl3_fast.cu``: a routed pair's gate/up/down is one warp's ascending mma chain over all of K; the expert's other
++  members only decide which warp and pass hold the pair; the Hadamard / SwiGLU epilogue is per element;
++- attention, the indexer's selection (patches/0065 row blocks select exactly), glue, hyper-connections, the router,
++  the bf16 gathers: the row-invariant kernels, or per-row arithmetic;
++- ``fast_kda``: 64-row blocks at absolute multiples of 64 (``off = pos % 64``); a block's bits depend only on its
++  rows and the fp32 state entering it, and a state handed between two calls is the fp32 value the one-call scan
++  keeps in registers. Every fast call starts at a multiple of 64 (chunk starts, cuts, marks, resume points, lean
++  sub-blocks), so the only partial block is the prompt's last one, the same in every schedule.
++
++Hence the committed state after a fast prefill of tokens t[0:n] (KDA states and conv windows, attention / indexer /
++MTP / DFlash2 caches, the first token) is a function of t[0:n] alone: the chunk size C is a speed choice, a chunk may
++be cut at any multiple of 64, and the state at any multiple of 64 is what every fast prefill of a prompt extending
++it holds there (the rows below it never read a later row).
++
++The rules (``plan``, ``decode._prefill``, ``engine._run``)
++---------------------------------------------------------
++1. Chunks: from the resume point (a multiple of 64), chunks of up to C rows (``chunk_rows``: the request's
++   ``prefill_rows`` rounded down to a multiple of 64, or ``auto``), also cut at the session store's marks and at
++   the snapshot point.
++2. Snapshots (fast): one per prefill, at S = the prompt's last multiple of ``snapshot_grid()`` G (default 64,
++   ``GLM53_TF_SNAPSHOT_GRID``): after the prefill when S = n, else before the chunk that starts at S, the prefill
++   cutting a chunk there when needed. Exception (``snapshot_tail()``, ``GLM53_TF_SNAPSHOT_TAIL``, default 256):
++   when the schedule's last chunk already starts within that many rows before S, the snapshot is taken there
++   instead (no extra chunk of fewer than G rows now; a next turn re-prefills at most tail + G - 1 more rows).
++   Positions past the prompt's last grid point are never kept, and neither is the reply (its rows were written by
++   the row-invariant decode kernels, not the fast chunks, so they are not what a fast prefill of the next prompt
++   holds): a next turn re-prefills the old prompt's last < G tokens (or < tail + G), the reply and its new tokens.
++3. Tags: exact snapshots 0, fast ones G, FP8 fast ones G + 1 (``tag``) -- by mode, never by C. A fast request
++   resumes from any snapshot with its tag at a multiple of 64 (``resumable``), whatever C made it.
++
++Claim: a fast prefill of p resumed from a snapshot at B (tag match, B a multiple of 64, p[:B] = its ids) ends in the
++fresh fast prefill's state. The snapshot holds the state of some fast prefill of a prompt q with q[:B] = p[:B] at B
++(by induction over the prefills that made it: each resumed one ended, at every position, in its fresh state); that is
++the fresh prefill of p's state at B (the rows below B depend on p[:B] only); from B on, the chunks may differ from the
++fresh prefill's, which does not change a bit. With patches/0080's argument for the caches (a request writes them only
++from its resume point on) this gives resumed == fresh; drafted == serial holds because the prefill is deterministic.
++
++With GLM53_TF_SNAPSHOT_GRID = C and a fixed C the snapshots, tags and chunks are exactly patches/0080's grid rule.
++
++Nothing here imports torch (the session store and host tests use it).
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass, field
++from typing import Sequence
++
++ALIGN = 64                      # fast_kda's block: fast calls, cuts and fast snapshots sit on multiples of it
++AUTO = 0                        # prefill_rows "auto": the chunk size chosen per request (``chunk_rows``)
++FP8 = 1                         # added to the grid in an FP8 fast prefill's tag (fp8pf.TAG)
++GRID_ENV = "GLM53_TF_SNAPSHOT_GRID"
++TAIL_ENV = "GLM53_TF_SNAPSHOT_TAIL"
++DEFAULT_GRID = 64
++DEFAULT_TAIL = 256
++
++
++def snapshot_grid() -> int:
++    """GLM53_TF_SNAPSHOT_GRID (default 64, a multiple of 64): a fast prefill's snapshot sits at the prompt's last
++    multiple of it. Both ranks must agree (``settings``)."""
++
++    raw = os.environ.get(GRID_ENV, "").strip()
++    v = int(raw) if raw else DEFAULT_GRID
++    if v < ALIGN or v % ALIGN:
++        raise ValueError(f"{GRID_ENV}={raw}: expected a multiple of {ALIGN}")
++    return v
++
++
++def snapshot_tail() -> int:
++    """GLM53_TF_SNAPSHOT_TAIL (default 256, rows, >= 0): skip the cut at the snapshot point when the last chunk
++    already starts within this many rows before it (0: always cut)."""
++
++    raw = os.environ.get(TAIL_ENV, "").strip()
++    v = int(raw) if raw else DEFAULT_TAIL
++    if v < 0:
++        raise ValueError(f"{TAIL_ENV}={raw}: expected 0 or more rows")
++    return v
++
++
++def settings() -> list[int]:
++    """What both ranks must agree on (they decide the chunks, hence the collectives)."""
++
++    return [snapshot_grid(), snapshot_tail()]
++
++
++# -- tags -----------------------------------------------------------------------------------------------------------
++def tag(fast: bool, fp8: bool = False, grid: int | None = None) -> int:
++    """A prefill's snapshot tag: 0 (exact), G (fast), G + 1 (FP8 fast). Not the chunk size."""
++
++    if not fast:
++        return 0
++    g = snapshot_grid() if grid is None else int(grid)
++    return g + FP8 if fp8 else g
++
++
++def grid_of(t: int) -> int:
++    """The snapshot grid G of a tag (0 for exact snapshots): fast rows below a snapshot depend on the tokens up to the
++    end of their G-block at most (their 64-block, in fact)."""
++
++    return t - t % ALIGN
++
++
++def is_fp8(t: int) -> bool:
++    return bool(t) and t % ALIGN == FP8
++
++
++def resumable(snap_tag: int, req_tag: int, pos: int) -> bool:
++    """A snapshot of ``snap_tag`` at ``pos`` may resume a prefill of ``req_tag``: same mode, and a fast one sits on a
++    multiple of 64 (any chunk size resumes from it)."""
++
++    return snap_tag == req_tag and (not req_tag or pos % ALIGN == 0)
++
++
++# -- the chunk size -------------------------------------------------------------------------------------------------
++def parse_rows(v) -> int:
++    """GLM53_TF_PREFILL_ROWS / ``tf_knobs.prefill_rows``: a row count (>= 1), or "auto" (``AUTO``)."""
++
++    if isinstance(v, str):
++        s = v.strip().lower()
++        if s == "auto":
++            return AUTO
++        v = int(s)
++    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
++        raise ValueError(f"prefill rows {v!r}: expected a positive integer or \"auto\"")
++    return v
++
++
++def show_rows(rows: int):
++    """The knob's value as a request writes it: an int, or "auto"."""
++
++    return "auto" if rows == AUTO else int(rows)
++
++
++def chunk_rows(rows: int, todo: int, cap: int, fast: bool) -> int:
++    """The chunk size C of a prefill of ``todo`` tokens: ``rows`` (a count, or ``AUTO``) on buffers of ``cap`` rows.
++    Fast: a multiple of 64 (rows rounded down, at least 64); auto = the rows to prefill rounded up to 64, at most cap
++    rounded down to 64 (bigger chunks are never slower: each reads the weights once; the snapshot rule, not C, bounds
++    what a next turn re-prefills). Exact: rows capped at the buffers (auto: all of them); any C gives the same bits."""
++
++    if not fast:
++        return max(1, min(cap, todo if rows == AUTO else rows))
++    most = cap // ALIGN * ALIGN
++    if most < ALIGN:
++        raise ValueError(f"fast prefill: chunks are multiples of {ALIGN} rows, the buffers hold {cap}")
++    if rows == AUTO:
++        return max(ALIGN, min(most, -(-todo // ALIGN) * ALIGN))
++    c = max(ALIGN, rows // ALIGN * ALIGN)
++    if c > most:
++        raise ValueError(f"fast prefill: {c}-row chunks, the buffers hold {cap} rows")
++    return c
++
++
++# -- the plan -------------------------------------------------------------------------------------------------------
++@dataclass
++class Plan:
++    """A prefill of positions [begin, n): its chunks, where its snapshot is taken (``snap``: begin = the resume
++    snapshot, or none when begin = 0; begin < snap < n: before the chunk starting there; n: after the prefill;
++    -1: none, exact prefills) and the marks it snapshots too (each the start of a chunk)."""
++
++    spans: list[tuple[int, int]]
++    snap: int
++    marks: list[int] = field(default_factory=list)
++    cut: bool = False                    # a chunk was cut at the snapshot point
++
++
++def spans(begin: int, n: int, step: int, cuts: Sequence[int] = ()) -> list[tuple[int, int]]:
++    """Chunks [start, stop) of up to ``step`` rows from ``begin``, also cut at every position in ``cuts``."""
++
++    out: list[tuple[int, int]] = []
++    start = begin
++    for q in sorted({c for c in cuts if begin < c < n}) + [n]:
++        while start < q:
++            stop = min(start + step, q)
++            out.append((start, stop))
++            start = stop
++    return out
++
++
++def plan(begin: int, n: int, step: int, *, fast: bool, marks: Sequence[int] = (), grid: int | None = None,
++         tail: int | None = None) -> Plan:
++    """The chunks and snapshot of a prefill of positions [begin, n) in chunks of ``step`` rows (``chunk_rows``),
++    also snapshotting at ``marks`` (the session store's: exact anywhere, fast on multiples of 64)."""
++
++    if not 0 <= begin < n or step < 1:
++        raise ValueError(f"prefill plan: positions {begin}..{n}, {step}-row chunks")
++    if not fast:
++        m = sorted({q for q in marks if begin < q < n})
++        return Plan(spans(begin, n, step, m), -1, m)
++    if begin % ALIGN or step % ALIGN:
++        raise ValueError(f"fast prefill plan: resume point {begin} and chunk size {step} must be multiples of {ALIGN}")
++    g = snapshot_grid() if grid is None else int(grid)
++    t = snapshot_tail() if tail is None else int(tail)
++    m = sorted({q for q in marks if begin < q < n and q % ALIGN == 0})
++    base = spans(begin, n, step, m)
++    if n % g == 0:
++        return Plan(base, n, m)
++    s = n // g * g
++    last = base[-1][0]
++    if last >= s or s - last <= t:
++        return Plan(base, last, [q for q in m if q != last])
++    return Plan(spans(begin, n, step, m + [s]), s, [q for q in m if q != s], cut=True)
+diff --git a/src/tensorfold/families/glm5_next/cuda/pfoverlap.py b/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+index 15c7cff..2842869 100644
+--- a/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
++++ b/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+@@ -419,7 +419,7 @@ def compute(w, st, b, lb, R: int, *, head: bool = True) -> torch.Tensor:
+     pipe = _pipe(w, b, lb)
+     pipe.begin(mode.gather)
+     run = _Chunk(w, st, b, lb, R, pipe, slab_rows(w, lb.block) if mode.slab else 0)
+-    with fastpf.chunk(b):
++    with fastpf.chunk(b, w.head):           # patches/0085: the head keeps qmm below 64 rows
+         b.defer = pipe
+         ok = False
+         try:

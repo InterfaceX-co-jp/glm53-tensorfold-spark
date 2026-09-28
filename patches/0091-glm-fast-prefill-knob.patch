@@ -1,0 +1,87 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index e878f76..51569de 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -305,7 +305,8 @@ class GlmEngine:
+ 
+         return {"expert_loop": int(bool(exl3_mm.LOOP)), "prefill_rows": int(self.e.prefill_rows),
+                 "longctx_graphs": int(bool(self.e.longctx)), "profile": int(bool(profile.ON)),
+-                "auto_fdrafts": int(self.f_most), "calib_online": int(bool(self.calib_on))}
++                "auto_fdrafts": int(self.f_most), "calib_online": int(bool(self.calib_on)),
++                "fast_prefill": int(bool(self.e.fast_prefill))}          # patches/0091
+ 
+     def _set_knobs(self, values: dict[str, int]) -> None:
+         """Set the knobs whose value differs from the current one (the others are left exactly as they are)."""
+@@ -332,6 +333,8 @@ class GlmEngine:
+             self.f_most = changed["auto_fdrafts"]
+         if "calib_online" in changed:
+             self.calib_on = bool(changed["calib_online"])
++        if "fast_prefill" in changed:           # patches/0091
++            self.e.fast_prefill = bool(changed["fast_prefill"])
+ 
+     def _knobs(self, values: dict[str, int]):
+         """Context: the request's knobs on this rank, then this rank's previous values again (also on errors)."""
+@@ -657,7 +660,9 @@ class GlmEngine:
+ 
+             self.online = OnlineCosts(self.base_costs["verify"])
+         stop_eos = bool(getattr(self.request, "stop_eos", True))
+-        hit = self._resume(list(prompt), code) if draft else None
++        # patches/0091: a snapshot made by the request's own prefill mode (exact, or fast on the request's grid)
++        grid = self._grid(bool(values["fast_prefill"]), values["prefill_rows"])
++        hit = self._resume(list(prompt), code, grid) if draft else None
+         # patches/0070: frozen for the request; patches/0090: only while its calib_online is on
+         table = self.online.table() if self.online is not None and values["calib_online"] else []
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+diff --git a/src/tensorfold/families/glm5_next/cuda/knobs.py b/src/tensorfold/families/glm5_next/cuda/knobs.py
+index 88b2e25..d7589a9 100644
+--- a/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ b/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -2,8 +2,12 @@
+ 
+ The GLM53_TF_* environment of the earlier patches sets each knob's DEFAULT at load; a request may override any
+ subset of the knobs below for itself only, so one loaded server (a load takes minutes) can A/B many variants.
+-After the request, the defaults apply again. Every knob here only picks among speed paths already proven exact
+-(drafted == serial, chunk-size independence, bit-identical kernels), so a request's tokens do not depend on them.
++After the request, the defaults apply again. Every knob here but ``fast_prefill`` only picks among speed paths
++already proven exact (drafted == serial, chunk-size independence, bit-identical kernels), so a request's tokens do not
++depend on them. ``fast_prefill`` (patches/0091) runs the prompt through patches/0080's fast kernels: the request's
++tokens then depend on it and on ``prefill_rows`` (its chunk grid, rounded down to a multiple of 64), while drafted
++== serial and resumed == fresh still hold within the same setting (fast snapshots resume fast requests of the same
++grid only).
+ 
+     key             values                   env default                    what it switches
+     lookup          0 | 1                    GLM53_TF_LOOKUP (1)            prompt-lookup drafts inside ``auto``
+@@ -17,6 +21,8 @@ After the request, the defaults apply again. Every knob here only picks among sp
+                                                                             (1 needs the load-time default 1)
+     profile         0 | 1                    GLM53_TF_PROFILE (0)           prefill timing probe (rank 0 prints)
+     depth           "cost" | "threshold"     GLM53_TF_DEPTH (threshold)     plain ``auto``'s draft depths
++    fast_prefill    0 | 1                    GLM53_TF_FAST_PREFILL (0)      patches/0080's fast prefill (needs a
++                                                                            PREFILL_ROWS_MAX of at least 64)
+ 
+ Knobs fixed at load (``LOAD_ONLY``) are refused with the reason. Rank 0 validates a request's knobs
+ (``parse``), resolves every knob to the value the request runs with, and sends the integers rank 1 needs in the
+@@ -40,12 +46,13 @@ RANGES: dict[str, tuple[int, int | None]] = {
+     "calib_online": (0, 1),
+     "longctx_graphs": (0, 1),
+     "profile": (0, 1),
++    "fast_prefill": (0, 1),              # patches/0091
+ }
+ PER_REQUEST = tuple(RANGES) + ("depth",)
+ 
+ # the knobs rank 1 applies itself, in header order (lookup / lookup_min travel in the policy code, depth as
+ # patches/0071's cost flag, calib_online as rank 0's cost table)
+-HEADER = ("expert_loop", "prefill_rows", "longctx_graphs", "profile", "auto_fdrafts", "calib_online")
++HEADER = ("expert_loop", "prefill_rows", "longctx_graphs", "profile", "auto_fdrafts", "calib_online", "fast_prefill")
+ 
+ LOAD_ONLY: dict[str, str] = {
+     "nonexpert": "GLM53_TF_NONEXPERT is the stored weight format, quantized once at load",
+@@ -91,6 +98,9 @@ def parse(raw: Any, *, rows_max: int, longctx_ok: bool = True, batch: bool = Fal
+         if not lo <= value <= hi:
+             extra = " (GLM53_TF_PREFILL_ROWS_MAX at load)" if key == "prefill_rows" else ""
+             raise ValueError(f"tf_knobs.{key}={value}: expected {lo} to {hi}{extra}")
++        if key == "fast_prefill" and value and rows_max < 64:          # patches/0091: the smallest chunk grid
++            raise ValueError(f"tf_knobs.fast_prefill=1: fast prefill chunks are multiples of 64 rows, the buffers hold "
++                             f"{rows_max} (GLM53_TF_PREFILL_ROWS_MAX at load)")
+         if key == "longctx_graphs" and value and not longctx_ok:
+             raise ValueError("tf_knobs.longctx_graphs=1: this engine was loaded with GLM53_TF_LONGCTX_GRAPHS=0 (no "
+                              "long-context graph buffers); load with the default 1 to switch it per request")

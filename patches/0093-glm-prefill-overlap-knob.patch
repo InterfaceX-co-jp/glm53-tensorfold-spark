@@ -1,0 +1,62 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 906539c..775e730 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -334,13 +334,14 @@ class GlmEngine:
+     def _knob_state(self) -> dict[str, int]:
+         """This rank's current value of every knob in the header (the load-time defaults between requests)."""
+ 
+-        from . import exl3_mm, profile
++        from . import exl3_mm, pfoverlap, profile
+ 
+         return {"expert_loop": int(bool(exl3_mm.LOOP)), "prefill_rows": int(self.e.prefill_rows),
+                 "longctx_graphs": int(bool(self.e.longctx)), "profile": int(bool(profile.ON)),
+                 "auto_fdrafts": int(self.f_most), "calib_online": int(bool(self.calib_on)),
+                 "fast_prefill": int(bool(self.e.fast_prefill)),          # patches/0091
+-                "fp8_prefill": int(bool(getattr(self.e, "fp8_prefill", False)))}      # patches/0092
++                "fp8_prefill": int(bool(getattr(self.e, "fp8_prefill", False))),     # patches/0092
++                "prefill_overlap": int(pfoverlap.on())}                  # patches/0093
+ 
+     def _set_knobs(self, values: dict[str, int]) -> None:
+         """Set the knobs whose value differs from the current one (the others are left exactly as they are)."""
+@@ -372,6 +373,10 @@ class GlmEngine:
+             self.e.fast_prefill = bool(changed["fast_prefill"])
+         if "fp8_prefill" in changed:            # patches/0092
+             self.e.fp8_prefill = bool(changed["fp8_prefill"])
++        if "prefill_overlap" in changed:        # patches/0093: the same bits either way (patches/0084)
++            from . import pfoverlap
++
++            pfoverlap.set_request(bool(changed["prefill_overlap"]))
+ 
+     def _knobs(self, values: dict[str, int]):
+         """Context: the request's knobs on this rank, then this rank's previous values again (also on errors)."""
+diff --git a/src/tensorfold/families/glm5_next/cuda/knobs.py b/src/tensorfold/families/glm5_next/cuda/knobs.py
+index bd062ad..20229d7 100644
+--- a/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ b/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -27,6 +27,9 @@ its snapshots are tagged C + 1 and resume FP8 fast requests of the same grid onl
+     fp8_prefill     0 | 1                    GLM53_TF_FP8_PREFILL (0)       patches/0083's FP8 kernels in fast
+                                                                             chunks (no effect with fast_prefill 0;
+                                                                             needs FP8 tensor cores)
++    prefill_overlap 0 | 1                    GLM53_TF_PREFILL_OVERLAP (0)   patches/0084's pipelined lean chunks
++                                                                            (same bits; 1 = the env's variant, or
++                                                                            gather,slab)
+ 
+ Knobs fixed at load (``LOAD_ONLY``) are refused with the reason. Rank 0 validates a request's knobs
+ (``parse``), resolves every knob to the value the request runs with, and sends the integers rank 1 needs in the
+@@ -52,13 +55,14 @@ RANGES: dict[str, tuple[int, int | None]] = {
+     "profile": (0, 1),
+     "fast_prefill": (0, 1),              # patches/0091
+     "fp8_prefill": (0, 1),               # patches/0092
++    "prefill_overlap": (0, 1),           # patches/0093
+ }
+ PER_REQUEST = tuple(RANGES) + ("depth",)
+ 
+ # the knobs rank 1 applies itself, in header order (lookup / lookup_min travel in the policy code, depth as
+ # patches/0071's cost flag, calib_online as rank 0's cost table)
+ HEADER = ("expert_loop", "prefill_rows", "longctx_graphs", "profile", "auto_fdrafts", "calib_online", "fast_prefill",
+-          "fp8_prefill")
++          "fp8_prefill", "prefill_overlap")
+ 
+ LOAD_ONLY: dict[str, str] = {
+     "nonexpert": "GLM53_TF_NONEXPERT is the stored weight format, quantized once at load",

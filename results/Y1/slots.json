@@ -1,0 +1,91 @@
+{
+ "label": "",
+ "args": {
+  "base": "http://127.0.0.1:8000",
+  "model": "GLM-5.3-Flash-EXL3",
+  "modes": "slots",
+  "doc": 20000,
+  "system": 2000,
+  "append": 1500,
+  "tokens": 64,
+  "long_tokens": 256,
+  "streams": "1,2,4",
+  "reps": 2,
+  "delay": 3.0,
+  "extra": "{}",
+  "label": "",
+  "out": "results/Y1/slots.json"
+ },
+ "slots": [
+  {
+   "step": 0,
+   "session": 1,
+   "ttft_s": 22.563923983994755,
+   "prompt_tokens": 24733,
+   "cached_tokens": 0
+  },
+  {
+   "step": 1,
+   "session": 2,
+   "ttft_s": 23.668829374997586,
+   "prompt_tokens": 25933,
+   "cached_tokens": 0
+  },
+  {
+   "step": 2,
+   "session": 3,
+   "ttft_s": 23.422284222993767,
+   "prompt_tokens": 24663,
+   "cached_tokens": 0
+  },
+  {
+   "step": 3,
+   "session": 4,
+   "ttft_s": 22.590408768999623,
+   "prompt_tokens": 24741,
+   "cached_tokens": 0
+  },
+  {
+   "step": 4,
+   "session": 1,
+   "ttft_s": 2.1547640499993577,
+   "prompt_tokens": 26428,
+   "cached_tokens": 24576
+  },
+  {
+   "step": 5,
+   "session": 2,
+   "ttft_s": 1.8692382159933913,
+   "prompt_tokens": 27624,
+   "cached_tokens": 25920
+  },
+  {
+   "step": 6,
+   "session": 3,
+   "ttft_s": 1.9403511359996628,
+   "prompt_tokens": 26352,
+   "cached_tokens": 24576
+  },
+  {
+   "step": 7,
+   "session": 4,
+   "ttft_s": 2.016803088001325,
+   "prompt_tokens": 26421,
+   "cached_tokens": 24576
+  },
+  {
+   "step": 8,
+   "session": 5,
+   "ttft_s": 23.973748398006137,
+   "prompt_tokens": 25968,
+   "cached_tokens": 0
+  },
+  {
+   "step": 9,
+   "session": 1,
+   "ttft_s": 25.59036971200112,
+   "prompt_tokens": 28106,
+   "cached_tokens": 0
+  }
+ ]
+}

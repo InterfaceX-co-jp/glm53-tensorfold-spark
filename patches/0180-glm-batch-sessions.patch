@@ -1,0 +1,587 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+index 55e9d7b..7aae7e4 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batch.py
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -49,6 +49,22 @@ capturable code (its result) and is captured after (as 0050 does). Windows cross
+ Tensor parallelism. Rank 0 alone decides each round's cancels, admissions (slot, resume length, request header)
+ and pieces and shares them before the round; rank 1 runs the same rounds in ``follow``.
+ 
++Sessions (patches/0180, GLM53_TF_SESSION_GIB > 0 with GLM53_TF_BATCH_SESSIONS=1): patches/0110's store behind every
++slot. At admission rank 0 looks the prompt up in the store (``SessionStore.plan``: the longest stored prefix of the
++request's prefill mode, and the marks its prefill takes); when that resumes more than the free slots' own snapshots,
++the request goes to the free slot already holding most of the entry's pages, and ``_admit`` copies the entry into
++that slot's caches (restore = copy-in: the slot owns its copy, so later evictions never touch it) and resumes its
++first piece from the entry's snapshot. Saves follow the lone engine's rules on the slot's live caches: marks (and a
++piece end that is one) right after the piece that took them, the prompt snapshot after the last piece (exact: at the
++prompt's end; fast: its last grid point), the reply snapshot when a drafted exact request ends. Rank 0 ships each
++admission's session plan (entry, marks, its store digest) right after the admission's prompt, and each save's
++decision (stored / skipped / duplicate, evictions) when it happens, both inside the round both ranks run; rank 1
++checks the digest and applies the decisions. The store's budget is set aside at load (slots are added while the
++reserve AND the budget stay free) and at admission (``batchplan.admit_free``). A fork point is also a prefix shared
++with a prompt in flight (running or admitted in the same round): sessions admitted together see no stored entry of
++each other. Which side of a save decision a batcher is on is its role (``follow`` = rank 1), never ``g.rank``, as
++for every other message of a round.
++
+ Kept in step with ``forward.py``: ``compute_multi``'s layer loop, ``_kda`` and ``_dsa`` mirror ``forward.compute``,
+ ``kda_block`` and ``dsa_block`` (and ``latent``'s pieces); a change there must be made here too (the tests compare
+ batched rows with lone ones bit for bit).
+@@ -314,6 +330,7 @@ class Job:
+     submitted: float = 0.0
+     echo: dict = field(default_factory=dict)      # the response's ``tf_knobs``
+     stats: dict = field(default_factory=dict)
++    sess: Any = None                              # patches/0180: the admission's ``sessions.Plan`` (store on)
+ 
+ 
+ class Always:
+@@ -531,6 +548,7 @@ class Seq:
+     t0: float = 0.0
+     pieces: int = 0
+     emitted: int = 0                              # tokens produced by this run (a rerun re-produces the sent ones)
++    marks: tuple = ()                             # patches/0180: the session store's marks for this prompt
+ 
+ 
+ class Batcher:
+@@ -561,6 +579,13 @@ class Batcher:
+         self.reserve = float(os.environ.get("GLM53_TF_BATCH_RESERVE_GB", "") or 4.0) * 2**30
+         self.admit_min = float(os.environ.get("GLM53_TF_BATCH_ADMIT_GB", "") or 1.0) * 2**30
+         self.last_verify = False
++        # patches/0180: the session store behind the slots (``attach_store``, after the batcher); its budget is set
++        # aside now, so the slots never take the memory the store may fill later
++        from . import sessions
++
++        self.store = None
++        self.store_budget = sessions.budget_bytes() if sessions.batch_enabled() else 0
++        self.following = False                    # patches/0180: True in ``follow`` (rank 1's side of every message)
+         # -- slots: what fits, the same count on both ranks ------------------------------------------------------
+         b = e.buf
+         self.states: list[State] = [e.st]
+@@ -571,7 +596,7 @@ class Batcher:
+         for _ in range(1, n):
+             # both ranks decide each slot together: making one captures graphs with collectives in them
+             before = self._free()
+-            ok = g._gather_ints([int(before - per >= self.reserve)])
++            ok = g._gather_ints([int(before - per - self.store_budget >= self.reserve)])
+             if not (ok[0][0] and ok[1][0]):
+                 break
+             st = self._new_state()
+@@ -584,7 +609,8 @@ class Batcher:
+         if fit < n and g.rank == 0:
+             print(f"[tensorfold] GLM53_TF_BATCH={n}: only {fit} sequence(s) fit with GLM53_TF_BATCH_RESERVE_GB="
+                   f"{self.reserve / 2**30:g} GB kept free ({per / 2**30:.2f} GB a sequence at {e.st.capacity} cache "
+-                  "slots); serving that many", flush=True)
++                  "slots)" + (f" and the session store's {self.store_budget / 2**30:g} GiB (GLM53_TF_SESSION_GIB)"
++                              if self.store_budget else "") + "; serving that many", flush=True)
+         self.n = n = fit
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+         rows = min(b.rows, n * MAX_ROWS)
+@@ -624,6 +650,52 @@ class Batcher:
+             self.thread = threading.Thread(target=self._serve, name="glm-batch", daemon=True)
+             self.thread.start()
+ 
++    # -- patches/0180: the session store behind the slots ----------------------------------------------------------
++    def attach_store(self, store) -> None:
++        """Serve the slots from ``store`` (``sessions.SessionStore`` built on slot 0's state): a live map per slot; the
++        store keeps at least the admission minimum free when it grows."""
++
++        store.bind_slots(self.states)
++        store.reserve = max(store.reserve, int(self.admit_min))
++        self.store = store
++
++    def _headroom(self) -> int:
++        return self.store.headroom() if self.store is not None else 0
++
++    def _session_plan(self, job: Job, slot: int, cached: int, free: list[int],
++                      others: list[list[int]]) -> tuple[int, int]:
++        """Rank 0: the store's plan for an admission (``job.sess``); when a stored entry resumes more than the slot's
++        own snapshots, the free slot to restore it into and its length. ``others``: the prompts in flight beside it
++        (fork points too: their entries are not stored yet). -> (slot, resume length)."""
++
++        g = self.g
++        _, need_mtp, need_f = g._drafters(job.code)
++        sess = self.store.plan(job.prompt, self._grid(job.values), need_mtp, need_f and g.drafter is not None,
++                               cached, job.draft, others)
++        job.sess = sess
++        if sess.entry is None:
++            return slot, cached
++        e = sess.entry
++        slot = batchplan.place_entry(free, {s: self.store.overlap(e, s) for s in free},
++                                     {s: self.used[s] for s in free})
++        return slot, len(e.ids)
++
++    def _save(self, slot: int, snaps: list) -> None:
++        """Store snapshots of ``slot``'s live state (both ranks, in the round's order: rank 0 decides and sends its
++        decisions, the follower applies them). The side is the batcher's role (``follow``), as for the round plans,
++        not ``g.rank``."""
++
++        if self.store is None:
++            return
++        snaps = [x for x in snaps if x is not None]
++        if not snaps:
++            return
++        with self.store.on(slot):
++            if self.following:
++                self.store.save_all(snaps, forced=self.g._share(None))
++            else:
++                self.g._share(self.store.save_all(snaps))
++
+     # -- slots ----------------------------------------------------------------------------------------------------
+     @staticmethod
+     def _free() -> int:
+@@ -842,11 +914,17 @@ class Batcher:
+     def follow(self) -> None:
+         """Rank 1: run every round rank 0 plans, forever."""
+ 
++        self.following = True                   # patches/0180: the save decisions come from rank 0 too
+         with torch.no_grad():
+             while True:
+                 cancels, admits, pieces = batchplan.parse_plan(self.g._share(None))
+-                self._execute(cancels, [(slot, cached, self._job_from(header, self.g._share(None)))
+-                                        for slot, cached, header in admits], pieces)
++                jobs = []
++                for slot, cached, header in admits:
++                    job = self._job_from(header, self.g._share(None))
++                    if self.store is not None:          # patches/0180: rank 0's session plan, after its digest check
++                        job.sess = self.store.follow(self.g._share(None))
++                    jobs.append((slot, cached, job))
++                self._execute(cancels, jobs, pieces)
+ 
+     def _plan(self) -> tuple[list[int], list[tuple[int, int, Job]], list[int]] | None:
+         """Rank 0: this round's cancels, admissions and prefill piece, shared with rank 1 (None: ``stop``)."""
+@@ -872,15 +950,20 @@ class Batcher:
+                 requeue.append(self.seqs[v].job)
+             admits: list[tuple[int, int, Job]] = []
+             others = any(s is not None and i not in cancels for i, s in enumerate(self.seqs))
++            # patches/0180: the prompts in flight (fork partners whose entries are not stored yet)
++            flying = [s.job.prompt for i, s in enumerate(self.seqs) if s is not None and i not in cancels]
+             waiting = list(self.queue)
+             for i in batchplan.admission_order([j.background for j in waiting]):
+                 job = waiting[i]
+                 if not free:
+                     break
+-                if (others or admits) and self._free() < self.admit_min:
++                if (others or admits) and batchplan.admit_free(self._free(), self._headroom()) < self.admit_min:
+                     self.counts["deferred"] += 1               # short of memory: it waits for a request to end
+                     break
+                 slot, cached = self._place(job, free)
++                if self.store is not None:                     # patches/0180: a stored session may resume more
++                    slot, cached = self._session_plan(job, slot, cached, free,
++                                                      flying + [j.prompt for _, _, j in admits])
+                 free.remove(slot)
+                 self.queue.remove(job)
+                 admits.append((slot, cached, job))
+@@ -905,6 +988,8 @@ class Batcher:
+         self.g._share(plan)
+         for _, _, job in admits:
+             self.g._share(job.prompt)
++            if self.store is not None:                  # patches/0180: the plan, with rank 0's store digest
++                self.g._share(job.sess.encode(self.store.index.digest()))
+         return cancels, admits, pieces
+ 
+     @staticmethod
+@@ -995,17 +1080,33 @@ class Batcher:
+         if self.seqs[slot] is not None:
+             raise RuntimeError(f"slot {slot} is busy")
+         hit = None
+-        if cached:
++        sess = job.sess if self.store is not None else None
++        entry = sess.entry if sess is not None else None
++        if entry is not None:                   # patches/0180: a stored session, copied into this slot's caches
++            if len(entry.ids) != cached or job.prompt[:cached] != entry.ids:
++                raise RuntimeError(f"session entry {entry.id} does not hold the {cached} tokens slot {slot} resumes "
++                                   "from")
++            _, _, use_dflash = self.g._drafters(job.code)
++            with self.store.on(slot):
++                hit = self.store.restore(entry, self.drafters[slot] if use_dflash else None)
++            self.caches[slot] = []              # the slot's own snapshots no longer match its caches
++        elif cached:
+             hit = next((c for c in self.caches[slot] if len(c.ids) == cached and job.prompt[:cached] == c.ids), None)
+             if hit is None:
+                 raise RuntimeError(f"no snapshot of {cached} tokens on slot {slot} to resume from")
+         # the request writes the slot's attention caches from its resume point on: longer snapshots go
+         self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= cached]
++        if self.store is not None:
++            with self.store.on(slot):
++                self.store.begin(hit, cached)
+         self.used[slot] = self.round
+         self.seqs[slot] = Seq(job, slot, self.round, resume=hit, done=cached, grid=self._grid(job.values),
+-                              t0=time.perf_counter())
++                              t0=time.perf_counter(), marks=tuple(sess.marks) if sess is not None and job.draft
++                              else ())
+         job.stats.update(cached=cached, slot=slot, queued_s=round(time.perf_counter() - job.submitted, 3)
+                          if job.submitted else 0.0)
++        if entry is not None:
++            job.stats["restored"] = entry.id
+ 
+     def _piece(self, slot: int) -> None:
+         """The next piece of the slot's prompt through ``decode.prefill`` (the request's knobs, resumed from the
+@@ -1023,9 +1124,18 @@ class Batcher:
+         self.counts["pieces"] += 1
+         try:
+             with self._on(slot) as e, self._borrow(slot), g._knobs(job.values):
+-                grid = fastpf.grid(e.prefill_rows) if e.fast_prefill else 0
++                # patches/0180: pieces end on the chunk grid and on the snapshot grid (the snapshot the next resumes)
++                grid = batchplan.piece_grid(fastpf.grid(e.prefill_rows), int(getattr(e, "snap_grid", 0) or 0)) \
++                    if e.fast_prefill else 0
+                 end = batchplan.piece_end(seq.done, n, self.piece, grid)
+-                first = prefill(e, job.prompt[:end], job.sampling, mtp=use_mtp, drafter=drafter, resume=seq.resume)
++                e.checkpoints = seq.marks           # patches/0180: the store's marks inside this piece
++                try:
++                    first = prefill(e, job.prompt[:end], job.sampling, mtp=use_mtp, drafter=drafter,
++                                    resume=seq.resume)
++                finally:
++                    e.checkpoints = ()
++                saves = list(getattr(e, "mark_snaps", ()) or ()) if job.draft else []
++                e.mark_snaps = []
+                 seq.pieces += 1
+                 if end < n:
+                     if grid:
+@@ -1036,6 +1146,9 @@ class Batcher:
+                         snap = take_snapshot(e, job.prompt[:end], e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                              drafter=drafter)
+                     seq.resume, seq.done = snap, end
++                    if job.draft and end in seq.marks:      # a mark on the piece bound: the piece's own snapshot
++                        saves.append(snap)
++                    self._save(slot, saves)
+                     return
+                 seq.done = n
+                 seq.resume = None
+@@ -1043,13 +1156,19 @@ class Batcher:
+                 if job.draft and tag:
+                     if e.fast_snap is not None:     # the state at the prompt's last grid point, nothing later
+                         self._remember(slot, e.fast_snap)
++                        saves.append(e.fast_snap)
+                 elif job.draft:
+-                    self._remember(slot, take_snapshot(e, job.prompt, e.last_hidden if use_mtp else None,
+-                                                       mtp=use_mtp, drafter=drafter))
++                    snap = take_snapshot(e, job.prompt, e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                         drafter=drafter)
++                    self._remember(slot, snap)
++                    saves.append(snap)
++                self._save(slot, saves)             # patches/0180: marks, then the prompt snapshot
+                 last_hidden = e.last_hidden
+         except ValueError as exc:                   # the request's own problem (the same on both ranks)
+             self.seqs[slot] = None
+             self.caches[slot] = []
++            if self.store is not None:
++                self.store.forget(slot)
+             if job.out is not None:
+                 job.out.put(exc)
+             return
+@@ -1183,7 +1302,9 @@ class Batcher:
+                 pending = st.close()
+                 if job.draft and st.policy is not None and st.keeps and not q.grid:
+                     committed = list(job.prompt) + st.out[:e.st.pos - len(job.prompt)]
+-                    self._remember(slot, take_snapshot(e, committed, pending, mtp=st.use_mtp, drafter=st.drafter))
++                    snap = take_snapshot(e, committed, pending, mtp=st.use_mtp, drafter=st.drafter)
++                    self._remember(slot, snap)
++                    self._save(slot, [snap])            # patches/0180: the reply snapshot (exact requests)
+                 elif st.policy is None:         # the reply's rows are not kept
+                     self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= len(job.prompt)]
+         else:
+@@ -1201,5 +1322,7 @@ class Batcher:
+                              tokens_per_round=round((len(tokens) - 1) / max(st.rounds, 1), 3), sha256=sha,
+                              keeps=st.keeps, drafters="".join(st.arms))
+         job.stats.update(cancelled=cancelled)
++        if self.store is not None:                  # patches/0180
++            job.stats["sessions"] = self.store.describe()
+         if job.out is not None:
+             job.out.put(None)
+diff --git i/src/tensorfold/families/glm5_next/cuda/batchplan.py w/src/tensorfold/families/glm5_next/cuda/batchplan.py
+index 4ec490f..45c4a06 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batchplan.py
++++ w/src/tensorfold/families/glm5_next/cuda/batchplan.py
+@@ -108,16 +108,35 @@ def piece_rows(piece: int, grid: int) -> int:
+     return piece
+ 
+ 
++ALIGN = 64                   # ``pfgrid.ALIGN``: fast snapshots (and so fast resume points) sit on multiples of it
++
++
+ def piece_end(done: int, n: int, piece: int, grid: int) -> int:
+     """Where the piece starting at ``done`` of an ``n``-token prompt ends: the prompt's end, or the next piece bound.
+-    Fast pieces start on the grid (a grid snapshot or 0), so they end on it too."""
++    Fast pieces start on the grid (a grid snapshot or 0), so they end on it too. patches/0180: a fast resume point
++    may sit on the 64-token snapshot grid between two bounds of ``grid`` (a stored session's snapshot or mark,
++    patches/0085); that piece ends on the next bound at least a piece away, and the rest are on the grid."""
+ 
+-    if grid and done % grid:
++    if grid and done % ALIGN:
+         raise ValueError(f"a fast prefill piece starts at {done}, off the chunk grid {grid}")
+     step = piece_rows(piece, grid)
++    if grid and done % grid:
++        end = (done + step) // grid * grid
++        return n if end >= n else end
+     return n if n - done <= step else done + step
+ 
+ 
++def piece_grid(chunk: int, snap_grid: int) -> int:
++    """patches/0180: the bound fast pieces end on: a multiple of the chunk grid C and of the snapshot grid G (a piece
++    must end where its prefill takes the snapshot the next piece resumes from). G = 64 (default): C itself."""
++
++    import math
++
++    if not chunk:
++        return 0
++    return chunk * snap_grid // math.gcd(chunk, snap_grid) if snap_grid else chunk
++
++
+ class Fairness:
+     """Rank 0: when a prefill piece may run while other sequences decode. ``share`` is the part of the time prefill
+     pieces may take (GLM53_TF_BATCH_PREFILL_SHARE, 0 < share <= 1): a piece of t seconds is followed by at least
+@@ -176,6 +195,20 @@ def victim(slots: Sequence[tuple[int, bool, int]], foreground_waiting: bool, fre
+     return max(bg)[1] if bg else None
+ 
+ 
++def place_entry(free: Sequence[int], overlap: dict[int, int], used: dict[int, int]) -> int:
++    """patches/0180: the free slot a stored session is restored into: the one whose caches already hold most of its
++    pages (fewest bytes copied), then the least recently admitted (its kept states are the likeliest stale)."""
++
++    return min(free, key=lambda s: (-overlap.get(s, 0), used.get(s, 0), s))
++
++
++def admit_free(free: int, store_headroom: int) -> int:
++    """patches/0180: device memory a new request may count on: what is free less what the session store may still
++    take within its budget (the store is budgeted at load alongside the slots, so admission leaves it that room)."""
++
++    return int(free) - max(0, int(store_headroom))
++
++
+ def is_title_request(messages, tools) -> bool:
+     """A client's session-title request (``tensorfold.server.app.is_title_request``): a short system prompt about a
+     title, no tools, short messages. Runs as a background request."""
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index d65c142..e08374d 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -353,8 +353,10 @@ class GlmEngine:
+         fastboot.mark("engine ready (session store, batcher)")
+ 
+     def _sessions(self):
+-        """patches/0110: the session store (``sessions.py``), or None (GLM53_TF_SESSION_GIB=0, the default, or
+-        GLM53_TF_BATCH > 1, whose slots keep their own states). Both ranks must agree on its settings."""
++        """patches/0110: the session store (``sessions.py``), or None (GLM53_TF_SESSION_GIB=0, the default).
++        patches/0180: with GLM53_TF_BATCH > 1 only when GLM53_TF_BATCH_SESSIONS=1 (one store behind every slot,
++        ``Batcher.attach_store``); otherwise the slots keep their own states as patches/0120 does. Both ranks must
++        agree on its settings."""
+ 
+         from . import sessions
+ 
+@@ -363,16 +365,27 @@ class GlmEngine:
+         if both[0] != both[1]:
+             raise RuntimeError("the two ranks were started with different session settings (GLM53_TF_SESSION_GIB, "
+                                f"GLM53_TF_SESSION_EVERY, GLM53_TF_SESSION_FORK_MIN): {both[0]}, {both[1]}")
+-        if not mine[0] or self.batch is not None:
++        in_batch = False
++        if self.batch is not None:
++            in_batch = sessions.batch_enabled()
++            got = self._gather_ints([int(in_batch)])
++            if got[0] != got[1]:
++                raise RuntimeError(f"the two ranks were started with different GLM53_TF_BATCH_SESSIONS: {got[0][0]}, "
++                                   f"{got[1][0]}")
++        if not mine[0] or (self.batch is not None and not in_batch):
+             if mine[0] and self.rank == 0:
+-                print("[tensorfold] GLM53_TF_SESSION_GIB is ignored with GLM53_TF_BATCH > 1", flush=True)
++                print("[tensorfold] GLM53_TF_SESSION_GIB is ignored with GLM53_TF_BATCH > 1 unless "
++                      "GLM53_TF_BATCH_SESSIONS=1", flush=True)
+             return None
+         store = sessions.SessionStore(self.e, self.drafter, sessions.budget_bytes())
++        if self.batch is not None:          # patches/0180: every slot's caches, one index / budget / slab pool
++            self.batch.attach_store(store)
+         if self.rank == 0:
+             ix = store.index
+             print(f"[tensorfold] session store: {ix.budget / 2 ** 30:.1f} GiB, pages of {sessions.PAGE} tokens "
+                   f"({ix.page_bytes / 2 ** 20:.2f} MiB, {ix.page_bytes / sessions.PAGE / 1024:.2f} KB a token), "
+-                  f"marks every {store.every} tokens and at forks of {store.fork_min}+", flush=True)
++                  f"marks every {store.every} tokens and at forks of {store.fork_min}+"
++                  + (f", behind {self.batch.n} batch slots" if self.batch is not None else ""), flush=True)
+         return store
+ 
+     def _store_save(self, snaps: list) -> None:
+diff --git i/src/tensorfold/families/glm5_next/cuda/sessions.py w/src/tensorfold/families/glm5_next/cuda/sessions.py
+index 5ef4a12..69c6b6b 100644
+--- i/src/tensorfold/families/glm5_next/cuda/sessions.py
++++ w/src/tensorfold/families/glm5_next/cuda/sessions.py
+@@ -63,6 +63,16 @@ budget; a page goes when no entry references it; empty slabs are released. An en
+ not stored. The snapshots the engine keeps for the live sequence (``GlmEngine.cache``, at most two) are the same
+ objects, so an evicted one lives until the engine drops it.
+ 
++Batch mode (patches/0180, GLM53_TF_BATCH > 1 with GLM53_TF_BATCH_SESSIONS=1): one store behind every batch slot.
++The index, the budget and the page slabs are shared; each slot has its own live caches, so the store keeps one
++``live`` map per slot (``bind_slots``) and every save / restore / ``begin`` runs on one slot (``on(slot)``). A
++restore COPIES an entry into the slot's caches, so a slot never reads the slabs afterwards: evicting an entry (or a
++page) while a slot runs the session it restored cannot touch that slot. The snapshot objects are plain copies
++(KDA states, conv windows, pending rows, drafter window) and restore into any slot of the same shapes. Requests
++admitted together cannot see each other's entries (none is stored yet), so rank 0 also counts a prefix shared with
++a prompt in flight (running or admitted in the same round) as a fork point (``plan(others=...)``): N sessions over
++one system prompt submitted at once still leave a fork mark for the next one.
++
+ This module imports no torch at load: ``SessionIndex`` (keys, lookup, LRU, reference counts, budget) is plain
+ Python and tested on the host; ``SessionStore`` moves the tensors.
+ """
+@@ -70,6 +80,7 @@ Python and tested on the host; ``SessionStore`` moves the tensors.
+ from __future__ import annotations
+ 
+ import bisect
++import contextlib
+ import hashlib
+ import os
+ import zlib
+@@ -118,6 +129,16 @@ def reserve_bytes() -> int:
+     return int(float(os.environ.get("GLM53_TF_SESSION_RESERVE_GIB", "2") or 0) * 2 ** 30)
+ 
+ 
++def batch_enabled() -> bool:
++    """GLM53_TF_BATCH_SESSIONS=1 (patches/0180): the store also serves GLM53_TF_BATCH > 1 (one store behind every
++    slot). Default 0: batch mode keeps only each slot's own snapshots, as patches/0120 does."""
++
++    v = os.environ.get("GLM53_TF_BATCH_SESSIONS", "0").strip()
++    if v not in ("0", "1", ""):
++        raise ValueError(f"GLM53_TF_BATCH_SESSIONS={v}: expected 0 or 1")
++    return v == "1"
++
++
+ def settings() -> list[int]:
+     """What both ranks must agree on (MiB, tokens, tokens)."""
+ 
+@@ -192,6 +213,22 @@ def page_keys(tag: int, ids: Sequence[int], blocks: list[bytes], count: int, has
+     return [_h(b"page", head, blocks[p], _bytes(ids[PAGE * (p + 1):key_end(tag, p)])) for p in range(count)]
+ 
+ 
++def common_prefix(a: Sequence[int], b: Sequence[int]) -> int:
++    """The length of the longest common prefix of two token lists (patches/0180: a prompt in flight, not stored)."""
++
++    n = min(len(a), len(b))
++    lo = 0
++    while lo < n:                           # C-speed slice compares a block at a time, then the block's tokens
++        hi = min(n, lo + 4096)
++        if list(a[lo:hi]) == list(b[lo:hi]):
++            lo = hi
++            continue
++        while a[lo] == b[lo]:
++            lo += 1
++        return lo
++    return n
++
++
+ # -- the index (host only) -------------------------------------------------------------------------------------------
+ @dataclass
+ class Entry:
+@@ -335,11 +372,12 @@ class SessionIndex:
+         return self.entries.get(i) if i is not None else None
+ 
+     def marks(self, prompt: Sequence[int], tag: int, resume: int, *, has_mtp: bool, drafter: bool, every: int,
+-              fork_min: int, blocks: list[bytes] | None = None) -> list[int]:
++              fork_min: int, blocks: list[bytes] | None = None, others: Sequence[Sequence[int]] = ()) -> list[int]:
+         """Positions where the request's prefill should also snapshot: the fork point (the page or grid point at or
+-        before the longest common prefix with a stored entry) and every ``every`` tokens, each at least
+-        ``fork_min`` past the resume point, before the prompt's own snapshot (exact: ``len(prompt)``; fast: its last
+-        grid point), and not stored already."""
++        before the longest common prefix with a stored entry, or with one of ``others``: patches/0180, the prompts
++        of the requests in flight beside it) and every ``every`` tokens, each at least ``fork_min`` past the resume
++        point, before the prompt's own snapshot (exact: ``len(prompt)``; fast: its last grid point), and not stored
++        already."""
+ 
+         n = len(prompt)
+         g = snapshot_grid(tag)
+@@ -347,7 +385,7 @@ class SessionIndex:
+         limit = (n // g) * g if g else n
+         blocks = chain(prompt) if blocks is None else blocks
+         want = set()
+-        d = self.lcp(prompt, blocks)
++        d = max([self.lcp(prompt, blocks)] + [common_prefix(prompt, o) for o in others])
+         q = min(d, limit) // step * step
+         if q >= resume + fork_min and 0 < q < limit:
+             want.add(q)
+@@ -595,13 +633,80 @@ class SessionStore:
+         self.slabs: dict[int, list] = {}
+         self.live: dict[int, bytes] = {}         # page index -> key of the page the live caches hold there
+         self.stats = {"copied": 0, "skipped": 0, "restores": 0}
++        # patches/0180: one live map (and layout) per batch slot; ``comps`` / ``live`` are the current slot's
++        self.cur = 0
++        self.slot_comps: list[list[Comp]] = [self.comps]
++        self.slot_live: list[dict[int, bytes]] = [self.live]
+         if drafter is not None:
+             e.snap_window = capture_window       # ``decode.take_snapshot`` keeps the drafter's window
+ 
++    # -- patches/0180: batch slots -----------------------------------------------------------------------------------
++    @staticmethod
++    def _shape(comps: list[Comp]) -> list[tuple]:
++        return [(c.per, c.mtp, tuple(c.live.shape), str(c.live.dtype), str(c.live.device)) for c in comps]
++
++    def bind_slots(self, states: Sequence[Any]) -> None:
++        """Serve every batch slot's ``State`` (slot 0 is the engine's own, the one the store was built on): each slot
++        gets its own live map; the slabs are shared, so every slot's caches must have slot 0's layout."""
++
++        if self.cur != 0:
++            raise RuntimeError("bind_slots inside on()")
++        comps = [layout(st) for st in states]
++        want = self._shape(self.comps)
++        for i, c in enumerate(comps):
++            if self._shape(c) != want:
++                raise RuntimeError(f"batch slot {i}'s caches do not have slot 0's layout: the session store cannot "
++                                   "serve it (GLM53_TF_BATCH_SESSIONS=1)")
++        if comps and [x.live.data_ptr() for x in comps[0]] != [x.live.data_ptr() for x in self.comps]:
++            raise RuntimeError("batch slot 0 is not the state the session store was built on")
++        self.slot_comps = comps or [self.comps]
++        self.comps = self.slot_comps[0]
++        self.slot_live = [self.live] + [{} for _ in comps[1:]]
++
++    @contextlib.contextmanager
++    def on(self, slot: int):
++        """Context: saves, restores and ``begin`` act on batch slot ``slot``'s live caches and live map."""
++
++        prev = self.cur
++        if slot == prev:
++            yield self
++            return
++        self.slot_live[prev] = self.live
++        self.cur, self.comps, self.live = slot, self.slot_comps[slot], self.slot_live[slot]
++        try:
++            yield self
++        finally:
++            self.slot_live[slot] = self.live
++            self.cur, self.comps, self.live = prev, self.slot_comps[prev], self.slot_live[prev]
++
++    def live_of(self, slot: int) -> dict[int, bytes]:
++        return self.live if slot == self.cur else self.slot_live[slot]
++
++    def forget(self, slot: int) -> None:
++        """The slot's caches hold nothing the store knows of (a failed prefill wrote them)."""
++
++        if slot == self.cur:
++            self.live = {}
++        else:
++            self.slot_live[slot] = {}
++
++    def overlap(self, entry: Entry, slot: int) -> int:
++        """Pages of ``entry`` the slot's live caches already hold (a restore there skips copying them)."""
++
++        live = self.live_of(slot)
++        return sum(1 for p, k in enumerate(entry.pages) if live.get(p) == k)
++
++    def headroom(self) -> int:
++        """Bytes the store may still grow by within its budget (batch admission leaves them free)."""
++
++        return max(0, self.index.budget - self.index.used)
++
+     # -- rank 0's decisions ----------------------------------------------------------------------------------------
+     def plan(self, prompt: list[int], tag: int, need_mtp: bool, need_drafter: bool, cached: int,
+-             draft: bool) -> Plan:
+-        """The entry to restore (when it resumes more than the live snapshot of ``cached`` tokens) and the marks."""
++             draft: bool, others: Sequence[Sequence[int]] = ()) -> Plan:
++        """The entry to restore (when it resumes more than the live snapshot of ``cached`` tokens) and the marks.
++        ``others`` (patches/0180, batch slots): the prompts of the requests running or admitted beside this one;
++        a prefix shared with one of them is a fork point too (its entry may not be stored yet)."""
+ 
+         if not draft:
+             return Plan(None, [])
+@@ -610,7 +715,8 @@ class SessionStore:
+         entry = best if best is not None and len(best.ids) > cached else None
+         resume = max(cached, len(entry.ids) if entry is not None else 0)
+         marks = self.index.marks(prompt, tag, resume, has_mtp=need_mtp and self.e.w.mtp is not None,
+-                                 drafter=need_drafter, every=self.every, fork_min=self.fork_min, blocks=blocks)
++                                 drafter=need_drafter, every=self.every, fork_min=self.fork_min, blocks=blocks,
++                                 others=others)
+         return Plan(entry, marks)
+ 
+     def follow(self, msg: list[int]) -> Plan:

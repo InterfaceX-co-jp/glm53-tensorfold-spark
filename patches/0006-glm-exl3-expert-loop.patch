@@ -1,0 +1,364 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/exl3.cpp w/src/tensorfold/families/glm5_next/cuda/exl3.cpp
+index f33057f..21f6ab4 100644
+--- i/src/tensorfold/families/glm5_next/cuda/exl3.cpp
++++ w/src/tensorfold/families/glm5_next/cuda/exl3.cpp
+@@ -4,6 +4,9 @@
+ void exl3_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                        const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+                        int64_t, int64_t, int64_t, int64_t);
++void exl3_grouped_loop_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                            const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t,
++                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+ void exl3_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+                       at::Tensor&, int64_t, int64_t, int64_t);
+ void exl3_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+@@ -33,6 +36,24 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, c
+     exl3_grouped_cuda(X0, X1, T0, T1, uids, ucount, members, Z, mats, K, N, P, SK, slots, nt, warps, E);
+ }
+ 
++void grouped_loop(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
++                  const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, at::Tensor Z,
++                  int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t nt, int64_t warps,
++                  int64_t mg) {
++    const int64_t E = T0.size(0);
++    check(X0, at::kHalf, "X0");
++    check(X1, at::kHalf, "X1");
++    check(T0, at::kInt, "T0");
++    check(T1, at::kInt, "T1");
++    check(uids, at::kInt, "uids");
++    check(ucount, at::kInt, "ucount");
++    check(members, at::kInt, "members");
++    check(Z, at::kFloat, "Z");
++    TORCH_CHECK(Z.numel() >= mats * SK * P * N, "Z too small");
++    c10::cuda::CUDAGuard guard(X0.device());
++    exl3_grouped_loop_cuda(X0, X1, T0, T1, uids, ucount, members, Z, mats, K, N, P, SK, slots, nt, warps, mg, E);
++}
++
+ void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
+             const at::Tensor& suh1, at::Tensor out0, at::Tensor out1, int64_t rows, int64_t K, int64_t slots) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16, "x: bf16 CUDA");
+@@ -73,6 +94,7 @@ void down_epilogue(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("grouped", &grouped);
++    m.def("grouped_loop", &grouped_loop);
+     m.def("rot_in", &rot_in);
+     m.def("gateup_epilogue", &gateup_epilogue);
+     m.def("down_epilogue", &down_epilogue);
+diff --git i/src/tensorfold/families/glm5_next/cuda/exl3.cu w/src/tensorfold/families/glm5_next/cuda/exl3.cu
+index 66e3a35..c514c60 100644
+--- i/src/tensorfold/families/glm5_next/cuda/exl3.cu
++++ w/src/tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -52,10 +52,98 @@ __device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
+     return ok ? *reinterpret_cast<const uint32_t*>(x) : 0u;
+ }
+ 
++// The work item of both grouped kernels: MG member tiles (16 rows of X each, row codes in rows_sh[16 * MG], -1 =
++// none) of expert e times W_q of one matrix over one K split, for the NT column tiles from nt0;
++// Z[mat][split][member row][n]. Warp w of W runs a fixed contiguous range of the split's k tiles; warps are added
++// in order 0..W-1. Each member tile has its own accumulators and gets, k tile by k tile, the same mma on the same
++// decoded B fragments whatever MG, NT and the block the item runs in, so a row's Z depends only on (W, SK) and its
++// own inputs: MG > 1 decodes a weight tile once for several member tiles, it does not change a sum.
++template <int NT, int W, int MG>
++__device__ __forceinline__ void member_tiles(const half* __restrict__ X, const uint32_t* __restrict__ T, int e,
++                                             const int* rows_sh, float (*red)[16 * MG][NT * 16], float* __restrict__ Z,
++                                             int K, int N, int P, int SK, int split, int mat, int nt0) {
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int KT = K >> 4, NTILES = N >> 4;
++
++    int r0[MG], r1[MG];
++    const half* x0[MG];
++    const half* x1[MG];
++#pragma unroll
++    for (int m = 0; m < MG; ++m) {
++        r0[m] = rows_sh[16 * m + g];
++        r1[m] = rows_sh[16 * m + g + 8];
++        x0[m] = X + (size_t)(r0[m] < 0 ? 0 : r0[m]) * K + 2 * t;
++        x1[m] = X + (size_t)(r1[m] < 0 ? 0 : r1[m]) * K + 2 * t;
++    }
++
++    const int per_split = KT / SK, per_warp = per_split / W;
++    const int kt0 = split * per_split + warp * per_warp;
++    const uint32_t* tile = T + (((size_t)e * KT + kt0) * NTILES + nt0) * 32 + lane;
++
++    float acc[MG][NT][2][4];
++#pragma unroll
++    for (int m = 0; m < MG; ++m)
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
++
++    for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
++        uint32_t words[NT];
++#pragma unroll
++        for (int i = 0; i < NT; ++i) words[i] = __ldg(tile + i * 32);
++        const int k = kt * 16;
++        uint32_t a[MG][4];
++#pragma unroll
++        for (int m = 0; m < MG; ++m) {
++            a[m][0] = load_pair(x0[m] + k, r0[m] >= 0);
++            a[m][1] = load_pair(x1[m] + k, r1[m] >= 0);
++            a[m][2] = load_pair(x0[m] + k + 8, r0[m] >= 0);
++            a[m][3] = load_pair(x1[m] + k + 8, r1[m] >= 0);
++        }
++#pragma unroll
++        for (int i = 0; i < NT; ++i) {
++            uint32_t b0[2], b1[2];
++            decode_tile(words[i], lane, b0, b1);
++#pragma unroll
++            for (int m = 0; m < MG; ++m) {
++                mma16816(acc[m][i][0], a[m], b0);
++                mma16816(acc[m][i][1], a[m], b1);
++            }
++        }
++        tile += (size_t)NTILES * 32;
++    }
++
++    // warps' partial sums through shared memory, added in warp order
++#pragma unroll
++    for (int m = 0; m < MG; ++m)
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int col = i * 16 + h * 8 + 2 * t;
++                red[warp][16 * m + g][col] = acc[m][i][h][0];
++                red[warp][16 * m + g][col + 1] = acc[m][i][h][1];
++                red[warp][16 * m + g + 8][col] = acc[m][i][h][2];
++                red[warp][16 * m + g + 8][col + 1] = acc[m][i][h][3];
++            }
++    __syncthreads();
++    for (int idx = threadIdx.x; idx < 16 * MG * NT * 16; idx += W * 32) {
++        const int row = idx / (NT * 16), col = idx % (NT * 16);
++        const int r = rows_sh[row];
++        if (r < 0) continue;
++        float s = red[0][row][col];
++#pragma unroll
++        for (int w = 1; w < W; ++w) s += red[w][row][col];
++        Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
++    }
++}
++
+ // Program (u, n block, (mat * SK + split) * MT + member tile): 16 members of distinct expert u (rows of X, one
+-// row per member) times W_q of matrix `mat` over this split's K range, for NT columns;
+-// Z[mat][split][member row][n]. Warp w of W runs a fixed contiguous range of the split's k tiles; warps are
+-// added in order 0..W-1.
++// row per member) times W_q of matrix `mat` over this split's K range, for NT columns (``member_tiles``).
+ template <int NT, int W>
+ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
+@@ -70,9 +158,6 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     const half* X = mat ? X1 : X0;
+     const uint32_t* T = mat ? T1 : T0;
+     const int e = uids[u];
+-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+-    const int g = lane >> 2, t = lane & 3;
+-    const int KT = K >> 4, NTILES = N >> 4;
+ 
+     __shared__ int rows_sh[16];
+     if (threadIdx.x < 16) {
+@@ -82,61 +167,41 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     }
+     __syncthreads();
+     if (rows_sh[0] < 0) return;                           // members come first, so this tile is empty
+-    const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+-    const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
+-    const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
+-
+-    const int per_split = KT / SK, per_warp = per_split / W;
+-    const int kt0 = split * per_split + warp * per_warp;
+-    const int nt0 = blockIdx.y * NT;
+-    const uint32_t* tile = T + (((size_t)e * KT + kt0) * NTILES + nt0) * 32 + lane;
+-
+-    float acc[NT][2][4];
+-#pragma unroll
+-    for (int i = 0; i < NT; ++i)
+-#pragma unroll
+-        for (int h = 0; h < 2; ++h)
+-#pragma unroll
+-            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+-
+-    for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
+-        uint32_t words[NT];
+-#pragma unroll
+-        for (int i = 0; i < NT; ++i) words[i] = __ldg(tile + i * 32);
+-        const int k = kt * 16;
+-        uint32_t a[4] = {load_pair(x0 + k, r0 >= 0), load_pair(x1 + k, r1 >= 0), load_pair(x0 + k + 8, r0 >= 0),
+-                         load_pair(x1 + k + 8, r1 >= 0)};
+-#pragma unroll
+-        for (int i = 0; i < NT; ++i) {
+-            uint32_t b0[2], b1[2];
+-            decode_tile(words[i], lane, b0, b1);
+-            mma16816(acc[i][0], a, b0);
+-            mma16816(acc[i][1], a, b1);
+-        }
+-        tile += (size_t)NTILES * 32;
+-    }
+-
+-    // warps' partial sums through shared memory, added in warp order
+     __shared__ float red[W][16][NT * 16];
+-#pragma unroll
+-    for (int i = 0; i < NT; ++i)
+-#pragma unroll
+-        for (int h = 0; h < 2; ++h) {
+-            const int col = i * 16 + h * 8 + 2 * t;
+-            red[warp][g][col] = acc[i][h][0];
+-            red[warp][g][col + 1] = acc[i][h][1];
+-            red[warp][g + 8][col] = acc[i][h][2];
+-            red[warp][g + 8][col + 1] = acc[i][h][3];
++    member_tiles<NT, W, 1>(X, T, e, rows_sh, red, Z, K, N, P, SK, split, mat, blockIdx.y * NT);
++}
++
++// Long windows (prefill chunks): program (n block, u, mat * SK + split) runs every member tile of distinct
++// expert u, MG at a time, in one block. Upstream's grid gives each member tile its own program, far apart in launch
++// order, so an expert with more than 16 members read its weights from memory once per member tile, and a window
++// of R rows launched R/16 programs per (expert, n block, split), almost all empty. Here the weights come from
++// memory once (later passes find the block's slice in L2), no program is empty, and the n blocks of one (expert,
++// split) run side by side, so they share X in L2. Same work items, same bits (``member_tiles``).
++template <int NT, int W, int MG>
++__global__ void __launch_bounds__(W * 32) grouped_loop_kernel(
++    const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
++    const uint32_t* __restrict__ T1, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int E) {
++    const int u = blockIdx.y;
++    if (u >= ucount[0] || uids[u] >= E) return;          // the shared expert (id E) is not EXL3
++    const int split = blockIdx.z % SK;
++    const int mat = blockIdx.z / SK;
++    const half* X = mat ? X1 : X0;
++    const uint32_t* T = mat ? T1 : T0;
++    const int e = uids[u];
++
++    __shared__ int rows_sh[16 * MG];
++    __shared__ float red[W][16 * MG][NT * 16];
++    for (int m0 = 0; m0 < maxm; m0 += 16 * MG) {
++        if (threadIdx.x < 16 * MG) {
++            const int m = m0 + threadIdx.x;
++            int code = m < maxm ? members[u * maxm + m] : -1;
++            rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+         }
+-    __syncthreads();
+-    for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+-        const int row = idx / (NT * 16), col = idx % (NT * 16);
+-        const int r = rows_sh[row];
+-        if (r < 0) continue;
+-        float s = red[0][row][col];
+-#pragma unroll
+-        for (int w = 1; w < W; ++w) s += red[w][row][col];
+-        Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
++        __syncthreads();
++        if (rows_sh[0] < 0) break;                        // members come first: no member left (same for all threads)
++        member_tiles<NT, W, MG>(X, T, e, rows_sh, red, Z, K, N, P, SK, split, mat, blockIdx.x * NT);
++        __syncthreads();                                  // rows_sh and red are rewritten by the next pass
+     }
+ }
+ 
+@@ -274,6 +339,33 @@ void exl3_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Ten
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++// The same Z as exl3_grouped_cuda, every member tile of an expert in one program (grouped_loop_kernel).
++void exl3_grouped_loop_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
++                            const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z,
++                            int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t nt,
++                            int64_t warps, int64_t mg, int64_t E) {
++    const int maxm = (int)members.size(1);
++    TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
++    TORCH_CHECK(uids.size(0) <= 65535, "too many distinct experts");
++    dim3 grid((unsigned)(N / (16 * nt)), (unsigned)uids.size(0), (unsigned)(mats * SK));
++    auto stream = at::cuda::getCurrentCUDAStream();
++    auto x0 = reinterpret_cast<const half*>(X0.data_ptr());
++    auto x1 = reinterpret_cast<const half*>(X1.data_ptr());
++    auto t0 = reinterpret_cast<const uint32_t*>(T0.data_ptr());
++    auto t1 = reinterpret_cast<const uint32_t*>(T1.data_ptr());
++#define LAUNCH(NT_, W_, MG_)                                                                                     \
++    grouped_loop_kernel<NT_, W_, MG_><<<grid, W_ * 32, 0, stream>>>(                                             \
++        x0, x1, t0, t1, uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), Z.data_ptr<float>(), \
++        (int)K, (int)N, (int)P, (int)SK, maxm, (int)slots, (int)E)
++    if (nt == 4 && warps == 4 && mg == 2) LAUNCH(4, 4, 2);
++    else if (nt == 8 && warps == 4 && mg == 1) LAUNCH(8, 4, 1);
++    else if (nt == 4 && warps == 4 && mg == 1) LAUNCH(4, 4, 1);
++    else if (nt == 2 && warps == 4 && mg == 4) LAUNCH(2, 4, 4);
++    else TORCH_CHECK(false, "unsupported loop tile setting");
++#undef LAUNCH
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
+ void exl3_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
+                       const at::Tensor& suh1, at::Tensor& out0, at::Tensor& out1, int64_t rows, int64_t K,
+                       int64_t slots) {
+diff --git i/src/tensorfold/families/glm5_next/cuda/exl3_mm.py w/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+index 229267c..bfc9465 100644
+--- i/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ w/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -11,6 +11,12 @@ A window's routed (row, slot) pairs go through, per layer:
+ H is the 128-block Hadamard / sqrt(128) (``exl3.py``). The shared expert is BF16 and fills Y's last slot
+ elsewhere; ``glue.combine`` then adds the slots in order as before. Splits of K and warps are fixed by the shape,
+ so a pair's outputs never depend on the window's other rows.
++
++Windows where an expert can have more than 16 members (prefill chunks) run ``grouped_loop``: one program per
++(n block, expert, split) takes all of the expert's member tiles, so its weights come from memory once per window
++instead of once per 16 members, and no program is launched empty. It runs the same work item per member tile as
++``grouped`` (``member_tiles`` in exl3.cu: same K ranges per warp and split, same warp order), so Z has the same
++bits; GLM53_TF_EXPERT_LOOP=0 turns it off.
+ """
+ 
+ from __future__ import annotations
+@@ -19,6 +25,8 @@ from dataclasses import dataclass
+ from functools import lru_cache
+ from pathlib import Path
+ 
++import os
++
+ import torch
+ 
+ # (n tiles a block, warps a block, K splits) for the gate/up (K = model width) and down (K = the rank's expert
+@@ -26,13 +34,19 @@ import torch
+ GATEUP_CFG = (8, 4, 4)
+ DOWN_CFG = (8, 4, 1)
+ 
++# grouped_loop: (n tiles a block, member tiles a pass) for windows past 16 rows; the warps and K splits are the
++# ones above (they define the sums), these two only place work. GLM53_TF_EXPERT_LOOP=0: upstream's grid everywhere;
++# GLM53_TF_EXPERT_LOOP_CFG="nt,mg" (4,2 | 8,1 | 4,1 | 2,4) to tune.
++LOOP = os.environ.get("GLM53_TF_EXPERT_LOOP", "1").strip() not in ("0", "", "false", "no", "off")
++LOOP_CFG = tuple(int(v) for v in os.environ.get("GLM53_TF_EXPERT_LOOP_CFG", "4,2").split(","))
++
+ 
+ @lru_cache(maxsize=1)
+ def _ext():
+     from torch.utils.cpp_extension import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v1", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v2", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+@@ -86,10 +100,18 @@ def routed(x: torch.Tensor, pick: torch.Tensor, group, ex: Exl3Experts, s: Scrat
+     ext = _ext()
+     slots, P = s.slots, s.rows * s.slots
+     D, NI = ex.dims, ex.width
++    loop = LOOP and group.members.shape[1] > 16          # an expert may have more than one member tile
++
++    def grouped(x0, x1, t0, t1, mats, K, N, cfg):
++        nt, w, sk = cfg
++        if loop:
++            ext.grouped_loop(x0, x1, t0, t1, group.ids, group.count, group.members, s.z, mats, K, N, P, sk, slots,
++                             LOOP_CFG[0], w, LOOP_CFG[1])
++        else:
++            ext.grouped(x0, x1, t0, t1, group.ids, group.count, group.members, s.z, mats, K, N, P, sk, slots, nt, w)
++
+     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+-    nt, w, sk = GATEUP_CFG
+-    ext.grouped(s.xg, s.xu, ex.gt, ex.ut, group.ids, group.count, group.members, s.z, 2, D, NI, P, sk, slots, nt, w)
+-    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, sk, slots, float(limit))
+-    nt, w, sk = DOWN_CFG
+-    ext.grouped(s.xd, s.xd, ex.dt, ex.dt, group.ids, group.count, group.members, s.z, 1, NI, D, P, sk, slots, nt, w)
+-    ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, sk, slots)
++    grouped(s.xg, s.xu, ex.gt, ex.ut, 2, D, NI, GATEUP_CFG)
++    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, GATEUP_CFG[2], slots, float(limit))
++    grouped(s.xd, s.xd, ex.dt, ex.dt, 1, NI, D, DOWN_CFG)
++    ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, DOWN_CFG[2], slots)

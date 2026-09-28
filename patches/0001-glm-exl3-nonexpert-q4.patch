@@ -1,0 +1,149 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index 7581378..ca0d4a0 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -32,6 +32,8 @@ A request's draft policy is a spec (the engine's default, or the request's throu
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import hashlib
+ import json
+ import struct
+@@ -279,7 +281,10 @@ class GlmEngine:
+         """The code a request runs: plain ``auto`` is ``EXL3_AUTO`` on an EXL3 checkpoint with the draft model; on a
+         checkpoint without the MTP head, ``auto`` is ``DFLASH_POLICY`` and an MTP spec runs as its DFlash2 version."""
+ 
+-        if code[0] == 4 and self.drafter is not None and self.w.cfg.quant == "exl3":
++        # EXL3_AUTO was measured with BF16 non-expert weights; stored in 4 bits (GLM53_TF_NONEXPERT) the MTP head is
++        # as cheap as on the MLX checkpoint, so plain ``auto`` chooses between the drafters as it does there
++        if code[0] == 4 and self.drafter is not None and self.w.cfg.quant == "exl3" \
++                and os.environ.get("GLM53_TF_NONEXPERT", "bf16").strip().lower() == "bf16":
+             return encode_policy(EXL3_AUTO)
+         if self.w.mtp is None and code[0] in (1, 2, 3, 4, 5):
+             return encode_policy(DFLASH_POLICY) if code[0] in (4, 5) else [code[0] + 10] + code[1:]
+diff --git i/src/tensorfold/families/glm5_next/cuda/qmm.py w/src/tensorfold/families/glm5_next/cuda/qmm.py
+index 429c9e8..8ec4859 100644
+--- i/src/tensorfold/families/glm5_next/cuda/qmm.py
++++ w/src/tensorfold/families/glm5_next/cuda/qmm.py
+@@ -243,9 +243,11 @@ def make_b16(weight: torch.Tensor) -> B16:
+     return B16(w, int(w.shape[0]), int(w.shape[1]))
+ 
+ 
+-def quantize4(w: torch.Tensor, chunk: int = 8192) -> Q4:
++def quantize4(w: torch.Tensor, chunk: int = 8192, mse: bool = False) -> Q4:
+     """bf16 (N, K) -> MLX-style affine 4-bit in groups of 64 along K (q = round((w - min) / scale)), tiled: for
+-    weights that only draft (the DFlash2 drafter, a copy of a BF16 head for draft steps), never for verifying."""
++    weights that only draft (the DFlash2 drafter, a copy of a BF16 head for draft steps), and for an EXL3
++    checkpoint's non-expert weights when GLM53_TF_NONEXPERT asks. ``mse``: per group, shrink the [min, max] range
++    toward its centre by the factor (from a small grid) with the smallest squared reconstruction error."""
+ 
+     n, k = w.shape
+     words = torch.empty((n, k // 8), dtype=torch.int32, device=w.device)
+@@ -254,6 +256,8 @@ def quantize4(w: torch.Tensor, chunk: int = 8192) -> Q4:
+     for r in range(0, n, chunk):
+         g = w[r:r + chunk].float().view(-1, k // 64, 64)
+         lo, hi = g.amin(-1), g.amax(-1)
++        if mse:
++            lo, hi = _clip_search(g, lo, hi)
+         scale = ((hi - lo) / 15).clamp_min(1e-8).to(torch.bfloat16)
+         bias = lo.to(torch.bfloat16)
+         q = torch.round((g - bias.float()[..., None]) / scale.float()[..., None]).clamp(0, 15).to(torch.int32)
+@@ -265,6 +269,28 @@ def quantize4(w: torch.Tensor, chunk: int = 8192) -> Q4:
+     return make_q4(words, scales.contiguous(), biases.contiguous())
+ 
+ 
++def _clip_search(g: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor,
++                 factors: tuple[float, ...] = (1.0, 0.97, 0.94, 0.91, 0.88, 0.85, 0.82, 0.79, 0.76)):
++    """Per group of ``g`` (rows, groups, 64): the [lo, hi] range, shrunk about its centre by one of ``factors``,
++    whose bf16-rounded affine 4-bit reconstruction has the smallest squared error."""
++
++    best_err = best_lo = best_hi = None
++    mid, half = (hi + lo) / 2, (hi - lo) / 2
++    for f in factors:
++        l, h = mid - half * f, mid + half * f
++        s = ((h - l) / 15).clamp_min(1e-8).to(torch.bfloat16).float()
++        b = l.to(torch.bfloat16).float()
++        q = torch.round((g - b[..., None]) / s[..., None]).clamp(0, 15)
++        err = ((q * s[..., None] + b[..., None] - g) ** 2).sum(-1)
++        if best_err is None:
++            best_err, best_lo, best_hi = err, l, h
++        else:
++            better = err < best_err
++            best_err = torch.where(better, err, best_err)
++            best_lo, best_hi = torch.where(better, l, best_lo), torch.where(better, h, best_hi)
++    return best_lo, best_hi
++
++
+ def stack_b16(parts: list[torch.Tensor]) -> B16:
+     """Rows of several BF16 matrices with the same K, stacked in order."""
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/weights.py w/src/tensorfold/families/glm5_next/cuda/weights.py
+index 686f8fa..9223cea 100644
+--- i/src/tensorfold/families/glm5_next/cuda/weights.py
++++ w/src/tensorfold/families/glm5_next/cuda/weights.py
+@@ -29,6 +29,26 @@ import torch
+ from .exl3_mm import Exl3Experts, words as exl3_words
+ from .qmm import B16, Experts, Q4, as_i32, make_b16, make_experts, make_q4, quantize4, stack_b16, stack_q4
+ 
++import os
++
++# EXL3 checkpoints keep every non-expert weight in BF16, which is most of what a token reads on each rank
++# (10.7 GB against 5.0 for the all-4-bit MLX checkpoint). GLM53_TF_NONEXPERT=q4 quantizes those weights once at
++# load to the engine's affine 4-bit groups of 64 (the MLX checkpoint's format), keeping the EXL3 routed experts
++# as stored. "q4mse" searches each group's clip range for the smallest squared error (same format, same speed).
++# "bf16" (default) is upstream's behaviour. Drafted replies stay byte-identical to serial ones either way:
++# drafting and verification read the same weights.
++NONEXPERT = os.environ.get("GLM53_TF_NONEXPERT", "bf16").strip().lower()
++if NONEXPERT not in ("bf16", "q4", "q4mse"):
++    raise ValueError(f"GLM53_TF_NONEXPERT must be bf16, q4 or q4mse, not {NONEXPERT!r}")
++
++
++def nonexpert(w: torch.Tensor) -> Q4 | B16:
++    """A non-expert BF16 weight of an EXL3 checkpoint, stored as GLM53_TF_NONEXPERT asks."""
++
++    if NONEXPERT == "bf16":
++        return make_b16(w)
++    return quantize4(w.to(torch.bfloat16), mse=NONEXPERT == "q4mse")
++
+ PREFIX = "model.language_model."
+ 
+ 
+@@ -280,11 +300,11 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
+         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
+ 
+     def q4(name: str) -> Q4 | B16:
+-        return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
++        return nonexpert(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+ 
+     def stack(names: list[str]) -> Q4 | B16:
+         if exl3:
+-            return stack_b16([t(n + ".weight") for n in names])
++            return nonexpert(torch.cat([t(n + ".weight").to(torch.bfloat16) for n in names]))
+         return stack_q4([trip(n) for n in names])
+ 
+     def hc(i: int, site: str) -> HCW:
+@@ -305,7 +325,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
+         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
+         if exl3:
+             w = t(p + "kv_b_proj.weight")
+-            kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
++            kv_k, kv_v = nonexpert(w[krows]), nonexpert(w[vrows])
+         else:
+             w, s, b = trip(p + "kv_b_proj")
+             kv_k = make_q4(w[krows], s[krows], b[krows])
+@@ -382,8 +402,11 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
+     vl = cfg.vocab // world
+     draft_head = None
+     if exl3:
+-        head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
+-        draft_head = quantize4(head.weight)        # MTP and DFlash2 steps read 0.18 GB a rank instead of 0.63
++        hw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
++        head = nonexpert(hw)
++        # MTP and DFlash2 steps read 0.18 GB a rank instead of 0.63; a 4-bit head already is that copy
++        draft_head = quantize4(hw.to(torch.bfloat16)) if isinstance(head, B16) else None
++        del hw
+     else:
+         hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
+         head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),

@@ -1,0 +1,409 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 03f1a09..e86e5c5 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -96,6 +96,9 @@ class Engine:
+         from .latent import enabled as latent_kv
+ 
+         w.meta["latent_kv"] = latent_kv()        # GLM53_TF_LATENT_KV (patches/0060): before any State or Buffers
++        from .latent import kv_dtype
++
++        w.meta["kv_fp8"] = kv_dtype() == "fp8"   # GLM53_TF_KV_DTYPE (patches/0220): the latent rows' format
+         # patches/0082 (GLM53_TF_LEAN_PREFILL=1): past GLM53_TF_LEAN_BLOCK rows, the window buffers stay at the block
+         # and fast-prefill chunks of up to ``prefill_rows`` rows run through the lean set (``lean.py``: sub-blocks
+         # on these buffers, the routed experts over the whole chunk; the same bits)
+@@ -140,7 +143,8 @@ class Engine:
+             from .latent import kv_bytes_per_token
+ 
+             per = kv_bytes_per_token(self.st)
+-            print(f"[tensorfold] latent KV cache: {per / 1024:.1f} KB a token a rank ({capacity} slots, "
++            kvd = "fp8" if w.meta.get("kv_fp8") else "bf16"          # patches/0220
++            print(f"[tensorfold] latent KV cache ({kvd} rows): {per / 1024:.1f} KB a token a rank ({capacity} slots, "
+                   f"{per * capacity / 2**30:.2f} GB)", flush=True)
+         self.last_hidden: torch.Tensor | None = None
+         self.draft_n = w.head.n
+@@ -316,6 +320,14 @@ class Snapshot:
+     drafter_end: int
+     grid: int = 0
+     window: dict | None = None
++    kv: int = 0          # patches/0220: 1 when the attention rows below ``ids`` are FP8 latent rows (GLM53_TF_KV_DTYPE)
++
++
++def _kv8(e) -> int:
++    """patches/0220: 1 when ``e``'s latent caches hold FP8 rows."""
++
++    meta = getattr(getattr(e, "w", None), "meta", None)
++    return int(bool(meta.get("kv_fp8"))) if isinstance(meta, dict) else 0
+ 
+ 
+ def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
+@@ -331,11 +343,14 @@ def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *
+     return Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
+                     mtp_len if mtp and pending is not None else -1,
+                     drafter.context_end if drafter is not None else -1, grid,
+-                    capture(drafter) if capture is not None and drafter is not None else None)
++                    capture(drafter) if capture is not None and drafter is not None else None,
++                    _kv8(e))
+ 
+ 
+ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+     st = e.st
++    if snap.kv != _kv8(e):     # patches/0220: never across latent row formats
++        raise ValueError(f"a snapshot of {'fp8' if snap.kv else 'bf16'} latent rows cannot resume on this engine")
+     if st.cur:
+         st.rec[st.cur[0]].copy_(snap.rec)
+     st.conv.copy_(snap.conv)
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index d6962c2..d9108db 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -238,12 +238,13 @@ class GlmEngine:
+         self.w = w
+         # GLM53_TF_LATENT_KV=1 (patches/0060): DSA layers cache the MLA latent (1 KB a token a layer) and attend in
+         # latent space. The replies' bits depend on it, so both ranks must agree.
+-        from .latent import enabled as latent_kv
++        from .latent import enabled as latent_kv, kv_dtype
+ 
+-        lat_both = self._gather_ints([int(latent_kv())])
++        # patches/0220: GLM53_TF_KV_DTYPE (bf16 / fp8 latent rows) decides the replies' bits too
++        lat_both = self._gather_ints([int(latent_kv()), int(kv_dtype() == "fp8")])
+         if lat_both[0] != lat_both[1]:
+-            raise RuntimeError(f"the two ranks were started with different GLM53_TF_LATENT_KV: {lat_both[0][0]}, "
+-                               f"{lat_both[1][0]}")
++            raise RuntimeError("the two ranks were started with different GLM53_TF_LATENT_KV / GLM53_TF_KV_DTYPE: "
++                               f"{lat_both[0]}, {lat_both[1]}")
+         # patches/0080: GLM53_TF_FAST_PREFILL and GLM53_TF_FAST_GATHER decide a fast prefill's bits, and so do the
+         # optional fast kernels (patches/0081): both ranks must agree on all of them
+         from . import fastpf
+diff --git a/src/tensorfold/families/glm5_next/cuda/knobs.py b/src/tensorfold/families/glm5_next/cuda/knobs.py
+index 8b03874..4a87e5e 100644
+--- a/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ b/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -87,6 +87,7 @@ HEADER = ("expert_loop", "prefill_rows", "longctx_graphs", "profile", "auto_fdra
+ LOAD_ONLY: dict[str, str] = {
+     "nonexpert": "GLM53_TF_NONEXPERT is the stored weight format, quantized once at load",
+     "latent_kv": "GLM53_TF_LATENT_KV is the attention cache layout, allocated at load",
++    "kv_dtype": "GLM53_TF_KV_DTYPE (patches/0220) is the latent cache's row format (bf16 / fp8), allocated at load",
+     "comm": "GLM53_TF_COMM (prefetch / NCCL protocol) is captured into the CUDA graphs and set before NCCL starts",
+     "batch": "GLM53_TF_BATCH builds the batch scheduler at load",
+     "prefill_rows_max": "GLM53_TF_PREFILL_ROWS_MAX sizes the window buffers at load (a request picks any "
+diff --git a/src/tensorfold/families/glm5_next/cuda/latent.py b/src/tensorfold/families/glm5_next/cuda/latent.py
+index 1026a7b..28fa2ad 100644
+--- a/src/tensorfold/families/glm5_next/cuda/latent.py
++++ b/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -29,6 +29,18 @@ own top-k tokens (``sparse.select_tokens``, unchanged) through the same tile ari
+ 
+ Relative to the expanded engine the arithmetic differs (k and v are never rounded to bf16 per head; q' is), so
+ replies differ from the expanded engine's in the last bits; within this configuration every guarantee holds.
++
++patches/0220, GLM53_TF_KV_DTYPE=fp8 (load-time; default bf16): every latent cache (the 11 DSA layers' and the MTP
++head's) stores a token's row as 512 e4m3 values and one power-of-two fp32 scale, in one uint8 tensor
++[capacity, ``ROW8`` = 528] (bytes 0-511 the values, 512-515 the scale, 516-527 padding that keeps rows 16-byte
++aligned): 528 B a token a layer instead of 1,024. ``latent_write`` quantizes each row on its own (s = the smallest
++power of two with amax / s <= 448; values rounded to nearest even, never saturating); the attention kernels
++dequantize the rows they read, e4m3 x 2^k, which is exact in bf16, and then run the bf16 arithmetic above
++unchanged. So an FP8 cache gives exactly the bits of a bf16 cache holding the dequantized rows (tested), and every
++guarantee (row independence, verify == serial, chunk size, resumed == fresh) holds within the FP8 configuration for
++the same reasons. New arithmetic against bf16 KV (the stored latent is rounded to 4 mantissa bits): replies differ;
++snapshots carry the dtype (``decode.Snapshot.kv``) and the session store's keys include it. Pool keys and the
++indexer's keys and gates stay bf16 (they decide the token selection).
+ """
+ 
+ from __future__ import annotations
+@@ -66,6 +78,10 @@ BF16_BM32 = False
+ # snapshots carry their own tag (``pfgrid.TC``) so they never resume a prefill of the other arithmetic.
+ BF16_TC = False
+ TC_ROWS = 64
++# patches/0220: the FP8 latent row (GLM53_TF_KV_DTYPE=fp8): 512 e4m3 bytes, the fp32 scale at byte 512, padded to 528
++ROW8 = 528
++SCALE_AT = 512
++E4M3_MAX = 448.0
+ 
+ 
+ def fast8(b) -> bool:
+@@ -94,22 +110,93 @@ def on(w) -> bool:
+     return bool(w.meta.get("latent_kv"))
+ 
+ 
++def kv_dtype() -> str:
++    """GLM53_TF_KV_DTYPE (patches/0220, load-time): ``bf16`` (default) or ``fp8`` latent cache rows (e4m3 + a per-row
++    power-of-two scale). ``fp8`` needs GLM53_TF_LATENT_KV=1 (the expanded per-head cache stays bf16)."""
++
++    v = os.environ.get("GLM53_TF_KV_DTYPE", "bf16").strip().lower() or "bf16"
++    if v not in ("bf16", "fp8"):
++        raise ValueError(f"GLM53_TF_KV_DTYPE must be bf16 or fp8, not {v!r}")
++    if v == "fp8" and not enabled():
++        raise ValueError("GLM53_TF_KV_DTYPE=fp8 stores the MLA latent in FP8: it needs GLM53_TF_LATENT_KV=1")
++    return v
++
++
++def fp8_on(w) -> bool:
++    """patches/0220: this engine's latent caches hold FP8 rows (``w.meta['kv_fp8']``, set at load)."""
++
++    return bool(w.meta.get("kv_fp8"))
++
++
++def is_fp8(lc: torch.Tensor) -> bool:
++    """An FP8 latent cache (uint8 rows of ``ROW8`` bytes) rather than a bf16 one."""
++
++    return lc.dtype == torch.uint8
++
++
+ def caches(w, capacity: int, n: int) -> list[torch.Tensor]:
+-    """``n`` latent caches [capacity, kv_lora] bf16 (one row a token)."""
++    """``n`` latent caches [capacity, kv_lora] bf16 (one row a token), or with patches/0220's FP8 rows
++    [capacity, ``ROW8``] uint8 (512 e4m3 values and an fp32 scale a row; zero rows read as zeros)."""
+ 
+     c = w.cfg
+     if c.kv_lora % 64 or c.kv_lora & (c.kv_lora - 1):
+         raise ValueError(f"latent KV needs a power-of-two kv_lora_rank of at least 64, not {c.kv_lora}")
++    if fp8_on(w):
++        if c.kv_lora != SCALE_AT:
++            raise ValueError(f"GLM53_TF_KV_DTYPE=fp8 is laid out for a 512-wide latent, not {c.kv_lora}")
++        return [torch.zeros((capacity, ROW8), dtype=torch.uint8, device=w.device) for _ in range(n)]
+     return [torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=w.device) for _ in range(n)]
+ 
+ 
++def _views(lc: torch.Tensor, L: int):
++    """Kernel arguments of a latent cache: (rows, scales, FP8, row stride in elements, scale stride in fp32s)."""
++
++    if is_fp8(lc):
++        if lc.shape[1] != ROW8 or L != SCALE_AT or not lc.is_contiguous():
++            raise ValueError("FP8 latent cache: expected contiguous [capacity, 528] uint8 rows of a 512-wide latent")
++        return lc, lc.view(torch.float32), True, ROW8, ROW8 // 4
++    if lc.shape[1] != L:
++        raise ValueError("latent cache rows must be as wide as the latent")
++    return lc, lc, False, L, 0
++
++
++def dequantize_rows(lc: torch.Tensor) -> torch.Tensor:
++    """patches/0220 (tests, host checks): an FP8 latent cache's rows as bf16 [n, 512] (exact: e4m3 x 2^k); a bf16
++    cache is returned as is."""
++
++    if not is_fp8(lc):
++        return lc
++    vals = lc[:, :SCALE_AT].contiguous().view(torch.float8_e4m3fn).to(torch.float32)
++    scale = lc[:, SCALE_AT:SCALE_AT + 4].contiguous().view(torch.float32)
++    return (vals * scale).to(torch.bfloat16)
++
++
++def quantize_rows_reference(x: torch.Tensor) -> torch.Tensor:
++    """patches/0220: torch reference of ``latent_write``'s FP8 rows: x [n, 512] bf16 -> [n, ROW8] uint8."""
++
++    n, L = x.shape
++    xf = x.float()
++    amax = xf.abs().amax(1)
++    bits = amax.view(torch.int32)
++    E = (bits >> 23) & 0xFF
++    e = E - 135 + ((bits & 0x7FFFFF) > 0x600000).to(torch.int32)
++    e = torch.where(amax > 0, e, torch.zeros_like(e)).clamp(-126, 126)
++    scale = ((e + 127) << 23).view(torch.float32)
++    inv = ((127 - e) << 23).view(torch.float32)
++    q = (xf * inv[:, None]).to(torch.float8_e4m3fn)
++    out = torch.zeros((n, ROW8), dtype=torch.uint8, device=x.device)
++    out[:, :L] = q.view(torch.uint8)
++    out[:, SCALE_AT:SCALE_AT + 4] = scale.view(torch.uint8).view(n, 4)
++    return out
++
++
+ def kv_bytes_per_token(st) -> int:
+     """Bytes a cached token costs on this rank: every attention cache (the model's layers and the MTP head's) and the
+     indexer caches (pool keys are one row per 4 tokens), counted once however they alias."""
+ 
+     seen, total = set(), 0
+ 
+-    def add(t: torch.Tensor, per: float = 1.0) -> None:
++    def add(t: torch.Tensor, per: float = 1.0) -> None:       # patches/0220: an FP8 row counts its 528 bytes
+         nonlocal total
+         if t.data_ptr() in seen:
+             return
+@@ -341,16 +428,68 @@ def _lwrite(LAT, LC, POS, L: tl.constexpr):
+     tl.store(LC + (P + r) * L + d, tl.load(LAT + r * L + d))
+ 
+ 
++@triton.jit
++def _lwrite8(LAT, LC, LCS, POS, L: tl.constexpr, RB: tl.constexpr, SB: tl.constexpr, SA: tl.constexpr):
++    """patches/0220: row r quantized on its own: s = 2^e, the smallest power of two with amax / s <= 448 (448 =
++    1.75 x 2^8, so e = E - 135, + 1 when amax's mantissa exceeds 1.75), values x / s (exact) rounded to nearest-even
++    e4m3 (never saturating: |x / s| <= 448); an all-zero row stores zeros and s = 1. torch's float8_e4m3fn
++    conversion gives the same bytes (``quantize_rows_reference``)."""
++
++    r = tl.program_id(0)
++    P = tl.load(POS).to(tl.int64)
++    d = tl.arange(0, L)
++    x = tl.load(LAT + r * L + d).to(tl.float32)
++    amax = tl.max(tl.abs(x), 0)
++    bits = amax.to(tl.int32, bitcast=True)
++    e = ((bits >> 23) & 0xFF) - 135 + ((bits & 0x7FFFFF) > 0x600000).to(tl.int32)
++    e = tl.where(amax > 0.0, e, 0)
++    e = tl.minimum(tl.maximum(e, -126), 126)
++    scale = ((e + 127) << 23).to(tl.float32, bitcast=True)
++    inv = ((127 - e) << 23).to(tl.float32, bitcast=True)
++    # rounded to the e4m3 grid here, to nearest even, in fp32 (normal range: 3 mantissa bits; below 2^-6 the fixed
++    # 2^-9 step, by adding and subtracting 1.5 x 2^14); the conversion then only relabels exact values, whatever
++    # rounding (or double rounding through fp16) the compiler's cvt would do
++    y = x * inv
++    yb = y.to(tl.int32, bitcast=True)
++    near = ((yb + 0x7FFFF + ((yb >> 20) & 1)) & -1048576).to(tl.float32, bitcast=True)
++    a = tl.abs(y)
++    small = (a + 24576.0) - 24576.0
++    small = (small.to(tl.int32, bitcast=True) | (yb & -2147483648)).to(tl.float32, bitcast=True)   # y's sign (-0 too)
++    y = tl.where(a < 0.015625, small, near)
++    q = y.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
++    row = (P + r) * RB
++    tl.store(LC + row + d, q)
++    tl.store(LCS + (P + r) * SB + SA, scale)
++
++
+ def latent_write(lat: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor) -> None:
+-    """Rows [R, L] into cache slots pos .. pos + R - 1 (pos read on the device)."""
++    """Rows [R, L] into cache slots pos .. pos + R - 1 (pos read on the device). patches/0220: an FP8 cache stores
++    each row quantized on its own (``_lwrite8``)."""
+ 
+     R, L = lat.shape
+-    if not lat.is_contiguous() or lc.shape[1] != L:
++    if not lat.is_contiguous():
+         raise ValueError("latent_write: rows must be contiguous and as wide as the cache")
++    lcv, lcs, f8, rb, sb = _views(lc, L)
++    if f8:
++        _lwrite8[(R,)](lat, lcv, lcs, pos, L=L, RB=rb, SB=sb, SA=SCALE_AT // 4, num_warps=4)
++        return
+     _lwrite[(R,)](lat, lc, pos, L=L, num_warps=4)
+ 
+ 
+ # -- attention in latent space ------------------------------------------------------------------------------------
++@triton.jit
++def _lrows(LC, LCS, rows, ok, d, FP8: tl.constexpr, RB: tl.constexpr, SB: tl.constexpr, SA: tl.constexpr):
++    """Latent rows ``rows`` (int64, masked by ``ok``) as bf16 [n, L]. patches/0220: FP8 rows dequantized, e4m3 x 2^k
++    (exact in bf16: the bf16 kernels' inputs are the dequantized rows, bit for bit)."""
++
++    if FP8:
++        v = tl.load(LC + rows[:, None] * RB + d[None, :], mask=ok[:, None], other=0)
++        s = tl.load(LCS + rows * SB + SA, mask=ok, other=0.0)
++        return (v.to(tl.float8e4nv, bitcast=True).to(tl.float32) * s[:, None]).to(tl.bfloat16)
++    else:
++        return tl.load(LC + rows[:, None] * RB + d[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
++
++
+ @triton.jit
+ def _ltile(q, kv, m, l, o, valid, SCALE: tl.constexpr):
+     """One tile of latent rows (keys = values) for BM queries: the expanded kernel's online softmax step."""
+@@ -368,8 +507,9 @@ def _ltile(q, kv, m, l, o, valid, SCALE: tl.constexpr):
+ 
+ 
+ @triton.jit
+-def _lchunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, L: tl.constexpr, CH: tl.constexpr, KTS: tl.constexpr,
+-             SCALE: tl.constexpr, BMQ: tl.constexpr):
++def _lchunks(QA, LC, LCS, POS, PO, PM, PL, R, H: tl.constexpr, L: tl.constexpr, CH: tl.constexpr, KTS: tl.constexpr,
++             SCALE: tl.constexpr, BMQ: tl.constexpr, FP8: tl.constexpr = False, RB: tl.constexpr = 0,
++             SB: tl.constexpr = 0, SA: tl.constexpr = 0):
+     """Program (query tile, chunk c): queries i = (row r, head h) flattened as r H + h, 16 to a tile; keys
+     c CH .. c CH + CH - 1 of the latent cache, row r seeing keys up to pos + r."""
+ 
+@@ -390,7 +530,7 @@ def _lchunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, L: tl.constexpr, CH: t
+         for t in range(CH // KTS):
+             ki = start + t * KTS + tl.arange(0, KTS)
+             inside = ki < P + R
+-            kv = tl.load(LC + ki[:, None].to(tl.int64) * L + d[None, :], mask=inside[:, None], other=0).to(tl.bfloat16)
++            kv = _lrows(LC, LCS, ki.to(tl.int64), inside, d, FP8, RB, SB, SA)
+             valid = (ki[None, :] <= limit[:, None]) & iok[:, None]
+             m, l, o = _ltile(q, kv, m, l, o, valid, SCALE)
+     base = c * (R * H) + i
+@@ -442,8 +582,10 @@ def attention_latent(qa: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor, scra
+     po = scratch.po[:nch * RH * L]
+     pm = scratch.pm[:nch * RH]
+     pl = scratch.pl[:nch * RH]
+-    _lchunks[(triton.cdiv(RH, bm), nch)](qa, lc, pos, po, pm, pl, R, H=H, L=L, CH=CHUNK, KTS=KT, SCALE=scale,
+-                                         BMQ=bm, num_warps=ATTN_WARPS, num_stages=stages)
++    lcv, lcs, f8, rb, sb = _views(lc, L)                    # patches/0220: FP8 rows or bf16 rows
++    _lchunks[(triton.cdiv(RH, bm), nch)](qa, lcv, lcs, pos, po, pm, pl, R, H=H, L=L, CH=CHUNK, KTS=KT, SCALE=scale,
++                                         BMQ=bm, FP8=f8, RB=rb, SB=sb, SA=SCALE_AT // 4,
++                                         num_warps=ATTN_WARPS, num_stages=stages)
+     if out is None:
+         out = scratch.u[:R]
+     elif out.shape != (R, H, L) or out.dtype != torch.float32 or not out.is_contiguous():
+@@ -453,8 +595,9 @@ def attention_latent(qa: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor, scra
+ 
+ 
+ @triton.jit
+-def _lsparse_chunks(QA, LC, TOK, CNT, PO, PM, PL, RS, W: tl.constexpr, H: tl.constexpr, L: tl.constexpr,
+-                    CH: tl.constexpr, KTS: tl.constexpr, SCALE: tl.constexpr, BMQ: tl.constexpr):
++def _lsparse_chunks(QA, LC, LCS, TOK, CNT, PO, PM, PL, RS, W: tl.constexpr, H: tl.constexpr, L: tl.constexpr,
++                    CH: tl.constexpr, KTS: tl.constexpr, SCALE: tl.constexpr, BMQ: tl.constexpr,
++                    FP8: tl.constexpr = False, RB: tl.constexpr = 0, SB: tl.constexpr = 0, SA: tl.constexpr = 0):
+     """Program (row r, head tile, chunk c): the row's selected tokens [c CH, (c + 1) CH) in list order for 16 of its
+     heads at once (the tile's latent rows are read once for all of them)."""
+ 
+@@ -474,7 +617,7 @@ def _lsparse_chunks(QA, LC, TOK, CNT, PO, PM, PL, RS, W: tl.constexpr, H: tl.con
+             idx = c * CH + t * KTS + tl.arange(0, KTS)
+             ok = idx < n
+             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
+-            kv = tl.load(LC + tok[:, None] * L + d[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
++            kv = _lrows(LC, LCS, tok, ok, d, FP8, RB, SB, SA)
+             valid = ok[None, :] & hok[:, None]
+             m, l, o = _ltile(q, kv, m, l, o, valid, SCALE)
+     base = (c * RS + r) * H + h
+@@ -524,9 +667,10 @@ def sparse_latent(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, coun
+         po = torch.empty((nch * R * H * L,), dtype=torch.float32, device=qa.device)
+         pm = torch.empty((nch * R * H,), dtype=torch.float32, device=qa.device)
+         pl = torch.empty((nch * R * H,), dtype=torch.float32, device=qa.device)
+-    _lsparse_chunks[(R, triton.cdiv(H, bm), nch)](qa, lc, tokens, counts, po, pm, pl, R, W=W, H=H, L=L, CH=CHUNK,
+-                                                  KTS=KT, SCALE=scale, BMQ=bm, num_warps=ATTN_WARPS,
+-                                                  num_stages=stages)
++    lcv, lcs, f8, rb, sb = _views(lc, L)                    # patches/0220: FP8 rows or bf16 rows
++    _lsparse_chunks[(R, triton.cdiv(H, bm), nch)](qa, lcv, lcs, tokens, counts, po, pm, pl, R, W=W, H=H, L=L, CH=CHUNK,
++                                                  KTS=KT, SCALE=scale, BMQ=bm, FP8=f8, RB=rb, SB=sb, SA=SCALE_AT // 4,
++                                                  num_warps=ATTN_WARPS, num_stages=stages)
+     _lsparse_merge[(R, H)](po, pm, pl, out, counts, R, H=H, L=L, NCH=nch, CH=CHUNK, num_warps=4)
+ 
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/sessions.py b/src/tensorfold/families/glm5_next/cuda/sessions.py
+index 69c6b6b..063e899 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sessions.py
++++ b/src/tensorfold/families/glm5_next/cuda/sessions.py
+@@ -157,6 +157,16 @@ def snapshot_grid(tag: int) -> int:
+ 
+ 
+ # -- hashing --------------------------------------------------------------------------------------------------------
++# patches/0220: the latent cache's row format (GLM53_TF_KV_DTYPE) in every entry and page key: b"" for bf16 (the keys
++# of earlier patches), b"kv:fp8" for FP8 rows (``SessionStore`` sets it from the engine at load)
++KV_TAG = b""
++
++
++def _kv_fp8(e) -> bool:
++    meta = getattr(getattr(e, "w", None), "meta", None)
++    return bool(meta.get("kv_fp8")) if isinstance(meta, dict) else False
++
++
+ def _bytes(ids: Sequence[int]) -> bytes:
+     return array("i", [int(t) for t in ids]).tobytes()
+ 
+@@ -183,7 +193,7 @@ def chain(ids: Sequence[int], blocks: int | None = None) -> list[bytes]:
+ def ids_key(tag: int, ids: Sequence[int], has_mtp: bool, drafter: bool) -> bytes:
+     """An entry's identity: two snapshots with the same key hold the same state."""
+ 
+-    return _h(b"entry", tag.to_bytes(4, "little"), bytes([int(has_mtp), int(drafter)]),
++    return _h(b"entry", KV_TAG, tag.to_bytes(4, "little"), bytes([int(has_mtp), int(drafter)]),
+               len(ids).to_bytes(8, "little"), _bytes(ids))
+ 
+ 
+@@ -209,7 +219,7 @@ def page_count(tag: int, length: int, mtp_len: int) -> int:
+ 
+ 
+ def page_keys(tag: int, ids: Sequence[int], blocks: list[bytes], count: int, has_mtp: bool) -> list[bytes]:
+-    head = tag.to_bytes(4, "little") + bytes([int(has_mtp)])
++    head = KV_TAG + tag.to_bytes(4, "little") + bytes([int(has_mtp)])
+     return [_h(b"page", head, blocks[p], _bytes(ids[PAGE * (p + 1):key_end(tag, p)])) for p in range(count)]
+ 
+ 
+@@ -623,8 +633,10 @@ class SessionStore:
+ 
+     def __init__(self, e, drafter, budget: int, *, every_tokens: int | None = None,
+                  fork_tokens: int | None = None) -> None:
++        global KV_TAG
+         self.e = e
+         self.drafter = drafter
++        KV_TAG = b"kv:fp8" if _kv_fp8(e) else b""        # patches/0220
+         self.comps = layout(e.st)
+         self.index = SessionIndex(budget, row_bytes(self.comps))
+         self.every = every() if every_tokens is None else every_tokens

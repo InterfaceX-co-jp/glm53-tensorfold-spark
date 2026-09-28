@@ -1,0 +1,415 @@
+diff --git c/src/tensorfold/cuda/health.py i/src/tensorfold/cuda/health.py
+new file mode 100644
+index 0000000..2f2bb84
+--- /dev/null
++++ i/src/tensorfold/cuda/health.py
+@@ -0,0 +1,236 @@
++"""patches/0150: liveness for ``tensorfold.cuda.server``: ``GET /health`` that can say no, and ``GET /metrics``.
++
++Upstream's ``/health`` answers ``{"ok": true}`` whatever the engine is doing. With two ranks that is not enough: a
++CUDA error or an out-of-memory in the middle of a request leaves rank 1 waiting in a collective forever, the next
++request hangs behind it, and ``/health`` still says ok (the MiaAI-Lab and vLLM-kit watchdogs found the same with
++vLLM: ``/health`` stays 200 through a stuck NCCL collective, so they watch forward progress instead). This module
++keeps, per server:
++
++- ``fatal``: the first exception (other than ``ValueError``: a bad request) raised out of ``engine.generate``. The
++  ranks are out of step after one, so nothing after it can be trusted.
++- the requests in flight, each with its prompt length, start time and the time of its last token, so a request that
++  stopped making progress is visible (a stall).
++- counters for ``/metrics`` (Prometheus text): requests, errors, prompt / completion / cached tokens, decode rounds
++  and seconds, prefill seconds. Tokens a round over an interval is the drafter's health (a broken or mismatched
++  drafter decodes one token a round).
++
++``GLM53_TF_HEALTH``:
++
++- ``basic`` (default): ``/health`` stays 200 and adds the fields below (``fatal``, ``stalled``, ``inflight``, ...),
++  so nothing that polls it today changes behaviour.
++- ``strict``: ``/health`` answers 503 once ``fatal`` is set or while a request is stalled, and new completions get a
++  503 right away once ``fatal`` is set (instead of queueing behind a hung collective). ``scripts/serve.sh watch``
++  restarts both ranks on it.
++
++A request is stalled when its last token (or its start, before the first token) is older than ``GLM53_TF_STALL_S``
++(default 0: never) plus, before the first token, its prompt at ``GLM53_TF_STALL_PREFILL_TPS`` tokens a second
++(default 200, well under the slowest measured prefill, so a 1M prompt gets ~83 min before it counts).
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++import threading
++import time
++from typing import Any
++
++MODES = ("basic", "strict")
++
++
++def env_mode() -> str:
++    mode = os.environ.get("GLM53_TF_HEALTH", "basic").strip().lower() or "basic"
++    if mode not in MODES:
++        raise ValueError(f"GLM53_TF_HEALTH={mode!r}: expected one of {', '.join(MODES)}")
++    return mode
++
++
++def _env_float(name: str, default: float) -> float:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return default
++    value = float(raw)
++    if value < 0:
++        raise ValueError(f"{name}={raw}: must be >= 0")
++    return value
++
++
++class Health:
++    """Thread-safe request bookkeeping for ``/health`` and ``/metrics``. ``clock``: for tests."""
++
++    def __init__(self, *, mode: str | None = None, stall_s: float | None = None, prefill_tps: float | None = None,
++                 clock=time.monotonic) -> None:
++        self.mode = mode or env_mode()
++        self.stall_s = _env_float("GLM53_TF_STALL_S", 0.0) if stall_s is None else float(stall_s)
++        self.prefill_tps = _env_float("GLM53_TF_STALL_PREFILL_TPS", 200.0) if prefill_tps is None \
++            else float(prefill_tps)
++        self.clock = clock
++        self.started = clock()
++        self.lock = threading.Lock()
++        self.fatal: str | None = None
++        self.inflight: dict[int, dict[str, float]] = {}
++        self.next_id = 0
++        self.last_done = None
++        self.counters: dict[str, float] = {k: 0 for k in (
++            "requests", "errors", "rejected", "prompt_tokens", "completion_tokens", "cached_tokens",
++            "decode_rounds", "decode_seconds", "prefill_seconds")}
++
++    # -- request lifecycle -------------------------------------------------------------------------------------
++
++    def begin(self, prompt_tokens: int) -> int:
++        with self.lock:
++            rid = self.next_id
++            self.next_id += 1
++            now = self.clock()
++            self.inflight[rid] = {"prompt": float(prompt_tokens), "start": now, "last": now, "tokens": 0.0}
++            return rid
++
++    def progress(self, rid: int, n: int) -> None:
++        with self.lock:
++            entry = self.inflight.get(rid)
++            if entry is not None:
++                entry["last"] = self.clock()
++                entry["tokens"] += n
++
++    def end(self, rid: int, *, stats: dict[str, Any] | None = None, completion_tokens: int = 0,
++            error: BaseException | None = None) -> None:
++        with self.lock:
++            entry = self.inflight.pop(rid, None)
++            self.last_done = self.clock()
++            c = self.counters
++            c["requests"] += 1
++            if error is not None:
++                c["errors"] += 1
++                if not isinstance(error, ValueError) and self.fatal is None:
++                    self.fatal = f"{type(error).__name__}: {error}"[:500]
++                return
++            c["prompt_tokens"] += entry["prompt"] if entry else 0
++            c["completion_tokens"] += completion_tokens
++            stats = stats or {}
++            c["cached_tokens"] += float(stats.get("cached", 0) or 0)
++            c["decode_rounds"] += float(stats.get("rounds", 0) or 0)
++            c["decode_seconds"] += float(stats.get("decode_s", 0) or 0)
++            c["prefill_seconds"] += float(stats.get("prefill_s", 0) or 0)
++
++    def reject(self) -> str | None:
++        """Why a new completion must not start (strict mode after a fatal error), or None."""
++
++        if self.mode == "strict" and self.fatal is not None:
++            with self.lock:
++                self.counters["rejected"] += 1
++            return f"the engine failed earlier ({self.fatal}); restart both ranks"
++        return None
++
++    def track(self, engine) -> "TrackedEngine":
++        return TrackedEngine(engine, self)
++
++    # -- views -------------------------------------------------------------------------------------------------
++
++    def _stalled(self, now: float) -> list[dict[str, float]]:
++        if self.stall_s <= 0:
++            return []
++        out = []
++        for entry in self.inflight.values():
++            allow = self.stall_s
++            if entry["tokens"] == 0 and self.prefill_tps > 0:
++                allow += entry["prompt"] / self.prefill_tps
++            quiet = now - entry["last"]
++            if quiet > allow:
++                out.append({"prompt": entry["prompt"], "quiet_s": round(quiet, 1), "allowed_s": round(allow, 1)})
++        return out
++
++    def status(self) -> tuple[int, dict[str, Any]]:
++        """(HTTP code, body) for ``GET /health``."""
++
++        with self.lock:
++            now = self.clock()
++            stalled = self._stalled(now)
++            body: dict[str, Any] = {
++                "ok": self.fatal is None and not stalled,
++                "mode": self.mode,
++                "uptime_s": round(now - self.started, 1),
++                "inflight": len(self.inflight),
++                "oldest_s": round(max((now - e["start"] for e in self.inflight.values()), default=0.0), 1),
++                "idle_s": round(now - self.last_done, 1) if self.last_done is not None and not self.inflight
++                else None,
++                "requests": int(self.counters["requests"]),
++                "errors": int(self.counters["errors"]),
++            }
++            if self.fatal is not None:
++                body["fatal"] = self.fatal
++            if stalled:
++                body["stalled"] = stalled
++        code = 503 if self.mode == "strict" and not body["ok"] else 200
++        return code, body
++
++    def metrics(self, served: str = "") -> str:
++        """Prometheus text exposition (counters and gauges, one ``model`` label)."""
++
++        with self.lock:
++            now = self.clock()
++            c = dict(self.counters)
++            inflight = len(self.inflight)
++            stalled = len(self._stalled(now))
++            fatal = int(self.fatal is not None)
++            uptime = now - self.started
++        label = '{model="%s"}' % served.replace("\\", "\\\\").replace('"', '\\"')
++        rows = [
++            ("tensorfold_requests_total", "counter", "completions finished (errors included)", c["requests"]),
++            ("tensorfold_request_errors_total", "counter", "completions that raised", c["errors"]),
++            ("tensorfold_requests_rejected_total", "counter", "completions refused after a fatal error",
++             c["rejected"]),
++            ("tensorfold_prompt_tokens_total", "counter", "prompt tokens of finished completions", c["prompt_tokens"]),
++            ("tensorfold_cached_tokens_total", "counter", "prompt tokens resumed instead of prefilled",
++             c["cached_tokens"]),
++            ("tensorfold_completion_tokens_total", "counter", "generated tokens", c["completion_tokens"]),
++            ("tensorfold_decode_rounds_total", "counter", "decode rounds (tokens / rounds: draft acceptance)",
++             c["decode_rounds"]),
++            ("tensorfold_decode_seconds_total", "counter", "seconds decoding", c["decode_seconds"]),
++            ("tensorfold_prefill_seconds_total", "counter", "seconds prefilling", c["prefill_seconds"]),
++            ("tensorfold_requests_inflight", "gauge", "completions running now", inflight),
++            ("tensorfold_requests_stalled", "gauge", "running completions past GLM53_TF_STALL_S", stalled),
++            ("tensorfold_engine_fatal", "gauge", "1 once the engine raised (restart both ranks)", fatal),
++            ("tensorfold_uptime_seconds", "gauge", "seconds since the server started", uptime),
++        ]
++        out = []
++        for name, kind, doc, value in rows:
++            value = float(value)
++            shown = str(int(value)) if value.is_integer() else f"{value:.6f}"
++            out += [f"# HELP {name} {doc}", f"# TYPE {name} {kind}", f"{name}{label} {shown}"]
++        return "\n".join(out) + "\n"
++
++
++class TrackedEngine:
++    """``engine`` with ``generate`` going through ``Health`` (begin, a progress mark per token callback, end with
++    the stats or the exception). Every other attribute is the engine's own (read and written through)."""
++
++    def __init__(self, engine, health: Health) -> None:
++        object.__setattr__(self, "_engine", engine)
++        object.__setattr__(self, "_health", health)
++        inner = engine.generate
++
++        @functools.wraps(inner)                 # keeps the signature: ``App.check`` inspects it for ``draft``
++        def generate(prompt, max_tokens, sampling, on_tokens, *args, **kwargs):
++            rid = health.begin(len(prompt))
++            count = [0]
++
++            def tracked(new):
++                count[0] += len(new)
++                health.progress(rid, len(new))
++                return on_tokens(new)
++
++            try:
++                stats = inner(prompt, max_tokens, sampling, tracked, *args, **kwargs)
++            except BaseException as exc:
++                health.end(rid, error=exc)
++                raise
++            health.end(rid, stats=stats if isinstance(stats, dict) else None, completion_tokens=count[0])
++            return stats
++
++        object.__setattr__(self, "generate", generate)
++
++    def __getattr__(self, name: str):
++        return getattr(self._engine, name)
++
++    def __setattr__(self, name: str, value) -> None:
++        setattr(self._engine, name, value)
+diff --git c/src/tensorfold/cuda/server.py i/src/tensorfold/cuda/server.py
+index 135487b..17cb10a 100644
+--- c/src/tensorfold/cuda/server.py
++++ i/src/tensorfold/cuda/server.py
+@@ -229,7 +229,10 @@ class App:
+                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096):
+         from tokenizers import Tokenizer
+ 
+-        self.engine = engine
++        from .health import Health       # patches/0150: /health that can say no, /metrics
++
++        self.health = Health()
++        self.engine = self.health.track(engine)     # patches/0150: generate() through the request bookkeeping
+         self.served = served
+         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
+         self.template = ChatTemplate(model_dir)
+@@ -351,7 +354,14 @@ def make_handler(app: App):
+             if self.path.rstrip("/") in ("/v1/models", "/models"):
+                 self._json(200, {"object": "list", "data": [{"id": app.served, "object": "model", "owned_by": "tensorfold"}]})
+             elif self.path.rstrip("/") in ("/health", "/v1/health"):
+-                self._json(200, {"ok": True})
++                self._json(*app.health.status())            # patches/0150
++            elif self.path.rstrip("/") == "/metrics":       # patches/0150: Prometheus text
++                data = app.health.metrics(app.served).encode()
++                self.send_response(200)
++                self.send_header("Content-Type", "text/plain; version=0.0.4")
++                self.send_header("Content-Length", str(len(data)))
++                self.end_headers()
++                self.wfile.write(data)
+             else:
+                 self._json(404, {"error": "not found"})
+ 
+@@ -366,6 +376,9 @@ def make_handler(app: App):
+             problem = app.check(body)
+             if problem:
+                 return self._json(400, {"error": {"message": problem, "type": "invalid_request_error"}})
++            refused = app.health.reject()           # patches/0150: GLM53_TF_HEALTH=strict after a fatal error
++            if refused:
++                return self._json(503, {"error": {"message": refused, "type": "server_error"}})
+             rid = f"chatcmpl-{uuid.uuid4().hex[:24]}" if chat else f"cmpl-{uuid.uuid4().hex[:24]}"
+             created = int(time.time())
+             stream = bool(body.get("stream"))
+@@ -395,7 +408,17 @@ def make_handler(app: App):
+ 
+                 if chat:
+                     emit({"role": "assistant"})
+-                result = app.run(body, chat, emit)
++                try:
++                    result = app.run(body, chat, emit)
++                except Exception as exc:        # patches/0150: an error event, not a dropped connection
++                    try:
++                        err = {"error": {"message": f"{type(exc).__name__}: {exc}"[:500], "type": "server_error"}}
++                        self.wfile.write(f"data: {json.dumps(err)}\n\ndata: [DONE]\n\n".encode())
++                        self.wfile.flush()
++                    except (BrokenPipeError, ConnectionResetError):
++                        pass
++                    self.close_connection = True
++                    return
+                 if result["final"]:
+                     emit(result["final"])
+                 if result["calls"]:
+@@ -417,7 +440,13 @@ def make_handler(app: App):
+                     pass
+                 self.close_connection = True
+                 return
+-            result = app.run(body, chat, lambda delta: True)
++            try:
++                result = app.run(body, chat, lambda delta: True)
++            except ValueError as exc:           # patches/0150: a request the engine refused
++                return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
++            except Exception as exc:            # patches/0150: a JSON 500, not a dropped connection
++                return self._json(500, {"error": {"message": f"{type(exc).__name__}: {exc}"[:500],
++                                                  "type": "server_error"}})
+             usage = {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
+                      "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
+                      "prompt_tokens_details": _cached(result)}              # patches/0110
+diff --git c/src/tensorfold/families/glm5_next/cuda/app.py i/src/tensorfold/families/glm5_next/cuda/app.py
+index 33cc6e4..e04e277 100644
+--- c/src/tensorfold/families/glm5_next/cuda/app.py
++++ i/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -11,16 +11,65 @@ A request whose prompt plus ``max_tokens`` needs more context than the engine wa
+ before anything streams, naming the ``--context`` to restart both ranks with. Without ``max_tokens`` the reply
+ stops where the context ends.
+ 
++patches/0150: GLM53_TF_EFFORT_FIELD=1 honours OpenAI's top-level ``reasoning_effort`` (``none`` / ``minimal``: thinking
++off; ``low``: the template's Low effort; ``medium`` / ``high``: High; ``max`` / ``xhigh``: the template default, Max) by
++filling ``chat_template_kwargs`` where the request left them unset, and GLM53_TF_DEFAULT_EFFORT (``low`` | ``high`` |
++``max``) is the effort of a thinking request that names none. For structured output (long tables, JSON with many
++numbers), thinking on at ``low`` effort is the reliable setting: the MiaAI-Lab kit measured 0/6 garbled and 791/792
++numbers right against 5-6/6 garbled with thinking off (their PR #279).
++
+ With thinking off, a chat renders the way GLM-5.3's thinking-off template does: the checkpoint's template always
+ opens a think block, so it gets an empty ``<think></think>`` and no reasoning-effort line.
+ """
+ 
+ from __future__ import annotations
+ 
++import os
+ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App
+ 
++# patches/0150: OpenAI ``reasoning_effort`` -> (enable_thinking, the template's reasoning_effort or None: its default)
++EFFORTS: dict[str, tuple[bool, str | None]] = {
++    "none": (False, None), "minimal": (False, None), "low": (True, "low"), "medium": (True, "high"),
++    "high": (True, "high"), "xhigh": (True, None), "max": (True, None)}
++
++
++def effort_env() -> tuple[bool, str | None]:
++    """(GLM53_TF_EFFORT_FIELD on, GLM53_TF_DEFAULT_EFFORT or None), validated."""
++
++    field = os.environ.get("GLM53_TF_EFFORT_FIELD", "0").strip() or "0"
++    if field not in ("0", "1"):
++        raise ValueError(f"GLM53_TF_EFFORT_FIELD={field!r}: expected 0 or 1")
++    default = os.environ.get("GLM53_TF_DEFAULT_EFFORT", "").strip().lower() or None
++    if default not in (None, "low", "high", "max"):
++        raise ValueError(f"GLM53_TF_DEFAULT_EFFORT={default!r}: expected low, high or max")
++    return field == "1", (None if default == "max" else default)
++
++
++def apply_effort(body: dict[str, Any], *, field: bool, default: str | None, default_thinking: bool) -> str | None:
++    """Fill ``body["chat_template_kwargs"]`` from ``reasoning_effort`` (with ``field``) and ``default``; keys the
++    request set itself win. Idempotent (``check`` and ``run`` both call it). Returns an error message, or None."""
++
++    kwargs = body.get("chat_template_kwargs")
++    if kwargs is not None and not isinstance(kwargs, dict):
++        return None                                     # left for the template to reject as before
++    kwargs = dict(kwargs or {})
++    asked = body.get("reasoning_effort") if field else None
++    if asked is not None:
++        key = str(asked).strip().lower()
++        if key not in EFFORTS:
++            return f"reasoning_effort must be one of {', '.join(EFFORTS)} (got {asked!r})"
++        thinking, effort = EFFORTS[key]
++        kwargs.setdefault("enable_thinking", thinking)
++        if thinking and effort is not None:
++            kwargs.setdefault("reasoning_effort", effort)
++    elif default is not None and bool(kwargs.get("enable_thinking", default_thinking)):
++        kwargs.setdefault("reasoning_effort", default)
++    if kwargs or "chat_template_kwargs" in body:
++        body["chat_template_kwargs"] = kwargs
++    return None
++
+ 
+ class ThinkingOffTemplate:
+     """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off."""
+@@ -41,6 +90,7 @@ class GlmApp(App):
+     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
+         super().__init__(engine, model_dir, served, **kwargs)
+         self.template = ThinkingOffTemplate(self.template)
++        self.effort_field, self.default_effort = effort_env()       # patches/0150
+         if getattr(engine, "batch", None) is not None:
+             # GLM53_TF_BATCH (patches/0030): the engine queues concurrent requests itself, so ``App.run`` must not
+             # serialize them
+@@ -52,7 +102,8 @@ class GlmApp(App):
+         """``App.check``, then the context: the prompt as ``run`` renders it plus ``max_tokens`` must fit the
+         engine's limit (2,051 tokens unless the server was started with a larger ``--context``)."""
+ 
+-        problem = super().check(body)
++        problem = apply_effort(body, field=self.effort_field, default=self.default_effort,
++                               default_thinking=self.default_thinking) or super().check(body)   # patches/0150
+         limit = getattr(self.engine, "limit", None)
+         if problem or limit is None:
+             return problem
+@@ -73,6 +124,8 @@ class GlmApp(App):
+                 f"restart both ranks with --context {need} or more")
+ 
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
++        apply_effort(body, field=self.effort_field, default=self.default_effort,
++                     default_thinking=self.default_thinking)           # patches/0150 (validated by ``check``)
+         model = str(body.get("model") or "")
+         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
+         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))

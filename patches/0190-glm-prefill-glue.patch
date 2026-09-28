@@ -1,0 +1,1005 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index c39625f..03f1a09 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -20,7 +20,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+-from . import fastpf, fp8pf, lean as lean_mod, pfgrid, profile
++from . import fastpf, fp8pf, lean as lean_mod, pfglue, pfgrid, profile
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .weights import Weights
+@@ -394,8 +394,12 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     fp8pf.ON = fast and bool(getattr(e, "fp8_prefill", False))
+     # patches/0085: tagged by mode (exact 0, fast G, FP8 G + 1), not by the chunk size
+     grid = getattr(e, "snap_grid", None) or pfgrid.snapshot_grid()
+-    tag = pfgrid.tag(fast, fp8pf.ON, grid)
++    # patches/0190: + pfgrid.TC for GLM53_TF_LATENT_TC's arithmetic
++    tag = pfgrid.tag(fast, fp8pf.ON, grid, pfglue.latent_tc(getattr(e, "w", None)))
+     cap = lean.rows if lean is not None else e.rows
++    # patches/0190 (``tf_knobs.mtp_window``): the MTP head absorbs positions from ``mtp_lo`` on (a function of the
++    # prompt length only); below it its caches are zeroed. Drafts only: replies never read the head
++    mtp_lo = pfglue.mtp_start(len(prompt)) if use_mtp else 0
+     e.fast_snap = None
+     e.mark_snaps = []
+     begin = 0
+@@ -414,7 +418,8 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+         restore(e, resume, drafter)
+         if use_mtp:
+             k = resume.pending.shape[0]
+-            absorb(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
++            # patches/0190: rows below the MTP window's start are skipped (zeroed), drafts only
++            pfglue.absorb(e, resume.pending, list(prompt[begin - k + 1:begin + 1]), begin - k, mtp_lo, absorb)
+     prof = profile.ON
+     if prof:
+         profile.lap("resume")
+@@ -459,7 +464,7 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+             if nxt:
+                 if prof:
+                     profile.P.prefix = "mtp."
+-                absorb(e, e.main_hidden(slice(0, len(nxt))), nxt)
++                pfglue.absorb(e, e.main_hidden(slice(0, len(nxt))), nxt, start, mtp_lo, absorb)   # patches/0190
+                 if prof:
+                     profile.lap("other")
+                     profile.P.prefix = ""
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index e08374d..d6962c2 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -345,6 +345,28 @@ class GlmEngine:
+         self.online = (calib.OnlineCosts(self.costs["verify"]) if calib.online() and rank == 0 and n == 1
+                        else None)
+         self.calib_on = calib.online()      # patches/0090: the default of ``tf_knobs.calib_online``
++        # patches/0190: the prefill glue knobs' defaults (per request: tf_knobs.moe_glue / mtp_window / hc_fused /
++        # attn_bm32)
++        from . import glue, latent, pfglue
++
++        pfglue.set_moe_glue(glue, pfglue.moe_glue_default())
++        pfglue.MTP_WINDOW = pfglue.mtp_window_default()
++        glue.HC_FUSED = pfglue.hc_default()
++        latent.BF16_BM32 = pfglue.bm32_default()
++        # GLM53_TF_LATENT_TC (load-time: other bits, snapshots tagged G + 2): both ranks must agree
++        latent.BF16_TC = pfglue.latent_tc_default()
++        tc_both = self._gather_ints(pfglue.load_settings())
++        if tc_both[0] != tc_both[1]:
++            raise RuntimeError(f"the two ranks were started with different GLM53_TF_LATENT_TC: {tc_both[0]}, "
++                               f"{tc_both[1]}")
++        if rank == 0 and latent.BF16_TC:
++            print("[tensorfold] latent absorb / expand on bf16 tensor cores in fast chunks (patches/0190, "
++                  "GLM53_TF_LATENT_TC=1: new arithmetic, own snapshot tag)"
++                  + ("" if latent.on(w) else "; inactive: GLM53_TF_LATENT_KV=0"), flush=True)
++        if rank == 0 and (pfglue.moe_glue(glue) or pfglue.MTP_WINDOW or glue.HC_FUSED or latent.BF16_BM32):
++            print(f"[tensorfold] prefill glue (patches/0190): MoE glue {pfglue.moe_glue(glue)}, "
++                  f"MTP prefill window {pfglue.MTP_WINDOW or 'off'}, fused hc {glue.HC_FUSED}, 32-query attention "
++                  f"tiles {int(latent.BF16_BM32)}", flush=True)
+         if n > 1:                           # patches/0120: per-request knobs, fast / lean prefill and every drafter
+             from .batch import Batcher
+ 
+@@ -414,7 +436,7 @@ class GlmEngine:
+     def _knob_state(self) -> dict[str, int]:
+         """This rank's current value of every knob in the header (the load-time defaults between requests)."""
+ 
+-        from . import exl3_mm, pfoverlap, profile
++        from . import exl3_mm, glue, latent, pfglue, pfoverlap, profile
+ 
+         return {"expert_loop": int(bool(exl3_mm.LOOP)), "prefill_rows": int(self.e.prefill_rows),
+                 "longctx_graphs": int(bool(self.e.longctx)), "profile": int(bool(profile.ON)),
+@@ -422,7 +444,11 @@ class GlmEngine:
+                 "fast_prefill": int(bool(self.e.fast_prefill)),          # patches/0091
+                 "fp8_prefill": int(bool(getattr(self.e, "fp8_prefill", False))),     # patches/0092
+                 "prefill_overlap": int(pfoverlap.on()),                  # patches/0093
+-                "fat_experts": int(bool(exl3_mm.FAT))}                   # patches/0170
++                "fat_experts": int(bool(exl3_mm.FAT)),                   # patches/0170
++                "moe_glue": pfglue.moe_glue(glue),                       # patches/0190
++                "mtp_window": int(pfglue.MTP_WINDOW),
++                "hc_fused": int(glue.HC_FUSED),
++                "attn_bm32": int(bool(latent.BF16_BM32))}
+ 
+     def _set_knobs(self, values: dict[str, int]) -> None:
+         """Set the knobs whose value differs from the current one (the others are left exactly as they are)."""
+@@ -460,6 +486,22 @@ class GlmEngine:
+             pfoverlap.set_request(bool(changed["prefill_overlap"]))
+         if "fat_experts" in changed:            # patches/0170: the same bits either way (fat == fast2)
+             exl3_mm.FAT = bool(changed["fat_experts"])
++        if "moe_glue" in changed:               # patches/0190: the same bits either way
++            from . import glue, pfglue
++
++            pfglue.set_moe_glue(glue, changed["moe_glue"])
++        if "mtp_window" in changed:             # patches/0190: drafts only, replies unchanged
++            from . import pfglue
++
++            pfglue.MTP_WINDOW = int(changed["mtp_window"])
++        if "hc_fused" in changed:               # patches/0190: the same bits either way (bitwise-tested)
++            from . import glue
++
++            glue.HC_FUSED = int(changed["hc_fused"])
++        if "attn_bm32" in changed:              # patches/0190: the same bits (bitwise-tested), fast chunks only
++            from . import latent
++
++            latent.BF16_BM32 = bool(changed["attn_bm32"])
+ 
+     def _knobs(self, values: dict[str, int]):
+         """Context: the request's knobs on this rank, then this rank's previous values again (also on errors)."""
+@@ -700,7 +742,10 @@ class GlmEngine:
+ 
+         fast = self.e.fast_prefill if fast is None else fast
+         fp8 = bool(getattr(self.e, "fp8_prefill", False)) if fp8 is None else fp8
+-        return pfgrid.tag(bool(fast), fp8, getattr(self.e, "snap_grid", None))
++        from . import pfglue
++
++        return pfgrid.tag(bool(fast), fp8, getattr(self.e, "snap_grid", None),
++                          pfglue.latent_tc(getattr(self, "w", None)))          # patches/0190: GLM53_TF_LATENT_TC
+ 
+     def _resume(self, prompt: list[int], code: list[int], grid: int | None = None):
+         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters (and,
+diff --git i/src/tensorfold/families/glm5_next/cuda/glue.py w/src/tensorfold/families/glm5_next/cuda/glue.py
+index 8ed4b46..1d46199 100644
+--- i/src/tensorfold/families/glm5_next/cuda/glue.py
++++ w/src/tensorfold/families/glm5_next/cuda/glue.py
+@@ -191,8 +191,10 @@ def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.T
+         FAST_HC(x, fn, part, HC_BLOCKS)
+     else:
+         _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
+-    _hc_finish[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,
+-                        ITERS=iters, BLOCK=d, num_warps=8)
++    # patches/0190: in fast chunks only (decode / graphs keep _hc_finish), the same bits with the loads in flight
++    fin = _hc_finish_u if (HC_FUSED & 2 and FAST_HC is not None) else _hc_finish
++    fin[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,
++                 ITERS=iters, BLOCK=d, num_warps=8)
+ 
+ 
+ @triton.jit
+@@ -239,6 +241,243 @@ def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: t
+                                  BLOCK=block, num_warps=4)
+ 
+ 
++# -- patches/0190: hc_post and the next hc_pre's mixing dots in one pass (``tf_knobs.hc_fused``) ----------------------
++# In a fast chunk (0084's slabs) a site ran hc_post (read X and the gathered partials, write X'), then hc_pre's
++# ``fast_qmm.hc_partial`` (read X' again, 24 dots with fn + the sum of squares per K block), then ``_hc_finish``. The
++# fused kernel computes X' tile by tile in registers, stores it, and feeds the SAME bf16 tile straight into the
++# partial's dot and square sum. Bits: each X' element is ``_hc_post``'s expression, operand for operand (the same
++# fp32 ops in the same order); each partial is ``_hc_partial_mm``'s chain for its row (the same [BM, BK] tiles
++# of the same bf16 values against the same fn tiles, one tl.dot per BK step in ascending t from a zero accumulator,
++# the same per-row square sum per step, the same shapes and warps). ``_hc_finish`` then runs unchanged (or its
++# unrolled twin ``_hc_finish_u``: the 16 partial loads issued at once, added in the same block order). The GPU test
++# checks every output bit for bit against the separate kernels; the knob stays off where it would not.
++HC_FUSED = 0           # bit 0: hc_post + partial fused; bit 1: _hc_finish_u (per request: tf_knobs.hc_fused)
++HC_FUSED_BM = 64       # rows a program of the fused kernel (the partial's own BM is 64)
++HC_FUSED_STAGES = 1    # software-pipelining depth of the fused kernel's column loop (shared memory; no bit changes)
++_HC_FUSED_BROKEN = ""  # set when the fused kernel cannot run here (e.g. out of shared memory): the separate kernels run
++
++
++@triton.jit
++def _hc_mix_tile(XOUT, FN, off_x, d, rr, ok, m, x0, x1, x2, x3, branch, c0, c1, c2, c3, ps, acc, ss,
++                 WIDE: tl.constexpr, SD: tl.constexpr):
++    """One stream's tile: X'_s = bf16(post_s * branch + (((c0s X0 + c1s X1) + c2s X2) + c3s X3)), stored, then the
++    partial's dot and square-sum step on the stored values."""
++
++    mixed = ((c0[:, None] * x0 + c1[:, None] * x1) + c2[:, None] * x2) + c3[:, None] * x3
++    v = ps[:, None] * branch + mixed
++    vb = v.to(tl.bfloat16)
++    tl.store(XOUT + off_x + SD + d[None, :], vb, mask=ok[:, None])
++    w = tl.load(FN + m[:, None] * WIDE + SD + d[None, :], mask=m[:, None] < 24, other=0.0)
++    acc = tl.dot(vb, tl.trans(w), acc)
++    xf = vb.to(tl.float32)
++    ss += tl.sum(xf * xf, axis=1)
++    return acc, ss
++
++
++@triton.jit
++def _hc_post_part(X, XOUT, G, POST, COMB, FN, PART, RS, R, D: tl.constexpr, S: tl.constexpr, WORLD: tl.constexpr,
++                  NB: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr):
++    """Program (row tile, q): columns [q KB, (q + 1) KB) of every stream (KB = S D / NB), i.e. K blocks
++    s (NB / S) + q of the flattened streams: ``_hc_post`` there, then ``fast_qmm._hc_partial_mm``'s partials of
++    those blocks from the new values (S = 4)."""
++
++    pid = tl.program_id(0)
++    q = tl.program_id(1)
++    WIDE: tl.constexpr = S * D
++    KB: tl.constexpr = WIDE // NB
++    rows = pid * BM + tl.arange(0, BM)
++    ok = rows < R
++    rr = tl.where(ok, rows, 0).to(tl.int64)
++    m = tl.arange(0, 32)
++    k = tl.arange(0, BK)
++    cb = COMB + rr * 16
++    c00 = tl.load(cb + 0, mask=ok, other=0.0)
++    c10 = tl.load(cb + 4, mask=ok, other=0.0)
++    c20 = tl.load(cb + 8, mask=ok, other=0.0)
++    c30 = tl.load(cb + 12, mask=ok, other=0.0)
++    c01 = tl.load(cb + 1, mask=ok, other=0.0)
++    c11 = tl.load(cb + 5, mask=ok, other=0.0)
++    c21 = tl.load(cb + 9, mask=ok, other=0.0)
++    c31 = tl.load(cb + 13, mask=ok, other=0.0)
++    c02 = tl.load(cb + 2, mask=ok, other=0.0)
++    c12 = tl.load(cb + 6, mask=ok, other=0.0)
++    c22 = tl.load(cb + 10, mask=ok, other=0.0)
++    c32 = tl.load(cb + 14, mask=ok, other=0.0)
++    c03 = tl.load(cb + 3, mask=ok, other=0.0)
++    c13 = tl.load(cb + 7, mask=ok, other=0.0)
++    c23 = tl.load(cb + 11, mask=ok, other=0.0)
++    c33 = tl.load(cb + 15, mask=ok, other=0.0)
++    p0 = tl.load(POST + rr * S + 0, mask=ok, other=0.0)
++    p1 = tl.load(POST + rr * S + 1, mask=ok, other=0.0)
++    p2 = tl.load(POST + rr * S + 2, mask=ok, other=0.0)
++    p3 = tl.load(POST + rr * S + 3, mask=ok, other=0.0)
++    a0 = tl.zeros((BM, 32), dtype=tl.float32)
++    a1 = tl.zeros((BM, 32), dtype=tl.float32)
++    a2 = tl.zeros((BM, 32), dtype=tl.float32)
++    a3 = tl.zeros((BM, 32), dtype=tl.float32)
++    s0 = tl.zeros((BM,), dtype=tl.float32)
++    s1 = tl.zeros((BM,), dtype=tl.float32)
++    s2 = tl.zeros((BM,), dtype=tl.float32)
++    s3 = tl.zeros((BM,), dtype=tl.float32)
++    off_x = rr[:, None] * WIDE
++    for t in range(KB // BK):
++        d = q * KB + t * BK + k
++        g = tl.load(G + rr[:, None] * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++        for kk in tl.static_range(1, WORLD):
++            g = g + tl.load(G + kk * RS + rr[:, None] * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++        branch = g.to(tl.bfloat16).to(tl.float32)
++        x0 = tl.load(X + off_x + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++        x1 = tl.load(X + off_x + D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++        x2 = tl.load(X + off_x + 2 * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++        x3 = tl.load(X + off_x + 3 * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++        a0, s0 = _hc_mix_tile(XOUT, FN, off_x, d, rr, ok, m, x0, x1, x2, x3, branch, c00, c10, c20, c30, p0, a0, s0,
++                              WIDE, 0)
++        a1, s1 = _hc_mix_tile(XOUT, FN, off_x, d, rr, ok, m, x0, x1, x2, x3, branch, c01, c11, c21, c31, p1, a1, s1,
++                              WIDE, D)
++        a2, s2 = _hc_mix_tile(XOUT, FN, off_x, d, rr, ok, m, x0, x1, x2, x3, branch, c02, c12, c22, c32, p2, a2, s2,
++                              WIDE, 2 * D)
++        a3, s3 = _hc_mix_tile(XOUT, FN, off_x, d, rr, ok, m, x0, x1, x2, x3, branch, c03, c13, c23, c33, p3, a3, s3,
++                              WIDE, 3 * D)
++    QB: tl.constexpr = NB // S                          # K blocks a stream
++    pm = ok[:, None] & (m[None, :] < 24)
++    tl.store(PART + (rr[:, None] * NB + q) * 32 + m[None, :], a0, mask=pm)
++    tl.store(PART + (rr * NB + q) * 32 + 24, s0, mask=ok)
++    tl.store(PART + (rr[:, None] * NB + QB + q) * 32 + m[None, :], a1, mask=pm)
++    tl.store(PART + (rr * NB + QB + q) * 32 + 24, s1, mask=ok)
++    tl.store(PART + (rr[:, None] * NB + 2 * QB + q) * 32 + m[None, :], a2, mask=pm)
++    tl.store(PART + (rr * NB + 2 * QB + q) * 32 + 24, s2, mask=ok)
++    tl.store(PART + (rr[:, None] * NB + 3 * QB + q) * 32 + m[None, :], a3, mask=pm)
++    tl.store(PART + (rr * NB + 3 * QB + q) * 32 + 24, s3, mask=ok)
++
++
++@triton.jit
++def _hc_finish_u(X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps,
++                 D: tl.constexpr, S: tl.constexpr, NB: tl.constexpr, ITERS: tl.constexpr, BLOCK: tl.constexpr):
++    """``_hc_finish`` with the partial blocks' loads unrolled (all in flight at once, added in the same block order
++    into the same accumulators); every other line is ``_hc_finish``'s."""
++
++    r = tl.program_id(0)
++    m = tl.arange(0, 32)
++    mix = tl.zeros((32,), dtype=tl.float32)
++    ss = 0.0
++    for b in tl.static_range(NB):
++        mix += tl.load(PART + (r * NB + b) * 32 + m)
++        ss += tl.load(PART + (r * NB + b) * 32 + 24)
++    rinv = 1.0 / tl.sqrt(ss / (S * D) + eps_norm)
++    mix = mix * rinv
++    s_pre = tl.load(SCALE + 0)
++    s_post = tl.load(SCALE + 1)
++    s_comb = tl.load(SCALE + 2)
++    sv = tl.arange(0, 4)
++    base = tl.load(BASE + m, mask=m < 24, other=0.0)
++    pre_logit = tl.sum(tl.where(m[None, :] == sv[:, None], (mix * s_pre + base)[None, :], 0.0), axis=1)
++    post_logit = tl.sum(tl.where(m[None, :] == (sv[:, None] + 4), (mix * s_post + base)[None, :], 0.0), axis=1)
++    pre = 1.0 / (1.0 + tl.exp(-pre_logit)) + hc_eps
++    post = 2.0 * (1.0 / (1.0 + tl.exp(-post_logit)))
++    ii = tl.arange(0, 4)[:, None]
++    jj = tl.arange(0, 4)[None, :]
++    flat = 8 + ii * 4 + jj
++    cl = tl.sum(tl.where(m[None, None, :] == flat[:, :, None], (mix * s_comb + base)[None, None, :], 0.0), axis=2)
++    cmax = tl.max(cl, axis=1)
++    ce = tl.exp(cl - cmax[:, None])
++    comb = ce / tl.sum(ce, axis=1)[:, None] + hc_eps
++    comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
++    for _ in range(ITERS - 1):
++        comb = comb / (tl.sum(comb, axis=1)[:, None] + hc_eps)
++        comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
++    tl.store(POST + r * S + sv, post)
++    tl.store(COMB + r * 16 + ii * 4 + jj, comb)
++    d = tl.arange(0, BLOCK)
++    p0 = tl.sum(tl.where(sv == 0, pre, 0.0), axis=0)
++    p1 = tl.sum(tl.where(sv == 1, pre, 0.0), axis=0)
++    p2 = tl.sum(tl.where(sv == 2, pre, 0.0), axis=0)
++    p3 = tl.sum(tl.where(sv == 3, pre, 0.0), axis=0)
++    x0 = tl.load(X + r * (S * D) + d).to(tl.float32)
++    x1 = tl.load(X + r * (S * D) + D + d).to(tl.float32)
++    x2 = tl.load(X + r * (S * D) + 2 * D + d).to(tl.float32)
++    x3 = tl.load(X + r * (S * D) + 3 * D + d).to(tl.float32)
++    c = (((p0 * x0 + p1 * x1) + p2 * x2) + p3 * x3).to(tl.bfloat16).to(tl.float32)
++    rinv2 = 1.0 / tl.sqrt(tl.sum(c * c, axis=0) / D + eps_norm)
++    w = tl.load(NW + d).to(tl.float32)
++    y = (w * (c * rinv2).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
++    tl.store(OUT + r * D + d, y)
++    g = tl.sum(tl.reshape(y.to(tl.float32), (BLOCK // 64, 64)), axis=1)
++    tl.store(XS + r * (D // 64) + tl.arange(0, BLOCK // 64), g)
++
++
++def hc_fused_ok(x: torch.Tensor, gathered: torch.Tensor, fn: torch.Tensor) -> bool:
++    """The fused post + partial kernel applies: a fast chunk (hc_pre's partial is ``fast_qmm.hc_partial``), 4
++    contiguous streams, fn contiguous, K blocks that split every stream evenly into 64-wide steps."""
++
++    if not (HC_FUSED & 1) or _HC_FUSED_BROKEN or FAST_HC is None or getattr(FAST_HC, "__name__", "") != "hc_partial":
++        return False
++    world, rows, d = gathered.shape
++    wide = x.shape[1]
++    if wide != 4 * d or HC_BLOCKS % 4 or wide % (HC_BLOCKS * 64) or not fn.is_contiguous():
++        return False
++    if x.stride(1) != 1 or x.stride(0) != wide or gathered.stride(2) != 1 or gathered.stride(1) != d:
++        return False
++    return torch.cuda.is_available() and x.is_cuda
++
++
++def hc_post_part(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor,
++                 comb: torch.Tensor, fn: torch.Tensor, part: torch.Tensor) -> None:
++    """``hc_post(x, xout, gathered, post, comb)`` followed by ``fast_qmm.hc_partial(xout, fn, part, HC_BLOCKS)``, in
++    one pass (same bits; check ``hc_fused_ok`` first). x and xout may be the same tensor."""
++
++    world, rows, d = gathered.shape
++    bm = HC_FUSED_BM
++    # num_stages=1: no software pipelining (with 3 stages Triton staged the 4 stream tiles, both partial tiles and 4 fn
++    # tiles a step in shared memory, 128 KB > GB10's 99 KB a block). Pipelining never changes a bit.
++    _hc_post_part[(triton.cdiv(rows, bm), 4)](x, xout, gathered, post, comb, fn, part, gathered.stride(0), rows,
++                                              D=d, S=4, WORLD=world, NB=HC_BLOCKS, BM=bm, BK=64, num_warps=4,
++                                              num_stages=HC_FUSED_STAGES)
++
++
++def try_hc_post_part(x, xout, gathered, post, comb, fn, part) -> bool:
++    """``hc_post_part``, or False (nothing written) when the kernel cannot be launched on this GPU (Triton raises
++    OutOfResources at launch, before the kernel runs): the fused path is then off for the process and the caller runs
++    the separate kernels, which give the same bits."""
++
++    global _HC_FUSED_BROKEN
++    try:
++        hc_post_part(x, xout, gathered, post, comb, fn, part)
++        return True
++    except Exception as exc:                            # noqa: BLE001 - triton.runtime.errors.OutOfResources et al.
++        if type(exc).__name__ not in ("OutOfResources", "CompilationError"):
++            raise
++        _HC_FUSED_BROKEN = f"{type(exc).__name__}: {exc}"
++        print(f"[tensorfold] hc_fused: the fused hc kernel cannot run here ({_HC_FUSED_BROKEN}); separate kernels",
++              flush=True)
++        return False
++
++
++def hc_finish(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
++              out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
++              eps: float, hc_eps: float, iters: int) -> None:
++    """``hc_pre`` after its partials are in ``part`` (``hc_post_part`` wrote them)."""
++
++    rows, wide = x.shape
++    d = norm_w.shape[0]
++    fin = _hc_finish_u if (HC_FUSED & 2 and FAST_HC is not None) else _hc_finish
++    fin[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=wide // d, NB=HC_BLOCKS,
++                 ITERS=iters, BLOCK=d, num_warps=8)
++
++
++def hc_post_pre(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor,
++                comb: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
++                out: torch.Tensor, xs: torch.Tensor, npost: torch.Tensor, ncomb: torch.Tensor, part: torch.Tensor,
++                eps: float, hc_eps: float, iters: int) -> None:
++    """hc_post of rows (post / comb: this site's mixes) then the next hc_pre of the same rows (its mixes into npost /
++    ncomb, its normed rows into out / xs): fused where ``hc_fused_ok``, else the two calls."""
++
++    if hc_fused_ok(xout, gathered, fn) and try_hc_post_part(x, xout, gathered, post, comb, fn, part):
++        hc_finish(xout, fn, base, scale, norm_w, out, xs, npost, ncomb, part, eps, hc_eps, iters)
++        return
++    hc_post(x, xout, gathered, post, comb)
++    hc_pre(xout, fn, base, scale, norm_w, out, xs, npost, ncomb, part, eps, hc_eps, iters)
++
++
+ @triton.jit
+ def _residual_add(X, XOUT, G, RS, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
+     """Plain residual (the MTP block): X = bf16(X + bf16(partials summed rank 0 first))."""
+@@ -361,11 +600,52 @@ def _router_sum(PART, OUT, total, KS: tl.constexpr, BLOCK: tl.constexpr):
+ ROUTER_KS = 8
+ 
+ 
++@triton.jit
++def _router_fused(X, W, OUT, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM: tl.constexpr,
++                  BLOCK_E: tl.constexpr, BK: tl.constexpr, KS: tl.constexpr):
++    """patches/0190: ``_router_part`` for every slice in one program, then ``_router_sum``'s adds in slice order in
++    registers: each slice's accumulator is the same chain of dots from zero over the same K range, and the total is
++    ((p0 + p1) + p2) + ... as ``_router_sum`` adds the stored fp32 partials. No [KS, M, NE] partial buffer."""
++
++    rm = tl.program_id(0) * BM + tl.arange(0, BM)
++    re = tl.program_id(1) * BLOCK_E + tl.arange(0, BLOCK_E)
++    rk = tl.arange(0, BK)
++    m_ok = rm < M
++    e_ok = re < NE
++    total = tl.zeros((BM, BLOCK_E), dtype=tl.float32)
++    for s in tl.static_range(KS):
++        acc = tl.zeros((BM, BLOCK_E), dtype=tl.float32)
++        for k0 in range(s * (D // KS), s * (D // KS) + D // KS, BK):
++            x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++            w = tl.load(W + re[:, None] * D + (k0 + rk)[None, :], mask=e_ok[:, None], other=0.0)
++            acc = tl.dot(x, tl.trans(w), acc)
++        if s == 0:
++            total = acc
++        else:
++            total = total + acc
++    tl.store(OUT + rm[:, None] * NE + re[None, :], total, mask=m_ok[:, None] & e_ok[None, :])
++
++
++# patches/0190 (``tf_knobs.moe_glue`` bit 1): the K-slice router in one kernel for windows of 64+ rows (the same bits;
++# decode windows and graph captures keep the two kernels)
++ROUTER_FUSED = False
++# patches/0190 (``tf_knobs.moe_glue`` bit 2): lean chunks' combine reads the shared expert's output where its matmul
++# wrote it instead of copying it into its slot of ``ey`` first (``combine(..., shared=)``; the same sums in the same
++# order)
++SHARED_INPLACE = False
++
++
+ def router(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+     m, d = x.shape
+     ne = w.shape[0]
+     bm = 16 if m <= 16 else 32 if m <= 32 else 64 if m <= 64 else 128
+     ks = ROUTER_KS
++    if (ROUTER_FUSED and m >= GROUP_MIN and ks > 1 and not d % (ks * 64) and out.is_contiguous()
++            and not (x.is_cuda and torch.cuda.is_current_stream_capturing())):
++        _router_fused[(triton.cdiv(m, bm), triton.cdiv(ne, 32))](x, w, out, m, x.stride(0), D=d, NE=ne, BM=bm,
++                                                                  BLOCK_E=32, BK=64, KS=ks, num_warps=4,
++                                                                  num_stages=3)
++        return out
+     if ks <= 1 or d % (ks * 64) or not out.is_contiguous():
+         _router[(triton.cdiv(m, bm), triton.cdiv(ne, 64))](x, w, out, m, x.stride(0), D=d, NE=ne, BM=bm,
+                                                             BLOCK_E=64, BK=64, num_warps=4, num_stages=3)
+@@ -443,12 +723,66 @@ def _group(PICK, UIDS, UCOUNT, UMEM, R, SLOTS: tl.constexpr, MAXU: tl.constexpr,
+         tl.store(UMEM + tail * MAXM + j, -1, mask=tail < MAXU)
+ 
+ 
++# patches/0190 (``tf_knobs.moe_glue`` bit 0, GLM53_TF_MOE_GLUE): windows of at least GROUP_MIN rows are grouped by
++# ``group_sorted`` (a stable sort by expert id and a scatter, all rows in parallel) instead of ``_group``'s one
++# program walking every (row, slot) twice and every member column twice (O(R) serial: ~5-8 ms a MoE layer at 8,192
++# rows, most of ``moe.router``). Integer outputs, element for element those of ``_group`` (tested), so no bit of any
++# row changes. Decode / verify windows (and anything captured in a graph) keep ``_group``.
++GROUP_SORT = False
++GROUP_MIN = 64
++
++
++def group_sorted(pick: torch.Tensor, rows: int, ids: torch.Tensor, count: torch.Tensor, members: torch.Tensor,
++                 experts: int) -> None:
++    """``_group``'s outputs for rows [0, rows) of ``pick`` [.., SLOTS] int32, from device-side torch ops (no host
++    sync): ids[u] = the u-th distinct expert in increasing order (entries past the count left as they are, as
++    ``_group`` leaves them), count[0] = their number, members[u, j] = row * 32 + slot of the j-th (row, slot) that
++    picked expert u, in row then slot order (a stable sort of the row-major picks by expert), -1 after the last and
++    in every row from the count on."""
++
++    slots = pick.shape[1]
++    maxu, maxm = members.shape
++    dev = pick.device
++    block = triton.next_power_of_2(experts + 1)
++    flat = pick[:rows].reshape(-1).to(torch.int64)
++    sv, si = torch.sort(flat, stable=True)               # by expert id, then (row, slot) order: _group's order
++    ar = torch.arange(block, device=dev, dtype=torch.int64)
++    starts = torch.searchsorted(sv, ar)
++    ends = torch.searchsorted(sv, ar, right=True)
++    used = ends > starts
++    place = torch.cumsum(used.to(torch.int64), 0) - 1
++    n_used = used.to(torch.int64).sum()
++    # ids: the used experts, compacted (a dummy slot ``block`` takes the unused ones)
++    comp = torch.zeros((block + 1,), dtype=torch.int64, device=dev)
++    comp.scatter_(0, torch.where(used, place, block), ar)
++    keep = torch.arange(maxu, device=dev) < n_used
++    ids.copy_(torch.where(keep, comp[:maxu].to(ids.dtype), ids))
++    count.copy_(n_used.to(count.dtype).view(1))
++    # members: -1 everywhere, then each (row, slot) at (place of its expert, its rank among the expert's members)
++    members.fill_(-1)
++    t = torch.arange(sv.shape[0], device=dev, dtype=torch.int64)
++    dest = place[sv] * maxm + (t - starts[sv])
++    code = (si // slots) * 32 + si % slots
++    members.view(-1).scatter_(0, dest, code.to(members.dtype))
++
++
++def _group_fast_ok(rows: int, members: torch.Tensor) -> bool:
++    if not GROUP_SORT or rows < GROUP_MIN or not members.is_contiguous() or rows > members.shape[1]:
++        return False
++    if members.is_cuda and torch.cuda.is_current_stream_capturing():
++        return False
++    return True
++
++
+ def select(logits: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor, ids: torch.Tensor,
+            count: torch.Tensor, members: torch.Tensor, top_k: int, experts: int, scale: float, norm: bool) -> None:
+     rows = logits.shape[0]
+     block = triton.next_power_of_2(experts + 1)
+     _topk[(rows,)](logits, bias, pick, wts, float(scale), NE=experts, TOPK=top_k, SLOTS=top_k + 1, BLOCK=block,
+                    SLOTP=triton.next_power_of_2(top_k + 1), NORM=norm, num_warps=4)
++    if _group_fast_ok(rows, members):                    # patches/0190: the same integers, in parallel
++        group_sorted(pick, rows, ids, count, members, experts)
++        return
+     _group[(1,)](pick, ids, count, members, rows, SLOTS=top_k + 1, MAXU=ids.shape[0], MAXM=members.shape[1],
+                  BLOCK=block, num_warps=8)
+ 
+@@ -468,11 +802,32 @@ def _combine(Y, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.conste
+     tl.store(OUT + r * D + d, acc.to(OUT.dtype.element_ty))
+ 
+ 
+-def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
+-    """out [R, D]: fp32, or bf16 (patches/0084), contiguous."""
++@triton.jit
++def _combine_s(Y, SY, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr):
++    """``_combine`` with the last slot (the shared expert) read from SY [R, D] instead of Y's last slot: the same
++    values in the same order (patches/0190)."""
++
++    r = tl.program_id(0)
++    c = tl.program_id(1)
++    d = c * BLOCK + tl.arange(0, BLOCK)
++    acc = tl.zeros((BLOCK,), dtype=tl.float32)
++    for k in tl.static_range(SLOTS - 1):
++        acc = acc + tl.load(Y + (r * SLOTS + k) * D + d) * tl.load(WTS + r * SLOTS + k)
++    acc = acc + tl.load(SY + r * D + d) * tl.load(WTS + r * SLOTS + SLOTS - 1)
++    tl.store(OUT + r * D + d, acc.to(OUT.dtype.element_ty))
++
++
++def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor, shared: torch.Tensor | None = None) -> None:
++    """out [R, D]: fp32, or bf16 (patches/0084), contiguous. ``shared`` (patches/0190): the last slot's rows [R, D]
++    fp32 (contiguous), read there instead of from ``y``."""
+ 
+     rows, d = out.shape
+     if out.stride(0) != d or out.stride(1) != 1:
+         raise ValueError("combine: out must be a contiguous [R, D]")
+     block = min(1024, d)
++    if shared is not None:
++        if shared.shape != (rows, d) or not shared.is_contiguous() or shared.dtype != torch.float32:
++            raise ValueError("combine: shared must be a contiguous fp32 [R, D]")
++        _combine_s[(rows, d // block)](y, shared, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
++        return
+     _combine[(rows, d // block)](y, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
+diff --git i/src/tensorfold/families/glm5_next/cuda/knobs.py w/src/tensorfold/families/glm5_next/cuda/knobs.py
+index d7e74a6..8b03874 100644
+--- i/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ w/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -33,6 +33,18 @@ its snapshots are tagged C + 1 and resume FP8 fast requests of the same grid onl
+                                                                             gather,slab)
+     fat_experts     0 | 1                    GLM53_TF_FAST_EXPERTS=fat (0)  patches/0170's fat expert kernels in
+                                                                             fast chunks (same bits as fast2)
++    moe_glue        0 .. 7                   GLM53_TF_MOE_GLUE (0)          patches/0190, bits: 1 grouping by a
++                                                                            parallel sort, 2 one-kernel router, 4
++                                                                            shared expert read in place by the
++                                                                            combine (64+-row windows; same bits)
++    mtp_window      0 .. 2^30 tokens         GLM53_TF_MTP_PREFILL_WINDOW    patches/0190: prefill runs the MTP
++                                             (0 = off)                      head on the prompt's last ~N positions
++                                                                            only (drafts may change, replies not)
++    hc_fused        0 .. 3                   GLM53_TF_HC_FUSED (0)          patches/0190: 1 hc_post + next hc_pre's
++                                                                            dots fused, 2 unrolled hc finish, 3 both
++                                                                            (fast pipelined chunks; same bits)
++    attn_bm32       0 | 1                    GLM53_TF_ATTN_BM32 (0)         patches/0190: 32-query latent attention
++                                                                            tiles in bf16 fast chunks (same bits)
+ 
+ Knobs fixed at load (``LOAD_ONLY``) are refused with the reason. Rank 0 validates a request's knobs
+ (``parse``), resolves every knob to the value the request runs with, and sends the integers rank 1 needs in the
+@@ -60,13 +72,17 @@ RANGES: dict[str, tuple[int, int | None]] = {
+     "fp8_prefill": (0, 1),               # patches/0092
+     "prefill_overlap": (0, 1),           # patches/0093
+     "fat_experts": (0, 1),               # patches/0170
++    "moe_glue": (0, 7),                  # patches/0190
++    "mtp_window": (0, 1 << 30),          # patches/0190
++    "hc_fused": (0, 3),                  # patches/0190
++    "attn_bm32": (0, 1),                 # patches/0190
+ }
+ PER_REQUEST = tuple(RANGES) + ("depth",)
+ 
+ # the knobs rank 1 applies itself, in header order (lookup / lookup_min travel in the policy code, depth as
+ # patches/0071's cost flag, calib_online as rank 0's cost table)
+ HEADER = ("expert_loop", "prefill_rows", "longctx_graphs", "profile", "auto_fdrafts", "calib_online", "fast_prefill",
+-          "fp8_prefill", "prefill_overlap", "fat_experts")
++          "fp8_prefill", "prefill_overlap", "fat_experts", "moe_glue", "mtp_window", "hc_fused", "attn_bm32")
+ 
+ LOAD_ONLY: dict[str, str] = {
+     "nonexpert": "GLM53_TF_NONEXPERT is the stored weight format, quantized once at load",
+@@ -78,6 +94,8 @@ LOAD_ONLY: dict[str, str] = {
+     "calib": "GLM53_TF_CALIB is the load-time cost calibration (use calib_online per request)",
+     "kda_proj_bf16": "GLM53_TF_KDA_PROJ_BF16 keeps (or not) the KDA projections' bf16 copies, made at load, and "
+                      "changes a fast prefill's bits (snapshots are not tagged by it)",
++    "latent_tc": "GLM53_TF_LATENT_TC (patches/0190) changes a fast prefill's bits and its snapshot tag; the batch "
++                 "scheduler and the session store key snapshots by the load-time tag",
+ }
+ 
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/latent.py w/src/tensorfold/families/glm5_next/cuda/latent.py
+index 90e2087..1026a7b 100644
+--- i/src/tensorfold/families/glm5_next/cuda/latent.py
++++ w/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -53,6 +53,18 @@ ATTN_WARPS = 8           # a tile's [16, 512] fp32 accumulator and [32, 512] lat
+ # ``FAST_STAGES``: software-pipelining depth of the attention's key loop (1 = none; never changes a bit).
+ FAST_BM = 32
+ FAST_STAGES = 1
++# patches/0190 (``tf_knobs.attn_bm32``, GLM53_TF_ATTN_BM32): bf16 fast chunks use the same 32-query tiles (one gather of
++# a row's selected latent rows for all 32 local heads). A (row, head) query's scores and weighted sums are the same mma
++# chains whatever the tile's other queries; 0060 / 0083 measured the 32-query tile bit-identical to the 16-query one
++# on the real shapes, and ``tests/cuda/test_glue_patches.py`` checks it bit for bit (dense and sparse). Decode, verify,
++# the MTP head and exact prefill keep BM = 16.
++BF16_BM32 = False
++# patches/0190 (GLM53_TF_LATENT_TC=1, load-time): bf16 fast chunks run ``absorb_tc`` / ``expand_tc`` (the tensor-core
++# absorb / expand FP8 chunks use) instead of the fp32 FMA-pipe ``absorb`` / ``expand``. NEW arithmetic (q and u rounded
++# to bf16 at the dot, kv_b's dequantized tile rounded to bf16): fast replies change, like GLM53_TF_KDA_PROJ_BF16;
++# deterministic and row-independent (64-row tiles, fixed K order), so drafted == serial and resumed == fresh hold;
++# snapshots carry their own tag (``pfgrid.TC``) so they never resume a prefill of the other arithmetic.
++BF16_TC = False
+ TC_ROWS = 64
+ 
+ 
+@@ -62,6 +74,13 @@ def fast8(b) -> bool:
+     return fp8pf.ON and bool(getattr(b, "fast", False))
+ 
+ 
++def tc(b) -> bool:
++    """The tensor-core absorb / expand: FP8 fast chunks (patches/0083), and bf16 fast chunks with ``BF16_TC``
++    (patches/0190)."""
++
++    return fast8(b) or (BF16_TC and bool(getattr(b, "fast", False)))
++
++
+ def enabled() -> bool:
+     """GLM53_TF_LATENT_KV: 1 caches the MLA latent (this module), 0 (default) the expanded per-head keys/values."""
+ 
+@@ -522,7 +541,7 @@ def _project(layer, w, b, T: int) -> None:
+     glue.rmsnorm(b.dp[:T, :c.q_lora], a.q_norm, c.eps, b.qr[:T], b.xs_qr[:T])
+     glue.rmsnorm(b.dp[:T, c.q_lora:], a.kv_norm, c.eps, b.lat[:T], b.xs_lat[:T])
+     qmm.matmul(b.qr[:T], a.q_b, b.xs_qr[:T], out=b.q[:T].view(T, a.heads * c.qk_dim), part=b.sk)
+-    (absorb_tc if fast8(b) else absorb)(b.q[:T], a.kv_k, s.qa[:T])            # patches/0083
++    (absorb_tc if tc(b) else absorb)(b.q[:T], a.kv_k, s.qa[:T])               # patches/0083, 0190
+ 
+ 
+ def _attend(layer, w, lc, pos_dev, b, o: int, R: int, nch, index, host_pos, npb=None) -> None:
+@@ -550,6 +569,8 @@ def _attend(layer, w, lc, pos_dev, b, o: int, R: int, nch, index, host_pos, npb=
+             profile.lap("dsa.indexer")
+     u = s.u[o:o + R]
+     tile = dict(bm=FAST_BM, stages=FAST_STAGES) if fast8(b) else {}           # patches/0083
++    if not tile and BF16_BM32 and bool(getattr(b, "fast", False)):               # patches/0190: bf16 fast chunks
++        tile = dict(bm=FAST_BM, stages=FAST_STAGES)
+     if not every_sparse:                                           # every row sparse: the dense pass is skipped
+         attention_latent(s.qa[o:o + R], lc, pos_dev, s, scale=scale, nch=nch, out=u, **tile)
+         if profile.ON:
+@@ -584,7 +605,7 @@ def _output(layer, w, b, T: int) -> torch.Tensor:
+ 
+     a = layer.dsa
+     s = b.attn
+-    o = (expand_tc if fast8(b) else expand)(s.u[:T], a.kv_v, s.o[:T])          # patches/0083
++    o = (expand_tc if tc(b) else expand)(s.u[:T], a.kv_v, s.o[:T])             # patches/0083, 0190
+     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:T]), T, "dsa.o_proj")
+ 
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/lean.py w/src/tensorfold/families/glm5_next/cuda/lean.py
+index fdf1431..11f48fc 100644
+--- i/src/tensorfold/families/glm5_next/cuda/lean.py
++++ w/src/tensorfold/families/glm5_next/cuda/lean.py
+@@ -342,9 +342,16 @@ def _shared_combine(layer: LayerW, w: Weights, b: Buffers, lb: LeanBuffers, a: i
+         qmm.matmul(lb.normed[a:a + r], s.gu, lb.xs[a:a + r], out=b.sgu[:r], part=b.sk)
+         glue.swiglu(b.sgu[:r], b.sact[:r], b.sxs[:r], c.limit)
+         qmm.matmul(b.sact[:r], s.down, b.sxs[:r], out=b.sy[:r], f32=True, part=b.sk)
+-        lb.ey[a:a + r, c.top_k].copy_(b.sy[:r])
++        inplace = glue.SHARED_INPLACE and b.sy[:r].is_contiguous()          # patches/0190: no copy into ey
++        if not inplace:
++            lb.ey[a:a + r, c.top_k].copy_(b.sy[:r])
+         if profile.ON:
+             profile.lap("moe.shared")
++        if inplace:
++            glue.combine(lb.ey[a:a + r], lb.wts[a:a + r], out, shared=b.sy[:r])
++            if profile.ON:
++                profile.lap("moe.combine")
++            return
+     glue.combine(lb.ey[a:a + r], lb.wts[a:a + r], out)
+     if profile.ON:
+         profile.lap("moe.combine")
+diff --git i/src/tensorfold/families/glm5_next/cuda/pfglue.py w/src/tensorfold/families/glm5_next/cuda/pfglue.py
+new file mode 100644
+index 0000000..811666d
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/pfglue.py
+@@ -0,0 +1,222 @@
++"""Prefill "glue" for GLM-5.3-Flash on CUDA (patches/0190): the small ops between the big matmuls that a fast 8,192-row
++chunk now spends most of its non-expert time in, each behind its own knob (per request through patches/0090's
++header, so one load can A/B them).
++
++Measured (28,045-token cold prompt, fast + lean 8,192-row chunks, fast2 experts, overlap, latent KV; 23.09 s):
++``moe.router`` 1,268 ms, ``hc`` 2,916 ms (with the gather waits the overlap moves there), ``mtp.*`` ~1,300 ms,
++``moe.combine`` 802, ``moe.shared`` 961.
++
++1. ``moe_glue`` (GLM53_TF_MOE_GLUE = bits, default 0), windows of 64+ rows (decode / verify windows and graph
++   captures keep the old kernels):
++   - bit 1: the MoE grouping by a stable sort and a scatter (``glue.group_sorted``) instead of ``glue._group``, one
++     program that walks the chunk's R x 9 picks twice and its R member columns twice (O(R) serial on one SM: ~5-8 ms
++     a MoE layer at 8,192 rows, estimated from the loop counts; most of ``moe.router``). The outputs are integers
++     equal element for element to ``_group``'s (ids, count, members);
++   - bit 2: the router's 8 K slices in one kernel (``glue._router_fused``: each slice's dot chain as before, the
++     slices added in order in registers; no [8, R, 288] fp32 partial buffer written and read back, 150 MB a layer
++     at 8,192 rows);
++   - bit 4: the combine reads the shared expert's fp32 output where its matmul wrote it (``glue._combine_s``)
++     instead of a copy in its slot of ``ey`` (32 KB a row a MoE layer of traffic).
++   Same bits in every case, so replies, snapshots and the session store do not depend on the knob.
++
++2. ``mtp_window`` (GLM53_TF_MTP_PREFILL_WINDOW = tokens, default 0 = off): a prefill of n tokens runs the MTP head
++   (one DSA + MoE layer, every position) only on positions p >= lo = (n - W) rounded down to a multiple of 64. For
++   positions below lo the head's caches (latent / K,V rows, its indexer's keys and gates, and the pools those rows
++   complete) are ZEROED and ``mtp_len`` advances as if absorbed. The MTP head only drafts: a draft is verified by the
++   main model's window, and the keyed sampler and commit decide every token, so replies are those of the full head
++   (drafted == serial holds for any draft source). What changes is which drafts are proposed, i.e. speed, never
++   the reply. Determinism: the skipped rows are zeros whatever ran before, so the head's caches after a prefill are
++   a function of (prompt, W, the resume point); a resumed prefill's head rows below its resume point are those the
++   earlier request wrote (its own n and W), so drafts (not replies) after a resume may differ from a fresh prefill's,
++   as patches/0065 already allows for the DFlash2 ring. ``lo`` depends on the prompt length only (not on C or the
++   chunking), so the fast rule's chunk-size independence (patches/0085) holds for the head's rows too.
++   Batch mode (patches/0120) prefills a prompt in pieces, each a prefill of a prefix: every piece keeps its own last
++   W positions, so the saving there is smaller (never a correctness issue).
++
++3. ``hc_fused`` (GLM53_TF_HC_FUSED = 0..3, default 0; fast chunks through patches/0084's pipeline): bit 0 runs
++   hc_post and the next hc_pre's 24 mixing dots + square sums as one kernel (``glue._hc_post_part``: the new streams
++   are fed from registers into the partial's tensor-core dots instead of being re-read, one launch fewer per slab);
++   bit 1 runs hc_pre's finish with its 16 partial loads unrolled (``glue._hc_finish_u``: all in flight at once, added
++   in the same block order; the per-row finish was a chain of 16 dependent L2 round trips). Same arithmetic as the
++   separate kernels, operation for operation; the GPU test checks the bits (a Triton reduction's order follows the
++   layout the compiler picks, so "same code, same shapes, same warps" is checked, not assumed). Row-independent
++   (per-row mixes; 64-row tiles of independent mma rows).
++
++4. ``attn_bm32`` (GLM53_TF_ATTN_BM32, default 0): bf16 fast chunks use the latent attention's 32-query tiles (all 32
++   local heads of a row in one tile: one gather of the row's selected latent rows instead of two), which FP8 fast
++   chunks already use (patches/0083). 0060 measured -24% a layer for 1024 sparse rows and identical bits to the
++   16-query tile; decode keeps 16 (1-4-row windows are faster with it). The fast rule does not need prefill bits to
++   equal decode bits (fastpf), only determinism and row independence, which a tile of one row's heads has. The knob
++   is per request only because the bits are the same (checked on the GPU): were they not, snapshots of the two
++   settings must not mix, and it would have to be a load-time switch.
++
++5. ``GLM53_TF_LATENT_TC=1`` (load-time, default 0; NEW arithmetic): bf16 fast chunks run the latent absorb / expand
++   on bf16 tensor cores (``latent.absorb_tc`` / ``expand_tc``, patches/0083's kernels, tested against float64 there)
++   instead of the fp32 FMA-pipe kernels, which are most of ``dsa.o_proj`` (1.9 s of a 28k prompt) and part of
++   ``dsa.proj``. The operands are rounded to bf16 at the dot (q, u and kv_b's dequantized tile; fp32 sums in the same
++   K order): the usual bf16 matmul precision, not FP8's e4m3. Fast replies change (like GLM53_TF_KDA_PROJ_BF16);
++   drafted == serial and resumed == fresh hold (deterministic, row-independent 64-row tiles), and its snapshots are
++   tagged G + 2 (``pfgrid.TC``) so no prefill resumes from the other arithmetic. Both ranks must agree (checked at
++   load). Off by default: it is the user's call whether bf16-level reply changes are acceptable (FP8 prefill was
++   rejected for its e4m3 divergence).
++
++Items 1, 3, 4 give the same bits; 2 changes the MTP head's rows only; 5 is new arithmetic (opt-in, load-time).
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Sequence
++
++GROUP_ENV = "GLM53_TF_MOE_GLUE"
++MTP_ENV = "GLM53_TF_MTP_PREFILL_WINDOW"
++HC_ENV = "GLM53_TF_HC_FUSED"
++BM32_ENV = "GLM53_TF_ATTN_BM32"
++TC_ENV = "GLM53_TF_LATENT_TC"
++GRID = 64
++
++
++def _int_env(name: str, default: int) -> int:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return default
++    try:
++        v = int(raw)
++    except ValueError:
++        raise ValueError(f"{name}={raw!r}: expected an integer") from None
++    if v < 0:
++        raise ValueError(f"{name}={raw!r}: expected 0 or more")
++    return v
++
++
++def moe_glue_default() -> int:
++    """GLM53_TF_MOE_GLUE bits: 1 sorted grouping, 2 one-kernel router, 4 the combine reading the shared expert in
++    place (7 = all)."""
++
++    v = _int_env(GROUP_ENV, 0)
++    if v > 7:
++        raise ValueError(f"{GROUP_ENV}={v}: expected 0 to 7")
++    return v
++
++
++def group_default() -> bool:
++    return bool(moe_glue_default() & 1)
++
++
++def moe_glue(glue) -> int:
++    """The current ``moe_glue`` value from glue's switches."""
++
++    return int(bool(glue.GROUP_SORT)) | (2 if glue.ROUTER_FUSED else 0) | (4 if glue.SHARED_INPLACE else 0)
++
++
++def set_moe_glue(glue, v: int) -> None:
++    glue.GROUP_SORT = bool(v & 1)
++    glue.ROUTER_FUSED = bool(v & 2)
++    glue.SHARED_INPLACE = bool(v & 4)
++
++
++def mtp_window_default() -> int:
++    return _int_env(MTP_ENV, 0)
++
++
++def bm32_default() -> bool:
++    return bool(_int_env(BM32_ENV, 0))
++
++
++def hc_default() -> int:
++    """GLM53_TF_HC_FUSED: 0 off, 1 hc_post + the next hc_pre's partial dots in one kernel, 2 hc_pre's finish with its
++    loads unrolled, 3 both (fast chunks through 0084's pipeline only)."""
++
++    v = _int_env(HC_ENV, 0)
++    if v > 3:
++        raise ValueError(f"{HC_ENV}={v}: expected 0 to 3")
++    return v
++
++
++# what the next prefill runs (``tf_knobs.mtp_window`` switches it per request; both ranks, the header carries it)
++MTP_WINDOW = mtp_window_default()
++
++
++def mtp_start(n: int, window: int | None = None) -> int:
++    """The first position of an n-token prompt whose MTP row is computed: 0 (window off or the prompt fits), else
++    (n - window) rounded down to a multiple of 64 (so the zeroed pools are whole and the rule is a function of n)."""
++
++    window = MTP_WINDOW if window is None else window
++    if window <= 0 or n <= window:
++        return 0
++    return (n - window) // GRID * GRID
++
++
++def zero_mtp_rows(st, s: int, e: int) -> None:
++    """The MTP head's cache rows [s, e) (latent or K/V, its indexer's keys and gates) and the pools rows s..e-1
++    complete (p with s <= 4p + 3 < e) set to zero: what a skipped position leaves, whatever ran before."""
++
++    if e <= s:
++        return
++    kc = getattr(st, "mtp_kc", None)
++    if kc is None:
++        return
++    kc[s:e].zero_()
++    vc = getattr(st, "mtp_vc", None)
++    if vc is not None and vc is not kc:
++        vc[s:e].zero_()
++    index = getattr(st, "index", None)
++    if index is not None:
++        ik, ig, pk = index[-1]
++        ik[s:e].zero_()
++        ig[s:e].zero_()
++        p0, p1 = s // 4, e // 4
++        if p1 > p0:
++            pk[p0:p1].zero_()
++
++
++def absorb(e, hidden, next_tokens: Sequence[int], p0: int, lo: int, absorb_fn):
++    """``decode.absorb`` of rows at positions p0, p0 + 1, ... (hidden [k, D], the tokens after them), with the rows
++    below ``lo`` skipped: their head caches zeroed and ``mtp_len`` advanced past them. ``absorb_fn``: decode.absorb.
++    Returns the last absorbed row's logits (None when every row was skipped; prefill does not read them)."""
++
++    k = len(next_tokens)
++    skip = min(max(lo - p0, 0), k)
++    if skip == 0:
++        return absorb_fn(e, hidden, next_tokens)
++    st = e.st
++    if st.mtp_drafted:                           # as decode.absorb: drafted rows are not kept
++        st.set_mtp_len(st.mtp_len - st.mtp_drafted)
++        st.mtp_drafted = 0
++    s = st.mtp_len
++    if s + skip > st.mtp_kc.shape[0]:
++        raise ValueError("MTP window: the head's cache is full")
++    zero_mtp_rows(st, s, s + skip)
++    st.set_mtp_len(s + skip)
++    if skip == k:
++        return None
++    return absorb_fn(e, hidden[skip:], list(next_tokens[skip:]))
++
++
++def latent_tc_default() -> bool:
++    return bool(_int_env(TC_ENV, 0))
++
++
++def latent_tc(w) -> bool:
++    """A fast prefill on this engine runs the tensor-core latent absorb / expand (``latent.BF16_TC`` on a latent-KV
++    engine): its snapshot tag gets ``pfgrid.TC``. False without torch / the latent module (host fakes)."""
++
++    import sys
++
++    latent = sys.modules.get(__package__ + ".latent") if __package__ else None
++    if latent is None or not getattr(latent, "BF16_TC", False):        # never imported / off: host fakes, defaults
++        return False
++    meta = getattr(w, "meta", None)
++    return bool(meta.get("latent_kv")) if isinstance(meta, dict) else False
++
++
++def load_settings() -> list[int]:
++    """The load-time switches both ranks must agree on (they decide a fast prefill's bits)."""
++
++    return [int(latent_tc_default())]
++
++
++def settings() -> list[int]:
++    """The load-time defaults (both ranks print them; the per-request values travel in the header)."""
++
++    return [moe_glue_default(), mtp_window_default(), hc_default(), int(bm32_default())]
+diff --git i/src/tensorfold/families/glm5_next/cuda/pfgrid.py w/src/tensorfold/families/glm5_next/cuda/pfgrid.py
+index d5eebd5..547200e 100644
+--- i/src/tensorfold/families/glm5_next/cuda/pfgrid.py
++++ w/src/tensorfold/families/glm5_next/cuda/pfgrid.py
+@@ -65,6 +65,7 @@ from typing import Sequence
+ ALIGN = 64                      # fast_kda's block: fast calls, cuts and fast snapshots sit on multiples of it
+ AUTO = 0                        # prefill_rows "auto": the chunk size chosen per request (``chunk_rows``)
+ FP8 = 1                         # added to the grid in an FP8 fast prefill's tag (fp8pf.TAG)
++TC = 2                          # patches/0190: added for a bf16 fast prefill with GLM53_TF_LATENT_TC (other bits)
+ GRID_ENV = "GLM53_TF_SNAPSHOT_GRID"
+ TAIL_ENV = "GLM53_TF_SNAPSHOT_TAIL"
+ DEFAULT_GRID = 64
+@@ -100,13 +101,14 @@ def settings() -> list[int]:
+ 
+ 
+ # -- tags -----------------------------------------------------------------------------------------------------------
+-def tag(fast: bool, fp8: bool = False, grid: int | None = None) -> int:
+-    """A prefill's snapshot tag: 0 (exact), G (fast), G + 1 (FP8 fast). Not the chunk size."""
++def tag(fast: bool, fp8: bool = False, grid: int | None = None, tc: bool = False) -> int:
++    """A prefill's snapshot tag: 0 (exact), G (fast), G + 1 (FP8 fast), G + 2 (patches/0190: bf16 fast with the
++    tensor-core latent absorb / expand; FP8 fast chunks use those anyway). Not the chunk size."""
+ 
+     if not fast:
+         return 0
+     g = snapshot_grid() if grid is None else int(grid)
+-    return g + FP8 if fp8 else g
++    return g + FP8 if fp8 else g + TC if tc else g
+ 
+ 
+ def grid_of(t: int) -> int:
+diff --git i/src/tensorfold/families/glm5_next/cuda/pfoverlap.py w/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+index 2842869..f2d34a0 100644
+--- i/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
++++ w/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+@@ -342,8 +342,30 @@ class _Chunk:
+         return lean.dsa_block(layer, w, st.kc[di], st.vc[di], lb.pos_dev, b, r, -(-(pos + r) // CHUNK),
+                               st.index[di] if st.index is not None else None, pos, None)
+ 
++    def hc_post_pre(self, g, a: int, s0: int, n: int, h, norm, between=None) -> bool:
++        """patches/0190 (``glue.HC_FUSED``): hc_post of rows [s0, s0 + n) fused with the next hc_pre's partial dots,
++        ``between`` (the DFlash2 taps: they read the new streams) and then hc_pre's finish. Same bits as hc_post +
++        hc_pre. False when the fused kernel does not apply (the caller runs the two)."""
++
++        lb, b, c = self.lb, self.b, self.c
++        x = lb.x[s0:s0 + n]
++        gs = g[:, s0 - a:s0 - a + n]
++        if not glue.hc_fused_ok(x, gs, h.fn):
++            return False
++        if not glue.try_hc_post_part(x, x, gs, lb.post[s0:s0 + n], lb.comb[s0:s0 + n], h.fn, b.hcpart[:n]):
++            return False
++        if between is not None:
++            between()
++        glue.hc_finish(x, h.fn, h.base, h.scale, norm, lb.normed[s0:s0 + n], lb.xs[s0:s0 + n], lb.post[s0:s0 + n],
++                       lb.comb[s0:s0 + n], b.hcpart[:n], c.eps, c.hc_eps, c.hc_iters)
++        if profile.ON:
++            profile.lap("hc")
++        return True
++
+     def attn_post(self, layer, a: int, r: int, g) -> None:
+         for s0, n in self.slabs(a, r):
++            if self.hc_post_pre(g, a, s0, n, layer.ffn_hc, layer.post_norm):      # patches/0190
++                continue
+             self.hc_post(g, a, s0, n)
+             self.hc_pre(layer.ffn_hc, layer.post_norm, s0, n)
+ 
+@@ -362,11 +384,18 @@ class _Chunk:
+         w, b, lb, c = self.w, self.b, self.lb, self.c
+         taps = b.tap_at.get(layer.index, ())
+         for s0, n in self.slabs(a, r):
+-            self.hc_post(g, a, s0, n)
+             x = lb.x[s0:s0 + n]
+-            for slot in taps:
+-                glue.stream_mean(x, b.taps[slot][:n])
+-                lb.tapcat[s0:s0 + n, slot * lb.D:(slot + 1) * lb.D].copy_(b.taps[slot][:n])
++
++            def tap(x=x, s0=s0, n=n):
++                for slot in taps:
++                    glue.stream_mean(x, b.taps[slot][:n])
++                    lb.tapcat[s0:s0 + n, slot * lb.D:(slot + 1) * lb.D].copy_(b.taps[slot][:n])
++
++            # patches/0190: the taps read the new streams, between the fused post + partial and hc_pre's finish
++            if nxt is not None and self.hc_post_pre(g, a, s0, n, nxt.attn_hc, nxt.in_norm, tap):
++                continue
++            self.hc_post(g, a, s0, n)
++            tap()
+             if nxt is not None:
+                 self.hc_pre(nxt.attn_hc, nxt.in_norm, s0, n)
+                 continue

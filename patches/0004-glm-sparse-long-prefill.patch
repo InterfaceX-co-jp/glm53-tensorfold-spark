@@ -1,0 +1,92 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/sparse.py w/src/tensorfold/families/glm5_next/cuda/sparse.py
+index a5d0403..25bfd31 100644
+--- i/src/tensorfold/families/glm5_next/cuda/sparse.py
++++ w/src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -114,20 +114,21 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
+     order = torch.sort(scores, dim=1, descending=True, stable=True).indices[:, :TOPK_POOLS]
+     pools = torch.sort(order, dim=1).values                                            # ascending pool index
+     width = TOPK_POOLS * POOL + POOL - 1
+-    tokens = torch.full((R, width), -1, dtype=torch.int32, device=qi.device)
+-    counts = []
+-    for r in range(R):
+-        q = pos + r
+-        npool = (q + 1) // POOL
+-        if npool <= TOPK_POOLS:               # dense row: every visible token (the dense kernel's result is kept)
+-            counts.append(0)
+-            continue
+-        body = (pools[r, :, None] * POOL + torch.arange(POOL, device=qi.device)).reshape(-1)
+-        tail = torch.arange(npool * POOL, q + 1, device=qi.device)
+-        row = torch.cat([body, tail])
+-        tokens[r, :row.numel()] = row.to(torch.int32)
+-        counts.append(row.numel())
+-    return tokens, torch.tensor(counts, dtype=torch.int32, device=qi.device)
++    # every row at once (the same lists a per-row loop builds): the selected pools' tokens in ascending order, then
++    # the visible tokens of the incomplete last pool; a dense row (at most TOPK_POOLS complete pools) gets count 0
++    dev = qi.device
++    q = pos + torch.arange(R, device=dev, dtype=torch.int64)                         # [R] absolute positions
++    npool = (q + 1) // POOL
++    sparse_row = npool > TOPK_POOLS
++    body = (pools.to(torch.int64)[:, :, None] * POOL + torch.arange(POOL, device=dev)).reshape(R, -1)
++    lane = torch.arange(POOL - 1, device=dev)
++    tail = npool[:, None] * POOL + lane                                              # [R, POOL - 1]
++    tail_len = q + 1 - npool * POOL                                                  # 0 .. POOL - 1
++    tail = torch.where(lane[None, :] < tail_len[:, None], tail, torch.full_like(tail, -1))
++    tokens = torch.cat([body, tail], dim=1).to(torch.int32)
++    tokens = torch.where(sparse_row[:, None], tokens, torch.full_like(tokens, -1))
++    counts = torch.where(sparse_row, TOPK_POOLS * POOL + tail_len, torch.zeros_like(tail_len)).to(torch.int32)
++    return tokens.contiguous(), counts
+ 
+ 
+ @triton.jit
+@@ -145,7 +146,7 @@ def _gtile(q, k, v, m, l, o, valid, SCALE: tl.constexpr):
+ 
+ 
+ @triton.jit
+-def _sparse_chunks(Q, KC, VC, TOK, CNT, PO, PM, PL, W: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
++def _sparse_chunks(Q, KC, VC, TOK, CNT, PO, PM, PL, RS, W: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+                    CH: tl.constexpr, SCALE: tl.constexpr):
+     """Program (row, head, chunk): the row's selected tokens [c CH, (c + 1) CH) in list order; the query sits in
+     tile row 0 of a 16-row tile (rows 1-15 idle), the 27B kernel's arithmetic per row."""
+@@ -167,14 +168,14 @@ def _sparse_chunks(Q, KC, VC, TOK, CNT, PO, PM, PL, W: tl.constexpr, H: tl.const
+         kk = tl.load(KC + (tok[:, None] * H + h) * D + d[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
+         vv = tl.load(VC + (tok[:, None] * H + h) * D + d[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
+         m, l, o = _gtile(q, kk, vv, m, l, o, ok, SCALE)
+-    base = (c * 128 + r) * H + h
++    base = (c * RS + r) * H + h
+     tl.store(PO + base * D + d[None, :] + g[:, None] * 0, o, mask=(g == 0)[:, None])
+     tl.store(PM + base + g * 0, m, mask=g == 0)
+     tl.store(PL + base + g * 0, l, mask=g == 0)
+ 
+ 
+ @triton.jit
+-def _sparse_merge(PO, PM, PL, OUT, CNT, H: tl.constexpr, D: tl.constexpr, NCH: tl.constexpr, CH: tl.constexpr):
++def _sparse_merge(PO, PM, PL, OUT, CNT, RS, H: tl.constexpr, D: tl.constexpr, NCH: tl.constexpr, CH: tl.constexpr):
+     r = tl.program_id(0)
+     h = tl.program_id(1)
+     n = tl.load(CNT + r)
+@@ -186,7 +187,7 @@ def _sparse_merge(PO, PM, PL, OUT, CNT, H: tl.constexpr, D: tl.constexpr, NCH: t
+     o = tl.zeros((D,), tl.float32)
+     for c in range(NCH):
+         if c * CH < n:
+-            base = (c * 128 + r) * H + h
++            base = (c * RS + r) * H + h
+             cm = tl.load(PM + base)
+             cl = tl.load(PL + base)
+             co = tl.load(PO + base * D + d)
+@@ -209,9 +210,11 @@ def sparse_attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, tokens
+     W = tokens.shape[1]
+     CH = 512
+     nch = triton.cdiv(W, CH)
+-    po = torch.empty((nch * 128 * H * D,), dtype=torch.float32, device=q.device)
+-    pm = torch.empty((nch * 128 * H,), dtype=torch.float32, device=q.device)
+-    pl = torch.empty((nch * 128 * H,), dtype=torch.float32, device=q.device)
+-    _sparse_chunks[(R, H, nch)](q, kc, vc, tokens, counts, po, pm, pl, W=W, H=H, D=D, CH=CH, SCALE=scale,
++    # chunk partials for every row of the window (upstream sized them for 128 rows, the verify windows; longer
++    # prefill chunks, GLM53_TF_PREFILL_ROWS, need R); the row stride only places partials, not their bits
++    po = torch.empty((nch * R * H * D,), dtype=torch.float32, device=q.device)
++    pm = torch.empty((nch * R * H,), dtype=torch.float32, device=q.device)
++    pl = torch.empty((nch * R * H,), dtype=torch.float32, device=q.device)
++    _sparse_chunks[(R, H, nch)](q, kc, vc, tokens, counts, po, pm, pl, R, W=W, H=H, D=D, CH=CH, SCALE=scale,
+                                 num_warps=4, num_stages=1)
+-    _sparse_merge[(R, H)](po, pm, pl, out, counts, H=H, D=D, NCH=nch, CH=CH, num_warps=4)
++    _sparse_merge[(R, H)](po, pm, pl, out, counts, R, H=H, D=D, NCH=nch, CH=CH, num_warps=4)

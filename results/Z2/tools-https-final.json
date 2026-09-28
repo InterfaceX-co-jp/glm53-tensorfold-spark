@@ -1,0 +1,488 @@
+{
+  "config": {
+    "url": "http://127.0.0.1:8080/v1/chat/completions",
+    "reps": 1,
+    "temperature": 0.0,
+    "max_tokens": 1500,
+    "timeout": 900,
+    "out": "results/Z2/tools-https-final.json",
+    "only": null,
+    "stream": true,
+    "toolset": "opencode"
+  },
+  "passed": 19,
+  "total": 21,
+  "corruption": 0,
+  "results": [
+    {
+      "case": "bash_simple",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.5,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "bash",
+          "raw": "{\"command\":\"ls -la\"}",
+          "keys": [
+            "command"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "bash_4arg",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.5,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "bash",
+          "raw": "{\"command\":\"ls -la /home/user/projects\",\"description\":\"list projects\",\"timeout\":10000,\"workdir\":\"/tmp\"}",
+          "keys": [
+            "command",
+            "description",
+            "timeout",
+            "workdir"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "read_offset",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 2.3,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "read",
+          "raw": "{\"filePath\":\"src/main.ts\",\"offset\":100,\"limit\":51}",
+          "keys": [
+            "filePath",
+            "limit",
+            "offset"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "edit_file",
+      "ok": false,
+      "problems": [
+        "missing_expected:any_of(['edit'])"
+      ],
+      "elapsed_s": 1.6,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "read",
+          "raw": "{\"filePath\":\"src/app.ts\"}",
+          "keys": [
+            "filePath"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "glob_grep",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 2.9,
+      "finish_reason": "tool_calls",
+      "n_calls": 2,
+      "calls": [
+        {
+          "name": "glob",
+          "raw": "{\"pattern\":\"src/**/*.ts\"}",
+          "keys": [
+            "pattern"
+          ]
+        },
+        {
+          "name": "grep",
+          "raw": "{\"pattern\":\"TODO\",\"path\":\"src\",\"include\":\"*.ts\"}",
+          "keys": [
+            "include",
+            "path",
+            "pattern"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "task_3arg",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.3,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "task",
+          "raw": "{\"description\":\"Research discipline\",\"prompt\":\"Read the repo structure and return the last 5 lines of README.md\",\"subagent_type\":\"explore\"}",
+          "keys": [
+            "description",
+            "prompt",
+            "subagent_type"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "todowrite_list",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.1,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "todowrite",
+          "raw": "{\"todos\":[{\"content\":\"Inspect repo\",\"status\":\"completed\",\"priority\":\"high\"},{\"content\":\"Write tests\",\"status\":\"in_progress\",\"priority\":\"high\"},{\"content\":\"Ship\",\"status\":\"pending\",\"priority\":\"medium\"}]}",
+          "keys": [
+            "todos"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "parallel_two",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.3,
+      "finish_reason": "tool_calls",
+      "n_calls": 2,
+      "calls": [
+        {
+          "name": "read",
+          "raw": "{\"filePath\":\"package.json\"}",
+          "keys": [
+            "filePath"
+          ]
+        },
+        {
+          "name": "glob",
+          "raw": "{\"pattern\":\"**/*.ts\"}",
+          "keys": [
+            "pattern"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "nested_request",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.9,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "task",
+          "raw": "{\"description\":\"Explore packages\",\"prompt\":\"Run the following shell command and summarize its output:\\n\\ncd /home/user/projects && ls packages\\n\\nPlease report the list of packages found and provide a brief summary of what you observe.\",\"subagent_type\":\"explore\"}",
+          "keys": [
+            "description",
+            "prompt",
+            "subagent_type"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "write_file",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 0.9,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "write",
+          "raw": "{\"filePath\":\"notes.md\",\"content\":\"# Notes\\n\\nhello\\n\"}",
+          "keys": [
+            "content",
+            "filePath"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "multi_tool_four",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.7,
+      "finish_reason": "tool_calls",
+      "n_calls": 4,
+      "calls": [
+        {
+          "name": "read",
+          "raw": "{\"filePath\":\"README.md\"}",
+          "keys": [
+            "filePath"
+          ]
+        },
+        {
+          "name": "glob",
+          "raw": "{\"pattern\":\"**/*.json\"}",
+          "keys": [
+            "pattern"
+          ]
+        },
+        {
+          "name": "grep",
+          "raw": "{\"pattern\":\"TODO\"}",
+          "keys": [
+            "pattern"
+          ]
+        },
+        {
+          "name": "bash",
+          "raw": "{\"command\":\"git status\"}",
+          "keys": [
+            "command"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "reasoning_then_call",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 9.1,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "bash",
+          "raw": "{\"command\":\"ss -ltnp\",\"description\":\"List listening TCP sockets with owning processes\"}",
+          "keys": [
+            "command",
+            "description"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "edit_with_content",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.8,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "edit",
+          "raw": "{\"filePath\":\"src/app.ts\",\"newString\":\"const port = 8080;\",\"oldString\":\"const port = 3000;\"}",
+          "keys": [
+            "filePath",
+            "newString",
+            "oldString"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "after_tool_result",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.3,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "bash",
+          "raw": "{\"command\":\"ls; cat app.py 2>/dev/null; cat tests/test_app.py 2>/dev/null\"}",
+          "keys": [
+            "command"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "result_contains_markup",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.6,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "bash",
+          "raw": "{\"command\":\"ls -la && find . -maxdepth 2 -type f | head -50\"}",
+          "keys": [
+            "command"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "multi_turn_chain",
+      "ok": false,
+      "problems": [
+        "missing_expected:any_of(['bash', 'write'])"
+      ],
+      "elapsed_s": 1.8,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "read",
+          "raw": "{\"filePath\":\"src/app.ts\"}",
+          "keys": [
+            "filePath"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "three_calls_complex",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.8,
+      "finish_reason": "tool_calls",
+      "n_calls": 3,
+      "calls": [
+        {
+          "name": "read",
+          "raw": "{\"filePath\":\"tsconfig.json\"}",
+          "keys": [
+            "filePath"
+          ]
+        },
+        {
+          "name": "grep",
+          "raw": "{\"pattern\":\"strict\",\"path\":\"src\"}",
+          "keys": [
+            "path",
+            "pattern"
+          ]
+        },
+        {
+          "name": "bash",
+          "raw": "{\"command\":\"pnpm build\",\"description\":\"Run pnpm build\",\"timeout\":300000}",
+          "keys": [
+            "command",
+            "description",
+            "timeout"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "poisoned_tool_error",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 0.5,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "bash",
+          "raw": "{\"command\":\"ls\"}",
+          "keys": [
+            "command"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "poisoned_assistant_text",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 0.7,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "bash",
+          "raw": "{\"command\":\"find src -type f | head -50\"}",
+          "keys": [
+            "command"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "long_reasoning_tool",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 33.0,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "read",
+          "raw": "{\"filePath\":\"README.md\"}",
+          "keys": [
+            "filePath"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    },
+    {
+      "case": "markup_in_result_repeat",
+      "ok": true,
+      "problems": [],
+      "elapsed_s": 1.2,
+      "finish_reason": "tool_calls",
+      "n_calls": 1,
+      "calls": [
+        {
+          "name": "grep",
+          "raw": "{\"pattern\":\"tool_call\"}",
+          "keys": [
+            "pattern"
+          ]
+        }
+      ],
+      "corruption": false,
+      "rep": 0
+    }
+  ]
+}

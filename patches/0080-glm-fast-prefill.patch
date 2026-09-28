@@ -1,0 +1,1442 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 299afe4..8ef5d7c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -20,7 +20,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+-from . import profile
++from . import fastpf, profile
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .weights import Weights
+@@ -112,6 +112,11 @@ class Engine:
+                     bb.lc = LongScratch(max_rows, capacity, c.heads // w.world, c.qk_dim, w.device)
+         self.long_rows = tuple(range(1, max_rows + 1)) if self.longctx else ()
+         self.st = State(w, capacity, rows)
++        # patches/0080: prefill chunks through the fast kernels (``fastpf``: chunks and snapshots on the chunk grid);
++        # ``fast_snap``: the grid snapshot the last fast prefill left (None: none)
++        self.fast_prefill = fastpf.enabled()
++        self.fast_snap: "Snapshot | None" = None
++        w.meta["fast_gather16"] = fastpf.gather16()
+         if w.rank == 0 and w.meta["latent_kv"]:          # patches/0060
+             from .latent import kv_bytes_per_token
+ 
+@@ -272,7 +277,9 @@ class Snapshot:
+     copied; the attention caches (the model's, the MTP head's, DFlash2's) stay where they are, because a request
+     resumed from here writes only past ``len(ids)``. ``pending``: the MTP input rows of the last committed
+     positions the head has not absorbed yet (their next tokens come from the new prompt). ``mtp_len`` and
+-    ``drafter_end``: how far the MTP and DFlash2 caches are valid, -1 when they are not usable."""
++    ``drafter_end``: how far the MTP and DFlash2 caches are valid, -1 when they are not usable. ``grid``
++    (patches/0080): 0 for a state the row-invariant kernels built (resumable at any length), C for a fast-prefill
++    snapshot on the chunk grid C (``fastpf``: only fast requests with the same grid resume from it)."""
+ 
+     ids: list[int]
+     rec: torch.Tensor
+@@ -280,15 +287,21 @@ class Snapshot:
+     pending: torch.Tensor | None
+     mtp_len: int
+     drafter_end: int
++    grid: int = 0
+ 
+ 
+ def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
+-                  drafter=None) -> Snapshot:
++                  drafter=None, grid: int = 0, mtp_len: int | None = None) -> Snapshot:
++    """``mtp_len`` (patches/0080): the MTP cache's valid length when it is not the committed one (a grid snapshot
++    taken between prefill chunks, where the head already absorbed the pending row)."""
++
+     st = e.st
+     rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
++    if mtp_len is None:
++        mtp_len = st.mtp_len - st.mtp_drafted
+     return Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
+-                    st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1,
+-                    drafter.context_end if drafter is not None else -1)
++                    mtp_len if mtp and pending is not None else -1,
++                    drafter.context_end if drafter is not None else -1, grid)
+ 
+ 
+ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+@@ -328,12 +341,22 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     """Commit the prompt in chains of up to ``prefill_rows`` rows (the MTP cache absorbing every position whose
+     next token is known; a DFlash2 ``drafter`` taking every position's taps), sample the first output token, and
+     keep the last hidden row for the first draft. ``resume``: start from that snapshot, whose ids begin the prompt
+-    (rows never depend on their chunk-mates, so the state ends with the bits of a prefill from the start)."""
++    (rows never depend on their chunk-mates, so the state ends with the bits of a prefill from the start).
++
++    patches/0080, ``e.fast_prefill``: the main model's chunks run the fast kernels, at absolute multiples of the grid
++    C = ``fastpf.grid(prefill_rows)``; ``e.fast_snap`` becomes the snapshot at B = floor(n / C) * C (taken before the
++    last, partial chunk; None when B = 0), the only state of this prefill a later prompt may resume from, and
++    ``resume`` must be such a snapshot of grid C (``fastpf``: why that keeps resumed == fresh)."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+     w, st, b = e.w, e.st, e.buf
+     use_mtp = mtp and w.mtp is not None
++    fast = bool(getattr(e, "fast_prefill", False))
++    step = fastpf.grid(e.prefill_rows) if fast else e.prefill_rows
++    if fast and step > e.rows:
++        raise ValueError(f"fast prefill: a {step}-row chunk grid, the buffers hold {e.rows} rows")
++    e.fast_snap = None
+     begin = 0
+     if resume is None:
+         e.reset()
+@@ -345,6 +368,8 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+             raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt")
+         if (use_mtp and resume.mtp_len < 0) or (drafter is not None and resume.drafter_end != begin):
+             raise ValueError("this snapshot's draft caches do not fit the request")
++        if resume.grid != (step if fast else 0) or begin % max(resume.grid, 1):
++            raise ValueError(f"a snapshot of grid {resume.grid} cannot resume a prefill of grid {step if fast else 0}")
+         restore(e, resume, drafter)
+         if use_mtp:
+             k = resume.pending.shape[0]
+@@ -353,15 +378,23 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     if prof:
+         profile.lap("resume")
+     last = None
+-    for start in range(begin, len(prompt), e.prefill_rows):
+-        chunk = list(prompt[start:start + e.prefill_rows])
++    n = len(prompt)
++    edge = (n // step) * step if fast else -1       # patches/0080: the grid point B of the snapshot
++    if fast and edge == begin and resume is not None:
++        e.fast_snap = resume                        # no whole chunk past the resume point: it stays the grid state
++    for start in range(begin, n, step):
++        chunk = list(prompt[start:start + step])
+         R = len(chunk)
++        if start == edge and start > begin:         # patches/0080: the state at B, before the partial chunk [B, n)
++            e.fast_snap = take_snapshot(e, prompt[:start], e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                        drafter=drafter, grid=step, mtp_len=start - 1)
+         staged = stage(w, st, b, chunk)
+         if prof:
+             profile.lap("stage")
+             profile.P.chunks += 1
+             profile.P.rows += R
+-        logits = compute(w, st, b, staged, nch=chunks_for(st, R), host_pos=st.pos)
++        logits = compute(w, st, b, staged, nch=chunks_for(st, R), host_pos=st.pos, fast=fast,
++                         head=start + R == n)
+         last = logits[R - 1:R].clone()
+         e.last_hidden = e.main_hidden(slice(R - 1, R)).clone()
+         if prof:
+@@ -382,6 +415,9 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+         commit(w, st, b, R, R)
+         if prof:
+             profile.lap("commit")
++    if fast and edge == n and n > begin:            # patches/0080: the prompt ends on the grid
++        e.fast_snap = take_snapshot(e, prompt, e.last_hidden if use_mtp else None, mtp=use_mtp, drafter=drafter,
++                                    grid=step)
+     first = e.sample(last, [len(prompt)], sampling)[0]
+     if prof:
+         profile.lap("sample")
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index f5a8419..802e093 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -10,6 +10,11 @@ Snapshot``), and a prompt that extends either resumes from it. Rows never depend
+ resumed prompt ends in the state a fresh prefill gives. Both ranks keep the same snapshots; rank 0 names the one
+ it resumes from in the header.
+ 
++Fast prefill (patches/0080, GLM53_TF_FAST_PREFILL=1, ``fastpf.py``): prefill chunks run kernels that are not
++row-invariant, at absolute multiples of a chunk grid C; the only state kept is the prompt's at its last grid point
++(no snapshot after the reply), and fast requests resume only from such snapshots of their own grid, which keeps
++resumed == fresh and drafted == serial (the proof is in ``fastpf``).
++
+ A request's draft policy is a spec (the engine's default, or the request's through ``app.GlmApp``):
+ 
+     0             serial: one token a round
+@@ -210,6 +215,21 @@ class GlmEngine:
+         if lat_both[0] != lat_both[1]:
+             raise RuntimeError(f"the two ranks were started with different GLM53_TF_LATENT_KV: {lat_both[0][0]}, "
+                                f"{lat_both[1][0]}")
++        # patches/0080: GLM53_TF_FAST_PREFILL and GLM53_TF_FAST_GATHER decide a fast prefill's bits, and so do the
++        # optional fast kernels (patches/0081): both ranks must agree on all of them
++        from . import fastpf
++
++        fp_both = self._gather_ints(fastpf.settings())
++        if fp_both[0] != fp_both[1]:
++            raise RuntimeError("the two ranks were started with different fast-prefill settings "
++                               "(GLM53_TF_FAST_PREFILL, GLM53_TF_FAST_GATHER, fast_kda / fast_qmm present): "
++                               f"{fp_both[0]}, {fp_both[1]}")
++        if fastpf.enabled() and rank == 0:
++            gone = "; ".join(f"{k}: {v}" for k, v in fastpf.MISSING.items())
++            rows = int(os.environ.get("GLM53_TF_PREFILL_ROWS", "64"))
++            print(f"[tensorfold] fast prefill on: chunk grid {fastpf.grid(rows)}, "
++                  f"{'bf16' if fastpf.gather16() else 'fp32'} gathers"
++                  + (f"; row-invariant kernels for {gone}" if gone else ""), flush=True)
+         self.drafter = None
+         if drafter is not None:
+             from .dflash2 import Drafter
+@@ -245,6 +265,10 @@ class GlmEngine:
+             from .batch import Batcher
+ 
+             self.batch = Batcher(self, n)
++            if self.e.fast_prefill and rank == 0:
++                print("[tensorfold] GLM53_TF_FAST_PREFILL is ignored with GLM53_TF_BATCH > 1 (batched slots keep exact "
++                      "snapshots after replies)", flush=True)
++            self.e.fast_prefill = False      # patches/0080: the batch scheduler's snapshots are exact ones
+         # patches/0070: GLM53_TF_CALIB_ONLINE=1, rank 0 refines the verify windows' costs from the windows rounds
+         # run and sends the table in each request's header (calib.py); both ranks use the header's table
+         from . import calib
+@@ -411,13 +435,24 @@ class GlmEngine:
+         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
+         return auto, auto or not dflash, dflash
+ 
+-    def _resume(self, prompt: list[int], code: list[int]):
+-        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters."""
++    def _grid(self, fast: bool | None = None, rows: int | None = None) -> int:
++        """patches/0080: the snapshot grid a request uses: 0 (exact prefill), or its fast chunk grid."""
++
++        from . import fastpf
++
++        fast = self.e.fast_prefill if fast is None else fast
++        return fastpf.grid(self.e.prefill_rows if rows is None else rows) if fast else 0
++
++    def _resume(self, prompt: list[int], code: list[int], grid: int | None = None):
++        """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters (and,
++        patches/0080, made by the request's prefill mode: ``grid``, default the engine's current one)."""
+ 
+         _, mtp, dflash = self._drafters(code)
++        grid = self._grid() if grid is None else grid
+         best = None
+         for snap in self.cache:
+-            fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
++            fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0) \
++                and snap.grid == grid
+             if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
+                     best is None or len(snap.ids) > len(best.ids)):
+                 best = snap
+@@ -440,10 +475,16 @@ class GlmEngine:
+         self.cache = [c for c in self.cache if len(c.ids) <= cut]
+         first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit)
+         prefill_s = time.perf_counter() - t0
+-        if draft:
++        grid = self._grid()                 # patches/0080: 0, or the fast chunk grid this prefill ran on
++        if draft and grid:
++            if self.e.fast_snap is not None:        # the state at the prompt's last grid point, nothing later
++                self._remember(self.e.fast_snap)
++        elif draft:
+             self._remember(take_snapshot(self.e, prompt, self.e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                          drafter=drafter))
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
++        if grid:
++            stats["fast_prefill"] = grid
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+             return stats
+@@ -484,7 +525,7 @@ class GlmEngine:
+             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+                              on_tokens=on_tokens)
+         self.e.depth = None                 # patches/0071: the optimizer is the request's
+-        if draft and policy is not None and res.keeps:
++        if draft and policy is not None and res.keeps and not grid:     # patches/0080: fast: no reply snapshot
+             committed = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
+             if auto or code[0] == LOOKUP_KIND:     # patches/0020: lN runs auto_decode too
+                 pending = res.pending
+diff --git a/src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp b/src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp
+new file mode 100644
+index 0000000..6b35103
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp
+@@ -0,0 +1,57 @@
++// patches/0080: bindings of exl3_fast.cu (the fast-prefill EXL3 expert kernels).
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void exl3_fast_gateup_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                           const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                           const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, double);
++void exl3_fast_down_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                         const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
++                ": expected a contiguous CUDA tensor of the right dtype");
++}
++
++void gateup(const at::Tensor& XG, const at::Tensor& XU, const at::Tensor& TG, const at::Tensor& TU,
++            const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, const at::Tensor& svh_g,
++            const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor xd, int64_t K, int64_t N, int64_t slots,
++            double limit) {
++    check(XG, at::kHalf, "XG");
++    check(XU, at::kHalf, "XU");
++    check(TG, at::kInt, "TG");
++    check(TU, at::kInt, "TU");
++    check(uids, at::kInt, "uids");
++    check(ucount, at::kInt, "ucount");
++    check(members, at::kInt, "members");
++    check(svh_g, at::kHalf, "svh_g");
++    check(svh_u, at::kHalf, "svh_u");
++    check(suh_d, at::kHalf, "suh_d");
++    check(xd, at::kHalf, "xd");
++    TORCH_CHECK(XG.size(-1) == K && XU.size(-1) == K && xd.size(-1) == N, "gateup: X [P, K], Xd [P, N]");
++    TORCH_CHECK(TG.size(1) * 16 == K && TG.size(2) * 16 == N && TG.sizes() == TU.sizes(), "gateup: trellis shapes");
++    TORCH_CHECK(svh_g.size(-1) == N && svh_u.size(-1) == N && suh_d.size(-1) == N, "gateup: scales [E, N]");
++    c10::cuda::CUDAGuard guard(XG.device());
++    exl3_fast_gateup_cuda(XG, XU, TG, TU, uids, ucount, members, svh_g, svh_u, suh_d, xd, K, N, slots, limit);
++}
++
++void down(const at::Tensor& XD, const at::Tensor& TD, const at::Tensor& uids, const at::Tensor& ucount,
++          const at::Tensor& members, const at::Tensor& svh_d, at::Tensor y, int64_t K, int64_t N, int64_t slots) {
++    check(XD, at::kHalf, "XD");
++    check(TD, at::kInt, "TD");
++    check(uids, at::kInt, "uids");
++    check(ucount, at::kInt, "ucount");
++    check(members, at::kInt, "members");
++    check(svh_d, at::kHalf, "svh_d");
++    check(y, at::kFloat, "y");
++    TORCH_CHECK(XD.size(-1) == K && y.size(-1) == N, "down: Xd [P, K], Y [P, N]");
++    TORCH_CHECK(TD.size(1) * 16 == K && TD.size(2) * 16 == N, "down: trellis shape");
++    TORCH_CHECK(svh_d.size(-1) == N, "down: scales [E, N]");
++    c10::cuda::CUDAGuard guard(XD.device());
++    exl3_fast_down_cuda(XD, TD, uids, ucount, members, svh_d, y, K, N, slots);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("gateup", &gateup);
++    m.def("down", &down);
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/exl3_fast.cu b/src/tensorfold/families/glm5_next/cuda/exl3_fast.cu
+new file mode 100644
+index 0000000..8a05fcf
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/exl3_fast.cu
+@@ -0,0 +1,734 @@
++// patches/0080 (GLM53_TF_FAST_PREFILL=1): GLM-5.3-Flash's EXL3 routed experts for fast prefill chunks, as two fused
++// grouped GEMMs over the window's distinct experts.
++//
++//   gateup  Xd[p] = fp16(H(act * suh_d)),  act = limited SwiGLU(H(Xg[p] @ Wg_q) * svh_g, H(Xu[p] @ Wu_q) * svh_u)
++//   down    Y[p]  = H(Xd[p] @ Wd_q) * svh_d                                          (fp32, this rank's share)
++//
++// for every routed pair p = row * slots + slot (Xg, Xu from exl3.cu's rot_in; H = the 128-block Hadamard / sqrt(128)).
++// Program (128-column block, distinct expert u): the 4 warps decode each 16x16 trellis tile of a K slab ONCE into
++// shared memory (as the lanes' mma B fragments), then every warp multiplies its own member tiles (16 pairs each) by
++// the whole slab, so a weight tile is fetched and decoded once per 64 (gate/up) or 128 (down) members instead of once
++// per 16-32; the next slab's words are in flight while the current one multiplies.  The down kernel also loads each k tile's A
++// fragments (the members' rows) one k tile ahead of their mma (-10% on GB10 at 1024 rows; same values, same bits; for
++// gate/up the extra registers cost more than the latency they hide). One warp accumulates the FULL K
++// of its rows in one ascending chain of mma (no split-K partials, no Z buffer), and the column block is exactly one
++// Hadamard block, so the output rotation, scales and SwiGLU run in registers on the mma accumulators and the result
++// is stored once. Upstream's path (``exl3.cu``: K split 4 ways and 4 warps, Z partials, one-warp epilogue programs)
++// is kept for decode and verify windows.
++//
++// Exactness: this is NOT upstream's arithmetic (one K chain instead of 16 partial sums), so it is only used for
++// fast-prefill chunks, whose bits no decode window has to reproduce (``fastpf.py``: the boundary rule). It is
++// deterministic (fixed chains, fixed butterfly order, no atomics, each output written by one thread) and even row
++// independent: a pair's outputs depend only on its own inputs (mma keeps rows apart, the K order is fixed by K).
++
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cstdlib>
++#include <string>
++
++namespace {
++
++constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
++constexpr int WARPS = 4;                             // warps a block
++constexpr int NB = 8;                                // n tiles a block: 128 columns, one Hadamard block
++
++// -- the EXL3 format (the same definitions as exl3.cu) ----------------------------------------------------------------
++__device__ __forceinline__ uint32_t mcg2(uint32_t s0, uint32_t s1) {
++    uint32_t x0 = s0 * 0xCBAC1FEDu;
++    uint32_t x1 = s1 * 0xCBAC1FEDu;
++    x0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    x1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    uint32_t lo = __byte_perm(x0, x1, 0x5410);
++    uint32_t hi = __byte_perm(x0, x1, 0x7632);
++    half2 r = __hadd2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<half2*>(&hi));
++    return *reinterpret_cast<uint32_t*>(&r);
++}
++
++// This lane's eight values of a 4-bit tile (word = tile[lane]) as the B fragments of its two n8 halves: b0 = rows
++// (k) 2t, 2t+1 | 2t+8, 2t+9 of column (n) g, b1 the same of column g + 8 (g = lane / 4, t = lane % 4).
++__device__ __forceinline__ void decode_tile(uint32_t w, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
++    uint32_t p = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
++    uint32_t s = __funnelshift_r(w, p, 20);
++    b0[0] = mcg2((s >> 8) & 0xffffu, (s >> 4) & 0xffffu);
++    b0[1] = mcg2(s & 0xffffu, w >> 16);
++    b1[0] = mcg2((w >> 12) & 0xffffu, (w >> 8) & 0xffffu);
++    b1[1] = mcg2((w >> 4) & 0xffffu, w & 0xffffu);
++}
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
++    return ok ? *reinterpret_cast<const uint32_t*>(x) : 0u;
++}
++
++__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++// -- the Hadamard transform on mma accumulators -----------------------------------------------------------------------
++// A warp's accumulators for one member tile and the block's 128 columns: v[nt][h][c] holds row g + 8 * (c >> 1),
++// column nt * 16 + h * 8 + 2t + (c & 1). Column bit 0 is c & 1, bits 1-2 are t (lane bits 0-1), bit 3 is h, bits 4-6
++// are nt. The butterflies run bit 0 to bit 6, each as (lower + upper, lower - upper): the order of exl3.cu's fwht128,
++// so an element gets the same sums as there.
++__device__ __forceinline__ void fwht_frag(float (&v)[NB][2][4], int lane) {
++#pragma unroll
++    for (int nt = 0; nt < NB; ++nt)
++#pragma unroll
++        for (int h = 0; h < 2; ++h)
++#pragma unroll
++            for (int c = 0; c < 4; c += 2) {
++                const float a = v[nt][h][c], b = v[nt][h][c + 1];
++                v[nt][h][c] = a + b;
++                v[nt][h][c + 1] = a - b;
++            }
++#pragma unroll
++    for (int m = 1; m <= 2; m <<= 1)
++#pragma unroll
++        for (int nt = 0; nt < NB; ++nt)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) {
++                    const float o = __shfl_xor_sync(0xffffffffu, v[nt][h][c], m);
++                    v[nt][h][c] = (lane & m) ? o - v[nt][h][c] : v[nt][h][c] + o;
++                }
++#pragma unroll
++    for (int nt = 0; nt < NB; ++nt)
++#pragma unroll
++        for (int c = 0; c < 4; ++c) {
++            const float a = v[nt][0][c], b = v[nt][1][c];
++            v[nt][0][c] = a + b;
++            v[nt][1][c] = a - b;
++        }
++#pragma unroll
++    for (int m = 1; m < NB; m <<= 1)
++#pragma unroll
++        for (int nt = 0; nt < NB; ++nt) {
++            if (nt & m) continue;
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) {
++                    const float a = v[nt][h][c], b = v[nt | m][h][c];
++                    v[nt][h][c] = a + b;
++                    v[nt | m][h][c] = a - b;
++                }
++        }
++}
++
++// -- the mainloop -----------------------------------------------------------------------------------------------------
++// A K slab of MATS matrices x KS k tiles x NB n tiles, decoded: per tile, each lane's (b0[0], b0[1], b1[0], b1[1]).
++template <int MATS, int KS>
++struct Slab {
++    uint4 f[MATS * KS * NB][32];
++};
++
++// Member tiles warp + WARPS * j (j < MTW) of this pass (rows_sh: pair rows, -1 = none) times the block's 128 columns
++// of matrix mat over all of K: acc[j][mat]. K goes in slabs of KS k tiles; slab s is decoded into buffer s & 1 while
++// the words of slab s + 1 load, then multiplied (one __syncthreads a slab: a warp writing buffer s & 1 has passed the
++// barrier of slab s - 1, which every warp reaches only after multiplying slab s - 2).
++template <int MATS, int KS, int MTW, bool PREFETCH>
++__device__ __forceinline__ void mainloop(const half* __restrict__ X0, const half* __restrict__ X1,
++                                         const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1, int e,
++                                         int K, int N, int nb, const int* rows_sh, Slab<MATS, KS>* slabs,
++                                         float (&acc)[MTW][MATS][NB][2][4]) {
++    static_assert(MATS * KS == WARPS, "warp w decodes row w of a slab: (matrix w / KS, k tile w % KS), all NB n tiles");
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int KT = K >> 4, NTILES = N >> 4, S = KT / KS;
++
++    int r0[MTW], r1[MTW];
++    bool act[MTW];
++#pragma unroll
++    for (int j = 0; j < MTW; ++j) {
++        const int m = warp + WARPS * j;
++        r0[j] = rows_sh[16 * m + g];
++        r1[j] = rows_sh[16 * m + g + 8];
++        act[j] = rows_sh[16 * m] >= 0;             // members come first: an empty tile has no member at all
++    }
++#pragma unroll
++    for (int j = 0; j < MTW; ++j)
++#pragma unroll
++        for (int mat = 0; mat < MATS; ++mat)
++#pragma unroll
++            for (int nt = 0; nt < NB; ++nt)
++#pragma unroll
++                for (int h = 0; h < 2; ++h)
++#pragma unroll
++                    for (int c = 0; c < 4; ++c) acc[j][mat][nt][h][c] = 0.f;
++
++    // this warp's tiles of a slab: (matrix warp / KS, k tile warp % KS) x n tiles 0..NB-1, i = warp * NB + nt
++    const uint32_t* src = (warp / KS ? T1 : T0) + (((size_t)e * KT + warp % KS) * NTILES + nb * NB) * 32 + lane;
++    const size_t slab_step = (size_t)KS * NTILES * 32;
++    uint32_t words[NB];
++#pragma unroll
++    for (int q = 0; q < NB; ++q) words[q] = __ldg(src + q * 32);
++
++    // The A fragments (this warp's member rows) of k tile kt; loaded one k tile ahead of their mma, so the L2
++    // latency of the row gathers overlaps the previous k tile's products (the values, hence the bits, are the same).
++    uint32_t a_cur[MTW][MATS][4], a_nxt[MTW][MATS][4];
++    auto load_a = [&](int kt, uint32_t (&a)[MTW][MATS][4]) {
++        const int k = kt * 16 + 2 * t;
++#pragma unroll
++        for (int j = 0; j < MTW; ++j)
++#pragma unroll
++            for (int mat = 0; mat < MATS; ++mat) {
++                const half* X = mat ? X1 : X0;
++                const half* x0 = X + (size_t)(r0[j] < 0 ? 0 : r0[j]) * K + k;
++                const half* x1 = X + (size_t)(r1[j] < 0 ? 0 : r1[j]) * K + k;
++                const bool ok = act[j];
++                a[j][mat][0] = load_pair(x0, ok && r0[j] >= 0);
++                a[j][mat][1] = load_pair(x1, ok && r1[j] >= 0);
++                a[j][mat][2] = load_pair(x0 + 8, ok && r0[j] >= 0);
++                a[j][mat][3] = load_pair(x1 + 8, ok && r1[j] >= 0);
++            }
++    };
++    if (PREFETCH) load_a(0, a_cur);
++
++    for (int s = 0; s < S; ++s) {
++        Slab<MATS, KS>& sl = slabs[s & 1];
++#pragma unroll
++        for (int q = 0; q < NB; ++q) {
++            uint32_t b0[2], b1[2];
++            decode_tile(words[q], lane, b0, b1);
++            sl.f[warp * NB + q][lane] = make_uint4(b0[0], b0[1], b1[0], b1[1]);
++        }
++        if (s + 1 < S) {
++            src += slab_step;
++#pragma unroll
++            for (int q = 0; q < NB; ++q) words[q] = __ldg(src + q * 32);
++        }
++        __syncthreads();
++#pragma unroll
++        for (int kk = 0; kk < KS; ++kk) {
++            const int kt = s * KS + kk;
++            if (PREFETCH && kt + 1 < KT) load_a(kt + 1, a_nxt);
++#pragma unroll
++            for (int j = 0; j < MTW; ++j) {
++                if (!act[j]) continue;                 // warp-uniform
++#pragma unroll
++                for (int mat = 0; mat < MATS; ++mat) {
++                    uint32_t a[4];
++                    if (PREFETCH) {
++#pragma unroll
++                        for (int c = 0; c < 4; ++c) a[c] = a_cur[j][mat][c];
++                    } else {
++                        const int k = kt * 16 + 2 * t;
++                        const half* X = mat ? X1 : X0;
++                        const half* x0 = X + (size_t)(r0[j] < 0 ? 0 : r0[j]) * K + k;
++                        const half* x1 = X + (size_t)(r1[j] < 0 ? 0 : r1[j]) * K + k;
++                        a[0] = load_pair(x0, r0[j] >= 0);
++                        a[1] = load_pair(x1, r1[j] >= 0);
++                        a[2] = load_pair(x0 + 8, r0[j] >= 0);
++                        a[3] = load_pair(x1 + 8, r1[j] >= 0);
++                    }
++#pragma unroll
++                    for (int nt = 0; nt < NB; ++nt) {
++                        const uint4 f = sl.f[(mat * KS + kk) * NB + nt][lane];
++                        mma16816(acc[j][mat][nt][0], a, f.x, f.y);
++                        mma16816(acc[j][mat][nt][1], a, f.z, f.w);
++                    }
++                }
++            }
++            if (PREFETCH) {
++#pragma unroll
++                for (int j = 0; j < MTW; ++j)
++#pragma unroll
++                    for (int mat = 0; mat < MATS; ++mat)
++#pragma unroll
++                        for (int c = 0; c < 4; ++c) a_cur[j][mat][c] = a_nxt[j][mat][c];
++            }
++        }
++    }
++}
++
++// The pass loop of both kernels: members of expert u, 16 * WARPS * MTW at a time, into rows_sh (pair rows).
++__device__ __forceinline__ bool load_rows(int* rows_sh, int count, const int* __restrict__ members, int u, int maxm,
++                                          int m0, int slots) {
++    __syncthreads();                               // the previous pass is done with rows_sh and the slabs
++    for (int i = threadIdx.x; i < count; i += WARPS * 32) {
++        const int m = m0 + i;
++        const int code = m < maxm ? members[(size_t)u * maxm + m] : -1;
++        rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
++    }
++    __syncthreads();
++    return rows_sh[0] >= 0;                        // same for every thread
++}
++
++// Program (128-column block nb of the rank's expert width, distinct expert u): gate and up of every member, then
++// Xd = fp16(H(act * suh_d)) for the block (exl3.cu gateup_epilogue's formulas, per element in the same order).
++template <int KS>
++__global__ void __launch_bounds__(WARPS * 32) gateup_kernel(
++    const half* __restrict__ XG, const half* __restrict__ XU, const uint32_t* __restrict__ TG,
++    const uint32_t* __restrict__ TU, const int* __restrict__ uids, const int* __restrict__ ucount,
++    const int* __restrict__ members, const half* __restrict__ svh_g, const half* __restrict__ svh_u,
++    const half* __restrict__ suh_d, half* __restrict__ xd, int K, int N, int maxm, int slots, int E, float limit) {
++    constexpr int MTW = 1, ROWS = 16 * WARPS * MTW;
++    const int u = blockIdx.y, nb = blockIdx.x;
++    if (u >= ucount[0] || uids[u] >= E) return;    // the shared expert (id E) is not EXL3
++    const int e = uids[u];
++    __shared__ int rows_sh[ROWS];
++    __shared__ Slab<2, KS> slabs[2];
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    for (int m0 = 0; m0 < maxm; m0 += ROWS) {
++        if (!load_rows(rows_sh, ROWS, members, u, maxm, m0, slots)) break;
++        float acc[MTW][2][NB][2][4];
++        mainloop<2, KS, MTW, false>(XG, XU, TG, TU, e, K, N, nb, rows_sh, slabs, acc);
++        if (rows_sh[16 * warp] < 0) continue;       // this warp's member tile is empty (warp-uniform)
++        float (&gv)[NB][2][4] = acc[0][0];
++        float (&uv)[NB][2][4] = acc[0][1];
++        fwht_frag(gv, lane);
++        fwht_frag(uv, lane);
++        const half* sg = svh_g + (size_t)e * N + nb * 128;
++        const half* su = svh_u + (size_t)e * N + nb * 128;
++        const half* sd = suh_d + (size_t)e * N + nb * 128;
++#pragma unroll
++        for (int nt = 0; nt < NB; ++nt)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) {
++                    const int col = nt * 16 + h * 8 + 2 * t + (c & 1);
++                    const float gg = fminf(bf16r(gv[nt][h][c] * HAD_SCALE * __half2float(sg[col])), limit);
++                    const float uu = fminf(fmaxf(bf16r(uv[nt][h][c] * HAD_SCALE * __half2float(su[col])), -limit),
++                                           limit);
++                    const float a = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++                    gv[nt][h][c] = a * __half2float(sd[col]);
++                }
++        fwht_frag(gv, lane);
++        const int ra = rows_sh[16 * warp + g], rb = rows_sh[16 * warp + g + 8];
++#pragma unroll
++        for (int nt = 0; nt < NB; ++nt)
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int n = nb * 128 + nt * 16 + h * 8 + 2 * t;
++                if (ra >= 0)
++                    *reinterpret_cast<half2*>(xd + (size_t)ra * N + n) = __halves2half2(
++                        __float2half_rn(gv[nt][h][0] * HAD_SCALE), __float2half_rn(gv[nt][h][1] * HAD_SCALE));
++                if (rb >= 0)
++                    *reinterpret_cast<half2*>(xd + (size_t)rb * N + n) = __halves2half2(
++                        __float2half_rn(gv[nt][h][2] * HAD_SCALE), __float2half_rn(gv[nt][h][3] * HAD_SCALE));
++            }
++    }
++}
++
++// Program (128-column block nb of the model width, distinct expert u): Y[p][cols] = H(Xd[p] @ Wd_q) * svh_d
++// (exl3.cu down_epilogue's formula), for every member p of expert u.
++template <int KS>
++__global__ void __launch_bounds__(WARPS * 32) down_kernel(
++    const half* __restrict__ XD, const uint32_t* __restrict__ TD, const int* __restrict__ uids,
++    const int* __restrict__ ucount, const int* __restrict__ members, const half* __restrict__ svh_d,
++    float* __restrict__ y, int K, int N, int maxm, int slots, int E) {
++    constexpr int MTW = 2, ROWS = 16 * WARPS * MTW;
++    const int u = blockIdx.y, nb = blockIdx.x;
++    if (u >= ucount[0] || uids[u] >= E) return;
++    const int e = uids[u];
++    __shared__ int rows_sh[ROWS];
++    __shared__ Slab<1, KS> slabs[2];
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    for (int m0 = 0; m0 < maxm; m0 += ROWS) {
++        if (!load_rows(rows_sh, ROWS, members, u, maxm, m0, slots)) break;
++        float acc[MTW][1][NB][2][4];
++        mainloop<1, KS, MTW, true>(XD, XD, TD, TD, e, K, N, nb, rows_sh, slabs, acc);
++        const half* sv = svh_d + (size_t)e * N + nb * 128;
++#pragma unroll
++        for (int j = 0; j < MTW; ++j) {
++            const int m = warp + WARPS * j;
++            if (rows_sh[16 * m] < 0) continue;      // warp-uniform
++            float (&v)[NB][2][4] = acc[j][0];
++            fwht_frag(v, lane);
++            const int ra = rows_sh[16 * m + g], rb = rows_sh[16 * m + g + 8];
++#pragma unroll
++            for (int nt = 0; nt < NB; ++nt)
++#pragma unroll
++                for (int h = 0; h < 2; ++h) {
++                    const int col = nt * 16 + h * 8 + 2 * t;
++                    const float s0 = __half2float(sv[col]), s1 = __half2float(sv[col + 1]);
++                    if (ra >= 0)
++                        *reinterpret_cast<float2*>(y + (size_t)ra * N + nb * 128 + col) =
++                            make_float2(v[nt][h][0] * HAD_SCALE * s0, v[nt][h][1] * HAD_SCALE * s1);
++                    if (rb >= 0)
++                        *reinterpret_cast<float2*>(y + (size_t)rb * N + nb * 128 + col) =
++                            make_float2(v[nt][h][2] * HAD_SCALE * s0, v[nt][h][3] * HAD_SCALE * s1);
++                }
++        }
++    }
++}
++
++// -- fast2 (the default; GLM53_TF_FAST_EXPERTS=v1 runs the kernels above): the weights as the mma's A operand ----------
++// ncu on the v1 kernels (8192-row chunks): 2 blocks of 4 warps an SM, 43% of the stalls at the slab barrier. With
++// every warp decoding and multiplying they were bound by shared memory instead: each warp re-read every decoded 16 x 16
++// fragment (512 B) for its 16 member rows, ~300 KB a 32-k stage and SM, as long as the stage's mma.
++// So fast2 computes Y^T = W^T X^T. A warp owns MTL 16-column tiles of the item's 128 columns (of one matrix) for ALL
++// the item's BM members and decodes its own trellis tiles straight into registers: a decoded tile, as decode_tile lays
++// it out, is exactly an m16n8k16 A fragment, so decoded weights never touch shared memory and each fragment feeds
++// BM / 8 mma. Only the member rows are shared: gathered by cp.async into an NSA-deep ring of KS-k-tile stages
++// (zero-filled past the last member), read with ldmatrix as B fragments that each feed MTL mma. One __syncthreads a
++// stage. Work items (distinct expert u, pass of BM members, 128-column block nb) come from plan_kernel's per-expert
++// pass counts; a persistent grid walks them t-major with nb fastest, so the column blocks of a pass read its rows from
++// L2 together and an expert's passes read its weights together, and no program is launched for an absent expert.
++// Epilogue: the accumulators go to shared memory as fp32 rows (ER rows a round), then one warp a row runs the
++// 128-point transforms with butterflies bit 0 to bit 6, (lo + hi, lo - hi) -- fwht128's order, as fwht_frag -- and
++// v1's formulas element by element.
++//
++// Exactness: every output element is the same chain of m16n8k16 products over ascending k tiles as in v1 (A and B
++// swapped give the same element bits: checked against v1 bit for bit on GB10, 1024-8192 rows, uniform and skewed
++// routing), the same transforms and the same epilogue arithmetic, so fast2 == v1 bit for bit. Row-independent and
++// deterministic: the tiling is fixed by the shapes, a pair's outputs depend only on its own row, no atomics on data.
++namespace fast2 {
++
++constexpr int MAXU = 1024;
++
++__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool ok) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(ok ? 16 : 0));
++}
++__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++template <int N>
++__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
++__device__ __forceinline__ void ldsm4(uint32_t (&a)[4], const void* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
++                 : "r"(s));
++}
++
++// plan[0] = items (passes) in all, plan[1 + u] = the first pass of distinct expert u (plan[1 + maxu] = plan[0]).
++__global__ void plan_kernel(const int* __restrict__ uids, const int* __restrict__ ucount,
++                            const int* __restrict__ members, int maxu, int maxm, int E, int BM, int* __restrict__ plan) {
++    __shared__ int sc[MAXU];
++    const int u = threadIdx.x;
++    int items = 0;
++    if (u < maxu && u < ucount[0] && uids[u] < E) {
++        const int* m = members + (size_t)u * maxm;
++        int lo = 0, hi = maxm;                     // members come first: the count is the first -1
++        while (lo < hi) {
++            const int mid = (lo + hi) >> 1;
++            if (m[mid] >= 0) lo = mid + 1; else hi = mid;
++        }
++        items = (lo + BM - 1) / BM;
++    }
++    sc[u] = items;
++    __syncthreads();
++    for (int d = 1; d < MAXU; d <<= 1) {
++        const int v = u >= d ? sc[u - d] : 0;
++        __syncthreads();
++        sc[u] += v;
++        __syncthreads();
++    }
++    if (u < maxu) plan[2 + u] = sc[u];
++    if (u == 0) {
++        plan[1] = 0;
++        plan[0] = sc[maxu - 1];
++    }
++}
++
++template <int MATS, int MTL, int NG, int KS, int NSA, int NGR>
++struct Cfg {
++    static constexpr int BM = NG * 8, WPM = NB / MTL, W = MATS * WPM, THREADS = W * 32;
++    static constexpr int LDA = KS * 16 + 8, LDE = 132, ER = NGR * 8, ROUNDS = NG / NGR;
++    static constexpr size_t RING = (size_t)NSA * MATS * BM * LDA * sizeof(half);
++    static constexpr size_t EPI = (size_t)MATS * ER * LDE * sizeof(float);
++    static constexpr size_t SMEM = RING > EPI ? RING : EPI;
++};
++
++// 128-point transform of one row, 4 values a lane (column 4 * lane + j), butterflies bit 0 to bit 6.
++__device__ __forceinline__ void fwht_row(float (&v)[4], int lane) {
++    float a = v[0], b = v[1];
++    v[0] = a + b; v[1] = a - b;
++    a = v[2]; b = v[3];
++    v[2] = a + b; v[3] = a - b;
++    a = v[0]; b = v[2];
++    v[0] = a + b; v[2] = a - b;
++    a = v[1]; b = v[3];
++    v[1] = a + b; v[3] = a - b;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1)
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++}
++
++template <int MATS, int MTL, int NG, int KS, int NSA, int NGR>
++__global__ void __launch_bounds__(Cfg<MATS, MTL, NG, KS, NSA, NGR>::THREADS) expert_kernel(
++    const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
++    const uint32_t* __restrict__ T1, const int* __restrict__ uids, const int* __restrict__ members,
++    const int* __restrict__ plan, int K, int N, int maxm, int slots, int maxu, const half* __restrict__ sv0,
++    const half* __restrict__ sv1, const half* __restrict__ sd, half* __restrict__ xd, float* __restrict__ y,
++    float limit) {
++    using C = Cfg<MATS, MTL, NG, KS, NSA, NGR>;
++    constexpr int W = C::W, THREADS = C::THREADS, BM = C::BM, LDA = C::LDA, LDE = C::LDE, ER = C::ER;
++    static_assert(NG % 2 == 0 && NG % NGR == 0 && NGR % 2 == 0, "n groups in pairs");
++    extern __shared__ __align__(16) unsigned char smem[];
++    half* ring = reinterpret_cast<half*>(smem);              // [NSA][MATS][BM][LDA]
++    float* ep = reinterpret_cast<float*>(smem);              // [MATS][ER][LDE], after the K loop
++    __shared__ int rows_sh[BM];
++    __shared__ int offs[MAXU + 1];
++    __shared__ int cnt_sh;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int mat = warp / C::WPM, slice = warp % C::WPM;   // columns slice * 16 MTL .. + 16 MTL of the item
++    const int g = lane >> 2, t = lane & 3;
++    const int KT = K >> 4, NTILES = N >> 4, S = KT / KS, NBLK = N / 128;
++    const int total = plan[0] * NBLK;
++    for (int i = threadIdx.x; i <= maxu; i += THREADS) offs[i] = plan[1 + i];
++
++    for (int item = blockIdx.x; item < total; item += gridDim.x) {
++        const int tt = item / NBLK, nb = item % NBLK;
++        __syncthreads();
++        int lo = 0, hi = maxu;
++        while (hi - lo > 1) {
++            const int mid = (lo + hi) >> 1;
++            if (offs[mid] <= tt) lo = mid; else hi = mid;
++        }
++        const int u = lo, pass = tt - offs[u], e = uids[u];
++        if (threadIdx.x == 0) cnt_sh = 0;
++        __syncthreads();
++        for (int i = threadIdx.x; i < BM; i += THREADS) {
++            const int m = pass * BM + i;
++            const int code = m < maxm ? members[(size_t)u * maxm + m] : -1;
++            rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
++            if (code >= 0) atomicMax(&cnt_sh, i + 1);
++        }
++        __syncthreads();
++        const int cnt = cnt_sh;                                 // members of this pass (they come first)
++
++        auto load_a = [&](int s) {
++            constexpr int CPR = KS * 2;
++            const int k0 = s * KS * 16;
++            half* dst = ring + (size_t)(s % NSA) * MATS * BM * LDA;
++#pragma unroll
++            for (int i = threadIdx.x; i < MATS * BM * CPR; i += THREADS) {
++                const int m = i / (BM * CPR), r = (i / CPR) % BM, c = i % CPR;
++                const int row = rows_sh[r];
++                const half* src = (m ? X1 : X0) + (size_t)(row < 0 ? 0 : row) * K + k0 + c * 8;
++                cp_async16(dst + ((size_t)m * BM + r) * LDA + c * 8, src, row >= 0);
++            }
++        };
++        // this warp's trellis words: column tiles nb * 8 + slice * MTL + l, k tile kt
++        const uint32_t* tw = (mat ? T1 : T0) + ((size_t)e * KT * NTILES + nb * NB + slice * MTL) * 32 + lane;
++        uint32_t wr[KS][MTL];
++        auto load_w = [&](int kt, uint32_t (&w)[MTL]) {
++#pragma unroll
++            for (int l = 0; l < MTL; ++l) w[l] = __ldg(tw + ((size_t)kt * NTILES + l) * 32);
++        };
++
++        float acc[MTL][NG][4];
++#pragma unroll
++        for (int l = 0; l < MTL; ++l)
++#pragma unroll
++            for (int n = 0; n < NG; ++n)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[l][n][c] = 0.f;
++
++#pragma unroll
++        for (int s = 0; s < NSA - 1; ++s) {
++            if (s < S) load_a(s);
++            cp_commit();
++        }
++#pragma unroll
++        for (int kk = 0; kk < KS; ++kk) load_w(kk, wr[kk]);
++        cp_wait<NSA - 2>();
++        __syncthreads();
++        for (int s = 0; s < S; ++s) {
++            if (s + NSA - 1 < S) load_a(s + NSA - 1);
++            cp_commit();
++            const half* A = ring + ((size_t)(s % NSA) * MATS + mat) * BM * LDA;
++#pragma unroll
++            for (int kk = 0; kk < KS; ++kk) {
++                uint32_t af[MTL][4];
++#pragma unroll
++                for (int l = 0; l < MTL; ++l) {
++                    uint32_t b0[2], b1[2];
++                    decode_tile(wr[kk][l], lane, b0, b1);
++                    af[l][0] = b0[0]; af[l][1] = b1[0]; af[l][2] = b0[1]; af[l][3] = b1[1];
++                }
++                if (s + 1 < S) load_w((s + 1) * KS + kk, wr[kk]);
++#pragma unroll
++                for (int np = 0; np < NG / 2; ++np) {
++                    if (16 * np < cnt) {                         // warp-uniform
++                        uint32_t b[4];
++                        ldsm4(b, A + (16 * np + (lane & 7) + ((lane >> 4) << 3)) * LDA + kk * 16 + ((lane >> 3) & 1) * 8);
++#pragma unroll
++                        for (int l = 0; l < MTL; ++l) {
++                            mma16816(acc[l][2 * np], af[l], b[0], b[1]);
++                            mma16816(acc[l][2 * np + 1], af[l], b[2], b[3]);
++                        }
++                    }
++                }
++            }
++            cp_wait<NSA - 2>();
++            __syncthreads();
++        }
++
++        // epilogue, ER rows a round: accumulators -> ep[mat][row][col] (fp32), then one warp a row
++#pragma unroll
++        for (int rd = 0; rd < C::ROUNDS; ++rd) {
++            if (rd) __syncthreads();
++            if (ER * rd < cnt) {
++#pragma unroll
++                for (int n = 0; n < NGR; ++n) {
++                    const int ng = rd * NGR + n;
++                    float* E = ep + ((size_t)mat * ER + 8 * n + 2 * t) * LDE + slice * 16 * MTL + g;
++#pragma unroll
++                    for (int l = 0; l < MTL; ++l) {
++                        E[l * 16] = acc[l][ng][0];
++                        E[LDE + l * 16] = acc[l][ng][1];
++                        E[l * 16 + 8] = acc[l][ng][2];
++                        E[LDE + l * 16 + 8] = acc[l][ng][3];
++                    }
++                }
++            }
++            __syncthreads();
++            for (int r = warp; r < ER && ER * rd + r < cnt; r += W) {
++                const int row = rows_sh[ER * rd + r];
++                const int c0 = 4 * lane;
++                float v[4];
++                *reinterpret_cast<float4*>(v) = *reinterpret_cast<const float4*>(ep + (size_t)r * LDE + c0);
++                fwht_row(v, lane);
++                if constexpr (MATS == 2) {
++                    float w[4];
++                    *reinterpret_cast<float4*>(w) = *reinterpret_cast<const float4*>(ep + ((size_t)ER + r) * LDE + c0);
++                    fwht_row(w, lane);
++                    const half* sg = sv0 + (size_t)e * N + nb * 128 + c0;
++                    const half* su = sv1 + (size_t)e * N + nb * 128 + c0;
++                    const half* sdd = sd + (size_t)e * N + nb * 128 + c0;
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) {
++                        const float gg = fminf(bf16r(v[j] * HAD_SCALE * __half2float(sg[j])), limit);
++                        const float uu = fminf(fmaxf(bf16r(w[j] * HAD_SCALE * __half2float(su[j])), -limit), limit);
++                        const float a = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++                        v[j] = a * __half2float(sdd[j]);
++                    }
++                    fwht_row(v, lane);
++                    half2* o = reinterpret_cast<half2*>(xd + (size_t)row * N + nb * 128 + c0);
++                    o[0] = __halves2half2(__float2half_rn(v[0] * HAD_SCALE), __float2half_rn(v[1] * HAD_SCALE));
++                    o[1] = __halves2half2(__float2half_rn(v[2] * HAD_SCALE), __float2half_rn(v[3] * HAD_SCALE));
++                } else {
++                    const half* sv = sv0 + (size_t)e * N + nb * 128 + c0;
++                    float4 o;
++                    o.x = v[0] * HAD_SCALE * __half2float(sv[0]);
++                    o.y = v[1] * HAD_SCALE * __half2float(sv[1]);
++                    o.z = v[2] * HAD_SCALE * __half2float(sv[2]);
++                    o.w = v[3] * HAD_SCALE * __half2float(sv[3]);
++                    *reinterpret_cast<float4*>(y + (size_t)row * N + nb * 128 + c0) = o;
++                }
++            }
++        }
++    }
++}
++
++template <int MATS, int MTL, int NG, int KS, int NSA, int NGR>
++void launch(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1,
++            const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, const half* sv0,
++            const half* sv1, const half* sd, half* xd, float* y, int K, int N, int slots, float limit) {
++    using C = Cfg<MATS, MTL, NG, KS, NSA, NGR>;
++    auto kern = expert_kernel<MATS, MTL, NG, KS, NSA, NGR>;
++    static int per_sm = 0;
++    if (per_sm == 0) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)C::SMEM));
++        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kern, C::THREADS, C::SMEM));
++        TORCH_CHECK(per_sm > 0, "fast experts: the configuration does not fit an SM");
++    }
++    const int maxu = (int)uids.size(0), maxm = (int)members.size(1);
++    const int E = (int)T0.size(0);
++    TORCH_CHECK(maxu <= MAXU, "too many distinct experts");
++    TORCH_CHECK((K / 16) % KS == 0 && N % 128 == 0, "fast experts: K % (16 KS), N % 128");
++    auto stream = at::cuda::getCurrentCUDAStream();
++    at::Tensor plan = at::empty({maxu + 2}, uids.options());
++    plan_kernel<<<1, MAXU, 0, stream>>>(uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(),
++                                            maxu, maxm, E, C::BM, plan.data_ptr<int>());
++    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    kern<<<sms * per_sm, C::THREADS, C::SMEM, stream>>>(
++        reinterpret_cast<const half*>(X0.data_ptr()), reinterpret_cast<const half*>(X1.data_ptr()),
++        reinterpret_cast<const uint32_t*>(T0.data_ptr()), reinterpret_cast<const uint32_t*>(T1.data_ptr()),
++        uids.data_ptr<int>(), members.data_ptr<int>(), plan.data_ptr<int>(), K, N, maxm, slots, maxu, sv0, sv1, sd,
++        xd, y, limit);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++inline bool enabled() {
++    static const bool on = [] {
++        const char* s = getenv("GLM53_TF_FAST_EXPERTS");
++        return !(s && std::string(s) == "v1");
++    }();
++    return on;
++}
++
++// (MTL, NG, KS, NSA, NGR), measured on GB10 at 300-8192 rows (``test_fast_expert_timing``): 2 column tiles a warp
++// (8 warps for gate/up, 4 for down), 64 members an item, 4 k tiles a stage, 3 stages; down on chunks of 4096+ rows:
++// 128 members an item, 2 k tiles a stage (the configurations give the same bits: the choice is free).
++#define FAST2_GU 2, 8, 4, 3, 4
++#define FAST2_DN 2, 8, 4, 3, 8
++#define FAST2_DN_LARGE 2, 16, 2, 3, 8
++
++}  // namespace fast2
++
++constexpr int GATEUP_KS = 2;     // 2 matrices x 2 k tiles x 8 n tiles a slab (one row a warp): 16 KB a buffer
++constexpr int DOWN_KS = 4;       // 1 matrix x 4 k tiles x 8 n tiles (one row a warp): 16 KB a buffer
++
++}  // namespace
++
++// Xd [P, N] fp16 for every routed pair of the window's distinct experts (``gateup_kernel``). K: the model width, N:
++// the rank's expert width.
++void exl3_fast_gateup_cuda(const at::Tensor& XG, const at::Tensor& XU, const at::Tensor& TG, const at::Tensor& TU,
++                           const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members,
++                           const at::Tensor& svh_g, const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor& xd,
++                           int64_t K, int64_t N, int64_t slots, double limit) {
++    const int maxm = (int)members.size(1);
++    const int64_t E = TG.size(0);
++    TORCH_CHECK(N % 128 == 0 && (K / 16) % GATEUP_KS == 0 && K % 16 == 0, "fast gate/up: N % 128, K % 32");
++    TORCH_CHECK(uids.size(0) <= 65535, "too many distinct experts");
++    if (fast2::enabled()) {
++        fast2::launch<2, FAST2_GU>(XG, XU, TG, TU, uids, ucount, members, reinterpret_cast<const half*>(svh_g.data_ptr()),
++                                   reinterpret_cast<const half*>(svh_u.data_ptr()),
++                                   reinterpret_cast<const half*>(suh_d.data_ptr()), reinterpret_cast<half*>(xd.data_ptr()),
++                                   nullptr, (int)K, (int)N, (int)slots, (float)limit);
++        return;
++    }
++    dim3 grid((unsigned)(N / 128), (unsigned)uids.size(0));
++    gateup_kernel<GATEUP_KS><<<grid, WARPS * 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const half*>(XG.data_ptr()), reinterpret_cast<const half*>(XU.data_ptr()),
++        reinterpret_cast<const uint32_t*>(TG.data_ptr()), reinterpret_cast<const uint32_t*>(TU.data_ptr()),
++        uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(),
++        reinterpret_cast<const half*>(svh_g.data_ptr()), reinterpret_cast<const half*>(svh_u.data_ptr()),
++        reinterpret_cast<const half*>(suh_d.data_ptr()), reinterpret_cast<half*>(xd.data_ptr()), (int)K, (int)N, maxm,
++        (int)slots, (int)E, (float)limit);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// Y [P, N] fp32 (this rank's share of each routed pair's output, ``down_kernel``). K: the rank's expert width, N: the
++// model width.
++void exl3_fast_down_cuda(const at::Tensor& XD, const at::Tensor& TD, const at::Tensor& uids, const at::Tensor& ucount,
++                         const at::Tensor& members, const at::Tensor& svh_d, at::Tensor& y, int64_t K, int64_t N,
++                         int64_t slots) {
++    const int maxm = (int)members.size(1);
++    const int64_t E = TD.size(0);
++    TORCH_CHECK(N % 128 == 0 && (K / 16) % DOWN_KS == 0 && K % 16 == 0, "fast down: N % 128, K % 64");
++    TORCH_CHECK(uids.size(0) <= 65535, "too many distinct experts");
++    if (fast2::enabled()) {
++        const half* sv = reinterpret_cast<const half*>(svh_d.data_ptr());
++        if (members.size(1) >= 4096)
++            fast2::launch<1, FAST2_DN_LARGE>(XD, XD, TD, TD, uids, ucount, members, sv, sv, sv, nullptr,
++                                             y.data_ptr<float>(), (int)K, (int)N, (int)slots, 0.f);
++        else
++            fast2::launch<1, FAST2_DN>(XD, XD, TD, TD, uids, ucount, members, sv, sv, sv, nullptr, y.data_ptr<float>(),
++                                       (int)K, (int)N, (int)slots, 0.f);
++        return;
++    }
++    dim3 grid((unsigned)(N / 128), (unsigned)uids.size(0));
++    down_kernel<DOWN_KS><<<grid, WARPS * 32, 0, at::cuda::getCurrentCUDAStream()>>>(
++        reinterpret_cast<const half*>(XD.data_ptr()), reinterpret_cast<const uint32_t*>(TD.data_ptr()),
++        uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(),
++        reinterpret_cast<const half*>(svh_d.data_ptr()), y.data_ptr<float>(), (int)K, (int)N, maxm, (int)slots, (int)E);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/exl3_mm.py b/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+index bfc9465..429c6a1 100644
+--- a/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ b/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -17,6 +17,10 @@ Windows where an expert can have more than 16 members (prefill chunks) run ``gro
+ instead of once per 16 members, and no program is launched empty. It runs the same work item per member tile as
+ ``grouped`` (``member_tiles`` in exl3.cu: same K ranges per warp and split, same warp order), so Z has the same
+ bits; GLM53_TF_EXPERT_LOOP=0 turns it off.
++
++patches/0080 (``fast=True``, fast-prefill chunks only): ``exl3_fast.cu`` replaces grouped + epilogues with two fused
++grouped GEMMs (full K a warp, a trellis tile decoded once into shared memory for every member tile of the expert, the
++Hadamard epilogues on the accumulators, no Z partials). New arithmetic: never used for decode or verify windows.
+ """
+ 
+ from __future__ import annotations
+@@ -50,6 +54,17 @@ def _ext():
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
++@lru_cache(maxsize=1)
++def _fast_ext():
++    """patches/0080: the fast-prefill expert kernels (their own extension: the decode kernels' build is untouched)."""
++
++    from torch.utils.cpp_extension import load
++
++    here = Path(__file__).parent
++    return load(name="tensorfold_glm_exl3_fast_v1", sources=[str(here / "exl3_fast.cpp"), str(here / "exl3_fast.cu")],
++                extra_cuda_cflags=["-O3"], verbose=False)
++
++
+ @dataclass
+ class Exl3Experts:
+     """One layer's routed experts on this rank: trellis words [E, K/16, N/16, 32] int32 and scales per expert."""
+@@ -94,12 +109,20 @@ class Scratch:
+ 
+ 
+ def routed(x: torch.Tensor, pick: torch.Tensor, group, ex: Exl3Experts, s: Scratch, y: torch.Tensor, R: int,
+-           limit: float) -> None:
+-    """Y[row * slots + slot] for every routed slot of rows 0..R-1 (fp32, [.., D]); x: the normed rows (bf16)."""
++           limit: float, fast: bool = False) -> None:
++    """Y[row * slots + slot] for every routed slot of rows 0..R-1 (fp32, [.., D]); x: the normed rows (bf16).
++    ``fast`` (patches/0080, fast-prefill chunks): the fused kernels of exl3_fast.cu after the same input rotation."""
+ 
+     ext = _ext()
+     slots, P = s.slots, s.rows * s.slots
+     D, NI = ex.dims, ex.width
++    if fast:
++        fx = _fast_ext()
++        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
++        fx.gateup(s.xg, s.xu, ex.gt, ex.ut, group.ids, group.count, group.members, ex.svh_g, ex.svh_u, ex.suh_d, s.xd,
++                  D, NI, slots, float(limit))
++        fx.down(s.xd, ex.dt, group.ids, group.count, group.members, ex.svh_d, y, NI, D, slots)
++        return
+     loop = LOOP and group.members.shape[1] > 16          # an expert may have more than one member tile
+ 
+     def grouped(x0, x1, t0, t1, mats, K, N, cfg):
+diff --git a/src/tensorfold/families/glm5_next/cuda/fastpf.py b/src/tensorfold/families/glm5_next/cuda/fastpf.py
+new file mode 100644
+index 0000000..9967d41
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/fastpf.py
+@@ -0,0 +1,179 @@
++"""Fast prefill for GLM-5.3-Flash on CUDA (patches/0080, GLM53_TF_FAST_PREFILL=1): prefill chunks through kernels
++that need not be row-invariant, with the engine's exactness guarantees kept by a chunk-grid rule.
++
++Why the decode kernels are row-invariant, and why prefill does not have to be
++-----------------------------------------------------------------------------
++Every decode and verify window runs row-invariant kernels: a row's bits never depend on its window-mates. That is
++what makes a drafted reply byte-identical to serial decoding (a verify row = the serial step at its position) and a
++resumed prompt identical to a fresh prefill (any chunking of a prompt gives the same state). It forbids big-tile
++GEMMs, split-K choices by row count, chunked (parallel) KDA scans and low-precision gathers for prefill.
++
++The guarantees only constrain prefill this much:
++
++(a) drafted == serial. Both decodings of a request start from the state its prefill left. Any DETERMINISTIC prefill
++    does: the same prompt gives the same state, and every decode window after it stays row-invariant (unchanged).
++(b) resumed == fresh. A prompt resumed from a kept snapshot must end in the state a fresh prefill of the whole
++    prompt gives. The fast kernels' bits may depend on a chunk's shape (its rows, its length, where its KDA sub-chunks
++    start), so the fresh prefill and the resumed one must cut the prompt into the same chunks from the snapshot on,
++    and the snapshot must hold what the fresh prefill holds at that position.
++
++The rule (``grid``, ``decode._prefill``, ``engine._run``)
++--------------------------------------------------------
++Let C = the request's prefill chunk rows rounded down to a multiple of 64 (at least 64), the fast chunk grid.
++
++1. Chunks at absolute multiples of C. A fast prefill of tokens t[0:n] starting at position b (b = 0, or a resume
++   point, itself a multiple of C) runs the chunks [kC, min((k+1)C, n)) for kC >= b. A chunk's computation is a
++   deterministic function of (its absolute start kC, its length, its tokens, the committed state before kC): the fast
++   kernels are deterministic (no atomics, fixed tile and reduction orders), KDA sub-chunks start at multiples of 64
++   (C is one), and everything else a chunk reads (attention caches, indexer caches) holds positions < kC only.
++2. A fast snapshot sits on the grid. Of a fast prefill of n tokens only the state at B = floor(n / C) * C is kept
++   (``Snapshot.ids = t[:B]``, tagged ``grid = C``): before the last, partial, chunk [B, n) runs, or after the prefill
++   when B = n. Positions >= B are never kept: the partial chunk's shape depends on n, and the reply's rows were
++   written by decode windows (row-invariant kernels), neither of which a fresh prefill of a longer prompt reproduces.
++3. A fast request resumes only from a snapshot with its own grid C (exact requests only from exact snapshots,
++   grid 0), and re-prefills from B: the tail of the old prompt past B, the old reply and the new tokens, in the
++   chunks of rule 1.
++
++Claim: under rules 1-3, a fast prefill of prompt p resumed from snapshot S (grid C, len(S.ids) = B, p[:B] = S.ids)
++ends in the state a fresh fast prefill of p ends in, bit for bit (every piece of committed state: KDA recurrent
++states and conv windows, attention and indexer caches, the MTP head's cache and pending row, DFlash2's cache).
++
++Lemma. Two fresh fast prefills (same grid C) of prompts that share their first B tokens (B a multiple of C, both at
++least B long) hold equal state at position B. Every chunk [kC, (k+1)C) with (k+1)C <= B is full in both (same
++shape, rule 1) and reads equal inputs: the same tokens, and by induction on k the same committed state before kC.
++
++Proof of the claim, by induction over the prefills that made the snapshots (each one fresh, or resumed from an
++earlier snapshot of the same grid). Let P0 be the prefill that took S, of prompt q with q[:B] = S.ids = p[:B]. By the
++induction hypothesis (or trivially when P0 was fresh) P0 ran exactly the chunks a fresh prefill of q runs from its
++resume point on, from the state a fresh prefill of q holds there, so at position B it held the fresh prefill of q's
++state, which by the lemma is the fresh prefill of p's state at B. S copied the parts later requests overwrite (KDA
++states and conv windows; the pending MTP row B-1, the main model's final-normed row from the full chunk ending at B,
++with ``mtp_len = B - 1``; DFlash2's ``context_end = B``) and left the caches at positions < B in place; no request
++touched those since: a request writes caches only from its own resume point on, and ``engine._run`` drops every
++snapshot longer than that point before the prefill. So restoring S gives the fresh prefill of p's state at B, and
++from B on the resumed and the fresh prefill run the same chunks (rule 1: B is a multiple of C) on equal inputs,
++including the last chunk whose logits give the first token. The MTP head's absorb and DFlash2's taps stay on the
++row-invariant kernels, so their caches depend only on the main model's rows (equal) and not on how the rows were
++batched; the resumed prefill re-absorbs position B - 1 with the next token p[B], exactly what the fresh one did. QED.
++
++With (a) on top: a drafted request that resumed from a fast snapshot starts decoding from the fresh fast prefill's
++state, which is what the ``draft: false`` reference (always a fresh prefill) starts from.
++
++What a turn costs: the next turn of a conversation re-prefills the old prompt's tail past B (< C tokens) and the
++old reply through the fast path, then the new tokens. Exact snapshots after a reply (the row-invariant mode) avoid
++that, which is why the switch is per request (``tf_knobs.fast_prefill``, patches/0091) and snapshots carry their
++grid.
++
++What runs fast (only the main model's prefill chunks; decode, verify, the MTP head and DFlash2 never)
++------------------------------------------------------------------------------------------------------
++- routed experts (EXL3): ``exl3_fast.cu`` (fused grouped GEMMs, no Z partials), in-tree;
++- KDA: ``fast_kda.kda_prefill_chunked`` (chunked delta rule, sub-chunks at absolute multiples of 64), when present;
++- non-expert 4-bit / BF16 matmuls: ``fast_qmm.matmul_fast`` (large-M tiles, one accumulator over K), when present,
++  through ``qmm.matmul``;
++- hyper-connection mixing dots (``glue.hc_pre``): ``fast_qmm.hc_partial`` (row tiles share fn), when present;
++- rank partials: all-gathered as bf16 (GLM53_TF_FAST_GATHER=bf16, the default; fp32 keeps upstream's gather),
++  half the bytes on the link; both ranks add the same rounded partials, rank 0 first;
++- the head: only the last row of the last chunk (prefill samples one token; the MTP head reads the final-normed
++  rows, which are still computed for every row).
++
++``fast_kda`` and ``fast_qmm`` ship in patches/0081; without them those parts run the row-invariant kernels, and the
++rule above holds all the same (it asks nothing of the kernels but determinism).
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++
++GRID = 64                 # the KDA sub-chunk: fast chunk boundaries are multiples of it
++
++MISSING: dict[str, str] = {}      # optional fast module -> why it is not used (reported at load by the engine)
++
++
++def _optional(name: str):
++    """patches/0081's modules when they are there; a module that is there but fails to import is reported (the
++    engine prints it when fast prefill is on) instead of silently leaving its part on the row-invariant kernels."""
++
++    import importlib
++
++    try:
++        return importlib.import_module(f"{__package__}.{name}")
++    except ModuleNotFoundError as exc:
++        if exc.name != f"{__package__}.{name}":
++            MISSING[name] = f"{type(exc).__name__}: {exc}"
++        else:
++            MISSING[name] = "not installed (patches/0081)"
++    except Exception as exc:      # noqa: BLE001 - a broken optional module must not break the exact engine
++        MISSING[name] = f"{type(exc).__name__}: {exc}"
++    return None
++
++
++fast_kda = _optional("fast_kda")      # the chunked KDA scan
++fast_qmm = _optional("fast_qmm")      # large-M 4-bit / BF16 matmuls
++
++
++def enabled() -> bool:
++    """GLM53_TF_FAST_PREFILL (default 0): prefill chunks through the fast kernels by default."""
++
++    return os.environ.get("GLM53_TF_FAST_PREFILL", "0").strip().lower() in ("1", "true", "yes", "on")
++
++
++def gather16() -> bool:
++    """GLM53_TF_FAST_GATHER=bf16 (default) | fp32: the dtype of the rank partials a fast chunk all-gathers."""
++
++    v = os.environ.get("GLM53_TF_FAST_GATHER", "bf16").strip().lower()
++    if v not in ("bf16", "fp32"):
++        raise ValueError(f"GLM53_TF_FAST_GATHER={v!r}: expected bf16 or fp32")
++    return v == "bf16"
++
++
++def grid(rows: int) -> int:
++    """The fast chunk grid C for a chunk size of ``rows``: rows rounded down to a multiple of 64, at least 64."""
++
++    return max(GRID, (int(rows) // GRID) * GRID)
++
++
++def settings() -> list[int]:
++    """This rank's load-time fast-prefill settings (both ranks must agree: they decide the prefill's bits)."""
++
++    return [int(enabled()), int(gather16()), int(fast_kda is not None), int(fast_qmm is not None)]
++
++
++@contextlib.contextmanager
++def chunk(b):
++    """A fast chunk of the main model on buffers ``b``: the blocks see ``b.fast``, ``qmm.matmul`` runs
++    ``fast_qmm.matmul_fast`` and ``glue.hc_pre`` its dots through ``fast_qmm.hc_partial`` (when present) until the
++    chunk's forward returns."""
++
++    from . import glue, qmm
++
++    b.fast = True
++    prev, prev_hc = qmm.FAST_MM, glue.FAST_HC
++    mm = None if fast_qmm is None else getattr(fast_qmm, "matmul_fast", None) or fast_qmm.matmul_prefill
++    qmm.FAST_MM = mm
++    glue.FAST_HC = getattr(fast_qmm, "hc_partial", None)
++    try:
++        yield
++    finally:
++        qmm.FAST_MM, glue.FAST_HC = prev, prev_hc
++        b.fast = False
++
++
++def on(b) -> bool:
++    return getattr(b, "fast", False)
++
++
++def kda_chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows, scratch,
++              state_out, *, pos: int):
++    """KDA for a fast chunk starting at absolute position ``pos`` (a multiple of 64): ``fast_kda`` when present,
++    else the row-invariant chain. Same inputs, outputs and state layout as ``kda.chain`` (state [H, 128 (v), 128 (k)]
++    fp32; the conv window is shifted by ``forward.commit`` from the projection rows, as always). The replay inputs in
++    ``scratch`` are not needed: a prefill chunk keeps all its rows."""
++
++    if fast_kda is not None:
++        return fast_kda.kda_prefill_chunked(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps,
++                                            lower, rows, scratch, state_out, pos=pos)
++    from . import kda as kda_mod
++
++    return kda_mod.chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows,
++                         scratch, state_out)
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 4e59406..70dd276 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -27,7 +27,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from . import glue, kda as kda_mod, latent, profile, qmm, sparse
++from . import fastpf, glue, kda as kda_mod, latent, profile, qmm, sparse
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -108,6 +108,8 @@ class Buffers:
+         self.part = torch.empty((rows, D), dtype=f32, device=dev)
+         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
+         self.site = None                 # the all-gather site the next ``gather`` serves (GLM53_TF_COMM=prefetch)
++        self.fast = False                # patches/0080: a fast prefill chunk of the main model is running (fastpf)
++        self.part16 = self.gath16 = None     # patches/0080: bf16 partials of fast chunks (allocated on first use)
+         self.sk = torch.empty((8 * rows * 16384,), dtype=f32, device=dev)
+         # final
+         self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
+@@ -317,7 +319,18 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     if pf is not None and site is not None:
+         pf.launch(site)                  # the next kernels' weights into L2 while the exchange waits on the link
+     out = b.gath[:b.world * R * d]
+-    w.comm.all_gather(b.part[:R].reshape(-1), out)
++    if b.fast and w.meta.get("fast_gather16"):
++        # patches/0080: a fast chunk gathers its partials as bf16 (half the bytes); both ranks then add the same
++        # rounded partials, rank 0 first, as fp32 (``glue.hc_post``)
++        if b.part16 is None:
++            b.part16 = torch.empty(b.part.shape, dtype=torch.bfloat16, device=b.part.device)
++            b.gath16 = torch.empty(b.gath.shape, dtype=torch.bfloat16, device=b.gath.device)
++        p16, g16 = b.part16[:R], b.gath16[:b.world * R * d]
++        p16.copy_(b.part[:R])
++        w.comm.all_gather(p16.reshape(-1), g16)
++        out.copy_(g16)
++    else:
++        w.comm.all_gather(b.part[:R].reshape(-1), out)
+     if profile.ON:
+         profile.lap("allgather")
+     return out.view(b.world, R, d)
+@@ -344,8 +357,11 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+     if profile.ON:
+         profile.lap("kda.proj")
+     cur = st.cur[li]
+-    out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log, k.dt_bias,
+-                        k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
++    chain = kda_mod.chain
++    if b.fast:                           # patches/0080: a fast prefill chunk from absolute position st.pos
++        chain = lambda *args: fastpf.kda_chain(*args, pos=st.pos)       # noqa: E731
++    out = chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log, k.dt_bias, k.norm,
++                c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
+     if profile.ON:
+         profile.lap("kda.chain")
+     return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R, "kda.o_proj")
+@@ -443,7 +459,8 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+             qmm.matmul(b.sact[:R], s.down, b.sxs[:R], out=b.sy[:R], f32=True, part=b.sk)
+             if profile.ON:
+                 profile.lap("moe.shared")
+-        exl3_mm.routed(b.normed[:R], b.pick, grp, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
++        exl3_mm.routed(b.normed[:R], b.pick, grp, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit,
++                       fast=b.fast)          # patches/0080: the fused fast-prefill kernels in a fast chunk
+         if profile.ON:
+             profile.lap("moe.routed")
+         if not shared_first:
+@@ -520,10 +537,24 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+ 
+ 
+ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
+-            host_pos: int | None = None, npb: int | None = None):
++            host_pos: int | None = None, npb: int | None = None, fast: bool = False, head: bool = True):
+     """The GPU work of a forward on staged rows (capturable: static buffers, device-side positions). ``host_pos``
+     (eager calls): the committed length, which long contexts need to switch rows to sparse attention. ``npb``
+-    (patches/0050, capturable): every row is past 2050 with at most ``npb`` complete pools (``dsa_block``)."""
++    (patches/0050, capturable): every row is past 2050 with at most ``npb`` complete pools (``dsa_block``).
++
++    ``fast`` (patches/0080, eager prefill chunks of the main model only): the chunk runs the fast-prefill kernels
++    (``fastpf``); the final-normed rows are computed for every row (the MTP head reads them) but the head only for
++    the last row, and only with ``head`` (the returned logits' other rows are stale)."""
++
++    if not fast:
++        return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, npb=npb)
++    with fastpf.chunk(b):
++        return _compute(w, st, b, R, logits=logits, nch=nch, host_pos=host_pos, npb=npb, head_rows=1 if head else 0)
++
++
++def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
++             host_pos: int | None = None, npb: int | None = None, head_rows: int | None = None):
++    """``compute``; ``head_rows`` (patches/0080): the head runs on the last ``head_rows`` rows only (None: all)."""
+ 
+     c = w.cfg
+     glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
+@@ -540,7 +571,13 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+         _join(w)
+         return None
+     glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
+-    out = qmm.matmul(b.fnormed[:R], w.head, b.fxs[:R], out=b.logits[:R], part=b.sk)
++    if head_rows is None:
++        out = qmm.matmul(b.fnormed[:R], w.head, b.fxs[:R], out=b.logits[:R], part=b.sk)
++    else:                                # patches/0080: a fast chunk's head, on its last row(s) or none
++        out = b.logits[:R]
++        if head_rows:
++            qmm.matmul(b.fnormed[R - head_rows:R], w.head, b.fxs[R - head_rows:R], out=b.logits[R - head_rows:R],
++                       part=b.sk)
+     if profile.ON:
+         profile.lap("head")
+     _join(w)
+diff --git a/src/tensorfold/families/glm5_next/cuda/glue.py b/src/tensorfold/families/glm5_next/cuda/glue.py
+index 17c7524..292f0e4 100644
+--- a/src/tensorfold/families/glm5_next/cuda/glue.py
++++ b/src/tensorfold/families/glm5_next/cuda/glue.py
+@@ -24,6 +24,10 @@ import triton.language as tl
+ # fixed K split of the mixing dots (a function of the shape only; changing it changes bits for every row alike)
+ HC_BLOCKS = 16
+ 
++# patches/0080: hc_pre's partial dots for fast-prefill chunks (``fast_qmm.hc_partial``: same PART layout), installed by
++# ``fastpf.chunk`` only while a fast chunk of the main model runs; None everywhere else
++FAST_HC = None
++
+ 
+ # -- embedding ----------------------------------------------------------------------------------------------
+ @triton.jit
+@@ -183,7 +187,10 @@ def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.T
+     rows, wide = x.shape
+     d = norm_w.shape[0]
+     s = wide // d
+-    _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
++    if FAST_HC is not None:            # patches/0080: a fast-prefill chunk (row tiles share fn; not these bits)
++        FAST_HC(x, fn, part, HC_BLOCKS)
++    else:
++        _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
+     _hc_finish[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,
+                         ITERS=iters, BLOCK=d, num_warps=8)
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/qmm.py b/src/tensorfold/families/glm5_next/cuda/qmm.py
+index 970bd03..9c4ab91 100644
+--- a/src/tensorfold/families/glm5_next/cuda/qmm.py
++++ b/src/tensorfold/families/glm5_next/cuda/qmm.py
+@@ -336,12 +336,23 @@ def _bmm(X, W, OUT, PART, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.
+ # (warps, stages) for the BF16 matmul by row bucket: no choice changes bits
+ B16_CONFIG = {16: (4, 3), 32: (4, 3), 64: (4, 2), 128: (8, 2)}
+ 
++# patches/0080: the fast-prefill matmul (``fast_qmm.matmul_prefill``, same signature), installed by ``fastpf.chunk``
++# only while a fast prefill chunk of the main model runs; None everywhere else (decode, verify, MTP, DFlash2)
++FAST_MM = None
++
+ 
+ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
+            f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor:
+     """x (M, K) bf16 (rows may be strided) @ q.T -> (M, N) bf16, or unrounded fp32 sums with ``f32``. ``q``: a
+     4-bit matrix, or a BF16 one (``xs`` is then unused)."""
+ 
++    global FAST_MM
++    if FAST_MM is not None:          # patches/0080; cleared during the call, so it may fall back on this function
++        fn, FAST_MM = FAST_MM, None
++        try:
++            return fn(x, q, xs, out=out, f32=f32, part=part)
++        finally:
++            FAST_MM = fn
+     if isinstance(q, B16):
+         return _matmul_b16(x, q, out=out, f32=f32, part=part)
+     m, k = x.shape

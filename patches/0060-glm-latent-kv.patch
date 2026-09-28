@@ -1,0 +1,695 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+index 1813089..cdf84fb 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -52,7 +52,7 @@ from typing import Any, Callable, Sequence
+ 
+ import torch
+ 
+-from . import glue, kda as kda_mod, qmm, sparse
++from . import glue, kda as kda_mod, latent, qmm, sparse
+ from .attention import attention, kv_write
+ from .forward import State, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+ 
+@@ -95,6 +95,8 @@ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+          nchs: Sequence[int] | None, host_pos: Sequence[int] | None) -> torch.Tensor:
+     """``forward.dsa_block`` over T rows of several sequences: projections once, cache and attention per sequence."""
+ 
++    if latent.on(w):                     # GLM53_TF_LATENT_KV=1 (patches/0060)
++        return latent.dsa_multi(layer, w, sts, b, Rs, offs, T, nchs, host_pos)
+     c = w.cfg
+     a = layer.dsa
+     qmm.matmul(b.normed[:T], a.proj, b.xs[:T], out=b.dp[:T], part=b.sk)
+diff --git c/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index d91df29..c06f715 100644
+--- c/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -93,6 +93,9 @@ class Engine:
+         # replay CUDA graphs per (rows, parity, pool bucket); 0 is upstream's path (eager, every pool scored)
+         self.longctx = long_context and os.environ.get("GLM53_TF_LONGCTX_GRAPHS", "1").strip() != "0"
+         w.meta["longctx_bound"] = self.longctx
++        from .latent import enabled as latent_kv
++
++        w.meta["latent_kv"] = latent_kv()        # GLM53_TF_LATENT_KV (patches/0060): before any State or Buffers
+         rows = max(max_rows, prefill_rows)
+         self.rows = rows
+         self.prefill_rows = prefill_rows
+@@ -109,6 +112,12 @@ class Engine:
+                     bb.lc = LongScratch(max_rows, capacity, c.heads // w.world, c.qk_dim, w.device)
+         self.long_rows = tuple(range(1, max_rows + 1)) if self.longctx else ()
+         self.st = State(w, capacity, rows)
++        if w.rank == 0 and w.meta["latent_kv"]:          # patches/0060
++            from .latent import kv_bytes_per_token
++
++            per = kv_bytes_per_token(self.st)
++            print(f"[tensorfold] latent KV cache: {per / 1024:.1f} KB a token a rank ({capacity} slots, "
++                  f"{per * capacity / 2**30:.2f} GB)", flush=True)
+         self.last_hidden: torch.Tensor | None = None
+         self.draft_n = w.head.n
+         self.graphs = None
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index a4b4aa9..07c3972 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -184,6 +184,14 @@ class GlmEngine:
+                              "would decode one token: pull the draft model on both machines (--drafter), or pass "
+                              "--no-drafts to both for the serial reference")
+         self.w = w
++        # GLM53_TF_LATENT_KV=1 (patches/0060): DSA layers cache the MLA latent (1 KB a token a layer) and attend in
++        # latent space. The replies' bits depend on it, so both ranks must agree.
++        from .latent import enabled as latent_kv
++
++        lat_both = self._gather_ints([int(latent_kv())])
++        if lat_both[0] != lat_both[1]:
++            raise RuntimeError(f"the two ranks were started with different GLM53_TF_LATENT_KV: {lat_both[0][0]}, "
++                               f"{lat_both[1][0]}")
+         self.drafter = None
+         if drafter is not None:
+             from .dflash2 import Drafter
+diff --git c/src/tensorfold/families/glm5_next/cuda/forward.py w/src/tensorfold/families/glm5_next/cuda/forward.py
+index fbf8203..64fa92f 100644
+--- c/src/tensorfold/families/glm5_next/cuda/forward.py
++++ w/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -27,7 +27,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from . import glue, kda as kda_mod, profile, qmm, sparse
++from . import glue, kda as kda_mod, latent, profile, qmm, sparse
+ from .attention import AttnScratch, attention, kv_write
+ from .weights import LayerW, Weights
+ 
+@@ -47,7 +47,9 @@ class Buffers:
+         self.ids = torch.zeros((rows,), dtype=torch.int32, device=dev)
+         self.ids_host = torch.zeros((rows,), dtype=torch.int32, pin_memory=torch.cuda.is_available())
+         self.staged = torch.cuda.Event() if torch.cuda.is_available() else None
+-        self.attn = AttnScratch(rows, HL, c.qk_dim, capacity, dev)
++        # GLM53_TF_LATENT_KV=1 (patches/0060): the latent path's scratch (absorbed queries, latent-space partials)
++        self.attn = latent.Scratch(w, rows, capacity, dev) if latent.on(w) else AttnScratch(rows, HL, c.qk_dim,
++                                                                                             capacity, dev)
+         self.hin = torch.empty((rows, c.hidden), dtype=torch.bfloat16, device=dev)      # MTP input rows
+         self.zero_first = False          # MTP: this step starts at position 0 (its embedding is zeroed)
+         self.x = torch.empty((rows, S * D), dtype=bf, device=dev)
+@@ -173,11 +175,18 @@ class State:
+         self.proj = torch.zeros((n, rows, width), dtype=torch.bfloat16, device=dev)
+         self.scratch_set = kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None
+         self.scratch = self.scratch_set.views if n else []
+-        self.kc = [torch.zeros((capacity, HL, c.qk_dim), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+-        self.vc = [torch.zeros((capacity, HL, c.v_dim), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
++        if latent.on(w):
++            # GLM53_TF_LATENT_KV=1 (patches/0060): one kv_lora-wide latent row a token, keys = values (the same tensor)
++            self.kc = latent.caches(w, capacity, len(dsa_layers))
++            self.vc = self.kc
++        else:
++            self.kc = [torch.zeros((capacity, HL, c.qk_dim), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
++            self.vc = [torch.zeros((capacity, HL, c.v_dim), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+         self.mtp_len = 0
+         self.mtp_drafted = 0
+-        if w.mtp is not None:
++        if w.mtp is not None and latent.on(w):
++            self.mtp_kc = self.mtp_vc = latent.caches(w, capacity, 1)[0]
++        elif w.mtp is not None:
+             self.mtp_kc = torch.zeros((capacity, HL, c.qk_dim), dtype=torch.bfloat16, device=dev)
+             self.mtp_vc = torch.zeros((capacity, HL, c.v_dim), dtype=torch.bfloat16, device=dev)
+         # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys
+@@ -217,12 +226,12 @@ class State:
+         other.pos_dev = self.pos_dev.clone()
+         other.mtp_pos_dev = self.mtp_pos_dev.clone()
+         other.kc = [x.clone() for x in self.kc]
+-        other.vc = [x.clone() for x in self.vc]
++        other.vc = other.kc if self.vc is self.kc else [x.clone() for x in self.vc]       # latent: keys = values
+         if self.index is not None:
+             other.index = [tuple(x.clone() for x in trio) for trio in self.index]
+         if hasattr(self, "mtp_kc"):
+             other.mtp_kc = self.mtp_kc.clone()
+-            other.mtp_vc = self.mtp_vc.clone()
++            other.mtp_vc = other.mtp_kc if self.mtp_vc is self.mtp_kc else self.mtp_vc.clone()
+         return other
+ 
+ 
+@@ -281,6 +290,8 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+     every row is past 2050 and has at most ``npb`` complete pools; the selection runs on the device over ``npb``
+     pools into ``b.lc`` (capturable, no host position)."""
+ 
++    if latent.on(w):                     # GLM53_TF_LATENT_KV=1 (patches/0060): kc is the latent cache (vc the same)
++        return latent.dsa_block_latent(layer, w, kc, pos_dev, b, R, nch, index, host_pos, npb)
+     c = w.cfg
+     a = layer.dsa
+     qmm.matmul(b.normed[:R], a.proj, b.xs[:R], out=b.dp[:R], part=b.sk)
+diff --git c/src/tensorfold/families/glm5_next/cuda/latent.py w/src/tensorfold/families/glm5_next/cuda/latent.py
+new file mode 100644
+index 0000000..1f72b34
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -0,0 +1,551 @@
++"""Latent (absorbed) MLA attention for GLM-5.3-Flash's DSA layers (patches/0060, ``GLM53_TF_LATENT_KV=1``).
++
++GLM-5.3 has no rotary part in its MLA heads (qk_rope_head_dim 0), so a head's key and value are linear in the
++512-wide latent c = kv_a_layernorm(kv_a(x)) of its token: k_h = W_k,h c and v_h = W_v,h c (kv_b's key and value
++rows). Attention therefore runs in latent space with the head's weights absorbed on the query and output side:
++
++    score_t = q_h . (W_k,h c_t)                 = (W_k,h^T q_h) . c_t
++    o_h     = sum_t p_t W_v,h c_t / sum_t p_t   = W_v,h (sum_t p_t c_t / sum_t p_t)
++
++and the cache keeps c alone: 1 KB a token a layer (bf16), shared by every head, instead of 32 local heads x
++(256 + 256) x 2 B = 32 KB. Keys and values are the same rows, so one tile of latent rows serves the scores and
++the weighted sum of 16 (row, head) queries at once (MQA-style: the tile is read once for 16 heads).
++
++Arithmetic, every step fixed by the shapes and never by the row count or the window:
++
++- ``absorb``: q'_h = bf16(W_k,h^T q_h). The kv_b key rows stay as stored (4-bit groups of 64, or BF16 on an EXL3
++  checkpoint); a program dequantizes a 64 x 64 tile exactly in fp32 (s * q + b) and multiplies fp32 x fp32 in
++  IEEE precision (FMA, no tensor cores), over the head's 256 inputs in order. It reads the same weight bytes as
++  today's key projection.
++- attention over the latent cache: bf16 q' against bf16 c on tensor cores (fp32 sums), online softmax in fp32,
++  the weighted sum of bf16 probabilities times c; 512-key chunks fixed by absolute key position, merged in
++  chunk order (the expanded kernel's rule, ``attention.py``). The normalized latent u = sum p c / sum p stays fp32.
++- ``expand``: o_h = bf16(W_v,h u_h), the value rows dequantized the same way, fp32 FMA over the latent in order.
++- o_proj reads o exactly as before.
++
++Each (row, head) is one row of a 16-row tensor-core tile whatever its tile-mates, so a window row gets the bits of
++the serial step at its position (verify == serial, drafted == serial); rows past the dense limit attend to their
++own top-k tokens (``sparse.select_tokens``, unchanged) through the same tile arithmetic. No atomics anywhere.
++
++Relative to the expanded engine the arithmetic differs (k and v are never rounded to bf16 per head; q' is), so
++replies differ from the expanded engine's in the last bits; within this configuration every guarantee holds.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++from . import glue, profile, qmm, sparse
++from .qmm import B16, Q4
++
++CHUNK = 512              # keys a program visits (the expanded kernel's chunk: the same chunk counts serve both)
++SPARSE_ROWS = 8          # rows whose sparse partials are preallocated (decode/verify/MTP windows; captured steps)
++KT = 32                  # latent rows a tile step reads (32 x 512 bf16 = 32 KB)
++BM = 16                  # (row, head) queries a tensor-core tile holds
++ATTN_WARPS = 8           # a tile's [16, 512] fp32 accumulator and [32, 512] latent rows need the registers of 8 warps
++
++
++def enabled() -> bool:
++    """GLM53_TF_LATENT_KV: 1 caches the MLA latent (this module), 0 (default) the expanded per-head keys/values."""
++
++    v = os.environ.get("GLM53_TF_LATENT_KV", "0").strip()
++    if v not in ("", "0", "1"):
++        raise ValueError(f"GLM53_TF_LATENT_KV must be 0 or 1, not {v!r}")
++    return v == "1"
++
++
++def on(w) -> bool:
++    return bool(w.meta.get("latent_kv"))
++
++
++def caches(w, capacity: int, n: int) -> list[torch.Tensor]:
++    """``n`` latent caches [capacity, kv_lora] bf16 (one row a token)."""
++
++    c = w.cfg
++    if c.kv_lora % 64 or c.kv_lora & (c.kv_lora - 1):
++        raise ValueError(f"latent KV needs a power-of-two kv_lora_rank of at least 64, not {c.kv_lora}")
++    return [torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=w.device) for _ in range(n)]
++
++
++def kv_bytes_per_token(st) -> int:
++    """Bytes a cached token costs on this rank: every attention cache (the model's layers and the MTP head's) and the
++    indexer caches (pool keys are one row per 4 tokens), counted once however they alias."""
++
++    seen, total = set(), 0
++
++    def add(t: torch.Tensor, per: float = 1.0) -> None:
++        nonlocal total
++        if t.data_ptr() in seen:
++            return
++        seen.add(t.data_ptr())
++        total += int(t[0].numel() * t.element_size() * per)
++
++    for t in list(st.kc) + list(st.vc):
++        add(t)
++    if hasattr(st, "mtp_kc"):
++        add(st.mtp_kc)
++        add(st.mtp_vc)
++    if st.index is not None:
++        for ik, ig, pk in st.index:
++            add(ik)
++            add(ig)
++            add(pk, 0.25)
++    return total
++
++
++class Scratch:
++    """Per-``Buffers`` scratch of the latent path: absorbed queries, chunk partials, the normalized latent rows and
++    the expanded head outputs, for windows of up to ``rows`` rows.
++
++    Dense (chunked) attention only ever runs over contexts within DSA's dense limit (rows past it attend to their
++    top-k tokens instead), so the partials are sized by min(capacity, dense limit) + rows keys, not by the capacity:
++    a 1M-token cache does not need 1M / 512 chunk partials."""
++
++    def __init__(self, w, rows: int, capacity: int, device) -> None:
++        c = w.cfg
++        H = c.heads // w.world
++        L = c.kv_lora
++        self.rows, self.heads, self.lat = rows, H, L
++        self.nch = triton.cdiv(min(capacity, c.dense_limit) + rows, CHUNK)
++        self.po = torch.empty((self.nch * rows * H * L,), dtype=torch.float32, device=device)
++        self.pm = torch.empty((self.nch * rows * H,), dtype=torch.float32, device=device)
++        self.pl = torch.empty((self.nch * rows * H,), dtype=torch.float32, device=device)
++        self.qa = torch.empty((rows, H, L), dtype=torch.bfloat16, device=device)       # absorbed queries
++        self.u = torch.empty((rows, H, L), dtype=torch.float32, device=device)         # attention in latent space
++        self.o = torch.empty((rows, H * c.v_dim), dtype=torch.bfloat16, device=device)  # heads' outputs (o_proj in)
++        self.out = self.o.view(rows, H, c.v_dim)
++        # sparse partials of windows of up to SPARSE_ROWS rows (a captured long-context step allocates nothing,
++        # patches/0050); longer (prefill) windows allocate theirs per call. The row stride only places partials.
++        width = sparse.TOPK_POOLS * sparse.POOL + sparse.POOL - 1
++        self.sparse_rows = min(rows, SPARSE_ROWS)
++        self.snch = triton.cdiv(width, CHUNK)
++        n = self.snch * self.sparse_rows * H
++        self.spo = torch.empty((n * L,), dtype=torch.float32, device=device)
++        self.spm = torch.empty((n,), dtype=torch.float32, device=device)
++        self.spl = torch.empty((n,), dtype=torch.float32, device=device)
++
++    def sparse_part(self, R: int):
++        """Preallocated sparse partials for R rows, or None past ``sparse_rows``."""
++
++        if R > self.sparse_rows:
++            return None
++        n = self.snch * R * self.heads
++        return self.spo[:n * self.lat], self.spm[:n], self.spl[:n]
++
++
++# -- weights: exact fp32 tiles of kv_b as stored ------------------------------------------------------------------
++@triton.jit
++def _wtile(W, S, B, n0, g, N: tl.constexpr, K: tl.constexpr, IS_Q4: tl.constexpr):
++    """Rows n0 .. n0 + 63, columns g 64 .. g 64 + 63 of an [N, K] weight as fp32: a 4-bit tile (``qmm.Q4`` layout,
++    words [N/64, K/64, 64, 8], scales and biases [K/64, N]) dequantized exactly (s * q + b), or a BF16 tile."""
++
++    nl = tl.arange(0, 64)
++    if IS_Q4:
++        KG: tl.constexpr = K // 64
++        tile = W + (n0 // 64) * (KG * 512) + g * 512
++        rw = tl.arange(0, 8)
++        words = tl.load(tile + nl[:, None] * 8 + rw[None, :])
++        shifts = tl.arange(0, 8) * 4
++        q = (words[:, :, None] >> shifts[None, None, :]) & 0xF
++        q = tl.reshape(q, (64, 64)).to(tl.float32)
++        s = tl.load(S + g * N + n0 + nl).to(tl.float32)
++        b = tl.load(B + g * N + n0 + nl).to(tl.float32)
++        return q * s[:, None] + b[:, None]
++    else:
++        j = tl.arange(0, 64)
++        return tl.load(W + (n0 + nl)[:, None].to(tl.int64) * K + (g * 64 + j)[None, :]).to(tl.float32)
++
++
++def _parts(q: Q4 | B16):
++    if isinstance(q, Q4):
++        return q.weight, q.scales, q.biases, True
++    if isinstance(q, B16):
++        return q.weight, q.weight, q.weight, False
++    raise TypeError(f"latent KV: kv_b must be a Q4 or B16 matrix, not {type(q).__name__}")
++
++
++@triton.jit
++def _absorb(Q, W, S, B, QA, M, H: tl.constexpr, DQ: tl.constexpr, L: tl.constexpr, N: tl.constexpr,
++            IS_Q4: tl.constexpr, BMR: tl.constexpr):
++    """Program (row tile, head, latent group g): QA[r, h, g 64 ..] = bf16(sum_i q[r, h, i] W[h DQ + i, g 64 ..]),
++    i in 64-wide steps in order (fp32 IEEE dots)."""
++
++    rm = tl.program_id(0) * BMR + tl.arange(0, BMR)
++    h = tl.program_id(1)
++    g = tl.program_id(2)
++    ok = rm < M
++    k = tl.arange(0, 64)
++    acc = tl.zeros((BMR, 64), dtype=tl.float32)
++    for it in range(DQ // 64):
++        x = tl.load(Q + (rm[:, None] * H + h) * DQ + it * 64 + k[None, :], mask=ok[:, None], other=0.0)
++        wt = _wtile(W, S, B, h * DQ + it * 64, g, N, L, IS_Q4)                       # [64 inputs i, 64 latent j]
++        acc = acc + tl.dot(x.to(tl.float32), wt, input_precision="ieee")
++    tl.store(QA + (rm[:, None] * H + h) * L + g * 64 + k[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
++def absorb(q: torch.Tensor, kv_k: Q4 | B16, out: torch.Tensor) -> torch.Tensor:
++    """q [R, H, DQ] bf16 -> out [R, H, L] bf16: every head's query in latent space."""
++
++    R, H, DQ = q.shape
++    L = out.shape[2]
++    W, S, B, is_q4 = _parts(kv_k)
++    if kv_k.n != H * DQ or kv_k.k != L or DQ % 64 or L % 64 or not q.is_contiguous() or not out.is_contiguous():
++        raise ValueError("latent absorb: shapes do not match kv_b's key rows")
++    _absorb[(triton.cdiv(R, BM), H, L // 64)](q, W, S, B, out, R, H=H, DQ=DQ, L=L, N=kv_k.n, IS_Q4=is_q4, BMR=BM,
++                                               num_warps=4)
++    return out
++
++
++@triton.jit
++def _expand(U, W, S, B, OUT, M, H: tl.constexpr, DV: tl.constexpr, L: tl.constexpr, N: tl.constexpr,
++            IS_Q4: tl.constexpr, BMR: tl.constexpr):
++    """Program (row tile, 64 output rows n of head h = n // DV): OUT[r, n] = bf16(sum_j u[r, h, j] W[n, j]), j in
++    64-wide groups in order (fp32 IEEE dots)."""
++
++    rm = tl.program_id(0) * BMR + tl.arange(0, BMR)
++    n0 = tl.program_id(1) * 64
++    h = n0 // DV
++    ok = rm < M
++    j = tl.arange(0, 64)
++    acc = tl.zeros((BMR, 64), dtype=tl.float32)
++    for g in range(L // 64):
++        x = tl.load(U + (rm[:, None] * H + h) * L + g * 64 + j[None, :], mask=ok[:, None], other=0.0)
++        wt = _wtile(W, S, B, n0, g, N, L, IS_Q4)                                     # [64 outputs n, 64 latent j]
++        acc = acc + tl.dot(x, tl.trans(wt), input_precision="ieee")
++    tl.store(OUT + rm[:, None] * N + n0 + j[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
++def expand(u: torch.Tensor, kv_v: Q4 | B16, out: torch.Tensor) -> torch.Tensor:
++    """u [R, H, L] fp32 -> out [R, H DV] bf16: every head's output (the o_proj input)."""
++
++    R, H, L = u.shape
++    W, S, B, is_q4 = _parts(kv_v)
++    DV = kv_v.n // H
++    if kv_v.k != L or DV * H != kv_v.n or DV % 64 or out.shape != (R, kv_v.n) or not out.is_contiguous():
++        raise ValueError("latent expand: shapes do not match kv_b's value rows")
++    _expand[(triton.cdiv(R, BM), kv_v.n // 64)](u, W, S, B, out, R, H=H, DV=DV, L=L, N=kv_v.n, IS_Q4=is_q4, BMR=BM,
++                                               num_warps=4)
++    return out
++
++
++# -- the latent cache ---------------------------------------------------------------------------------------------
++@triton.jit
++def _lwrite(LAT, LC, POS, L: tl.constexpr):
++    r = tl.program_id(0)
++    P = tl.load(POS).to(tl.int64)
++    d = tl.arange(0, L)
++    tl.store(LC + (P + r) * L + d, tl.load(LAT + r * L + d))
++
++
++def latent_write(lat: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor) -> None:
++    """Rows [R, L] into cache slots pos .. pos + R - 1 (pos read on the device)."""
++
++    R, L = lat.shape
++    if not lat.is_contiguous() or lc.shape[1] != L:
++        raise ValueError("latent_write: rows must be contiguous and as wide as the cache")
++    _lwrite[(R,)](lat, lc, pos, L=L, num_warps=4)
++
++
++# -- attention in latent space ------------------------------------------------------------------------------------
++@triton.jit
++def _ltile(q, kv, m, l, o, valid, SCALE: tl.constexpr):
++    """One tile of latent rows (keys = values) for BM queries: the expanded kernel's online softmax step."""
++
++    scores = tl.dot(q, tl.trans(kv)).to(tl.float32) * SCALE
++    scores = tl.where(valid, scores, float("-inf"))
++    tile_m = tl.max(scores, 1)
++    active = tile_m != float("-inf")
++    next_m = tl.where(active, tl.maximum(m, tile_m), m)
++    alpha = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
++    p = tl.where(valid & active[:, None], tl.exp(scores - next_m[:, None]), 0.0)
++    o = o * alpha[:, None] + tl.dot(p.to(tl.bfloat16), kv)
++    l = l * alpha + tl.sum(p, 1)
++    return next_m, l, o
++
++
++@triton.jit
++def _lchunks(QA, LC, POS, PO, PM, PL, R, H: tl.constexpr, L: tl.constexpr, CH: tl.constexpr, KTS: tl.constexpr,
++             SCALE: tl.constexpr, BMQ: tl.constexpr):
++    """Program (query tile, chunk c): queries i = (row r, head h) flattened as r H + h, 16 to a tile; keys
++    c CH .. c CH + CH - 1 of the latent cache, row r seeing keys up to pos + r."""
++
++    ib = tl.program_id(0)
++    c = tl.program_id(1)
++    P = tl.load(POS)
++    i = ib * BMQ + tl.arange(0, BMQ)
++    iok = i < R * H
++    r = i // H
++    d = tl.arange(0, L)
++    m = tl.full((BMQ,), float("-inf"), tl.float32)
++    l = tl.zeros((BMQ,), tl.float32)
++    o = tl.zeros((BMQ, L), tl.float32)
++    start = c * CH
++    if start < P + R:
++        q = tl.load(QA + i[:, None] * L + d[None, :], mask=iok[:, None], other=0).to(tl.bfloat16)
++        limit = P + r
++        for t in range(CH // KTS):
++            ki = start + t * KTS + tl.arange(0, KTS)
++            inside = ki < P + R
++            kv = tl.load(LC + ki[:, None].to(tl.int64) * L + d[None, :], mask=inside[:, None], other=0).to(tl.bfloat16)
++            valid = (ki[None, :] <= limit[:, None]) & iok[:, None]
++            m, l, o = _ltile(q, kv, m, l, o, valid, SCALE)
++    base = c * (R * H) + i
++    tl.store(PO + base[:, None].to(tl.int64) * L + d[None, :], o, mask=iok[:, None])
++    tl.store(PM + base, m, mask=iok)
++    tl.store(PL + base, l, mask=iok)
++
++
++@triton.jit
++def _lmerge(PO, PM, PL, OUT, RH, L: tl.constexpr, NCH: tl.constexpr):
++    """Program i (row, head): chunk partials merged in chunk order -> OUT[i] = o / l (fp32)."""
++
++    i = tl.program_id(0)
++    d = tl.arange(0, L)
++    m = float("-inf")
++    l = 0.0
++    o = tl.zeros((L,), tl.float32)
++    for c in range(NCH):
++        base = c * RH + i
++        cm = tl.load(PM + base)
++        cl = tl.load(PL + base)
++        co = tl.load(PO + base.to(tl.int64) * L + d)
++        active = cl > 0.0
++        next_m = tl.where(active, tl.maximum(m, cm), m)
++        a = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
++        b = tl.where(active, tl.exp(cm - next_m), 0.0)
++        o = o * a + co * b
++        l = l * a + cl * b
++        m = next_m
++    tl.store(OUT + i.to(tl.int64) * L + d, o / l)
++
++
++def attention_latent(qa: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor, scratch: Scratch, *, scale: float,
++                     nch: int | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
++    """qa [R, H, L] bf16 (rows at positions pos .. pos + R - 1), lc [capacity, L] holding latents through
++    pos + R - 1 -> [R, H, L] fp32 (``out``, default scratch.u[:R]). ``nch``: chunks to visit (default: every chunk
++    the scratch holds, which covers every dense context; captured graphs use that)."""
++
++    R, H, L = qa.shape
++    if nch is None:
++        nch = scratch.nch
++    elif nch > scratch.nch:
++        raise ValueError(f"latent attention: {nch} chunks of keys, the scratch holds {scratch.nch} (dense attention "
++                         "runs only within DSA's dense limit)")
++    if R > scratch.rows or H != scratch.heads or L != scratch.lat or not qa.is_contiguous():
++        raise ValueError("unsupported latent attention shape")
++    RH = R * H
++    po = scratch.po[:nch * RH * L]
++    pm = scratch.pm[:nch * RH]
++    pl = scratch.pl[:nch * RH]
++    _lchunks[(triton.cdiv(RH, BM), nch)](qa, lc, pos, po, pm, pl, R, H=H, L=L, CH=CHUNK, KTS=KT, SCALE=scale,
++                                         BMQ=BM, num_warps=ATTN_WARPS, num_stages=1)
++    if out is None:
++        out = scratch.u[:R]
++    elif out.shape != (R, H, L) or out.dtype != torch.float32 or not out.is_contiguous():
++        raise ValueError("attention_latent: out must be contiguous fp32 [R, H, L]")
++    _lmerge[(RH,)](po, pm, pl, out, RH, L=L, NCH=nch, num_warps=4)
++    return out
++
++
++@triton.jit
++def _lsparse_chunks(QA, LC, TOK, CNT, PO, PM, PL, RS, W: tl.constexpr, H: tl.constexpr, L: tl.constexpr,
++                    CH: tl.constexpr, KTS: tl.constexpr, SCALE: tl.constexpr, BMQ: tl.constexpr):
++    """Program (row r, head tile, chunk c): the row's selected tokens [c CH, (c + 1) CH) in list order for 16 of its
++    heads at once (the tile's latent rows are read once for all of them)."""
++
++    r = tl.program_id(0)
++    hb = tl.program_id(1)
++    c = tl.program_id(2)
++    n = tl.load(CNT + r)
++    h = hb * BMQ + tl.arange(0, BMQ)
++    hok = h < H
++    d = tl.arange(0, L)
++    m = tl.full((BMQ,), float("-inf"), tl.float32)
++    l = tl.zeros((BMQ,), tl.float32)
++    o = tl.zeros((BMQ, L), tl.float32)
++    if c * CH < n:
++        q = tl.load(QA + (r * H + h[:, None]) * L + d[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++        for t in range(CH // KTS):
++            idx = c * CH + t * KTS + tl.arange(0, KTS)
++            ok = idx < n
++            tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
++            kv = tl.load(LC + tok[:, None] * L + d[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
++            valid = ok[None, :] & hok[:, None]
++            m, l, o = _ltile(q, kv, m, l, o, valid, SCALE)
++    base = (c * RS + r) * H + h
++    tl.store(PO + base[:, None].to(tl.int64) * L + d[None, :], o, mask=hok[:, None])
++    tl.store(PM + base, m, mask=hok)
++    tl.store(PL + base, l, mask=hok)
++
++
++@triton.jit
++def _lsparse_merge(PO, PM, PL, OUT, CNT, RS, H: tl.constexpr, L: tl.constexpr, NCH: tl.constexpr, CH: tl.constexpr):
++    r = tl.program_id(0)
++    h = tl.program_id(1)
++    n = tl.load(CNT + r)
++    if n == 0:
++        return
++    d = tl.arange(0, L)
++    m = float("-inf")
++    l = 0.0
++    o = tl.zeros((L,), tl.float32)
++    for c in range(NCH):
++        if c * CH < n:
++            base = (c * RS + r) * H + h
++            cm = tl.load(PM + base)
++            cl = tl.load(PL + base)
++            co = tl.load(PO + base.to(tl.int64) * L + d)
++            active = cl > 0.0
++            next_m = tl.where(active, tl.maximum(m, cm), m)
++            a = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
++            b = tl.where(active, tl.exp(cm - next_m), 0.0)
++            o = o * a + co * b
++            l = l * a + cl * b
++            m = next_m
++    tl.store(OUT + (r * H + h).to(tl.int64) * L + d, o / l)
++
++
++def sparse_latent(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, out: torch.Tensor,
++                  scale: float, part=None) -> None:
++    """Rows with counts > 0: latent attention over their selected tokens (``sparse.select_tokens``), written into
++    ``out`` [R, H, L] fp32 (other rows untouched). ``part``: preallocated partials (``Scratch.sparse_part``)."""
++
++    R, H, L = qa.shape
++    W = tokens.shape[1]
++    nch = triton.cdiv(W, CHUNK)
++    if part is not None and part[1].numel() == nch * R * H:
++        po, pm, pl = part
++    else:
++        po = torch.empty((nch * R * H * L,), dtype=torch.float32, device=qa.device)
++        pm = torch.empty((nch * R * H,), dtype=torch.float32, device=qa.device)
++        pl = torch.empty((nch * R * H,), dtype=torch.float32, device=qa.device)
++    _lsparse_chunks[(R, triton.cdiv(H, BM), nch)](qa, lc, tokens, counts, po, pm, pl, R, W=W, H=H, L=L, CH=CHUNK,
++                                                  KTS=KT, SCALE=scale, BMQ=BM, num_warps=ATTN_WARPS, num_stages=1)
++    _lsparse_merge[(R, H)](po, pm, pl, out, counts, R, H=H, L=L, NCH=nch, CH=CHUNK, num_warps=4)
++
++
++# -- the DSA block --------------------------------------------------------------------------------------------------
++def _project(layer, w, b, T: int) -> None:
++    """Row-local projections of T rows: [q_a | kv_a], both norms, q_b, and the queries absorbed into latent space."""
++
++    c = w.cfg
++    a = layer.dsa
++    s = b.attn
++    qmm.matmul(b.normed[:T], a.proj, b.xs[:T], out=b.dp[:T], part=b.sk)
++    glue.rmsnorm(b.dp[:T, :c.q_lora], a.q_norm, c.eps, b.qr[:T], b.xs_qr[:T])
++    glue.rmsnorm(b.dp[:T, c.q_lora:], a.kv_norm, c.eps, b.lat[:T], b.xs_lat[:T])
++    qmm.matmul(b.qr[:T], a.q_b, b.xs_qr[:T], out=b.q[:T].view(T, a.heads * c.qk_dim), part=b.sk)
++    absorb(b.q[:T], a.kv_k, s.qa[:T])
++
++
++def _attend(layer, w, lc, pos_dev, b, o: int, R: int, nch, index, host_pos, npb=None) -> None:
++    """One sequence's rows o .. o + R - 1: latent cache write, indexer caches, dense and/or sparse attention into
++    b.attn.u. The expanded ``dsa_block``'s control flow (with patches/0050's ``npb``: every row sparse, selection
++    on the device into ``b.lc``, capturable), on the latent."""
++
++    c = w.cfg
++    a = layer.dsa
++    s = b.attn
++    latent_write(b.lat[o:o + R], lc, pos_dev)
++    if profile.ON:
++        profile.lap("dsa.proj")
++    scale = c.qk_dim ** -0.5
++    sparse_rows = index is not None and host_pos is not None and host_pos + R - 1 >= c.dense_limit
++    if npb is not None and index is None:
++        raise ValueError("dsa_block: a long-context step needs the indexer caches")
++    every_sparse = npb is not None or (sparse_rows and host_pos >= c.dense_limit)
++    sparse_rows = sparse_rows or npb is not None
++    ix = a.index
++    if index is not None:
++        ik, ig, pk = index
++        sparse.index_update(b.ikr[o:o + R, :c.index_dim], b.igr[o:o + R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
++        if profile.ON:
++            profile.lap("dsa.indexer")
++    u = s.u[o:o + R]
++    if not every_sparse:                                           # every row sparse: the dense pass is skipped
++        attention_latent(s.qa[o:o + R], lc, pos_dev, s, scale=scale, nch=nch, out=u)
++        if profile.ON:
++            profile.lap("dsa.attn")
++    if sparse_rows:
++        qmm.matmul(b.qr[o:o + R], ix.qb, b.xs_qr[o:o + R], out=b.qi[o:o + R], part=b.sk)
++        if npb is not None:
++            tokens, counts = sparse.select_tokens_dev(b.qi[o:o + R], b.ikr[o:o + R, c.index_dim:], pk, pos_dev, R,
++                                                      npb, b.lc)
++        else:
++            np_max = pk.shape[0] - 2
++            if w.meta.get("longctx_bound"):            # patches/0050: score only the pools that exist
++                np_max = sparse.pool_bucket(host_pos + R, np_max)
++            tokens, counts = sparse.select_tokens(b.qi[o:o + R], b.ikr[o:o + R, c.index_dim:], pk, host_pos, R,
++                                                  np_max, pos_dev)
++        if profile.ON:
++            profile.lap("dsa.indexer")
++        sparse_latent(s.qa[o:o + R], lc, tokens, counts, u, scale, s.sparse_part(R))
++        if profile.ON:
++            profile.lap("dsa.sparse_attn")
++
++
++def _index_proj(layer, w, b, T: int) -> None:
++    c = w.cfg
++    ix = layer.dsa.index
++    qmm.matmul(b.normed[:T], ix.kw, b.xs[:T], out=b.ikr[:T], part=b.sk)
++    glue.router(b.normed[:T], ix.gate, b.igr[:T])
++
++
++def _output(layer, w, b, T: int) -> torch.Tensor:
++    from .forward import out_proj
++
++    a = layer.dsa
++    s = b.attn
++    o = expand(s.u[:T], a.kv_v, s.o[:T])
++    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:T]), T, "dsa.o_proj")
++
++
++def dsa_block_latent(layer, w, lc: torch.Tensor, pos_dev: torch.Tensor, b, R: int, nch: int | None, index=None,
++                     host_pos: int | None = None, npb: int | None = None) -> torch.Tensor:
++    """``forward.dsa_block`` on the latent cache ``lc`` [capacity, kv_lora] (same arguments, same contract)."""
++
++    _project(layer, w, b, R)
++    if index is not None:
++        _index_proj(layer, w, b, R)
++    _attend(layer, w, lc, pos_dev, b, 0, R, nch, index, host_pos, npb)
++    return _output(layer, w, b, R)
++
++
++def dsa_multi(layer, w, sts, b, Rs, offs, T: int, nchs, host_pos) -> torch.Tensor:
++    """``batch._dsa`` on latent caches: projections, absorption and expansion once over all T rows, cache and
++    attention per sequence."""
++
++    _project(layer, w, b, T)
++    indexed = sts[0].index is not None
++    if indexed:
++        _index_proj(layer, w, b, T)
++    for i, (st, R, o) in enumerate(zip(sts, Rs, offs)):
++        di = st.dsa_index[layer.index]
++        _attend(layer, w, st.kc[di], st.pos_dev, b, o, R, nchs[i] if nchs is not None else None,
++                st.index[di] if indexed else None, host_pos[i] if host_pos is not None else None)
++    return _output(layer, w, b, T)
++
++
++# -- reference (tests): the same attention through expanded per-head keys and values ---------------------------
++def expanded_reference(q: torch.Tensor, lat: torch.Tensor, kv_k: Q4 | B16, kv_v: Q4 | B16, scale: float,
++                       limits: list[int]) -> torch.Tensor:
++    """fp32 reference on the host side of a test: q [R, H, DQ], cache latents lat [T, L]; row r sees rows
++    0 .. limits[r]. Keys/values expanded per head from kv_b (dequantized, fp32) -> head outputs [R, H DV] fp32."""
++
++    wk = qmm.dequantize_q4(kv_k) if isinstance(kv_k, Q4) else kv_k.weight.float()
++    wv = qmm.dequantize_q4(kv_v) if isinstance(kv_v, Q4) else kv_v.weight.float()
++    R, H, DQ = q.shape
++    DV = wv.shape[0] // H
++    k = (lat.float() @ wk.t()).view(-1, H, DQ)
++    v = (lat.float() @ wv.t()).view(-1, H, DV)
++    out = torch.empty((R, H, DV), dtype=torch.float32, device=q.device)
++    for r in range(R):
++        n = limits[r] + 1
++        s = torch.einsum("hd,thd->ht", q[r].float(), k[:n]) * scale
++        p = torch.softmax(s, dim=-1)
++        out[r] = torch.einsum("ht,thd->hd", p, v[:n])
++    return out.view(R, H * DV)

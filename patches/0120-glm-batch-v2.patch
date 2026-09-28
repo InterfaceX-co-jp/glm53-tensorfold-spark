@@ -1,0 +1,1725 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/app.py i/src/tensorfold/families/glm5_next/cuda/app.py
+index 91b0b64..33cc6e4 100644
+--- c/src/tensorfold/families/glm5_next/cuda/app.py
++++ i/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -5,6 +5,7 @@
+ - ``"ignore_eos": true`` decodes ``max_tokens`` tokens past an end-of-sequence token (the benchmarks use it).
+ - ``"tf_knobs": {...}`` (patches/0090, ``knobs.py``) overrides engine knobs (prefill chunk rows, lookup, expert
+   kernel, ...) for this request only; the response's ``tensorfold.tf_knobs`` echoes the values it ran with.
++- ``"priority": "background"`` (patches/0120, with GLM53_TF_BATCH): the request yields to every other one.
+ 
+ A request whose prompt plus ``max_tokens`` needs more context than the engine was started for gets an HTTP 400
+ before anything streams, naming the ``--context`` to restart both ranks with. Without ``max_tokens`` the reply
+@@ -76,4 +77,11 @@ class GlmApp(App):
+         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
+         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
+         self.engine.request.knobs = body.get("tf_knobs")     # patches/0090: validated by ``check``
++        # patches/0120: with GLM53_TF_BATCH, a background request (``"priority": "background"``, or a client's
++        # session-title request) is admitted after every waiting request and steps aside for one when every slot is
++        # busy; it then runs again from the start and its caller receives the same tokens
++        from .batchplan import is_title_request
++
++        self.engine.request.background = body.get("priority") == "background" or (
++            chat and is_title_request(body.get("messages"), body.get("tools")))
+         return super().run(body, chat, emit)
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py i/src/tensorfold/families/glm5_next/cuda/batch.py
+index cdf84fb..f799854 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ i/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -1,47 +1,68 @@
+-"""Continuous batching for GLM-5.3-Flash's CUDA engine (patches/0030, ``GLM53_TF_BATCH=N``, N >= 2): up to N
+-requests decode together, and each round is ONE forward over every active request's verify window.
++"""Continuous batching for GLM-5.3-Flash's CUDA engine (``GLM53_TF_BATCH=N``, N >= 2; patches/0030, rebuilt on the
++current engine by patches/0120): up to N requests decode together, and each round is ONE forward over every
++decoding request's verify window.
+ 
+ Why it pays: decode reads the weights once a forward (about 5 GB a rank), and a row from a second sequence costs
+ what an extra draft row of one sequence costs (mostly the experts it adds). Rows never depend on their
+ window-mates (``forward.py``), so a round's rows can come from different sequences as long as the work that reads
+ per-sequence state is done per sequence.
+ 
+-Data. One ``forward.State`` per slot (slot 0 is the engine's own ``e.st``), the engine's ``Buffers`` shared. A
+-round's rows are the active slots' windows back to back (slot order). ``compute_multi`` runs everything that is
+-row-local once over all rows: the embedding, hyper-connections, norms, every matmul (KDA/DSA projections, the
+-indexer's, the dense MLPs, the MoE router, routed and shared experts), the all-gathers and the head. Per slot, on
+-its rows only: the KDA chain over the slot's recurrent state and conv window, the attention cache write and
+-attention at the slot's committed length, the indexer cache update and (past 2,051 tokens) the sparse
+-selection. ``forward.commit`` then keeps each slot's prefix of its own rows, as for a lone request.
++Slots. One ``forward.State`` per slot (slot 0 is the engine's own ``e.st``), the engine's ``Buffers`` shared. Every
++slot has the engine's context (latent KV with patches/0060, index rings with patches/0065), its own KDA states, its
++own MTP-head cache and CUDA graphs, and its own DFlash2 context (``_drafter_view``: the drafter's weights and
++buffers shared, its context caches, positions and graphs per slot). Slots other than 0 keep window-sized KDA
++projection / replay rows (8 rows); a prefill on such a slot borrows slot 0's (``_borrow``), which only hold the
++rows of one forward between that forward and its commit.
+ 
+-Scheduling. A loop thread on rank 0 runs rounds: it takes client cancels and admits queued requests into free
+-slots (the slot whose kept snapshots resume the longest prefix of the prompt), prefills each admitted prompt on its
+-slot (the others wait, phase 1), then runs one verify round over every active slot. Sampling, the accept rule and
+-the drafts are keyed per request exactly as in a lone request, so every reply is byte-identical to the same
+-request served alone (and to serial decoding).
++A round (``_execute``, both ranks, from rank 0's plan: ``batchplan``):
+ 
+-Drafting. MTP drafts only, per slot (the MTP head's cache lives in the slot's State; the head's CUDA graphs are
+-captured per slot). The DFlash2 drafter holds one sequence's context, so in batch mode every drafted policy runs
+-as MTP drafts with its depth rule (``auto``: c3:0.35 greedy, a:0.6:0.85 sampled). Without the MTP head, batched
+-requests decode serially (one row a round each). Drafts only propose, so none of this changes a token.
++1. cancels (a client went away; a background request steps aside for a waiting one and runs again later);
++2. admissions: a queued request takes a free slot (the one whose kept snapshots resume the longest prefix of its
++   prompt, else the least recently used);
++3. at most one prefill piece: the next ``GLM53_TF_BATCH_PIECE`` tokens of one admitted prompt (fast prefill:
++   rounded to its chunk grid), through ``decode.prefill`` itself (exact, fast, lean, FP8, pipelined: whatever the
++   request's knobs say), resumed from the snapshot the previous piece left. Resumed == fresh holds for every
++   prefill mode, so a prompt prefilled in pieces has the bits of one prefill. Pieces take at most
++   ``GLM53_TF_BATCH_PREFILL_SHARE`` of the time while other requests decode (``batchplan.Fairness``), so a long
++   prompt never stalls the others for more than one piece;
++4. one verify forward over every decoding request's window (pending token + drafts), then per request, from its own
++   rows: keyed sampling (all requests' candidates in ONE all-gather), the accept rule, ``forward.commit`` on its
++   state, and its drafter's next drafts (``Stepper``: ``decode.auto_decode``'s round cut at the forward, so MTP,
++   DFlash2, lookup, ``auto``'s choice and cost-derived depths run per request exactly as alone).
+ 
+-Tensor parallelism. Rank 0 alone decides each round's cancels and admissions (slot, resume length, request header)
+-and shares them with ``GlmEngine._share`` before the round; everything else (prefill, drafts, windows, sampling,
+-keeps, when a request ends) is computed alike on both ranks from the same inputs. Rank 1 runs the same rounds in
+-``follow``.
++Exactness. A request's tokens are the keyed samples of its own logits at its own positions. Its logit rows are the
++bits of its lone forward (row-local kernels; per-slot kernels see only the slot's state and rows), its state
++advances by ``commit`` exactly as alone, its prefill is ``decode.prefill`` (in pieces: resumed == fresh), and the
++accept rule only decides how many of its rows to keep; drafts only propose. So each batched reply is
++byte-identical to the same request served alone, and to serial decoding, whatever shares its rounds.
+ 
+-CUDA graphs. Slot 0 alone replays the engine's own graphs. Other compositions are captured lazily per (slots,
+-window rows, KDA parities) while every window has at most ``GLM53_TF_BATCH_GRAPH_ROWS`` rows (default 4) and the
+-context is dense; the rest runs eager. ``GLM53_TF_BATCH_GRAPHS=0`` keeps everything eager.
++Draft depths. ``auto`` / ``o`` requests with cost-derived depths (patches/0071) price a row at the slope of the
++verify curve past the other requests' rows, against the aggregate rate of the shared rounds
++(``batchplan.RoundCosts``): a draft row that slows every request must buy more than one that slows only its own.
++
++CUDA graphs. Slot 0 alone replays the engine's own graphs. Other rounds replay graphs captured lazily per (slots,
++window rows, per-slot context mode: dense or patches/0050's pool bucket), up to ``GLM53_TF_BATCH_MAX_GRAPHS``; the
++KDA states of a graphed round are kept in buffer 0 (``_parity0``: a copy of the state when a commit left it in
++buffer 1, 71 MB a slot) so parities do not multiply the keys. A key's first round runs eagerly through the
++capturable code (its result) and is captured after (as 0050 does). Windows crossing 2,051 tokens run eager.
++
++Tensor parallelism. Rank 0 alone decides each round's cancels, admissions (slot, resume length, request header)
++and pieces and shares them before the round; rank 1 runs the same rounds in ``follow``.
++
++Kept in step with ``forward.py``: ``compute_multi``'s layer loop, ``_kda`` and ``_dsa`` mirror ``forward.compute``,
++``kda_block`` and ``dsa_block`` (and ``latent``'s pieces); a change there must be made here too (the tests compare
++batched rows with lone ones bit for bit).
+ """
+ 
+ from __future__ import annotations
+ 
+ import collections
++import copy
+ import hashlib
+ import json
+ import os
+ import queue
++import sys
+ import threading
+ import time
+ import traceback
+@@ -50,13 +71,20 @@ from dataclasses import dataclass, field
+ from types import SimpleNamespace
+ from typing import Any, Callable, Sequence
+ 
++import numpy as np
+ import torch
+ 
+-from . import glue, kda as kda_mod, latent, qmm, sparse
++from tensorfold.engine.exact_sampling import MARGIN, choose_rows
++
++from . import batchplan, glue, kda as kda_mod, latent, qmm, sparse
+ from .attention import attention, kv_write
+ from .forward import State, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+ 
+-MAX_GRAPHS = 192                         # lazily captured batch compositions (the rest run eager)
++BACKLOG = 32                     # committed rows a drafter may lag behind before they are taken early
++
++
++def _env_int(name: str, default: int) -> int:
++    return int(os.environ.get(name, "") or default)
+ 
+ 
+ # -- the batched forward ------------------------------------------------------------------------------------------
+@@ -92,12 +120,22 @@ def _kda(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+ 
+ 
+ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[int], T: int,
+-         nchs: Sequence[int] | None, host_pos: Sequence[int] | None) -> torch.Tensor:
+-    """``forward.dsa_block`` over T rows of several sequences: projections once, cache and attention per sequence."""
++         nchs: Sequence[int] | None, host_pos: Sequence[int] | None, npbs: Sequence[int] | None) -> torch.Tensor:
++    """``forward.dsa_block`` over T rows of several sequences: projections once, cache and attention per sequence.
++    Per sequence: ``host_pos`` (eager), or ``npbs`` (capturable: 0 dense, else patches/0050's pool bucket)."""
+ 
+-    if latent.on(w):                     # GLM53_TF_LATENT_KV=1 (patches/0060)
+-        return latent.dsa_multi(layer, w, sts, b, Rs, offs, T, nchs, host_pos)
+     c = w.cfg
++    indexed = sts[0].index is not None
++    if latent.on(w):                     # GLM53_TF_LATENT_KV=1 (patches/0060): ``latent.dsa_block_latent`` per slot
++        latent._project(layer, w, b, T)
++        if indexed:
++            latent._index_proj(layer, w, b, T)
++        for i, (st, R, o) in enumerate(zip(sts, Rs, offs)):
++            di = st.dsa_index[layer.index]
++            latent._attend(layer, w, st.kc[di], st.pos_dev, b, o, R, nchs[i] if nchs is not None else None,
++                           st.index[di] if indexed else None, host_pos[i] if host_pos is not None else None,
++                           (npbs[i] or None) if npbs is not None else None)
++        return latent._output(layer, w, b, T)
+     a = layer.dsa
+     qmm.matmul(b.normed[:T], a.proj, b.xs[:T], out=b.dp[:T], part=b.sk)
+     glue.rmsnorm(b.dp[:T, :c.q_lora], a.q_norm, c.eps, b.qr[:T], b.xs_qr[:T])
+@@ -106,7 +144,6 @@ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+     qmm.matmul(b.qr[:T], a.q_b, b.xs_qr[:T], out=b.q[:T].view(T, HL * c.qk_dim), part=b.sk)
+     qmm.matmul(b.lat[:T], a.kv_k, b.xs_lat[:T], out=b.kn[:T].view(T, HL * c.qk_dim), part=b.sk)
+     qmm.matmul(b.lat[:T], a.kv_v, b.xs_lat[:T], out=b.vn[:T].view(T, HL * c.v_dim), part=b.sk)
+-    indexed = sts[0].index is not None
+     ix = a.index
+     if indexed:
+         qmm.matmul(b.normed[:T], ix.kw, b.xs[:T], out=b.ikr[:T], part=b.sk)
+@@ -117,29 +154,42 @@ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+         kc, vc = st.kc[di], st.vc[di]
+         kv_write(b.kn[o:o + R], b.vn[o:o + R], kc, vc, st.pos_dev)
+         hp = host_pos[i] if host_pos is not None else None
++        npb = (npbs[i] or None) if npbs is not None else None
+         sparse_rows = indexed and hp is not None and hp + R - 1 >= c.dense_limit
++        every_sparse = npb is not None or (sparse_rows and hp >= c.dense_limit)
++        sparse_rows = sparse_rows or npb is not None
+         if indexed:
+             ik, ig, pk = st.index[di]
+             sparse.index_update(b.ikr[o:o + R, :c.index_dim], b.igr[o:o + R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
+                                 st.pos_dev)
+         out = b.attn.out[o:o + R]
+-        if not (sparse_rows and hp >= c.dense_limit):
++        if not every_sparse:
+             attention(b.q[o:o + R], kc, vc, st.pos_dev, b.attn, scale=scale,
+                       nch=nchs[i] if nchs is not None else None, out=out)
+         if sparse_rows:
+             qmm.matmul(b.qr[o:o + R], ix.qb, b.xs_qr[o:o + R], out=b.qi[o:o + R], part=b.sk)
+-            tokens, counts = sparse.select_tokens(b.qi[o:o + R], b.ikr[o:o + R, c.index_dim:], pk, hp, R,
+-                                                  pk.shape[0] - 2, st.pos_dev)
+-            sparse.sparse_attention(b.q[o:o + R], kc, vc, tokens, counts, out, scale)
++            if npb is not None:
++                tokens, counts = sparse.select_tokens_dev(b.qi[o:o + R], b.ikr[o:o + R, c.index_dim:], pk,
++                                                          st.pos_dev, R, npb, b.lc)
++            else:
++                np_max = pk.shape[0] - 2
++                if w.meta.get("longctx_bound"):            # patches/0050: score only the pools that exist
++                    np_max = sparse.pool_bucket(hp + R, np_max)
++                tokens, counts = sparse.select_tokens(b.qi[o:o + R], b.ikr[o:o + R, c.index_dim:], pk, hp, R,
++                                                      np_max, st.pos_dev)
++            lc = b.lc if npb is not None or w.meta.get("longctx_bound") else None
++            sparse.sparse_attention(b.q[o:o + R], kc, vc, tokens, counts, out, scale, lc)
+     o_all = b.attn.out[:T].view(T, HL * c.v_dim)
+     return out_proj(w, b, o_all, a.o, qmm.group_sums(o_all, b.xs_ao[:T]), T)
+ 
+ 
+ def compute_multi(w, sts: Sequence[State], b, Rs: Sequence[int], *, logits: bool = True,
+-                  nchs: Sequence[int] | None = None, host_pos: Sequence[int] | None = None):
++                  nchs: Sequence[int] | None = None, host_pos: Sequence[int] | None = None,
++                  npbs: Sequence[int] | None = None):
+     """``forward.compute`` for staged rows of several sequences: sequence i's R_i rows follow sequence i-1's, at
+     positions sts[i].pos .. + R_i - 1. Capturable (static buffers, device positions) with ``nchs``/``host_pos``
+-    None. -> logits [sum R, V/world] (a view of b.logits)."""
++    None; ``npbs`` (capturable): per sequence 0 (every row dense) or patches/0050's pool bucket (every row past
++    2,050). -> logits [sum R, V/world] (a view of b.logits)."""
+ 
+     c = w.cfg
+     offs = _starts(Rs)
+@@ -153,7 +203,7 @@ def compute_multi(w, sts: Sequence[State], b, Rs: Sequence[int], *, logits: bool
+         if layer.kind == "kda":
+             g = _kda(layer, w, sts, b, Rs, offs, T)
+         else:
+-            g = _dsa(layer, w, sts, b, Rs, offs, T, nchs, host_pos)
++            g = _dsa(layer, w, sts, b, Rs, offs, T, nchs, host_pos, npbs)
+         glue.hc_post(x, x, g, b.post[:T], b.comb[:T])
+         h = layer.ffn_hc
+         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:T], b.xs[:T], b.post[:T], b.comb[:T],
+@@ -185,6 +235,63 @@ def stage_multi(w, sts: Sequence[State], b, windows: Sequence[Sequence[int]]) ->
+     return T
+ 
+ 
++def sample_multi(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Sequence[int], Any]]) -> list[list[int]]:
++    """``decode.sample_rows`` for several sequences' rows (specs: (row offset, rows, positions, sampling)) with ONE
++    all-gather of every row's candidates: each sequence's top-k is the call ``sample_rows`` makes, and the draw is
++    the same keyed rule on the same gathered candidates."""
++
++    parts, ks = [], []
++    for off, R, _, sampling in specs:
++        greedy = sampling is None or sampling.temperature <= 0
++        k = 1 if greedy else min(logits.shape[1], int(sampling.top_k) + MARGIN)
++        vals, ids = torch.topk(logits[off:off + R].float(), k, dim=-1)
++        ids = (ids + w.vocab_offset).to(torch.int32)
++        parts.append(torch.cat([vals, ids.view(torch.float32)], dim=1).reshape(-1))
++        ks.append(k)
++    flat = torch.cat(parts).contiguous()
++    if w.comm is None:
++        world = 1
++        got = flat.view(1, -1).cpu()
++    else:
++        world = w.world
++        buf = torch.empty((world * flat.numel(),), dtype=torch.float32, device=logits.device)
++        w.comm.all_gather(flat, buf)
++        got = buf.view(world, -1).cpu()
++    out, at = [], 0
++    for (off, R, positions, sampling), k in zip(specs, ks):
++        seg = got[:, at:at + R * 2 * k].reshape(world, R, 2 * k)
++        at += R * 2 * k
++        values = torch.cat([seg[r, :, :k] for r in range(world)], dim=1).numpy().astype(np.float32)
++        tokens = torch.cat([seg[r, :, k:].contiguous().view(torch.int32) for r in range(world)], dim=1).numpy()
++        tokens = tokens.astype(np.int64)
++        if sampling is None or sampling.temperature <= 0:
++            order = np.lexsort((tokens, -values), axis=-1)
++            out.append([int(tokens[i, order[i, 0]]) for i in range(R)])
++        else:
++            out.append(choose_rows(values, tokens, list(positions), sampling))
++    return out
++
++
++# -- per-slot DFlash2 contexts --------------------------------------------------------------------------------------
++def _drafter_view(d):
++    """The DFlash2 drafter with its own context: the weights and per-pass buffers shared with ``d`` (one pass runs at
++    a time), the context caches, positions and CUDA graphs its own (``Drafter.capture``: both ranks, at load)."""
++
++    v = copy.copy(d)
++    v.kc = [torch.zeros_like(t) for t in d.kc]
++    v.vc = [torch.zeros_like(t) for t in d.vc]
++    v.pos_dev = torch.zeros_like(d.pos_dev)
++    v.lo_dev = torch.zeros_like(d.lo_dev)
++    v._end = v._hi = v._lo = 0
++    v.packed = v.proj = None
++    v.pool = None
++    v.block_graph = None
++    v.tap_graphs = {}
++    if d.block_graph is not None:
++        v.capture()
++    return v
++
++
+ # -- requests and running sequences -------------------------------------------------------------------------------
+ @dataclass
+ class Job:
+@@ -195,31 +302,232 @@ class Job:
+     draft: bool
+     code: list[int]
+     spec: str = ""
++    cost: int = 0                                 # patches/0071: cost-derived depths for auto
++    values: dict = field(default_factory=dict)    # patches/0090: the request's knobs (every ``knobs.HEADER`` key)
++    background: bool = False                      # steps aside for a waiting request, runs again later
+     out: "queue.SimpleQueue | None" = None        # rank 0: token lists, then None (or an exception)
+     cancel: bool = False
++    sent: int = 0                                 # tokens delivered to the caller (a rerun skips them)
++    submitted: float = 0.0
++    echo: dict = field(default_factory=dict)      # the response's ``tf_knobs``
+     stats: dict = field(default_factory=dict)
+ 
+ 
++class Always:
++    """``depth.Always``: a drafter choice that always picks one arm (om / of / fN / N policies)."""
++
++    def __init__(self, arm: str) -> None:
++        self.arm = arm
++
++    def pick(self) -> str:
++        return self.arm
++
++    def record(self, *args) -> None:
++        pass
++
++
++class Stepper:
++    """One request's decode loop (``decode.auto_decode``; ``mtp_decode``, ``dflash_decode`` and ``serial_decode`` are
++    its special cases) cut at the forward: ``propose`` the next window's drafts, then ``accept`` the round's sampled
++    rows. Same drafters, policies, backlogs and records as alone, so the same drafts."""
++
++    def __init__(self, bat: "Batcher", slot: int, job: Job, first: int, last_hidden: torch.Tensor) -> None:
++        from . import depth as depth_mod
++        from .decode import DepthPolicy, DrafterChoice
++        from .engine import MAX_ROWS, decode_policy
++        from .lookup import LOOKUP_KIND, lookup_for
++
++        g = bat.g
++        code = job.code
++        self.bat, self.slot, self.job = bat, slot, job
++        auto, use_mtp, use_dflash = g._drafters(code)
++        self.use_mtp = use_mtp
++        self.drafter = bat.drafters[slot] if use_dflash else None
++        greedy = job.sampling is None or job.sampling.temperature <= 0
++        self.policy = policy = decode_policy(code)
++        costs = bat.costs
++        self.lookup = lookup_for(code, job.prompt, costs, eos=bat.eos, stop_eos=job.stop_eos)
++        self.opt = None
++        f_most = int(job.values.get("auto_fdrafts", g.f_most))
++        if policy is not None and (code[0] == depth_mod.OPT_KIND or (auto and job.cost)):
++            most_m = code[1] if code[0] == depth_mod.OPT_KIND else MAX_ROWS - 1
++            most_f = code[1] if code[0] == depth_mod.OPT_KIND else f_most
++            self.opt = BatchDepth(bat.round_costs, costs, most_m=most_m, most_f=most_f)
++            if self.lookup is not None:
++                self.lookup.opt = self.opt
++        m_std = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
++        self.choice = None
++        self.m_policy = self.f_policy = m_std
++        if policy is None or code[0] == LOOKUP_KIND:
++            pass                                  # serial; lN: lookup rounds, MTP rounds without a match
++        elif auto:
++            _, explore, every, margin, sampled_too = policy
++            if self.drafter is not None and (greedy or sampled_too):
++                self.choice = DrafterChoice(costs, first="f" if greedy else "m", explore=explore, every=every,
++                                            margin=margin)
++            self.f_policy = DepthPolicy(f_most, fixed=True, confidence=0.3)
++        elif use_dflash:
++            self.choice = Always("f")
++            self.f_policy = policy
++        else:
++            self.m_policy = policy
++        self.out = [first]
++        self.m_rows = bat.m_rows[slot]
++        self.m_next: list[int] = []
++        if self.use_mtp:
++            self.m_rows[:1].copy_(last_hidden)
++            self.m_next = [first]
++        self.f_taps = bat.f_taps[slot] if self.drafter is not None else None
++        self.n_f = 0
++        self.last = {"m": (0, 0), "f": (0, 0)}
++        self.arm, self.drafts, self.steps, self.backlog = "s", [], 0, 0
++        self.rounds = self.shared = self.drafted = self.accepted = 0
++        self.depths: list[int] = []
++        self.keeps: list[int] = []
++        self.arms: list[str] = []
++        self.start = time.perf_counter()
++
++    def done(self, eos) -> bool:
++        return len(self.out) >= self.job.max_tokens or (self.job.stop_eos and self.out[-1] in eos)
++
++    def propose(self, e) -> None:
++        """The next window's drafts (``e``: the engine on this slot)."""
++
++        from .decode import draft
++
++        job, st = self.job, e.st
++        out = self.out
++        room = job.max_tokens - len(out)
++        if self.policy is None or room <= 0:
++            self.arm, self.drafts, self.steps, self.backlog = "s", [], 0, 0
++            return
++        look = self.lookup.plan(out, room) if self.lookup is not None else None
++        arm = "l" if look else self.choice.pick() if self.choice is not None else "m"
++        if arm == "l":
++            backlog, drafts, steps = 0, look, 0
++        elif arm == "m":
++            backlog = len(self.m_next)
++            depth = max(1, min(self.m_policy.next(*self.last["m"]) if self.opt is None else self.opt.most_m, room))
++            drafts = draft(e, self.m_rows[:backlog], self.m_next, st.pos + 1, depth, job.sampling,
++                           self.m_policy.confidence, opt=self.opt)
++            steps = 1 + st.mtp_drafted
++            self.m_next = []
++        else:
++            d = self.drafter
++            backlog = self.n_f
++            if self.n_f:
++                d.add_taps(self.f_taps[:self.n_f])
++                self.n_f = 0
++            if self.opt is None:
++                depth = max(1, min(self.f_policy.next(*self.last["f"]), room))
++                drafts = d.propose(out[-1], depth, job.sampling, self.f_policy.confidence)
++            else:
++                f_probs: list[float] = []
++                drafts = d.propose(out[-1], max(1, min(self.opt.most_f, room)), job.sampling, 0.0, probs=f_probs)
++                if drafts:
++                    drafts = drafts[:self.opt.f_depth(f_probs[:len(drafts)])]
++            steps = 0
++        self.arm, self.drafts, self.steps, self.backlog = arm, list(drafts), steps, backlog
++
++    def window(self) -> list[int]:
++        return [self.out[-1]] + self.drafts
++
++    def accept(self, e, sampled: list[int], off: int, shared: bool) -> int:
++        """The round's sampled rows (this request's, at ``off`` of the forward): keep up to the first mismatch,
++        commit, and hand the kept rows to the drafters' backlogs. -> rows kept."""
++
++        from .decode import absorb
++
++        job, bat = self.job, self.bat
++        w, st, b = e.w, e.st, e.buf
++        drafts = self.drafts
++        R = 1 + len(drafts)
++        keep = 1
++        for i, d in enumerate(drafts):
++            if sampled[i] != d or (job.stop_eos and sampled[i] in bat.eos):
++                break
++            keep += 1
++        commit(w, st, b, R, keep)
++        if self.policy is not None:
++            if self.use_mtp:
++                if len(self.m_next) + keep > BACKLOG:
++                    absorb(e, self.m_rows[:len(self.m_next)], self.m_next)
++                    self.m_next = []
++                n = len(self.m_next)
++                self.m_rows[n:n + keep].copy_(e.main_hidden(slice(off, off + keep)))
++                self.m_next.extend(sampled[:keep])
++            if self.drafter is not None:
++                if self.n_f + keep > BACKLOG:
++                    self.drafter.add_taps(self.f_taps[:self.n_f])
++                    self.n_f = 0
++                self.f_taps[self.n_f:self.n_f + keep].copy_(torch.cat([t[off:off + keep] for t in b.taps], dim=1))
++                self.n_f += keep
++            arm = self.arm
++            if self.choice is not None and arm != "l":
++                self.choice.record(arm, R, self.steps, self.backlog, keep)
++            if self.lookup is not None:
++                self.lookup.record(arm, R, self.steps, self.backlog, keep)
++            if self.opt is not None:
++                self.opt.record(arm, R, self.steps, self.backlog, keep)
++            if arm in self.last:
++                self.last[arm] = (len(drafts), keep - 1)
++        self.rounds += 1
++        self.shared += int(shared)
++        self.drafted += len(drafts)
++        self.accepted += keep - 1
++        self.depths.append(len(drafts))
++        self.keeps.append(keep)
++        self.arms.append(self.arm)
++        self.out.extend(sampled[:keep])
++        return keep
++
++    def part(self) -> tuple[str, int, int, int]:
++        """(arm, rows, MTP steps, backlog) of the window just proposed (``batchplan.RoundCosts``)."""
++
++        return self.arm, 1 + len(self.drafts), self.steps, self.backlog
++
++    def close(self) -> torch.Tensor | None:
++        """At the end: DFlash2's context takes the rows it has not (it ends where the committed rows end); -> the MTP
++        input rows of committed positions the head has not absorbed (a reply snapshot's ``pending``)."""
++
++        if self.drafter is not None and self.n_f:
++            self.drafter.add_taps(self.f_taps[:self.n_f])
++            self.n_f = 0
++        return self.m_rows[:len(self.m_next)] if self.use_mtp else None
++
++
++def _depth_optimizer():
++    from .depth import DepthOptimizer
++
++    return DepthOptimizer
++
++
++class BatchDepth(_depth_optimizer()):
++    """``depth.DepthOptimizer`` in shared rounds: the running rate is the rounds' aggregate one while other requests
++    share them (``RoundCosts.rate``), and ``verify`` is the window-cost table past the other requests' rows (set
++    before each proposal). Alone it is the lone optimizer."""
++
++    def __init__(self, round_costs: batchplan.RoundCosts, costs: dict, **kw) -> None:
++        self.round_costs = round_costs
++        super().__init__(costs, **kw)
++
++    def rate(self) -> float:
++        shared = self.round_costs.rate() if self.round_costs is not None else None
++        return shared if shared is not None else super().rate()
++
++
+ @dataclass
+ class Seq:
+     job: Job
+     slot: int
+-    out: list[int]
+-    policy: Any = None                            # decode.DepthPolicy, or None for one row a round
+-    drafts: list[int] = field(default_factory=list)
+-    start: float = 0.0
+-    rounds: int = 0
+-    shared: int = 0                               # rounds this sequence shared with another
+-    drafted: int = 0
+-    accepted: int = 0
+-    depths: list[int] = field(default_factory=list)
+-    keeps: list[int] = field(default_factory=list)
+-
+-    def done(self, eos) -> bool:
+-        return len(self.out) >= self.job.max_tokens or (self.job.stop_eos and self.out[-1] in eos)
+-
+-
+-HEADER = 15                                       # ints a request's header takes in a round plan
++    admitted: int                                 # the round it was admitted in
++    resume: Any = None                            # decode.Snapshot the next prefill piece resumes from
++    done: int = 0                                 # prompt tokens prefilled
++    grid: int = 0                                 # patches/0080: the request's snapshot grid (0: exact)
++    stepper: Stepper | None = None                # None while prefilling
++    t0: float = 0.0
++    pieces: int = 0
++    emitted: int = 0                              # tokens produced by this run (a rerun re-produces the sent ones)
+ 
+ 
+ class Batcher:
+@@ -230,39 +538,82 @@ class Batcher:
+ 
+         self.g = g
+         e, w = g.e, g.w
+-        self.n = n
+         self.max_rows = MAX_ROWS
+         if n * MAX_ROWS > e.rows:
+             raise ValueError(f"GLM53_TF_BATCH={n}: {n} windows of up to {MAX_ROWS} rows need {n * MAX_ROWS} buffer "
+                              f"rows, the engine has {e.rows} (raise GLM53_TF_PREFILL_ROWS)")
+-        self.graph_rows = int(os.environ.get("GLM53_TF_BATCH_GRAPH_ROWS", "4"))
++        self.graph_rows = _env_int("GLM53_TF_BATCH_GRAPH_ROWS", MAX_ROWS)
++        self.max_graphs = _env_int("GLM53_TF_BATCH_MAX_GRAPHS", 256)
++        self.piece = _env_int("GLM53_TF_BATCH_PIECE", 2048)
+         self.use_graphs = e.graphs is not None and os.environ.get("GLM53_TF_BATCH_GRAPHS", "1").strip() != "0"
+-        both = g._gather_ints([n, int(self.use_graphs), self.graph_rows])
++        both = g._gather_ints([n, int(self.use_graphs), self.graph_rows, self.max_graphs, self.piece])
+         if both[0] != both[1]:
+             raise RuntimeError(f"the two ranks were started with different batch settings: rank 0 {both[0]}, "
+-                               f"rank 1 {both[1]} (GLM53_TF_BATCH, GLM53_TF_BATCH_GRAPHS, GLM53_TF_BATCH_GRAPH_ROWS)")
+-        free0 = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
+-        self.states: list[State] = [e.st] + [State(w, e.st.capacity, e.rows) for _ in range(n - 1)]
++                               f"rank 1 {both[1]} (GLM53_TF_BATCH, GLM53_TF_BATCH_GRAPHS, GLM53_TF_BATCH_GRAPH_ROWS, "
++                               "GLM53_TF_BATCH_MAX_GRAPHS, GLM53_TF_BATCH_PIECE)")
++        # rank 0 only: scheduling (its decisions travel in the round plans)
++        self.fair = batchplan.Fairness(float(os.environ.get("GLM53_TF_BATCH_PREFILL_SHARE", "") or 0.5))
++        # memory kept free: at load, for the slots (prefill transients, lazily captured graphs); at admission, while
++        # other requests run (a request waits for one to end when less is free)
++        self.reserve = float(os.environ.get("GLM53_TF_BATCH_RESERVE_GB", "") or 4.0) * 2**30
++        self.admit_min = float(os.environ.get("GLM53_TF_BATCH_ADMIT_GB", "") or 1.0) * 2**30
++        self.last_verify = False
++        # -- slots: what fits, the same count on both ranks ------------------------------------------------------
+         b = e.buf
++        self.states: list[State] = [e.st]
++        self.graphs = [e.graphs]
++        self.drafters = [g.drafter]
++        free0 = self._free()
++        per = self._slot_estimate()
++        for _ in range(1, n):
++            # both ranks decide each slot together: making one captures graphs with collectives in them
++            before = self._free()
++            ok = g._gather_ints([int(before - per >= self.reserve)])
++            if not (ok[0][0] and ok[1][0]):
++                break
++            st = self._new_state()
++            self.states.append(st)
++            self.graphs.append(self._slot_graphs(st, GRAPH_ROWS))
++            self.drafters.append(_drafter_view(g.drafter) if g.drafter is not None else None)
++            torch.cuda.synchronize()
++            per = max(per, before - self._free())
++        fit = len(self.states)
++        if fit < n and g.rank == 0:
++            print(f"[tensorfold] GLM53_TF_BATCH={n}: only {fit} sequence(s) fit with GLM53_TF_BATCH_RESERVE_GB="
++                  f"{self.reserve / 2**30:g} GB kept free ({per / 2**30:.2f} GB a sequence at {e.st.capacity} cache "
++                  "slots); serving that many", flush=True)
++        self.n = n = fit
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
++        rows = min(b.rows, n * MAX_ROWS)
+         if kda_layers:
+-            b.bproj = torch.empty((b.rows, kda_layers[0].kda.proj.n), dtype=torch.bfloat16, device=w.device)
+-            b.bkout = torch.empty((b.rows, e.st.scratch_set.out.shape[2]), dtype=torch.bfloat16, device=w.device)
+-        self.graphs = [e.graphs] + [self._slot_graphs(st, GRAPH_ROWS) for st in self.states[1:]]
++            b.bproj = torch.empty((rows, kda_layers[0].kda.proj.n), dtype=torch.bfloat16, device=w.device)
++            b.bkout = torch.empty((rows, e.st.scratch_set.out.shape[2]), dtype=torch.bfloat16, device=w.device)
++        # drafter backlogs per slot (auto_decode's m_rows / f_taps, BACKLOG rows)
++        self.m_rows = [torch.zeros((BACKLOG, w.cfg.hidden), dtype=torch.bfloat16, device=w.device) for _ in range(n)]
++        self.f_taps = [torch.zeros((BACKLOG, len(b.taps) * w.cfg.hidden), dtype=torch.bfloat16, device=w.device)
++                       if b.taps else None for _ in range(n)]
+         self.pool = torch.cuda.graph_pool_handle() if self.use_graphs else None
+         self.multi: dict[tuple, torch.cuda.CUDAGraph] = {}
+-        self.caches: list[list] = [[] for _ in range(n)]         # decode.Snapshot entries per slot
+-        self.used = [0] * n                                      # round of each slot's last admission
++        self.counts = collections.Counter()                        # graph / capture / eager rounds, pieces
++        self.caches: list[list] = [[] for _ in range(n)]           # decode.Snapshot entries per slot
++        self.used = [0] * n                                        # round of each slot's last admission
+         self.seqs: list[Seq | None] = [None] * n
+         self.round = 0
+         self.eos = tuple(w.cfg.eos)
+-        self.use_mtp = w.mtp is not None
++        self.costs = g.costs
++        self.round_costs = batchplan.RoundCosts(self.costs)
++        self.defaults = g._knob_state()                            # the load-time knob values (rank 0's requests)
++        self.log: collections.deque = collections.deque(maxlen=256)    # finished requests (both ranks; tests)
++        self.trace: collections.deque = collections.deque(maxlen=4096)  # (round, pieces, verified slots)
++        self.last_piece_s = 0.0
+         if g.rank == 0 and torch.cuda.is_available():
+             torch.cuda.synchronize()
+-            extra = (free0 - torch.cuda.mem_get_info()[0]) / 2**30
+-            print(f"[tensorfold] batching {n} requests: {n - 1} extra sequence state(s), {extra:.2f} GB on this "
+-                  f"rank ({e.st.capacity} cache slots each)", flush=True)
++            extra = (free0 - self._free()) / 2**30
++            print(f"[tensorfold] batching {n} requests: {n - 1} extra sequence(s), {extra:.2f} GB on this rank "
++                  f"({e.st.capacity} cache slots each; prefill pieces of {self.piece} tokens, at most "
++                  f"{self.fair.share:g} of the time while others decode)", flush=True)
+         self.cv = threading.Condition()
++        self.stopping = False
+         self.queue: collections.deque[Job] = collections.deque()
+         self.error: BaseException | None = None
+         self.thread = None
+@@ -270,15 +621,65 @@ class Batcher:
+             self.thread = threading.Thread(target=self._serve, name="glm-batch", daemon=True)
+             self.thread.start()
+ 
++    # -- slots ----------------------------------------------------------------------------------------------------
++    @staticmethod
++    def _free() -> int:
++        """Free device memory, counting what the caching allocator holds but does not use."""
++
++        if not torch.cuda.is_available():
++            return 0
++        return torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
++
++    def _slot_estimate(self) -> int:
++        """Bytes of one more slot before the first is made: the state's caches (window rows excepted), its DFlash2
++        context, and some room for its graphs; measured on the first slot after that."""
++
++        st, seen, total = self.g.e.st, set(), 0
++        tensors = list(st.kc) + list(st.vc) + [st.rec, st.conv]
++        for name in ("mtp_kc", "mtp_vc", "iring"):
++            if hasattr(st, name):
++                tensors.append(getattr(st, name))
++        if st.index is not None:
++            tensors += [t for trio in st.index for t in trio]
++        for t in tensors:
++            if t.data_ptr() not in seen:
++                seen.add(t.data_ptr())
++                total += t.numel() * t.element_size()
++        d = self.g.drafter
++        if d is not None:
++            total += sum(t.numel() * t.element_size() for t in list(d.kc) + list(d.vc))
++        return total + (64 << 20)
++
++    def _new_state(self) -> State:
++        """A slot's State: the engine's capacity and rings, window-sized KDA projection / replay rows (a prefill
++        borrows slot 0's, ``_borrow``)."""
++
++        from .engine import MAX_ROWS
++
++        g = self.g
++        e, w = g.e, g.w
++        st = State(w, e.st.capacity, min(MAX_ROWS, e.rows))
++        ring = sparse.index_ring_rows(e.rows)
++        if st.index_ring and ring > st.index_ring:
++            # patches/0065: the index rings hold a prefill chunk of the engine's rows (a ring as long as the capacity
++            # or longer is a full cache: positions never wrap); the committed tail slot does not depend on the ring
++            n, dim = st._tail_n, st.iring.shape[3]
++            st.iring = torch.zeros((2, n, ring, dim), dtype=st.iring.dtype, device=st.iring.device)
++            st.index_ring = ring
++            st.index[:n] = [(st.iring[0, i], st.iring[1, i], st.index[i][2]) for i in range(n)]
++        return st
++
+     def _slot_graphs(self, st: State, rows):
+-        """The MTP head's graphs for another slot's state (its main-model rounds go through ``compute_multi``)."""
++        """The MTP head's graphs for another slot's state (patches/0050's long-context ones too, lazily); its
++        main-model rounds go through ``compute_multi``."""
+ 
+         e = self.g.e
+         if e.graphs is None:
+             return None
+         from .graphs import Graphs
+ 
+-        return Graphs(SimpleNamespace(w=e.w, st=st, buf=e.buf, mbuf=e.mbuf), main_rows=(), mtp_rows=rows)
++        return Graphs(SimpleNamespace(w=e.w, st=st, buf=e.buf, mbuf=e.mbuf), main_rows=(), mtp_rows=rows,
++                      long_rows=e.long_rows)
+ 
+     @contextmanager
+     def _on(self, slot: int):
+@@ -292,18 +693,60 @@ class Batcher:
+         finally:
+             e.st, e.graphs = saved
+ 
+-    # -- rank 0: requests in -----------------------------------------------------------------------------------------
+-    def _job(self, prompt, max_tokens, sampling, draft: bool, spec: str | None, stop_eos: bool) -> Job:
+-        from .engine import encode_policy
++    @contextmanager
++    def _borrow(self, slot: int):
++        """Slot 0's KDA projection and replay rows for a prefill on ``slot`` (they only hold one forward's rows
++        between that forward and its commit, and no round is in flight during a prefill piece)."""
++
++        st, big = self.states[slot], self.states[0]
++        if st is big or st.proj.shape[1] >= big.proj.shape[1]:
++            yield
++            return
++        saved = st.proj, st.scratch_set, st.scratch
++        st.proj, st.scratch_set, st.scratch = big.proj, big.scratch_set, big.scratch
++        try:
++            yield
++        finally:
++            st.proj, st.scratch_set, st.scratch = saved
++
++    # -- rank 0: requests in ---------------------------------------------------------------------------------------
++    def _job(self, prompt, max_tokens, sampling, draft: bool, spec: str | None, stop_eos: bool, knobs=None,
++             background: bool = False) -> Job:
++        """A request as ``GlmEngine.generate`` resolves it (policy code, cost flag, lookup settings, knobs), on rank
++        0's load-time defaults."""
++
++        from . import depth as depth_mod, knobs as knobs_mod
++        from .engine import DFLASH_POLICY, encode_policy
++        from .lookup import env_settings, with_lookup
+ 
+         g = self.g
++        asked = g.parse_knobs(knobs)
+         prompt = [int(t) for t in prompt]
++        if not prompt:
++            raise ValueError("an empty prompt")
+         if len(prompt) >= g.limit:
+             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {g.limit}")
+         max_tokens = max(1, min(int(max_tokens), g.limit - len(prompt)))
+         spec = "0" if not draft or g.serial_only else (spec or g.policy)
+-        code = g._effective(encode_policy(spec))
+-        return Job(prompt, max_tokens, sampling, bool(stop_eos), bool(draft), code, spec, out=queue.SimpleQueue())
++        code = encode_policy(spec)
++        depth_cost = asked["depth"] == "cost" if "depth" in asked else depth_mod.env_cost()
++        cost = int(str(spec).strip() == "o" or code[0] == depth_mod.OPT_KIND or (code[0] in (4, 5) and depth_cost))
++        code = g._effective(code)
++        if cost:
++            code = depth_mod.as_cost(code)
++        code = with_lookup(code, g.w.mtp is not None, encode_policy(DFLASH_POLICY))
++        look = list(env_settings())
++        look = [int(asked.get("lookup", look[0])), int(asked.get("lookup_min", look[1]))]
++        if code[0] in (4, 5) and len(code) >= 6:
++            code = code[:4] + look + code[6:]
++        values = dict(self.defaults, **{k: v for k, v in asked.items() if k in knobs_mod.HEADER})
++        if not g.longctx_buffers:
++            values["longctx_graphs"] = 0
++        values["calib_online"] = 0                # no online cost table in shared rounds
++        job = Job(prompt, max_tokens, sampling, bool(stop_eos), bool(draft), list(code), str(spec), cost, values,
++                  bool(background), out=queue.SimpleQueue(), submitted=time.perf_counter())
++        job.echo = dict(values, lookup=look[0], lookup_min=look[1], depth="cost" if depth_cost else "threshold")
++        return job
+ 
+     def _submit(self, jobs: list[Job]) -> None:
+         if self.error is not None:
+@@ -314,41 +757,57 @@ class Batcher:
+ 
+     def _collect(self, job: Job, on_tokens: Callable | None) -> list[int]:
+         got: list[int] = []
++        listening = on_tokens is not None
+         while True:
+             item = job.out.get()
+             if item is None:
+                 return got
++            if isinstance(item, ValueError):
++                raise item
+             if isinstance(item, BaseException):
+                 raise RuntimeError("the batch loop failed") from item
+             got.extend(item)
+-            if on_tokens is not None and on_tokens(item):
++            if listening and on_tokens(item):
+                 job.cancel = True               # the client went away: the next round ends the request
++                listening = False
++                with self.cv:
++                    self.cv.notify()
+ 
+     def generate(self, prompt, max_tokens, sampling, on_tokens, draft: bool = True) -> dict[str, Any]:
+-        """``GlmEngine.generate`` in batch mode (the calling thread's policy and stop-at-EOS, as there)."""
++        """``GlmEngine.generate`` in batch mode (the calling thread's policy, stop-at-EOS, knobs and priority)."""
+ 
+-        g = self.g
+-        job = self._job(prompt, max_tokens, sampling, draft, getattr(g.request, "policy", None),
+-                        bool(getattr(g.request, "stop_eos", True)))
++        req = self.g.request
++        job = self._job(prompt, max_tokens, sampling, draft, getattr(req, "policy", None),
++                        bool(getattr(req, "stop_eos", True)), getattr(req, "knobs", None),
++                        bool(getattr(req, "background", False)))
+         self._submit([job])
+         self._collect(job, on_tokens)
+-        job.stats.update(policy=job.spec, drafts=job.draft)
++        job.stats.update(policy=job.spec, drafts=job.draft, tf_knobs=job.echo)
+         return job.stats
+ 
+     def generate_batch(self, requests: list[dict]) -> list[tuple[list[int], dict]]:
+         """Requests queued together (so they share rounds from the first): dicts with prompt, max_tokens and
+-        optionally sampling, policy, draft, stop_eos (False), on_tokens. -> [(tokens, stats)] in order."""
++        optionally sampling, policy, draft, stop_eos (False), knobs, background, on_tokens. -> [(tokens, stats)]."""
+ 
+         jobs = [self._job(r["prompt"], r["max_tokens"], r.get("sampling"), r.get("draft", True), r.get("policy"),
+-                          r.get("stop_eos", False)) for r in requests]
++                          r.get("stop_eos", False), r.get("knobs"), r.get("background", False)) for r in requests]
+         self._submit(jobs)
+         out = []
+         for r, job in zip(requests, jobs):
+             tokens = self._collect(job, r.get("on_tokens"))
+-            job.stats.update(policy=job.spec, drafts=job.draft)
++            job.stats.update(policy=job.spec, drafts=job.draft, tf_knobs=job.echo)
+             out.append((tokens, job.stats))
+         return out
+ 
++    def stop(self) -> None:
++        """Rank 0: end the loop thread once nothing runs or waits (tests; a server runs until the process ends)."""
++
++        with self.cv:
++            self.stopping = True
++            self.cv.notify()
++        if self.thread is not None:
++            self.thread.join(timeout=60)
++
+     # -- the round loop ------------------------------------------------------------------------------------------------
+     def _serve(self) -> None:
+         """Rank 0's loop thread: plan a round (shared with rank 1), run it."""
+@@ -357,8 +816,16 @@ class Batcher:
+         try:
+             with torch.no_grad():
+                 while True:
+-                    cancels, admits = self._plan()
+-                    self._execute(cancels, admits)
++                    plan = self._plan()
++                    if plan is None:
++                        return
++                    cancels, admits, pieces = plan
++                    t0 = time.perf_counter()
++                    self.last_piece_s = 0.0
++                    self._execute(cancels, admits, pieces)
++                    decode_s = max(time.perf_counter() - t0 - self.last_piece_s, 0.0) if self.last_verify else 0.0
++                    prefilling = any(s is not None and s.stepper is None for s in self.seqs)
++                    self.fair.after(self.last_piece_s, decode_s, prefilling)
+         except BaseException as exc:            # noqa: BLE001 - every waiting request must hear about it
+             traceback.print_exc()
+             self.error = exc
+@@ -366,94 +833,119 @@ class Batcher:
+                 jobs = [s.job for s in self.seqs if s is not None] + list(self.queue)
+                 self.queue.clear()
+             for job in jobs:
+-                job.out.put(exc)
++                if job.out is not None:
++                    job.out.put(exc)
+ 
+     def follow(self) -> None:
+         """Rank 1: run every round rank 0 plans, forever."""
+ 
+         with torch.no_grad():
+             while True:
+-                plan = self.g._share(None)
+-                cancels, admits = self._parse(plan)
++                cancels, admits, pieces = batchplan.parse_plan(self.g._share(None))
+                 self._execute(cancels, [(slot, cached, self._job_from(header, self.g._share(None)))
+-                                        for slot, cached, header in admits])
++                                        for slot, cached, header in admits], pieces)
++
++    def _plan(self) -> tuple[list[int], list[tuple[int, int, Job]], list[int]] | None:
++        """Rank 0: this round's cancels, admissions and prefill piece, shared with rank 1 (None: ``stop``)."""
+ 
+-    def _plan(self) -> tuple[list[int], list[tuple[int, int, Job]]]:
+         with self.cv:
+             while not self.queue and not any(s is not None for s in self.seqs):
++                if self.stopping:
++                    return None
+                 self.cv.wait()
++            for job in [j for j in self.queue if j.cancel]:          # gone before it started
++                self.queue.remove(job)
++                job.stats.update(cancelled=True)
++                job.out.put(None)
+             cancels = [i for i, s in enumerate(self.seqs) if s is not None and s.job.cancel]
+             free = [i for i in range(self.n) if self.seqs[i] is None or i in cancels]
+-            admits = []
+-            while free and self.queue:
+-                job = self.queue.popleft()
++            requeue = []
++            fg_waiting = any(not j.background for j in self.queue)
++            v = batchplan.victim([(i, s.job.background, s.admitted) for i, s in enumerate(self.seqs)
++                                  if s is not None and i not in cancels], fg_waiting, len(free))
++            if v is not None:
++                cancels.append(v)
++                free.append(v)
++                requeue.append(self.seqs[v].job)
++            admits: list[tuple[int, int, Job]] = []
++            others = any(s is not None and i not in cancels for i, s in enumerate(self.seqs))
++            waiting = list(self.queue)
++            for i in batchplan.admission_order([j.background for j in waiting]):
++                job = waiting[i]
++                if not free:
++                    break
++                if (others or admits) and self._free() < self.admit_min:
++                    self.counts["deferred"] += 1               # short of memory: it waits for a request to end
++                    break
+                 slot, cached = self._place(job, free)
+                 free.remove(slot)
++                self.queue.remove(job)
+                 admits.append((slot, cached, job))
+-        plan = [len(cancels), *cancels, len(admits)]
++            self.queue.extend(requeue)
++        # the prefill piece: one prompt's next piece, when the others have had their share of the time
++        admitted = {slot for slot, _, _ in admits}
++        prefilling, decoding = [], False
++        for i, s in enumerate(self.seqs):
++            if s is None or i in cancels or i in admitted:
++                continue
++            if s.stepper is None:
++                prefilling.append((i, len(s.job.prompt) - s.done, s.admitted))
++            else:
++                decoding = True
+         for slot, cached, job in admits:
+-            plan += [slot, cached] + self._header(job)
++            prefilling.append((slot, len(job.prompt) - cached, self.round + 1))
++        pieces = []
++        if prefilling and self.fair.allow(decoding):
++            pieces = [batchplan.pick_piece(prefilling)]
++        plan = batchplan.encode_plan(cancels, [(slot, cached, self._header(job)) for slot, cached, job in admits],
++                                     pieces)
+         self.g._share(plan)
+         for _, _, job in admits:
+             self.g._share(job.prompt)
+-        return cancels, admits
+-
+-    @staticmethod
+-    def _parse(plan: list[int]):
+-        nc = plan[0]
+-        cancels = plan[1:1 + nc]
+-        at = 1 + nc
+-        na = plan[at]
+-        at += 1
+-        admits = []
+-        for _ in range(na):
+-            admits.append((plan[at], plan[at + 1], plan[at + 2:at + 2 + HEADER]))
+-            at += 2 + HEADER
+-        return cancels, admits
++        return cancels, admits, pieces
+ 
+     @staticmethod
+     def _header(job: Job) -> list[int]:
+-        from .engine import _f64_ints
+-
+         s = job.sampling
+-        seed = (s.seed if s else 0) & 0xFFFFFFFFFFFFFFFF
+-        h = [job.max_tokens, int(job.stop_eos), int(job.draft), seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF,
+-             seed >> 62, *_f64_ints(s.temperature if s else 0.0), int(s.top_k) if s else 0,
+-             *_f64_ints(s.top_p if s else 1.0)] + list(job.code)
+-        assert len(h) == HEADER
+-        return h
++        return batchplan.encode_header(batchplan.Header(
++            job.max_tokens, job.stop_eos, job.draft, s.seed if s else 0, s.temperature if s else 0.0,
++            int(s.top_k) if s else 0, s.top_p if s else 1.0, job.cost, job.values, job.code))
+ 
+     @staticmethod
+-    def _job_from(h: list[int], prompt: list[int]) -> Job:
++    def _job_from(ints: list[int], prompt: list[int]) -> Job:
+         from tensorfold.engine.exact_sampling import Sampling
+ 
+-        from .engine import _ints_f64
++        h = batchplan.decode_header(ints)
++        sampling = Sampling(h.seed, h.temperature, h.top_k, h.top_p) if h.temperature > 0 else None
++        return Job(list(prompt), h.max_tokens, sampling, h.stop_eos, h.draft, list(h.code), cost=h.cost,
++                   values=dict(h.values))
+ 
+-        max_tokens, stop_eos, draft, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, *code = h
+-        temperature = _ints_f64(t_lo, t_hi)
+-        seed = (s_top << 62) | (s_hi << 31) | s_lo
+-        sampling = Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi)) if temperature > 0 else None
+-        return Job(list(prompt), max_tokens, sampling, bool(stop_eos), bool(draft), list(code))
+-
+-    def _resume(self, slot: int, prompt: list[int]):
+-        """The longest snapshot on ``slot`` of a strict prefix of ``prompt`` (``GlmEngine._resume`` per slot)."""
++    def _resume(self, slot: int, prompt: list[int], code: list[int], grid: int):
++        """``GlmEngine._resume`` on ``slot``: the longest snapshot of a strict prefix of ``prompt`` whose draft caches
++        fit the request's drafters and whose prefill mode (``grid``) is the request's."""
+ 
++        _, mtp, dflash = self.g._drafters(code)
+         best = None
+         for snap in self.caches[slot]:
+-            fits = not self.use_mtp or snap.mtp_len >= 0
++            fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0) \
++                and snap.grid == grid
+             if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
+                     best is None or len(snap.ids) > len(best.ids)):
+                 best = snap
+         return best
+ 
++    def _grid(self, values: dict) -> int:
++        return self.g._grid(bool(values["fast_prefill"]), int(values["prefill_rows"]), bool(values["fp8_prefill"]))
++
+     def _place(self, job: Job, free: list[int]) -> tuple[int, int]:
+         """(slot, resume length): the free slot resuming the longest prefix; else the least recently admitted one
+         (its kept states are the likeliest to be stale)."""
+ 
+         best, length = None, 0
+         if job.draft:
++            grid = self._grid(job.values)
+             for s in free:
+-                snap = self._resume(s, job.prompt)
++                snap = self._resume(s, job.prompt, job.code, grid)
+                 if snap is not None and len(snap.ids) > length:
+                     best, length = s, len(snap.ids)
+         if best is None:
+@@ -465,38 +957,38 @@ class Batcher:
+         self.caches[slot] = cache[-1:] + [snap]
+ 
+     def _emit(self, seq: Seq, tokens: list[int]) -> None:
+-        if seq.job.out is not None and tokens:
+-            seq.job.out.put(list(tokens))
++        """Deliver tokens to the caller; a background request running again skips the ones it already sent."""
+ 
+-    def _policy(self, job: Job):
+-        from .decode import DepthPolicy
+-
+-        from .engine import decode_policy
+-
+-        if not job.draft or not self.use_mtp:
+-            return None
+-        p = decode_policy(job.code)
+-        if isinstance(p, tuple):                # auto: the MTP arm of the per-round choice
+-            greedy = job.sampling is None or job.sampling.temperature <= 0
+-            return DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
+-        return p                                # None (serial) or a DepthPolicy; DFlash2 specs run as MTP drafts
++        start = seq.emitted
++        seq.emitted += len(tokens)
++        job = seq.job
++        if job.out is None or not tokens:
++            return
++        new = tokens[max(0, job.sent - start):]
++        if new:
++            job.out.put(list(new))
++            job.sent = start + len(tokens)
+ 
+     # -- a round (both ranks) --------------------------------------------------------------------------------------------
+-    def _execute(self, cancels: list[int], admits: list[tuple[int, int, Job]]) -> None:
++    def _execute(self, cancels: list[int], admits: list[tuple[int, int, Job]], pieces: list[int]) -> None:
+         self.round += 1
++        self.last_verify = False
+         for s in cancels:
+             if self.seqs[s] is not None:
+-                self._finish(s, None, cancelled=True)
++                self._finish(s, cancelled=True)
+         for slot, cached, job in admits:
+-            self.used[slot] = self.round
+-            self._start(slot, cached, job)
+-        active = [s for s in range(self.n) if self.seqs[s] is not None]
++            self._admit(slot, cached, job)
++        for s in pieces:
++            t0 = time.perf_counter()
++            self._piece(s)
++            self.last_piece_s += time.perf_counter() - t0
++        active = [s for s in range(self.n) if self.seqs[s] is not None and self.seqs[s].stepper is not None]
++        self.trace.append((self.round, tuple(pieces), tuple(active)))
+         if active:
++            self.last_verify = True
+             self._verify(active)
+ 
+-    def _start(self, slot: int, cached: int, job: Job) -> None:
+-        from .decode import draft, prefill, take_snapshot
+-
++    def _admit(self, slot: int, cached: int, job: Job) -> None:
+         if self.seqs[slot] is not None:
+             raise RuntimeError(f"slot {slot} is busy")
+         hit = None
+@@ -506,119 +998,205 @@ class Batcher:
+                 raise RuntimeError(f"no snapshot of {cached} tokens on slot {slot} to resume from")
+         # the request writes the slot's attention caches from its resume point on: longer snapshots go
+         self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= cached]
+-        t0 = time.perf_counter()
+-        with self._on(slot) as e:
+-            first = prefill(e, job.prompt, job.sampling, mtp=self.use_mtp, drafter=None, resume=hit)
+-            if job.draft:
+-                self._remember(slot, take_snapshot(e, job.prompt, e.last_hidden if self.use_mtp else None,
+-                                                   mtp=self.use_mtp))
+-            last_hidden = e.last_hidden
+-        seq = Seq(job, slot, [first])
+-        job.stats.update(prefill_s=time.perf_counter() - t0, cached=cached, slot=slot)
+-        self.seqs[slot] = seq
+-        self._emit(seq, [first])
+-        if job.max_tokens <= 1 or (job.stop_eos and first in self.eos):
++        self.used[slot] = self.round
++        self.seqs[slot] = Seq(job, slot, self.round, resume=hit, done=cached, grid=self._grid(job.values),
++                              t0=time.perf_counter())
++        job.stats.update(cached=cached, slot=slot, queued_s=round(time.perf_counter() - job.submitted, 3)
++                         if job.submitted else 0.0)
++
++    def _piece(self, slot: int) -> None:
++        """The next piece of the slot's prompt through ``decode.prefill`` (the request's knobs, resumed from the
++        previous piece's snapshot); after the last one, the first token and the first drafts."""
++
++        from . import fastpf
++        from .decode import prefill, take_snapshot
++
++        g = self.g
++        seq = self.seqs[slot]
++        job = seq.job
++        _, use_mtp, use_dflash = g._drafters(job.code)
++        drafter = self.drafters[slot] if use_dflash else None
++        n = len(job.prompt)
++        self.counts["pieces"] += 1
++        try:
++            with self._on(slot) as e, self._borrow(slot), g._knobs(job.values):
++                grid = fastpf.grid(e.prefill_rows) if e.fast_prefill else 0
++                end = batchplan.piece_end(seq.done, n, self.piece, grid)
++                first = prefill(e, job.prompt[:end], job.sampling, mtp=use_mtp, drafter=drafter, resume=seq.resume)
++                seq.pieces += 1
++                if end < n:
++                    if grid:
++                        snap = e.fast_snap          # the state at ``end`` (on the grid), resumable by fast pieces
++                        if snap is None or len(snap.ids) != end:
++                            raise RuntimeError(f"fast prefill piece to {end} left no grid snapshot there")
++                    else:
++                        snap = take_snapshot(e, job.prompt[:end], e.last_hidden if use_mtp else None, mtp=use_mtp,
++                                             drafter=drafter)
++                    seq.resume, seq.done = snap, end
++                    return
++                seq.done = n
++                seq.resume = None
++                tag = g._grid()                     # patches/0080: 0, or the fast chunk grid this prefill ran on
++                if job.draft and tag:
++                    if e.fast_snap is not None:     # the state at the prompt's last grid point, nothing later
++                        self._remember(slot, e.fast_snap)
++                elif job.draft:
++                    self._remember(slot, take_snapshot(e, job.prompt, e.last_hidden if use_mtp else None,
++                                                       mtp=use_mtp, drafter=drafter))
++                last_hidden = e.last_hidden
++        except ValueError as exc:                   # the request's own problem (the same on both ranks)
+             self.seqs[slot] = None
++            self.caches[slot] = []
+             if job.out is not None:
+-                job.out.put(None)
++                job.out.put(exc)
+             return
+-        seq.policy = self._policy(job)
+-        seq.start = time.perf_counter()
+-        if seq.policy is not None:
+-            depth = min(seq.policy.next(0, 0), job.max_tokens - len(seq.out))
+-            if depth > 0:
+-                with self._on(slot) as e:
+-                    seq.drafts = draft(e, last_hidden, [first], e.st.pos + 1, depth, job.sampling,
+-                                       seq.policy.confidence)
++        job.stats.update(prefill_s=round(time.perf_counter() - seq.t0, 4), pieces=seq.pieces)
++        if tag:
++            job.stats["fast_prefill"] = tag - tag % 64
++            if tag % 64:
++                job.stats["fp8_prefill"] = 1
++        self._emit(seq, [first])
++        seq.stepper = Stepper(self, slot, job, first, last_hidden)
++        if seq.stepper.done(self.eos):
++            self._finish(slot)
++            return
++        with self._on(slot) as e:
++            seq.stepper.propose(e)
++
++    def _parity0(self, st: State) -> None:
++        """Keep a slot's KDA states in buffer 0 for a graphed round (the same values, moved)."""
++
++        if st.cur and st.cur[0]:
++            st.rec[0].copy_(st.rec[1])
++            st.cur = [0] * len(st.cur)
++
++    def _mode(self, st: State, R: int) -> int | None:
++        """A window's context mode for the graph key: 0 (every row dense), patches/0050's pool bucket (every row
++        past 2,050, long-context graphs on), or None (eager: a window crossing 2,051, or no long graphs)."""
++
++        e = self.g.e
++        c = self.g.w.cfg
++        if st.pos + R <= c.dense_limit:
++            return 0
++        if e.longctx and st.index is not None and st.pos >= c.dense_limit and e.buf.lc is not None \
++                and R <= e.buf.lc.rows:
++            return sparse.pool_bucket(st.pos + R, st.index[0][2].shape[0] - 2)
++        return None
+ 
+     def _forward(self, active: list[int], windows: list[list[int]]) -> torch.Tensor:
+         g = self.g
+         e, w, b = g.e, g.w, g.e.buf
++        e.rows_from = None                      # patches/0082: rows come from the window buffers again
+         if active == [0]:
+             with self._on(0):
++                self.counts["alone"] += 1
+                 return e.forward(windows[0])    # the engine's own graphs
+         sts = [self.states[s] for s in active]
+         T = stage_multi(w, sts, b, windows)
+         Rs = [len(x) for x in windows]
+-        dense = all(st.pos + R <= w.cfg.dense_limit for st, R in zip(sts, Rs))
+-        if self.use_graphs and dense and max(Rs) <= self.graph_rows:
+-            key = (tuple(active), tuple(Rs), tuple(st.parity for st in sts))
++        modes = [self._mode(st, R) for st, R in zip(sts, Rs)]
++        if self.use_graphs and all(m is not None for m in modes) and max(Rs) <= self.graph_rows:
++            for st in sts:
++                self._parity0(st)
++            key = (tuple(active), tuple(Rs), tuple(modes))
+             graph = self.multi.get(key)
+-            if graph is None and len(self.multi) < MAX_GRAPHS:
+-                # the warm-up's writes are the replay's (uncommitted cache slots, the other KDA state buffer, the
+-                # slots' window rows), so capturing mid-request changes nothing
+-                compute_multi(w, sts, b, Rs)
+-                torch.cuda.synchronize()
+-                graph = torch.cuda.CUDAGraph()
+-                with torch.cuda.graph(graph, pool=self.pool):
+-                    compute_multi(w, sts, b, Rs)
+-                self.multi[key] = graph
+             if graph is not None:
++                self.counts["graph"] += 1
+                 graph.replay()
+                 return b.logits[:T]
++
++            def run() -> None:
++                compute_multi(w, sts, b, Rs, npbs=modes)
++
++            run()                               # the round's result, through the code the graph holds
++            self.counts["eager"] += 1
++            if len(self.multi) < self.max_graphs:
++                torch.cuda.synchronize()
++                graph = torch.cuda.CUDAGraph()
++                try:
++                    with torch.cuda.graph(graph, pool=self.pool, capture_error_mode="thread_local"):
++                        run()
++                except Exception as exc:  # noqa: BLE001 - keep serving eagerly
++                    self.use_graphs = False
++                    print(f"[tensorfold] batched round CUDA graph capture failed ({type(exc).__name__}: {exc}); "
++                          "multi-sequence rounds run eagerly", file=sys.stderr, flush=True)
++                    torch.cuda.synchronize()
++                else:
++                    self.multi[key] = graph
++                    self.counts["capture"] += 1
++            return b.logits[:T]
++        self.counts["eager"] += 1
+         return compute_multi(w, sts, b, Rs, nchs=[chunks_for(st, R) for st, R in zip(sts, Rs)],
+                              host_pos=[st.pos for st in sts])
+ 
+     def _verify(self, active: list[int]) -> None:
+-        from .decode import draft
+-
+         g = self.g
+-        e, w, b = g.e, g.w, g.e.buf
++        w = g.w
+         seqs = [self.seqs[s] for s in active]
+-        windows = [[q.out[-1]] + q.drafts for q in seqs]
++        windows = [q.stepper.window() for q in seqs]
++        parts = [q.stepper.part() for q in seqs]
+         logits = self._forward(active, windows)
+         torch.cuda.synchronize()
+-        off = 0
++        specs, off = [], 0
+         for s, q, win in zip(active, seqs, windows):
+-            st = self.states[s]
+-            R = len(win)
+-            job = q.job
+-            sampled = e.sample(logits[off:off + R], [st.pos + 1 + r for r in range(R)], job.sampling)
+-            keep = 1
+-            for i, d in enumerate(q.drafts):
+-                if sampled[i] != d or (job.stop_eos and sampled[i] in self.eos):
+-                    break
+-                keep += 1
+-            commit(w, st, b, R, keep)
+-            q.rounds += 1
+-            q.shared += len(active) > 1
+-            q.drafted += len(q.drafts)
+-            q.accepted += keep - 1
+-            q.depths.append(len(q.drafts))
+-            q.keeps.append(keep)
+-            q.out.extend(sampled[:keep])
+-            self._emit(q, sampled[:keep][:max(0, job.max_tokens - (len(q.out) - keep))])
+-            hidden = e.main_hidden(slice(off, off + keep))       # this slot's kept rows (the MTP head's input)
+-            if q.done(self.eos):
+-                self._finish(s, hidden)
+-            elif q.policy is not None:
+-                depth = min(q.policy.next(len(q.drafts), keep - 1), job.max_tokens - len(q.out))
+-                q.drafts = []
+-                if depth > 0:
+-                    with self._on(s) as es:
+-                        q.drafts = draft(es, hidden, sampled[:keep], st.pos + 1, depth, job.sampling,
+-                                         q.policy.confidence)
+-            off += R
++            pos = self.states[s].pos
++            specs.append((off, len(win), [pos + 1 + r for r in range(len(win))], q.job.sampling))
++            off += len(win)
++        sampled = sample_multi(w, logits, specs)
++        shared = len(active) > 1
++        tokens = 0
++        for s, q, (off, R, _, _), rows in zip(active, seqs, specs, sampled):
++            with self._on(s) as e:
++                keep = q.stepper.accept(e, rows, off, shared)
++            tokens += keep
++            out = q.stepper.out
++            self._emit(q, rows[:keep][:max(0, q.job.max_tokens - (len(out) - keep))])
++        self.round_costs.record(parts, tokens)
++        going = []
++        for s, q in zip(active, seqs):
++            if q.stepper.done(self.eos):
++                self._finish(s)
++            else:
++                going.append((s, q))
++        rows_of = {s: len(q.stepper.window()) for s, q in zip(active, seqs)}
++        for s, q in going:
++            st = q.stepper
++            if st.opt is not None:              # batch-aware depths: this request's rows come after the others'
++                others = sum(r for o, r in rows_of.items() if o != s and self.seqs[o] is not None)
++                st.opt.verify = self.round_costs.table(others)
++            with self._on(s) as e:
++                st.propose(e)
+ 
+-    def _finish(self, slot: int, hidden: torch.Tensor | None, *, cancelled: bool = False) -> None:
++    def _finish(self, slot: int, *, cancelled: bool = False) -> None:
+         from .decode import take_snapshot
+ 
+         q = self.seqs[slot]
+         self.seqs[slot] = None
+         job = q.job
+-        st = self.states[slot]
+-        if job.draft and q.policy is not None and q.keeps and hidden is not None and not cancelled:
+-            committed = list(job.prompt) + q.out[:st.pos - len(job.prompt)]
++        st = q.stepper
++        preempted = cancelled and job.background and not job.cancel and job.out is not None
++        if st is not None and not cancelled:
+             with self._on(slot) as e:
+-                self._remember(slot, take_snapshot(e, committed, hidden if self.use_mtp else None,
+-                                                   mtp=self.use_mtp))
+-        else:                                   # the reply's rows are not kept
++                pending = st.close()
++                if job.draft and st.policy is not None and st.keeps and not q.grid:
++                    committed = list(job.prompt) + st.out[:e.st.pos - len(job.prompt)]
++                    self._remember(slot, take_snapshot(e, committed, pending, mtp=st.use_mtp, drafter=st.drafter))
++                elif st.policy is None:         # the reply's rows are not kept
++                    self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= len(job.prompt)]
++        else:
+             self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= len(job.prompt)]
+-        tokens = q.out[:job.max_tokens]
+-        job.stats.update(decode_s=time.perf_counter() - q.start, rounds=q.rounds, batched_rounds=q.shared,
+-                         min_rows=1 + min(q.depths, default=0),
+-                         tokens_per_round=round((len(tokens) - 1) / max(q.rounds, 1), 3),
+-                         sha256=hashlib.sha256(json.dumps(tokens).encode()).hexdigest()[:16], keeps=q.keeps,
+-                         cancelled=cancelled)
++        tokens = st.out[:job.max_tokens] if st is not None else []
++        sha = hashlib.sha256(json.dumps(tokens).encode()).hexdigest()[:16]
++        self.log.append(dict(slot=slot, sha256=sha, tokens=len(tokens), keeps=list(st.keeps) if st else [],
++                             arms="".join(st.arms) if st else "", cancelled=cancelled))
++        if preempted:                           # rank 0 queued it again; its caller keeps waiting
++            job.stats["preempted"] = job.stats.get("preempted", 0) + 1
++            return
++        if st is not None:
++            job.stats.update(decode_s=round(time.perf_counter() - st.start, 4), rounds=st.rounds,
++                             batched_rounds=st.shared, min_rows=1 + min(st.depths, default=0),
++                             tokens_per_round=round((len(tokens) - 1) / max(st.rounds, 1), 3), sha256=sha,
++                             keeps=st.keeps, drafters="".join(st.arms))
++        job.stats.update(cancelled=cancelled)
+         if job.out is not None:
+             job.out.put(None)
+diff --git c/src/tensorfold/families/glm5_next/cuda/batchplan.py i/src/tensorfold/families/glm5_next/cuda/batchplan.py
+new file mode 100644
+index 0000000..4ec490f
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/batchplan.py
+@@ -0,0 +1,249 @@
++"""Host-side scheduling for GLM53_TF_BATCH rounds (patches/0120, ``batch.py``). Pure Python, no torch: the unit
++tests run anywhere.
++
++Rank 0 decides everything that depends on the outside world (clients, clocks, free memory) and ships it to rank 1
++as one int list before every round (``encode_plan`` / ``parse_plan``):
++
++    [n_cancel, slot..., n_admit, (slot, resume length, header length, header...)..., n_piece, slot...]
++
++- cancels: slots whose request ends now (the client went away, or a background request steps aside);
++- admits: queued requests placed in free slots, each with its request header (``encode_header``: sampling, stop,
++  max tokens, rank 0's cost-depth flag, its ``tf_knobs`` block and policy code, all resolved on rank 0);
++- pieces: slots that prefill their next piece of prompt this round (at most one; ``Fairness``).
++
++Everything else in a round (piece bounds, drafts, windows, sampling, keeps, when a request ends, the round's model
++cost for batch-aware depths) is a function of shared inputs, computed alike on both ranks.
++"""
++
++from __future__ import annotations
++
++import struct
++from dataclasses import dataclass
++from typing import Sequence
++
++from . import knobs as knobs_mod
++
++HEADER_FIXED = 12            # ints before the knob block: see ``encode_header``
++
++
++# -- request headers ---------------------------------------------------------------------------------------------
++def f64_ints(x: float) -> list[int]:
++    return list(struct.unpack("<2i", struct.pack("<d", float(x))))
++
++
++def ints_f64(lo: int, hi: int) -> float:
++    return struct.unpack("<d", struct.pack("<2i", int(lo), int(hi)))[0]
++
++
++@dataclass
++class Header:
++    """What rank 1 needs of a request (besides its prompt)."""
++
++    max_tokens: int
++    stop_eos: bool
++    draft: bool
++    seed: int                  # 0 with temperature 0
++    temperature: float
++    top_k: int
++    top_p: float
++    cost: int                  # patches/0071: rank 0's cost-depth flag
++    values: dict               # patches/0090: every knob in ``knobs.HEADER``
++    code: list                 # the policy code (lookup settings included)
++
++
++def encode_header(h: Header) -> list[int]:
++    seed = int(h.seed) & 0xFFFFFFFFFFFFFFFF
++    out = [int(h.max_tokens), int(bool(h.stop_eos)), int(bool(h.draft)), seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF,
++           seed >> 62, *f64_ints(h.temperature), int(h.top_k), *f64_ints(h.top_p), int(h.cost)]
++    assert len(out) == HEADER_FIXED
++    return out + knobs_mod.encode(h.values) + [int(c) for c in h.code]
++
++
++def decode_header(ints: Sequence[int]) -> Header:
++    ints = [int(v) for v in ints]
++    max_tokens, stop_eos, draft, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, cost = ints[:HEADER_FIXED]
++    values, code = knobs_mod.decode(ints[HEADER_FIXED:])
++    seed = (s_top << 62) | (s_hi << 31) | s_lo
++    return Header(max_tokens, bool(stop_eos), bool(draft), seed, ints_f64(t_lo, t_hi), top_k, ints_f64(p_lo, p_hi),
++                  cost, values, code)
++
++
++# -- round plans -------------------------------------------------------------------------------------------------
++def encode_plan(cancels: Sequence[int], admits: Sequence[tuple[int, int, Sequence[int]]],
++                pieces: Sequence[int]) -> list[int]:
++    plan = [len(cancels), *cancels, len(admits)]
++    for slot, cached, header in admits:
++        plan += [int(slot), int(cached), len(header), *header]
++    return plan + [len(pieces), *pieces]
++
++
++def parse_plan(plan: Sequence[int]) -> tuple[list[int], list[tuple[int, int, list[int]]], list[int]]:
++    plan = [int(v) for v in plan]
++    nc = plan[0]
++    cancels = plan[1:1 + nc]
++    at = 1 + nc
++    na = plan[at]
++    at += 1
++    admits = []
++    for _ in range(na):
++        slot, cached, n = plan[at:at + 3]
++        admits.append((slot, cached, plan[at + 3:at + 3 + n]))
++        at += 3 + n
++    npieces = plan[at]
++    pieces = plan[at + 1:at + 1 + npieces]
++    if at + 1 + npieces != len(plan):
++        raise RuntimeError(f"a round plan of {len(plan)} ints parsed to {at + 1 + npieces}: both ranks must run the "
++                           "same patched TensorFold")
++    return cancels, admits, pieces
++
++
++# -- prefill pieces ---------------------------------------------------------------------------------------------
++def piece_rows(piece: int, grid: int) -> int:
++    """A piece's tokens: ``piece`` (GLM53_TF_BATCH_PIECE), for a fast prefill (grid C > 0) rounded down to a multiple
++    of C and at least C (a fast piece must end on the chunk grid to leave a resumable snapshot)."""
++
++    piece = max(1, int(piece))
++    if grid:
++        return max(grid, piece // grid * grid)
++    return piece
++
++
++def piece_end(done: int, n: int, piece: int, grid: int) -> int:
++    """Where the piece starting at ``done`` of an ``n``-token prompt ends: the prompt's end, or the next piece bound.
++    Fast pieces start on the grid (a grid snapshot or 0), so they end on it too."""
++
++    if grid and done % grid:
++        raise ValueError(f"a fast prefill piece starts at {done}, off the chunk grid {grid}")
++    step = piece_rows(piece, grid)
++    return n if n - done <= step else done + step
++
++
++class Fairness:
++    """Rank 0: when a prefill piece may run while other sequences decode. ``share`` is the part of the time prefill
++    pieces may take (GLM53_TF_BATCH_PREFILL_SHARE, 0 < share <= 1): a piece of t seconds is followed by at least
++    t (1 - share) / share seconds of decode rounds (and at least one round) before the next piece. With nothing
++    decoding, pieces run back to back (one a round, so new arrivals are admitted between them)."""
++
++    def __init__(self, share: float = 0.5) -> None:
++        if not 0.0 < share <= 1.0:
++            raise ValueError(f"GLM53_TF_BATCH_PREFILL_SHARE={share}: expected 0 < share <= 1")
++        self.share = float(share)
++        self.debt = 0.0          # decode seconds owed before the next piece
++        self.rounds = 1          # decode rounds since the last piece
++
++    def allow(self, decoding: bool) -> bool:
++        if not decoding:
++            return True
++        return self.rounds >= 1 and self.debt <= 0.0
++
++    def after(self, piece_s: float, round_s: float, prefilling: bool) -> None:
++        """After a round: its piece's seconds (0 without one) and its decode seconds."""
++
++        if piece_s > 0.0:
++            self.debt = max(self.debt, 0.0) + piece_s * (1.0 - self.share) / self.share
++            self.rounds = 0
++        if round_s > 0.0:
++            self.debt -= round_s
++            self.rounds += 1
++        if not prefilling:
++            self.debt, self.rounds = 0.0, 1
++
++
++def pick_piece(prefilling: Sequence[tuple[int, int, int]]) -> int | None:
++    """The slot whose prompt prefills next, from (slot, tokens left, admission order): the fewest tokens left (a
++    short request behind a long prompt gets its first token soon), ties to the earliest admitted."""
++
++    if not prefilling:
++        return None
++    return min(prefilling, key=lambda p: (p[1], p[2], p[0]))[0]
++
++
++# -- queue and placement -------------------------------------------------------------------------------------------
++def admission_order(background: Sequence[bool]) -> list[int]:
++    """Queue indices in admission order: every foreground request in arrival order, then background ones."""
++
++    return [i for i, b in enumerate(background) if not b] + [i for i, b in enumerate(background) if b]
++
++
++def victim(slots: Sequence[tuple[int, bool, int]], foreground_waiting: bool, free: int) -> int | None:
++    """A running background request that steps aside (its caller receives the same tokens when it runs again from
++    the start), from (slot, background, admitted round): only when a foreground request waits and no slot is free;
++    the most recently admitted one (it has done the least)."""
++
++    if not foreground_waiting or free:
++        return None
++    bg = [(adm, slot) for slot, b, adm in slots if b]
++    return max(bg)[1] if bg else None
++
++
++def is_title_request(messages, tools) -> bool:
++    """A client's session-title request (``tensorfold.server.app.is_title_request``): a short system prompt about a
++    title, no tools, short messages. Runs as a background request."""
++
++    if tools or not messages or not isinstance(messages, list) or not isinstance(messages[0], dict) \
++            or messages[0].get("role") != "system":
++        return False
++    size = sum(len(m.get("content")) if isinstance(m, dict) and isinstance(m.get("content"), str) else 4096
++               for m in messages)
++    text = messages[0].get("content")
++    return size < 4096 and isinstance(text, str) and "title" in text.lower()
++
++
++# -- the round's model cost (batch-aware draft depths) -------------------------------------------------------------
++def verify_ms(table: Sequence[float], rows: int) -> float:
++    """Model ms of a forward of ``rows`` rows from the calibrated window costs (1..len(table) rows), extended past
++    the table along the slope of its upper half (rows of other sequences add experts as extra draft rows do)."""
++
++    table = list(table)
++    n = len(table)
++    if rows <= n:
++        return float(table[max(rows, 1) - 1])
++    half = n // 2
++    slope = (table[-1] - table[half - 1]) / max(n - half, 1) if n >= 2 else 0.0
++    return float(table[-1] + max(slope, 0.0) * (rows - n))
++
++
++class RoundCosts:
++    """Committed tokens and model ms of the recent rounds of all sequences (the same on both ranks: the costs are
++    the load-time table and the tokens are committed ones). ``rate()`` is the aggregate rate a round's rows must beat
++    when more than one sequence shares the rounds (a row of one sequence slows every other one), else None (a
++    request alone keeps its own running rate)."""
++
++    WINDOW = 16
++
++    def __init__(self, costs: dict) -> None:
++        self.costs = costs
++        self.verify = list(costs["verify"])
++        self.rounds: list[tuple[int, float]] = []
++        self.shared = False
++
++    def round_ms(self, parts: Sequence[tuple[str, int, int, int]]) -> float:
++        """parts: per sequence (arm, rows, MTP steps, backlog); "s" serial, "l" lookup, "m" MTP, "f" DFlash2."""
++
++        from .lookup import round_ms
++
++        total = sum(r for _, r, _, _ in parts)
++        ms = verify_ms(self.verify, total)
++        for arm, rows, steps, backlog in parts:
++            if arm in ("m", "f"):
++                ms += round_ms(self.costs, arm, rows, steps, backlog) - round_ms(self.costs, "l", rows, 0, 0)
++        return ms
++
++    def record(self, parts: Sequence[tuple[str, int, int, int]], tokens: int) -> None:
++        self.rounds.append((int(tokens), self.round_ms(parts)))
++        del self.rounds[:-self.WINDOW]
++        self.shared = len(parts) > 1
++
++    def rate(self) -> float | None:
++        if not self.shared or not self.rounds:
++            return None
++        ms = sum(m for _, m in self.rounds)
++        return sum(k for k, _ in self.rounds) / ms if ms > 0 else None
++
++    def table(self, others: int) -> list[float]:
++        """A sequence's window costs when ``others`` rows of other sequences share its forward: row k's marginal ms is
++        the slope of the curve at others + k (only the differences matter to ``depth.best_k``)."""
++
++        if others <= 0:
++            return list(self.verify)
++        return [verify_ms(self.verify, others + k + 1) for k in range(len(self.verify))]
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py i/src/tensorfold/families/glm5_next/cuda/engine.py
+index 5f8837a..78017b6 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ i/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -298,33 +298,26 @@ class GlmEngine:
+         self.eos = tuple(w.cfg.eos)
+         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
+         self.cache: list = []               # decode.Snapshot entries, each a prefix of the next
+-        # GLM53_TF_BATCH=N (patches/0030): up to N requests decode together, one forward a round over all their
+-        # verify windows (``batch.py``); 1 (default) serves one request at a time as upstream. Both ranks must agree.
++        # GLM53_TF_BATCH=N (patches/0030, 0120): up to N requests decode together, one forward a round over all their
++        # verify windows (``batch.py``, built below once the knob defaults exist); 1 (default) serves one request at
++        # a time as upstream. Both ranks must agree.
+         self.batch = None
+         n = int(os.environ.get("GLM53_TF_BATCH", "1") or 1)
+         both = self._gather_ints([n])
+         if both[0] != both[1]:
+             raise RuntimeError(f"the two ranks were started with different GLM53_TF_BATCH: {both[0][0]}, {both[1][0]}")
+-        if n > 1:
+-            from .batch import Batcher
+-
+-            self.batch = Batcher(self, n)
+-            if self.e.fast_prefill and rank == 0:
+-                print("[tensorfold] GLM53_TF_FAST_PREFILL is ignored with GLM53_TF_BATCH > 1 (batched slots keep exact "
+-                      "snapshots after replies)", flush=True)
+-            self.e.fast_prefill = False      # patches/0080: the batch scheduler's snapshots are exact ones
+-            if self.e.lean is not None:      # patches/0082: only fast chunks use the lean set
+-                self.e.lean = self.e.rows_from = None
+-                self.e.prefill_max = self.e.rows
+-                torch.cuda.empty_cache()
+         # patches/0070: GLM53_TF_CALIB_ONLINE=1, rank 0 refines the verify windows' costs from the windows rounds
+         # run and sends the table in each request's header (calib.py); both ranks use the header's table
+         from . import calib
+ 
+         self.base_costs = self.costs
+-        self.online = (calib.OnlineCosts(self.costs["verify"]) if calib.online() and rank == 0 and self.batch is None
++        self.online = (calib.OnlineCosts(self.costs["verify"]) if calib.online() and rank == 0 and n == 1
+                        else None)
+         self.calib_on = calib.online()      # patches/0090: the default of ``tf_knobs.calib_online``
++        if n > 1:                           # patches/0120: per-request knobs, fast / lean prefill and every drafter
++            from .batch import Batcher
++
++            self.batch = Batcher(self, n)
+         self.store = self._sessions()       # patches/0110
+ 
+     def _sessions(self):
+@@ -729,9 +722,7 @@ class GlmEngine:
+         """Rank 0: one request, mirrored by rank 1 (``follow``). ``draft=False``: serial decoding and a fresh
+         prefill, the reference drafted replies must equal."""
+ 
+-        if self.batch is not None:
+-            if getattr(self.request, "knobs", None):
+-                raise ValueError("tf_knobs: per-request knobs need GLM53_TF_BATCH=1")
++        if self.batch is not None:          # patches/0120: the request's knobs, policy and priority travel with it
+             return self.batch.generate(prompt, max_tokens, sampling, on_tokens, draft)
+         # patches/0090: the request's knobs (validated), everything else at this rank's current (load-time) values
+         asked = self.parse_knobs(getattr(self.request, "knobs", None))
+diff --git c/src/tensorfold/families/glm5_next/cuda/knobs.py i/src/tensorfold/families/glm5_next/cuda/knobs.py
+index 20229d7..c66a484 100644
+--- c/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ i/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -79,15 +79,14 @@ def parse(raw: Any, *, rows_max: int, longctx_ok: bool = True, batch: bool = Fal
+           fp8_ok: bool = True) -> dict[str, Any]:
+     """A request's ``tf_knobs`` as {key: value} (only the keys it sets), or ValueError naming the problem.
+     ``rows_max``: the most prefill rows the buffers hold; ``longctx_ok``: long-context graphs can be turned on
+-    (the engine was loaded with GLM53_TF_LONGCTX_GRAPHS=1); ``batch``: the engine batches requests (no knobs);
+-    ``fp8_ok``: the FP8 prefill kernels can run here (patches/0092)."""
++    (the engine was loaded with GLM53_TF_LONGCTX_GRAPHS=1); ``batch``: the engine batches requests (patches/0120:
++    every knob but ``calib_online``, whose table would time shared rounds); ``fp8_ok``: the FP8 prefill kernels can
++    run here (patches/0092)."""
+ 
+     if raw is None:
+         return {}
+     if not isinstance(raw, Mapping):
+         raise ValueError("tf_knobs must be an object, e.g. {\"prefill_rows\": 256, \"lookup\": 0}")
+-    if raw and batch:
+-        raise ValueError("tf_knobs: per-request knobs need GLM53_TF_BATCH=1 (batched requests share their rounds)")
+     out: dict[str, Any] = {}
+     for key, value in raw.items():
+         if key in LOAD_ONLY:
+@@ -115,6 +114,9 @@ def parse(raw: Any, *, rows_max: int, longctx_ok: bool = True, batch: bool = Fal
+                              f"{rows_max} (GLM53_TF_PREFILL_ROWS_MAX at load)")
+         if key == "fp8_prefill" and value and not fp8_ok:              # patches/0092
+             raise ValueError("tf_knobs.fp8_prefill=1: this GPU / Triton has no FP8 (e4m3) tensor-core dots")
++        if key == "calib_online" and value and batch:                  # patches/0120
++            raise ValueError("tf_knobs.calib_online=1: the online cost table times one request's rounds; with "
++                             "GLM53_TF_BATCH > 1 requests share their rounds")
+         if key == "longctx_graphs" and value and not longctx_ok:
+             raise ValueError("tf_knobs.longctx_graphs=1: this engine was loaded with GLM53_TF_LONGCTX_GRAPHS=0 (no "
+                              "long-context graph buffers); load with the default 1 to switch it per request")

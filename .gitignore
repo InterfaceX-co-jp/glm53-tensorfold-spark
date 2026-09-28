@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# run output
+results/*.log
+results/*.out
+results/tmp/
+*.log
+*.out
+
+# local config: copy config/*.env.example to config/<name>.env and fill it in
+config/*.env
+.env
+
+# private names for scripts/check-public.sh
+.check-public.local
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

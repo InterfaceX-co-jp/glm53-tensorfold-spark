@@ -1,0 +1,74 @@
+{
+ "label": "",
+ "base": "http://127.0.0.1:8000",
+ "model": "GLM-5.3-Flash-EXL3",
+ "started": "2026-09-28T00:59:44+0700",
+ "args": {
+  "base": "http://127.0.0.1:8000",
+  "model": "GLM-5.3-Flash-EXL3",
+  "key": "",
+  "suites": "ctx",
+  "reps": 5,
+  "long_tokens": 512,
+  "edit_tokens": 1024,
+  "ctx": "32000,128000",
+  "extra": "{}",
+  "label": "",
+  "out": "results/Y1/ctx.json"
+ },
+ "suites": {
+  "ctx": [
+   {
+    "ctx": 32000,
+    "prompt_tokens": 28042,
+    "cold": {
+     "ttft_s": 23.423783270001877,
+     "decode_s": 2.8966323729982832,
+     "prompt_tokens": 28042,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 88.03326317037994,
+     "sha256": "2ac106c6ed0dc59f",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "warm": {
+     "ttft_s": 0.13035244100319687,
+     "decode_s": 2.8047692620020825,
+     "prompt_tokens": 28042,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 90.91656966390794,
+     "sha256": "2ac106c6ed0dc59f",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "prefill_tps": 1197.2
+   },
+   {
+    "ctx": 128000,
+    "prompt_tokens": 112042,
+    "cold": {
+     "ttft_s": 95.64612553899497,
+     "decode_s": 2.966769975006173,
+     "prompt_tokens": 112042,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 85.95206306800696,
+     "sha256": "2ac106c6ed0dc59f",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "warm": {
+     "ttft_s": 0.27592000399454264,
+     "decode_s": 2.9214321310064406,
+     "prompt_tokens": 112042,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 87.2859572172063,
+     "sha256": "2ac106c6ed0dc59f",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "prefill_tps": 1171.4
+   }
+  ]
+ },
+ "finished": "2026-09-28T01:01:55+0700"
+}

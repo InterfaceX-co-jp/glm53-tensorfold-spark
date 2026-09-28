@@ -1,0 +1,61 @@
+diff --git i/src/tensorfold/cuda/server.py w/src/tensorfold/cuda/server.py
+index 057c121..66ee67a 100644
+--- i/src/tensorfold/cuda/server.py
++++ w/src/tensorfold/cuda/server.py
+@@ -30,6 +30,8 @@ _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
+ _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+ _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
+ _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
++# GLM-4.5 to 5.3: <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>
++_GLM_ARG_RE = re.compile(r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL)
+ 
+ 
+ # -- text helpers (same rules as the Mac lane server) ---------------------------------------
+@@ -104,8 +106,37 @@ def _tool_name(tool: dict[str, Any]) -> str:
+     return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
+ 
+ 
++def _glm_call(block: str, tools: list[dict[str, Any]]) -> tuple[str | None, dict[str, Any]]:
++    """GLM's ``name<arg_key>k</arg_key><arg_value>v</arg_value>...`` body, the way vLLM's glm47 parser reads it:
++    the name is the text before the first ``<arg_key>``; a value is kept as text when the tool's schema types the
++    parameter as a string, and read as JSON otherwise (falling back to the text)."""
++
++    cut = block.find("<arg_key>")
++    name = (block if cut < 0 else block[:cut]).strip()
++    if not name or "<" in name or "\n" in name:
++        return None, {}
++    schema: dict[str, Any] = {}
++    for t in tools:
++        if _tool_name(t).lower() == name.lower():
++            fn = t.get("function") if isinstance(t.get("function"), dict) else t
++            schema = ((fn.get("parameters") or {}).get("properties") or {}) if isinstance(fn, dict) else {}
++    args: dict[str, Any] = {}
++    for m in _GLM_ARG_RE.finditer(block):
++        key, raw = m.group(1).strip(), m.group(2)
++        kind = (schema.get(key) or {}).get("type") if isinstance(schema.get(key), dict) else None
++        if kind == "string":
++            args[key] = raw
++            continue
++        try:
++            args[key] = json.loads(raw)
++        except (json.JSONDecodeError, ValueError):
++            args[key] = raw
++    return name, args
++
++
+ def parse_tool_calls(text: str, tools: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]] | None]:
+-    """Qwen ``<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`` or JSON bodies."""
++    """Qwen ``<tool_call><function=name><parameter=k>v</parameter></function></tool_call>``, GLM
++    ``<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>``, or JSON bodies."""
+ 
+     if not tools:
+         return text, None
+@@ -131,6 +162,8 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]]) -> tuple[str, list[
+             if m:
+                 name = m.group(1).strip()
+                 args = {p.group(1).strip(): p.group(2) for p in _TOOL_PARAMETER_BLOCK_RE.finditer(m.group(2))}
++            else:
++                name, args = _glm_call(block, tools)
+         if not name or str(name).lower() not in known:
+             residue.append(match.group(0))
+             continue

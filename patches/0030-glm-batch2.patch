@@ -1,0 +1,715 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/app.py w/src/tensorfold/families/glm5_next/cuda/app.py
+index 4e68213..9e02cb3 100644
+--- i/src/tensorfold/families/glm5_next/cuda/app.py
++++ w/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -38,6 +38,12 @@ class GlmApp(App):
+     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
+         super().__init__(engine, model_dir, served, **kwargs)
+         self.template = ThinkingOffTemplate(self.template)
++        if getattr(engine, "batch", None) is not None:
++            # GLM53_TF_BATCH (patches/0030): the engine queues concurrent requests itself, so ``App.run`` must not
++            # serialize them
++            import contextlib
++
++            self.lock = contextlib.nullcontext()
+ 
+     def check(self, body: dict[str, Any]) -> str | None:
+         """``App.check``, then the context: the prompt as ``run`` renders it plus ``max_tokens`` must fit the
+diff --git i/src/tensorfold/families/glm5_next/cuda/attention.py w/src/tensorfold/families/glm5_next/cuda/attention.py
+index 59134c7..f81ef7a 100644
+--- i/src/tensorfold/families/glm5_next/cuda/attention.py
++++ w/src/tensorfold/families/glm5_next/cuda/attention.py
+@@ -102,9 +102,11 @@ class AttnScratch:
+ 
+ 
+ def attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, pos: torch.Tensor, scratch: AttnScratch,
+-              *, scale: float, nch: int | None = None) -> torch.Tensor:
++              *, scale: float, nch: int | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
+     """q [R, H, D] (rows at positions pos .. pos + R - 1), caches [capacity, H, D] holding keys through pos + R - 1,
+-    pos an int32 [1] device tensor. ``nch``: chunks to visit (default: all the scratch holds). -> [R, H, D] bf16."""
++    pos an int32 [1] device tensor. ``nch``: chunks to visit (default: all the scratch holds). ``out``: where the
++    rows go (contiguous [R, H, D]; default scratch.out[:R]; batched rounds give each sequence its rows of the
++    window). -> [R, H, D] bf16."""
+ 
+     R, H, D = q.shape
+     nch = scratch.nch if nch is None else min(nch, scratch.nch)
+@@ -117,7 +119,10 @@ def attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, pos
+     pl = scratch.pl[:nch * R * H]
+     _chunks[(triton.cdiv(R, BR), H, nch)](q, k_cache, v_cache, pos, po, pm, pl, R, H=H, D=D, CH=CHUNK, SCALE=scale,
+                                           BRT=BR, num_warps=4, num_stages=1)
+-    out = scratch.out[:R]
++    if out is None:
++        out = scratch.out[:R]
++    elif out.shape != (R, H, D) or not out.is_contiguous():
++        raise ValueError("attention: out must be contiguous [R, H, D]")
+     _merge[(R, H)](po, pm, pl, out, R, H=H, D=D, NCH=nch, num_warps=4)
+     return out
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+new file mode 100644
+index 0000000..1813089
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -0,0 +1,622 @@
++"""Continuous batching for GLM-5.3-Flash's CUDA engine (patches/0030, ``GLM53_TF_BATCH=N``, N >= 2): up to N
++requests decode together, and each round is ONE forward over every active request's verify window.
++
++Why it pays: decode reads the weights once a forward (about 5 GB a rank), and a row from a second sequence costs
++what an extra draft row of one sequence costs (mostly the experts it adds). Rows never depend on their
++window-mates (``forward.py``), so a round's rows can come from different sequences as long as the work that reads
++per-sequence state is done per sequence.
++
++Data. One ``forward.State`` per slot (slot 0 is the engine's own ``e.st``), the engine's ``Buffers`` shared. A
++round's rows are the active slots' windows back to back (slot order). ``compute_multi`` runs everything that is
++row-local once over all rows: the embedding, hyper-connections, norms, every matmul (KDA/DSA projections, the
++indexer's, the dense MLPs, the MoE router, routed and shared experts), the all-gathers and the head. Per slot, on
++its rows only: the KDA chain over the slot's recurrent state and conv window, the attention cache write and
++attention at the slot's committed length, the indexer cache update and (past 2,051 tokens) the sparse
++selection. ``forward.commit`` then keeps each slot's prefix of its own rows, as for a lone request.
++
++Scheduling. A loop thread on rank 0 runs rounds: it takes client cancels and admits queued requests into free
++slots (the slot whose kept snapshots resume the longest prefix of the prompt), prefills each admitted prompt on its
++slot (the others wait, phase 1), then runs one verify round over every active slot. Sampling, the accept rule and
++the drafts are keyed per request exactly as in a lone request, so every reply is byte-identical to the same
++request served alone (and to serial decoding).
++
++Drafting. MTP drafts only, per slot (the MTP head's cache lives in the slot's State; the head's CUDA graphs are
++captured per slot). The DFlash2 drafter holds one sequence's context, so in batch mode every drafted policy runs
++as MTP drafts with its depth rule (``auto``: c3:0.35 greedy, a:0.6:0.85 sampled). Without the MTP head, batched
++requests decode serially (one row a round each). Drafts only propose, so none of this changes a token.
++
++Tensor parallelism. Rank 0 alone decides each round's cancels and admissions (slot, resume length, request header)
++and shares them with ``GlmEngine._share`` before the round; everything else (prefill, drafts, windows, sampling,
++keeps, when a request ends) is computed alike on both ranks from the same inputs. Rank 1 runs the same rounds in
++``follow``.
++
++CUDA graphs. Slot 0 alone replays the engine's own graphs. Other compositions are captured lazily per (slots,
++window rows, KDA parities) while every window has at most ``GLM53_TF_BATCH_GRAPH_ROWS`` rows (default 4) and the
++context is dense; the rest runs eager. ``GLM53_TF_BATCH_GRAPHS=0`` keeps everything eager.
++"""
++
++from __future__ import annotations
++
++import collections
++import hashlib
++import json
++import os
++import queue
++import threading
++import time
++import traceback
++from contextlib import contextmanager
++from dataclasses import dataclass, field
++from types import SimpleNamespace
++from typing import Any, Callable, Sequence
++
++import torch
++
++from . import glue, kda as kda_mod, qmm, sparse
++from .attention import attention, kv_write
++from .forward import State, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
++
++MAX_GRAPHS = 192                         # lazily captured batch compositions (the rest run eager)
++
++
++# -- the batched forward ------------------------------------------------------------------------------------------
++def _starts(Rs: Sequence[int]) -> list[int]:
++    offs, o = [], 0
++    for R in Rs:
++        offs.append(o)
++        o += R
++    return offs
++
++
++def _kda(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[int], T: int) -> torch.Tensor:
++    """``forward.kda_block`` over T rows of several sequences: the projections once, the chain per sequence."""
++
++    c = w.cfg
++    k = layer.kda
++    li = sts[0].kda_index[layer.index]
++    p = b.bproj[:T]
++    qmm.matmul(b.normed[:T], k.proj, b.xs[:T], out=p, part=b.sk)
++    fa = p[:, k.fa_off:k.fa_off + 128]
++    ga = p[:, k.ga_off:k.ga_off + 128]
++    qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:T]), out=b.ka[:T], part=b.sk)
++    qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:T]), out=b.kg[:T], part=b.sk)
++    for st, R, o in zip(sts, Rs, offs):
++        sp = st.proj[li, :R]                 # the slot's window rows: its chain reads them, its commit shifts them
++        sp.copy_(p[o:o + R])
++        cur = st.cur[li]
++        y = kda_mod.chain(sp, k.b_off, b.ka[o:o + R], b.kg[o:o + R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
++                          k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
++        b.bkout[o:o + R].copy_(y)
++    out = b.bkout[:T]
++    return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:T]), T)
++
++
++def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[int], T: int,
++         nchs: Sequence[int] | None, host_pos: Sequence[int] | None) -> torch.Tensor:
++    """``forward.dsa_block`` over T rows of several sequences: projections once, cache and attention per sequence."""
++
++    c = w.cfg
++    a = layer.dsa
++    qmm.matmul(b.normed[:T], a.proj, b.xs[:T], out=b.dp[:T], part=b.sk)
++    glue.rmsnorm(b.dp[:T, :c.q_lora], a.q_norm, c.eps, b.qr[:T], b.xs_qr[:T])
++    glue.rmsnorm(b.dp[:T, c.q_lora:], a.kv_norm, c.eps, b.lat[:T], b.xs_lat[:T])
++    HL = a.heads
++    qmm.matmul(b.qr[:T], a.q_b, b.xs_qr[:T], out=b.q[:T].view(T, HL * c.qk_dim), part=b.sk)
++    qmm.matmul(b.lat[:T], a.kv_k, b.xs_lat[:T], out=b.kn[:T].view(T, HL * c.qk_dim), part=b.sk)
++    qmm.matmul(b.lat[:T], a.kv_v, b.xs_lat[:T], out=b.vn[:T].view(T, HL * c.v_dim), part=b.sk)
++    indexed = sts[0].index is not None
++    ix = a.index
++    if indexed:
++        qmm.matmul(b.normed[:T], ix.kw, b.xs[:T], out=b.ikr[:T], part=b.sk)
++        glue.router(b.normed[:T], ix.gate, b.igr[:T])
++    scale = c.qk_dim ** -0.5
++    for i, (st, R, o) in enumerate(zip(sts, Rs, offs)):
++        di = st.dsa_index[layer.index]
++        kc, vc = st.kc[di], st.vc[di]
++        kv_write(b.kn[o:o + R], b.vn[o:o + R], kc, vc, st.pos_dev)
++        hp = host_pos[i] if host_pos is not None else None
++        sparse_rows = indexed and hp is not None and hp + R - 1 >= c.dense_limit
++        if indexed:
++            ik, ig, pk = st.index[di]
++            sparse.index_update(b.ikr[o:o + R, :c.index_dim], b.igr[o:o + R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
++                                st.pos_dev)
++        out = b.attn.out[o:o + R]
++        if not (sparse_rows and hp >= c.dense_limit):
++            attention(b.q[o:o + R], kc, vc, st.pos_dev, b.attn, scale=scale,
++                      nch=nchs[i] if nchs is not None else None, out=out)
++        if sparse_rows:
++            qmm.matmul(b.qr[o:o + R], ix.qb, b.xs_qr[o:o + R], out=b.qi[o:o + R], part=b.sk)
++            tokens, counts = sparse.select_tokens(b.qi[o:o + R], b.ikr[o:o + R, c.index_dim:], pk, hp, R,
++                                                  pk.shape[0] - 2, st.pos_dev)
++            sparse.sparse_attention(b.q[o:o + R], kc, vc, tokens, counts, out, scale)
++    o_all = b.attn.out[:T].view(T, HL * c.v_dim)
++    return out_proj(w, b, o_all, a.o, qmm.group_sums(o_all, b.xs_ao[:T]), T)
++
++
++def compute_multi(w, sts: Sequence[State], b, Rs: Sequence[int], *, logits: bool = True,
++                  nchs: Sequence[int] | None = None, host_pos: Sequence[int] | None = None):
++    """``forward.compute`` for staged rows of several sequences: sequence i's R_i rows follow sequence i-1's, at
++    positions sts[i].pos .. + R_i - 1. Capturable (static buffers, device positions) with ``nchs``/``host_pos``
++    None. -> logits [sum R, V/world] (a view of b.logits)."""
++
++    c = w.cfg
++    offs = _starts(Rs)
++    T = sum(Rs)
++    glue.embed(b.ids[:T], w.embed, c.hidden, c.streams, b.x[:T])
++    for layer in w.layers:
++        x = b.x[:T]
++        h = layer.attn_hc
++        glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:T], b.xs[:T], b.post[:T], b.comb[:T],
++                    b.hcpart[:T], c.eps, c.hc_eps, c.hc_iters)
++        if layer.kind == "kda":
++            g = _kda(layer, w, sts, b, Rs, offs, T)
++        else:
++            g = _dsa(layer, w, sts, b, Rs, offs, T, nchs, host_pos)
++        glue.hc_post(x, x, g, b.post[:T], b.comb[:T])
++        h = layer.ffn_hc
++        glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:T], b.xs[:T], b.post[:T], b.comb[:T],
++                    b.hcpart[:T], c.eps, c.hc_eps, c.hc_iters)
++        g = mlp_block(layer, w, b, T) if layer.mlp is not None else moe_block(layer, w, b, T)
++        glue.hc_post(x, x, g, b.post[:T], b.comb[:T])
++        for slot in b.tap_at.get(layer.index, ()):
++            glue.stream_mean(b.x[:T], b.taps[slot][:T])
++    glue.stream_mean(b.x[:T], b.hidden[:T])
++    if not logits:
++        return None
++    glue.rmsnorm(b.hidden[:T], w.norm, c.eps, b.fnormed[:T], b.fxs[:T])
++    return qmm.matmul(b.fnormed[:T], w.head, b.fxs[:T], out=b.logits[:T], part=b.sk)
++
++
++def stage_multi(w, sts: Sequence[State], b, windows: Sequence[Sequence[int]]) -> int:
++    """``forward.stage`` for several sequences' windows (their token ids back to back)."""
++
++    tokens = [int(t) for win in windows for t in win]
++    T = len(tokens)
++    if T > b.rows:
++        raise ValueError(f"a batched round of {T} rows, buffers hold {b.rows}")
++    for st, win in zip(sts, windows):
++        check_room(w, st, len(win))
++    b.staged.synchronize()
++    b.ids_host[:T].numpy()[:] = tokens
++    b.ids[:T].copy_(b.ids_host[:T], non_blocking=True)
++    b.staged.record()
++    return T
++
++
++# -- requests and running sequences -------------------------------------------------------------------------------
++@dataclass
++class Job:
++    prompt: list[int]
++    max_tokens: int
++    sampling: Any
++    stop_eos: bool
++    draft: bool
++    code: list[int]
++    spec: str = ""
++    out: "queue.SimpleQueue | None" = None        # rank 0: token lists, then None (or an exception)
++    cancel: bool = False
++    stats: dict = field(default_factory=dict)
++
++
++@dataclass
++class Seq:
++    job: Job
++    slot: int
++    out: list[int]
++    policy: Any = None                            # decode.DepthPolicy, or None for one row a round
++    drafts: list[int] = field(default_factory=list)
++    start: float = 0.0
++    rounds: int = 0
++    shared: int = 0                               # rounds this sequence shared with another
++    drafted: int = 0
++    accepted: int = 0
++    depths: list[int] = field(default_factory=list)
++    keeps: list[int] = field(default_factory=list)
++
++    def done(self, eos) -> bool:
++        return len(self.out) >= self.job.max_tokens or (self.job.stop_eos and self.out[-1] in eos)
++
++
++HEADER = 15                                       # ints a request's header takes in a round plan
++
++
++class Batcher:
++    """Up to ``n`` concurrent requests on a ``GlmEngine`` (both ranks)."""
++
++    def __init__(self, g, n: int) -> None:
++        from .engine import GRAPH_ROWS, MAX_ROWS
++
++        self.g = g
++        e, w = g.e, g.w
++        self.n = n
++        self.max_rows = MAX_ROWS
++        if n * MAX_ROWS > e.rows:
++            raise ValueError(f"GLM53_TF_BATCH={n}: {n} windows of up to {MAX_ROWS} rows need {n * MAX_ROWS} buffer "
++                             f"rows, the engine has {e.rows} (raise GLM53_TF_PREFILL_ROWS)")
++        self.graph_rows = int(os.environ.get("GLM53_TF_BATCH_GRAPH_ROWS", "4"))
++        self.use_graphs = e.graphs is not None and os.environ.get("GLM53_TF_BATCH_GRAPHS", "1").strip() != "0"
++        both = g._gather_ints([n, int(self.use_graphs), self.graph_rows])
++        if both[0] != both[1]:
++            raise RuntimeError(f"the two ranks were started with different batch settings: rank 0 {both[0]}, "
++                               f"rank 1 {both[1]} (GLM53_TF_BATCH, GLM53_TF_BATCH_GRAPHS, GLM53_TF_BATCH_GRAPH_ROWS)")
++        free0 = torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else 0
++        self.states: list[State] = [e.st] + [State(w, e.st.capacity, e.rows) for _ in range(n - 1)]
++        b = e.buf
++        kda_layers = [l for l in w.layers if l.kind == "kda"]
++        if kda_layers:
++            b.bproj = torch.empty((b.rows, kda_layers[0].kda.proj.n), dtype=torch.bfloat16, device=w.device)
++            b.bkout = torch.empty((b.rows, e.st.scratch_set.out.shape[2]), dtype=torch.bfloat16, device=w.device)
++        self.graphs = [e.graphs] + [self._slot_graphs(st, GRAPH_ROWS) for st in self.states[1:]]
++        self.pool = torch.cuda.graph_pool_handle() if self.use_graphs else None
++        self.multi: dict[tuple, torch.cuda.CUDAGraph] = {}
++        self.caches: list[list] = [[] for _ in range(n)]         # decode.Snapshot entries per slot
++        self.used = [0] * n                                      # round of each slot's last admission
++        self.seqs: list[Seq | None] = [None] * n
++        self.round = 0
++        self.eos = tuple(w.cfg.eos)
++        self.use_mtp = w.mtp is not None
++        if g.rank == 0 and torch.cuda.is_available():
++            torch.cuda.synchronize()
++            extra = (free0 - torch.cuda.mem_get_info()[0]) / 2**30
++            print(f"[tensorfold] batching {n} requests: {n - 1} extra sequence state(s), {extra:.2f} GB on this "
++                  f"rank ({e.st.capacity} cache slots each)", flush=True)
++        self.cv = threading.Condition()
++        self.queue: collections.deque[Job] = collections.deque()
++        self.error: BaseException | None = None
++        self.thread = None
++        if g.rank == 0:
++            self.thread = threading.Thread(target=self._serve, name="glm-batch", daemon=True)
++            self.thread.start()
++
++    def _slot_graphs(self, st: State, rows):
++        """The MTP head's graphs for another slot's state (its main-model rounds go through ``compute_multi``)."""
++
++        e = self.g.e
++        if e.graphs is None:
++            return None
++        from .graphs import Graphs
++
++        return Graphs(SimpleNamespace(w=e.w, st=st, buf=e.buf, mbuf=e.mbuf), main_rows=(), mtp_rows=rows)
++
++    @contextmanager
++    def _on(self, slot: int):
++        """The engine as slot ``slot``'s sequence: its State and its graphs (prefill, drafts, snapshots)."""
++
++        e = self.g.e
++        saved = e.st, e.graphs
++        e.st, e.graphs = self.states[slot], self.graphs[slot]
++        try:
++            yield e
++        finally:
++            e.st, e.graphs = saved
++
++    # -- rank 0: requests in -----------------------------------------------------------------------------------------
++    def _job(self, prompt, max_tokens, sampling, draft: bool, spec: str | None, stop_eos: bool) -> Job:
++        from .engine import encode_policy
++
++        g = self.g
++        prompt = [int(t) for t in prompt]
++        if len(prompt) >= g.limit:
++            raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {g.limit}")
++        max_tokens = max(1, min(int(max_tokens), g.limit - len(prompt)))
++        spec = "0" if not draft or g.serial_only else (spec or g.policy)
++        code = g._effective(encode_policy(spec))
++        return Job(prompt, max_tokens, sampling, bool(stop_eos), bool(draft), code, spec, out=queue.SimpleQueue())
++
++    def _submit(self, jobs: list[Job]) -> None:
++        if self.error is not None:
++            raise RuntimeError("the batch loop stopped") from self.error
++        with self.cv:
++            self.queue.extend(jobs)
++            self.cv.notify()
++
++    def _collect(self, job: Job, on_tokens: Callable | None) -> list[int]:
++        got: list[int] = []
++        while True:
++            item = job.out.get()
++            if item is None:
++                return got
++            if isinstance(item, BaseException):
++                raise RuntimeError("the batch loop failed") from item
++            got.extend(item)
++            if on_tokens is not None and on_tokens(item):
++                job.cancel = True               # the client went away: the next round ends the request
++
++    def generate(self, prompt, max_tokens, sampling, on_tokens, draft: bool = True) -> dict[str, Any]:
++        """``GlmEngine.generate`` in batch mode (the calling thread's policy and stop-at-EOS, as there)."""
++
++        g = self.g
++        job = self._job(prompt, max_tokens, sampling, draft, getattr(g.request, "policy", None),
++                        bool(getattr(g.request, "stop_eos", True)))
++        self._submit([job])
++        self._collect(job, on_tokens)
++        job.stats.update(policy=job.spec, drafts=job.draft)
++        return job.stats
++
++    def generate_batch(self, requests: list[dict]) -> list[tuple[list[int], dict]]:
++        """Requests queued together (so they share rounds from the first): dicts with prompt, max_tokens and
++        optionally sampling, policy, draft, stop_eos (False), on_tokens. -> [(tokens, stats)] in order."""
++
++        jobs = [self._job(r["prompt"], r["max_tokens"], r.get("sampling"), r.get("draft", True), r.get("policy"),
++                          r.get("stop_eos", False)) for r in requests]
++        self._submit(jobs)
++        out = []
++        for r, job in zip(requests, jobs):
++            tokens = self._collect(job, r.get("on_tokens"))
++            job.stats.update(policy=job.spec, drafts=job.draft)
++            out.append((tokens, job.stats))
++        return out
++
++    # -- the round loop ------------------------------------------------------------------------------------------------
++    def _serve(self) -> None:
++        """Rank 0's loop thread: plan a round (shared with rank 1), run it."""
++
++        torch.cuda.set_device(0)
++        try:
++            with torch.no_grad():
++                while True:
++                    cancels, admits = self._plan()
++                    self._execute(cancels, admits)
++        except BaseException as exc:            # noqa: BLE001 - every waiting request must hear about it
++            traceback.print_exc()
++            self.error = exc
++            with self.cv:
++                jobs = [s.job for s in self.seqs if s is not None] + list(self.queue)
++                self.queue.clear()
++            for job in jobs:
++                job.out.put(exc)
++
++    def follow(self) -> None:
++        """Rank 1: run every round rank 0 plans, forever."""
++
++        with torch.no_grad():
++            while True:
++                plan = self.g._share(None)
++                cancels, admits = self._parse(plan)
++                self._execute(cancels, [(slot, cached, self._job_from(header, self.g._share(None)))
++                                        for slot, cached, header in admits])
++
++    def _plan(self) -> tuple[list[int], list[tuple[int, int, Job]]]:
++        with self.cv:
++            while not self.queue and not any(s is not None for s in self.seqs):
++                self.cv.wait()
++            cancels = [i for i, s in enumerate(self.seqs) if s is not None and s.job.cancel]
++            free = [i for i in range(self.n) if self.seqs[i] is None or i in cancels]
++            admits = []
++            while free and self.queue:
++                job = self.queue.popleft()
++                slot, cached = self._place(job, free)
++                free.remove(slot)
++                admits.append((slot, cached, job))
++        plan = [len(cancels), *cancels, len(admits)]
++        for slot, cached, job in admits:
++            plan += [slot, cached] + self._header(job)
++        self.g._share(plan)
++        for _, _, job in admits:
++            self.g._share(job.prompt)
++        return cancels, admits
++
++    @staticmethod
++    def _parse(plan: list[int]):
++        nc = plan[0]
++        cancels = plan[1:1 + nc]
++        at = 1 + nc
++        na = plan[at]
++        at += 1
++        admits = []
++        for _ in range(na):
++            admits.append((plan[at], plan[at + 1], plan[at + 2:at + 2 + HEADER]))
++            at += 2 + HEADER
++        return cancels, admits
++
++    @staticmethod
++    def _header(job: Job) -> list[int]:
++        from .engine import _f64_ints
++
++        s = job.sampling
++        seed = (s.seed if s else 0) & 0xFFFFFFFFFFFFFFFF
++        h = [job.max_tokens, int(job.stop_eos), int(job.draft), seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF,
++             seed >> 62, *_f64_ints(s.temperature if s else 0.0), int(s.top_k) if s else 0,
++             *_f64_ints(s.top_p if s else 1.0)] + list(job.code)
++        assert len(h) == HEADER
++        return h
++
++    @staticmethod
++    def _job_from(h: list[int], prompt: list[int]) -> Job:
++        from tensorfold.engine.exact_sampling import Sampling
++
++        from .engine import _ints_f64
++
++        max_tokens, stop_eos, draft, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, *code = h
++        temperature = _ints_f64(t_lo, t_hi)
++        seed = (s_top << 62) | (s_hi << 31) | s_lo
++        sampling = Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi)) if temperature > 0 else None
++        return Job(list(prompt), max_tokens, sampling, bool(stop_eos), bool(draft), list(code))
++
++    def _resume(self, slot: int, prompt: list[int]):
++        """The longest snapshot on ``slot`` of a strict prefix of ``prompt`` (``GlmEngine._resume`` per slot)."""
++
++        best = None
++        for snap in self.caches[slot]:
++            fits = not self.use_mtp or snap.mtp_len >= 0
++            if fits and len(snap.ids) < len(prompt) and prompt[:len(snap.ids)] == snap.ids and (
++                    best is None or len(snap.ids) > len(best.ids)):
++                best = snap
++        return best
++
++    def _place(self, job: Job, free: list[int]) -> tuple[int, int]:
++        """(slot, resume length): the free slot resuming the longest prefix; else the least recently admitted one
++        (its kept states are the likeliest to be stale)."""
++
++        best, length = None, 0
++        if job.draft:
++            for s in free:
++                snap = self._resume(s, job.prompt)
++                if snap is not None and len(snap.ids) > length:
++                    best, length = s, len(snap.ids)
++        if best is None:
++            best = min(free, key=lambda s: (self.used[s], s))
++        return best, length
++
++    def _remember(self, slot: int, snap) -> None:
++        cache = [c for c in self.caches[slot] if len(c.ids) < len(snap.ids) and snap.ids[:len(c.ids)] == c.ids]
++        self.caches[slot] = cache[-1:] + [snap]
++
++    def _emit(self, seq: Seq, tokens: list[int]) -> None:
++        if seq.job.out is not None and tokens:
++            seq.job.out.put(list(tokens))
++
++    def _policy(self, job: Job):
++        from .decode import DepthPolicy
++
++        from .engine import decode_policy
++
++        if not job.draft or not self.use_mtp:
++            return None
++        p = decode_policy(job.code)
++        if isinstance(p, tuple):                # auto: the MTP arm of the per-round choice
++            greedy = job.sampling is None or job.sampling.temperature <= 0
++            return DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
++        return p                                # None (serial) or a DepthPolicy; DFlash2 specs run as MTP drafts
++
++    # -- a round (both ranks) --------------------------------------------------------------------------------------------
++    def _execute(self, cancels: list[int], admits: list[tuple[int, int, Job]]) -> None:
++        self.round += 1
++        for s in cancels:
++            if self.seqs[s] is not None:
++                self._finish(s, None, cancelled=True)
++        for slot, cached, job in admits:
++            self.used[slot] = self.round
++            self._start(slot, cached, job)
++        active = [s for s in range(self.n) if self.seqs[s] is not None]
++        if active:
++            self._verify(active)
++
++    def _start(self, slot: int, cached: int, job: Job) -> None:
++        from .decode import draft, prefill, take_snapshot
++
++        if self.seqs[slot] is not None:
++            raise RuntimeError(f"slot {slot} is busy")
++        hit = None
++        if cached:
++            hit = next((c for c in self.caches[slot] if len(c.ids) == cached and job.prompt[:cached] == c.ids), None)
++            if hit is None:
++                raise RuntimeError(f"no snapshot of {cached} tokens on slot {slot} to resume from")
++        # the request writes the slot's attention caches from its resume point on: longer snapshots go
++        self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= cached]
++        t0 = time.perf_counter()
++        with self._on(slot) as e:
++            first = prefill(e, job.prompt, job.sampling, mtp=self.use_mtp, drafter=None, resume=hit)
++            if job.draft:
++                self._remember(slot, take_snapshot(e, job.prompt, e.last_hidden if self.use_mtp else None,
++                                                   mtp=self.use_mtp))
++            last_hidden = e.last_hidden
++        seq = Seq(job, slot, [first])
++        job.stats.update(prefill_s=time.perf_counter() - t0, cached=cached, slot=slot)
++        self.seqs[slot] = seq
++        self._emit(seq, [first])
++        if job.max_tokens <= 1 or (job.stop_eos and first in self.eos):
++            self.seqs[slot] = None
++            if job.out is not None:
++                job.out.put(None)
++            return
++        seq.policy = self._policy(job)
++        seq.start = time.perf_counter()
++        if seq.policy is not None:
++            depth = min(seq.policy.next(0, 0), job.max_tokens - len(seq.out))
++            if depth > 0:
++                with self._on(slot) as e:
++                    seq.drafts = draft(e, last_hidden, [first], e.st.pos + 1, depth, job.sampling,
++                                       seq.policy.confidence)
++
++    def _forward(self, active: list[int], windows: list[list[int]]) -> torch.Tensor:
++        g = self.g
++        e, w, b = g.e, g.w, g.e.buf
++        if active == [0]:
++            with self._on(0):
++                return e.forward(windows[0])    # the engine's own graphs
++        sts = [self.states[s] for s in active]
++        T = stage_multi(w, sts, b, windows)
++        Rs = [len(x) for x in windows]
++        dense = all(st.pos + R <= w.cfg.dense_limit for st, R in zip(sts, Rs))
++        if self.use_graphs and dense and max(Rs) <= self.graph_rows:
++            key = (tuple(active), tuple(Rs), tuple(st.parity for st in sts))
++            graph = self.multi.get(key)
++            if graph is None and len(self.multi) < MAX_GRAPHS:
++                # the warm-up's writes are the replay's (uncommitted cache slots, the other KDA state buffer, the
++                # slots' window rows), so capturing mid-request changes nothing
++                compute_multi(w, sts, b, Rs)
++                torch.cuda.synchronize()
++                graph = torch.cuda.CUDAGraph()
++                with torch.cuda.graph(graph, pool=self.pool):
++                    compute_multi(w, sts, b, Rs)
++                self.multi[key] = graph
++            if graph is not None:
++                graph.replay()
++                return b.logits[:T]
++        return compute_multi(w, sts, b, Rs, nchs=[chunks_for(st, R) for st, R in zip(sts, Rs)],
++                             host_pos=[st.pos for st in sts])
++
++    def _verify(self, active: list[int]) -> None:
++        from .decode import draft
++
++        g = self.g
++        e, w, b = g.e, g.w, g.e.buf
++        seqs = [self.seqs[s] for s in active]
++        windows = [[q.out[-1]] + q.drafts for q in seqs]
++        logits = self._forward(active, windows)
++        torch.cuda.synchronize()
++        off = 0
++        for s, q, win in zip(active, seqs, windows):
++            st = self.states[s]
++            R = len(win)
++            job = q.job
++            sampled = e.sample(logits[off:off + R], [st.pos + 1 + r for r in range(R)], job.sampling)
++            keep = 1
++            for i, d in enumerate(q.drafts):
++                if sampled[i] != d or (job.stop_eos and sampled[i] in self.eos):
++                    break
++                keep += 1
++            commit(w, st, b, R, keep)
++            q.rounds += 1
++            q.shared += len(active) > 1
++            q.drafted += len(q.drafts)
++            q.accepted += keep - 1
++            q.depths.append(len(q.drafts))
++            q.keeps.append(keep)
++            q.out.extend(sampled[:keep])
++            self._emit(q, sampled[:keep][:max(0, job.max_tokens - (len(q.out) - keep))])
++            hidden = e.main_hidden(slice(off, off + keep))       # this slot's kept rows (the MTP head's input)
++            if q.done(self.eos):
++                self._finish(s, hidden)
++            elif q.policy is not None:
++                depth = min(q.policy.next(len(q.drafts), keep - 1), job.max_tokens - len(q.out))
++                q.drafts = []
++                if depth > 0:
++                    with self._on(s) as es:
++                        q.drafts = draft(es, hidden, sampled[:keep], st.pos + 1, depth, job.sampling,
++                                         q.policy.confidence)
++            off += R
++
++    def _finish(self, slot: int, hidden: torch.Tensor | None, *, cancelled: bool = False) -> None:
++        from .decode import take_snapshot
++
++        q = self.seqs[slot]
++        self.seqs[slot] = None
++        job = q.job
++        st = self.states[slot]
++        if job.draft and q.policy is not None and q.keeps and hidden is not None and not cancelled:
++            committed = list(job.prompt) + q.out[:st.pos - len(job.prompt)]
++            with self._on(slot) as e:
++                self._remember(slot, take_snapshot(e, committed, hidden if self.use_mtp else None,
++                                                   mtp=self.use_mtp))
++        else:                                   # the reply's rows are not kept
++            self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= len(job.prompt)]
++        tokens = q.out[:job.max_tokens]
++        job.stats.update(decode_s=time.perf_counter() - q.start, rounds=q.rounds, batched_rounds=q.shared,
++                         min_rows=1 + min(q.depths, default=0),
++                         tokens_per_round=round((len(tokens) - 1) / max(q.rounds, 1), 3),
++                         sha256=hashlib.sha256(json.dumps(tokens).encode()).hexdigest()[:16], keeps=q.keeps,
++                         cancelled=cancelled)
++        if job.out is not None:
++            job.out.put(None)
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index 68358af..6fe7795 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -178,6 +178,17 @@ class GlmEngine:
+         self.eos = tuple(w.cfg.eos)
+         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
+         self.cache: list = []               # decode.Snapshot entries, each a prefix of the next
++        # GLM53_TF_BATCH=N (patches/0030): up to N requests decode together, one forward a round over all their
++        # verify windows (``batch.py``); 1 (default) serves one request at a time as upstream. Both ranks must agree.
++        self.batch = None
++        n = int(os.environ.get("GLM53_TF_BATCH", "1") or 1)
++        both = self._gather_ints([n])
++        if both[0] != both[1]:
++            raise RuntimeError(f"the two ranks were started with different GLM53_TF_BATCH: {both[0][0]}, {both[1][0]}")
++        if n > 1:
++            from .batch import Batcher
++
++            self.batch = Batcher(self, n)
+ 
+     def _calibrate(self) -> dict:
+         """Milliseconds for ``decode.DrafterChoice``, timed on random tokens as rounds use them and made the same on
+@@ -380,6 +391,8 @@ class GlmEngine:
+         """Rank 0: one request, mirrored by rank 1 (``follow``). ``draft=False``: serial decoding and a fresh
+         prefill, the reference drafted replies must equal."""
+ 
++        if self.batch is not None:
++            return self.batch.generate(prompt, max_tokens, sampling, on_tokens, draft)
+         if len(prompt) >= self.limit:
+             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
+         max_tokens = max(1, min(int(max_tokens), self.limit - len(prompt)))
+@@ -406,6 +419,8 @@ class GlmEngine:
+ 
+         from tensorfold.engine.exact_sampling import Sampling
+ 
++        if self.batch is not None:
++            return self.batch.follow()
+         while True:
+             max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, *code = \
+                 self._share(None)

@@ -1,0 +1,620 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/dflash2.py i/src/tensorfold/families/glm5_next/cuda/dflash2.py
+index fd88e17..19f5f43 100644
+--- c/src/tensorfold/families/glm5_next/cuda/dflash2.py
++++ i/src/tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -18,6 +18,7 @@ the same drafts. The weights are quantized to 4 bits (groups of 64) at load, lik
+ from __future__ import annotations
+ 
+ import json
++import os
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
+@@ -36,6 +37,14 @@ from .weights import Weights
+ EDGE = 0.6        # the selector's edge score weight in a chain pick
+ NOISE = 0.7       # the target's keyed noise weight when sampling
+ NO_LIMIT = 1e30
++RING_ON = os.environ.get("GLM53_TF_DRAFTER_RING", "1").strip() != "0"     # patches/0065
++
++
++def ring_slots(window: int, block: int, bk: int = 64) -> int:
++    """patches/0065: ring slots for a sliding window: a power of two holding the window, a block and the 64-key
++    block the attention loop starts in, so every slot a pass loads still holds its own position."""
++
++    return triton.next_power_of_2(window + 1 + block + bk)
+ 
+ 
+ @triton.jit
+@@ -102,11 +111,17 @@ def _prep_kernel(QKV, QN, KN, COS, SIN, QO, KO, VO, L, stride, eps,
+ 
+ 
+ @triton.jit
+-def _dattn_kernel(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.constexpr, NH: tl.constexpr,
++def _dattn_kernel(Q, K, V, OUT, POS, LO, window, scale, N: tl.constexpr, G: tl.constexpr, NH: tl.constexpr,
+                   HD: tl.constexpr, CAP: tl.constexpr, BK: tl.constexpr, CAUSAL: tl.constexpr):
+     """Program = one key/value head: its G query heads x N block rows against keys [0, s + N), where s is the
+     committed length on the device: context keys within the sliding window, and the block's own keys (all of
+-    them, or up to the row when causal). Online softmax in fp32; out [N, NH * HD] bf16."""
++    them, or up to the row when causal). Online softmax in fp32; out [N, NH * HD] bf16.
++
++    patches/0065: position t sits in cache slot t mod CAP (a ring when CAP is smaller than the context), and the
++    loop starts at the first 64-key block any row can see, min(max(s - window, LO, 0), s) rounded down to BK (LO:
++    the first context position the ring still holds after a rewind, 0 otherwise, on the device). The blocks skipped are masked for
++    every row: with m = -1e30, l = 0 and acc = +0 such a block leaves all three unchanged (alpha = exp(0) = 1,
++    p = 0, a +0 dot of finite values), so the result has the bits of the loop from key 0."""
+ 
+     kvh = tl.program_id(0)
+     M: tl.constexpr = G * N
+@@ -116,18 +131,22 @@ def _dattn_kernel(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.const
+     d = tl.arange(0, HD)
+     q = tl.load(Q + (qh[:, None] * N + qr[:, None]) * HD + d[None, :])
+     s = tl.load(POS).to(tl.int32)
++    lo = tl.load(LO).to(tl.int32)
+     klen = s + N
+     qpos = s + qr
+     m_i = tl.full([M], -1e30, tl.float32)
+     l_i = tl.zeros([M], tl.float32)
+     acc = tl.zeros([M, HD], tl.float32)
+-    for start in range(0, klen, BK):
++    first = tl.minimum(tl.maximum(tl.maximum(s - window, lo), 0), s) // BK * BK     # the block's keys always
++    for start in range(first, klen, BK):
+         kk = start + tl.arange(0, BK)
+         kin = kk < klen
+-        k = tl.load(K + (kvh * CAP + kk[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
+-        v = tl.load(V + (kvh * CAP + kk[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
++        slot = (kvh * CAP + kk[:, None] % CAP).to(tl.int64)
++        k = tl.load(K + slot * HD + d[None, :], mask=kin[:, None], other=0.0)
++        v = tl.load(V + slot * HD + d[None, :], mask=kin[:, None], other=0.0)
+         sc = tl.dot(q, tl.trans(k)) * scale
+-        ok = kin[None, :] & (((kk[None, :] < s) & (qpos[:, None] - kk[None, :] <= window)) | (kk[None, :] >= s))
++        ok = kin[None, :] & (((kk[None, :] < s) & (qpos[:, None] - kk[None, :] <= window) & (kk[None, :] >= lo))
++                             | (kk[None, :] >= s))
+         if CAUSAL:
+             ok = ok & (kk[None, :] <= qpos[:, None])
+         sc = tl.where(ok, sc, float("-inf"))
+@@ -261,11 +280,20 @@ class Drafter:
+         torch.cuda.empty_cache()
+         self.inv_freq = 1.0 / theta ** (torch.arange(hd // 2, device=dev, dtype=torch.float32) * 2 / hd)
+         # context keys and values by position (the block's own rows are written past the committed length
+-        # during a pass and overwritten by the next context update)
++        # during a pass and overwritten by the next context update). patches/0065 (GLM53_TF_DRAFTER_RING, default
++        # 1): every layer attends to the last ``window`` context keys only (sliding_window - 1 = 2,047 for the
++        # published drafter), so position t lives in slot t mod ``cap``, a ring of ``ring_slots`` (4,096: 42 MB a
++        # rank) instead of capacity + block slots (10 KB a token a rank: 10 GB at 1M)
+         self.cap = capacity + self.block
++        ring = ring_slots(self.window, self.block)
++        self.ring = RING_ON and ring < self.cap
++        if self.ring:
++            self.cap = ring
+         self.kc = [torch.zeros((KV, self.cap, hd), dtype=torch.bfloat16, device=dev) for _ in self.layers]
+         self.vc = [torch.zeros((KV, self.cap, hd), dtype=torch.bfloat16, device=dev) for _ in self.layers]
+         self.pos_dev = torch.zeros((1,), dtype=torch.int64, device=dev)
++        self.lo_dev = torch.zeros((1,), dtype=torch.int64, device=dev)
++        self._end = self._hi = self._lo = 0
+         self.context_end = 0
+         n = self.block
+         self.ids = torch.full((n,), self.mask_id, dtype=torch.int32, device=dev)
+@@ -282,8 +310,32 @@ class Drafter:
+         total = sum(q.nbytes() for L in self.layers for q in (L.a_kp, L.m_kp, L.qkv, L.kv, L.o, L.gu, L.down))
+         return total + self.fc.nbytes() + 2 * sum(t.numel() * 2 for t in self.kc)
+ 
++    @property
++    def context_end(self) -> int:
++        return self._end
++
++    @context_end.setter
++    def context_end(self, end: int) -> None:
++        """patches/0065: moving the committed length back (a snapshot restore, a calibration rewind) on a ring
++        keeps only the positions no later write reached: from ``_hi - cap`` on (``_hi`` bounds every position
++        written: context rows and a block's rows past them). Older ones are masked (``lo_dev``) until the window
++        moves past them, so after a rewind far behind the drafter only sees a shorter context: its drafts, never
++        the verified reply, can differ from a fresh prefill's."""
++
++        end = int(end)
++        if self.ring and end < self._end:
++            # positions from _hi - cap on are intact; everything from ``end`` on is written again before it is read
++            lo = min(max(self._lo, self._hi - self.cap), end)
++            if lo != self._lo:
++                self._lo = lo
++                self.lo_dev.fill_(lo)
++            self._hi = end + self.block
++        self._end = end
++        self._hi = max(self._hi, end + self.block)
++
+     def reset(self) -> None:
+-        self.context_end = 0
++        self._end = self._hi = self._lo = 0
++        self.lo_dev.zero_()
+         self.pos_dev.zero_()
+ 
+     # -- pieces -------------------------------------------------------------------------------------------------
+@@ -332,7 +384,8 @@ class Drafter:
+         self.kc[i].index_copy_(1, idx, k)
+         self.vc[i].index_copy_(1, idx, v)
+         out = torch.empty((rows, self.heads * self.hd), dtype=torch.bfloat16, device=self.dev)
+-        _dattn_kernel[(self.kvh,)](q, self.kc[i], self.vc[i], out, self.pos_dev, self.window, self.hd ** -0.5,
++        _dattn_kernel[(self.kvh,)](q, self.kc[i], self.vc[i], out, self.pos_dev, self.lo_dev, self.window,
++                                   self.hd ** -0.5,
+                                    N=rows, G=self.heads // self.kvh, NH=self.heads, HD=self.hd, CAP=self.cap, BK=64,
+                                    CAUSAL=self.causal, num_warps=4)
+         x = _dconv(self._row(out, L.o), dyn, L.a_base, 1, self.gs, x)
+@@ -348,7 +401,7 @@ class Drafter:
+     def _taps_compute(self, n: int) -> None:
+         ctx, _ = self._norm(_mm(self.tap_in[:n], self.fc), self.hidden_norm)
+         cos, sin = self._rotary(n)
+-        idx = self.pos_dev + self.ar[:n]
++        idx = (self.pos_dev + self.ar[:n]) % self.cap          # patches/0065: slots (a ring or the positions)
+         for i, L in enumerate(self.layers):
+             _, k, v = self._prep(_mm(ctx, L.kv), L, cos, sin, 0)
+             self.kc[i].index_copy_(1, idx, k)
+@@ -362,7 +415,7 @@ class Drafter:
+         for start in range(0, taps.shape[0], self.tap_in.shape[0]):
+             part = taps[start:start + self.tap_in.shape[0]]
+             n = part.shape[0]
+-            if self.context_end + n > self.cap - self.block:
++            if not self.ring and self.context_end + n > self.cap - self.block:
+                 raise ValueError("drafter context past its capacity")
+             self.tap_in[:n].copy_(part)
+             g = self.tap_graphs.get(n)
+@@ -381,7 +434,7 @@ class Drafter:
+         x = torch.empty((n, self.D), dtype=torch.bfloat16, device=self.dev)
+         glue.embed(self.ids, self.w.embed, self.D, 1, x)
+         cos, sin = self._rotary(n)
+-        idx = self.pos_dev + self.ar[:n]
++        idx = (self.pos_dev + self.ar[:n]) % self.cap          # patches/0065
+         for i in range(len(self.layers)):
+             x = self._layer(i, x, cos, sin, idx)
+         h, hs = self._norm(x[1:], self.norm)
+diff --git c/src/tensorfold/families/glm5_next/cuda/forward.py i/src/tensorfold/families/glm5_next/cuda/forward.py
+index 64fa92f..4e59406 100644
+--- c/src/tensorfold/families/glm5_next/cuda/forward.py
++++ i/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -191,10 +191,71 @@ class State:
+             self.mtp_vc = torch.zeros((capacity, HL, c.v_dim), dtype=torch.bfloat16, device=dev)
+         # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys
+         self.index = None
++        self.index_ring = 0
+         if w.meta.get("long_context"):
+             n_idx = len(dsa_layers) + (1 if w.mtp is not None else 0)
+             mk = lambda n: torch.zeros((n, c.index_dim), dtype=torch.bfloat16, device=dev)   # noqa: E731
+             self.index = [(mk(capacity), mk(capacity), mk(capacity // 4 + 2)) for _ in range(n_idx)]
++            self._index_ring(w, capacity, rows, len(dsa_layers))
++
++    def _index_ring(self, w: Weights, capacity: int, rows: int, n: int) -> None:
++        """patches/0065 (GLM53_TF_INDEX_RING, default 1): the model layers' index keys and gates in a ring of
++        ``sparse.index_ring_rows(rows)`` rows instead of ``capacity`` (1 KB a token for 11 layers: 1 GB per 1M
++        tokens -> ~2 MB). A row of them is read only when the window that completes its pool runs, so a ring
++        holding a window and the 3 rows before it serves every step with the same bits; the pool keys (every
++        complete pool, what scoring reads) stay full. The MTP layer's caches stay full (its positions follow the
++        head's own length). A snapshot must still bring back the last 3 committed rows (the incomplete pool) when
++        it rewinds past rows the ring overwrote: ``commit`` keeps them in a trailing slot of ``conv``, which every
++        snapshot already copies and restores, and ``set_pos`` writes them back on a rewind."""
++
++        ring = sparse.index_ring_rows(rows)
++        if not sparse.INDEX_RING or ring >= capacity or n == 0:
++            return
++        c = w.cfg
++        self.index_ring = ring
++        self.iring = torch.zeros((2, n, ring, c.index_dim), dtype=torch.bfloat16, device=w.device)
++        self.index[:n] = [(self.iring[0, i], self.iring[1, i], self.index[i][2]) for i in range(n)]
++        # the tail slot: rows pos - 3 .. pos - 1 of every ring, [2, n, 3, index_dim], after the KDA conv windows
++        tail = 2 * n * (sparse.POOL - 1) * c.index_dim
++        per = self.conv[0].numel() if self.conv.shape[0] else 0
++        if per == 0:
++            raise ValueError("index ring: no conv windows to keep the committed tail in")
++        extra = -(-tail // per)
++        conv = torch.zeros((self.conv.shape[0] + extra, *self.conv.shape[1:]), dtype=self.conv.dtype,
++                           device=self.conv.device)
++        self.conv_layers = self.conv.shape[0]
++        self.conv = conv
++        self._tail_n = n
++
++    def _tail(self) -> torch.Tensor:
++        n = self._tail_n
++        return self.conv[self.conv_layers:].view(-1)[:2 * n * (sparse.POOL - 1) * self.iring.shape[3]].view(
++            2, n, sparse.POOL - 1, self.iring.shape[3])
++
++    def _ring_rows(self, pos: int) -> list[tuple[int, int]]:
++        """(tail row, ring slot) of positions pos - 3 .. pos - 1 that exist."""
++
++        return [(j, (pos - (sparse.POOL - 1) + j) % self.index_ring) for j in range(sparse.POOL - 1)
++                if pos - (sparse.POOL - 1) + j >= 0]
++
++    def save_index_tail(self) -> None:
++        """patches/0065: the committed tail (rows pos - 3 .. pos - 1 of every ring) into conv's trailing slot."""
++
++        rows = self._ring_rows(self.pos)
++        if not rows:
++            return
++        t = self._tail()
++        j0, s0 = rows[0]
++        if s0 + len(rows) <= self.index_ring and [s for _, s in rows] == list(range(s0, s0 + len(rows))):
++            t[:, :, j0:j0 + len(rows)].copy_(self.iring[:, :, s0:s0 + len(rows)])
++        else:
++            for j, slot in rows:
++                t[:, :, j].copy_(self.iring[:, :, slot])
++
++    def _load_index_tail(self, pos: int) -> None:
++        t = self._tail()
++        for j, slot in self._ring_rows(pos):
++            self.iring[:, :, slot].copy_(t[:, :, j])
+ 
+     def reset(self) -> None:
+         self.conv.zero_()
+@@ -204,7 +265,12 @@ class State:
+         self.set_mtp_len(0)
+         self.mtp_drafted = 0
+ 
+-    def set_pos(self, pos: int) -> None:
++    def set_pos(self, pos: int, *, committed: bool = False) -> None:
++        """``committed``: ``commit`` advancing over the rows it keeps; any other move (a reset, a snapshot restore,
++        which copied that position's ``conv`` first) takes the index rings' tail from ``conv`` (patches/0065)."""
++
++        if self.index_ring and not committed:
++            self._load_index_tail(pos)
+         self.pos = pos
+         self.pos_dev.fill_(pos)
+ 
+@@ -229,6 +295,10 @@ class State:
+         other.vc = other.kc if self.vc is self.kc else [x.clone() for x in self.vc]       # latent: keys = values
+         if self.index is not None:
+             other.index = [tuple(x.clone() for x in trio) for trio in self.index]
++        if self.index_ring:                   # patches/0065: the clone's rings are views of its own ring tensor
++            other.iring = self.iring.clone()
++            other.index[:self._tail_n] = [(other.iring[0, i], other.iring[1, i], other.index[i][2])
++                                          for i in range(self._tail_n)]
+         if hasattr(self, "mtp_kc"):
+             other.mtp_kc = self.mtp_kc.clone()
+             other.mtp_vc = other.mtp_kc if self.mtp_vc is self.mtp_kc else self.mtp_vc.clone()
+@@ -542,4 +612,6 @@ def commit(w: Weights, st: State, b: Buffers, R: int, keep: int) -> None:
+             raise ValueError("the conv shift kernel is written for 4-tap convolutions")
+         _conv_shift[(n, triton.cdiv(C, 1024))](st.conv, st.proj, keep, st.conv.stride(0), st.proj.stride(0),
+                                                st.proj.stride(1), C=C, TAPS=taps, BLOCK=1024, num_warps=4)
+-    st.set_pos(st.pos + keep)
++    st.set_pos(st.pos + keep, committed=True)
++    if st.index_ring:
++        st.save_index_tail()             # patches/0065: what a snapshot at this position needs of the rings
+diff --git c/src/tensorfold/families/glm5_next/cuda/latent.py i/src/tensorfold/families/glm5_next/cuda/latent.py
+index 1f72b34..5c1f690 100644
+--- c/src/tensorfold/families/glm5_next/cuda/latent.py
++++ i/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -91,8 +91,9 @@ def kv_bytes_per_token(st) -> int:
+         add(st.mtp_vc)
+     if st.index is not None:
+         for ik, ig, pk in st.index:
+-            add(ik)
+-            add(ig)
++            if ik.shape[0] >= st.capacity:      # patches/0065: a ring (``State.index_ring``) costs no bytes a token
++                add(ik)
++                add(ig)
+             add(pk, 0.25)
+     return total
+ 
+diff --git c/src/tensorfold/families/glm5_next/cuda/sparse.py i/src/tensorfold/families/glm5_next/cuda/sparse.py
+index 4b94f82..9cc4b2b 100644
+--- c/src/tensorfold/families/glm5_next/cuda/sparse.py
++++ i/src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -17,6 +17,7 @@ ascending position, 512 at a time, and merges the chunks in order.
+ from __future__ import annotations
+ 
+ import math
++import os
+ 
+ import torch
+ import triton
+@@ -26,10 +27,22 @@ POOL = 4
+ TOPK_POOLS = 512
+ BR = 16
+ 
++# patches/0065, GLM53_TF_INDEX_RING (default 1): the model layers' index keys and gates live in a ring of
++# ``index_ring_rows(rows)`` rows once the capacity exceeds it (``forward.State._index_ring``); 0 keeps them full
++INDEX_RING = os.environ.get("GLM53_TF_INDEX_RING", "1").strip() != "0"
++
++
++def index_ring_rows(rows: int) -> int:
++    """Ring rows for windows of up to ``rows`` rows: a power of two >= rows + 64 (a window and the 3 rows of its
++    first incomplete pool fit with room to spare)."""
++
++    return max(256, triton.next_power_of_2(rows + 64))
++
+ 
+ @triton.jit
+-def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, eps, D: tl.constexpr):
+-    """Row r: LayerNorm(k_raw) -> bf16 into IK[pos + r]; the gate row (fp32) -> bf16 into IG[pos + r]."""
++def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, NR, eps, D: tl.constexpr):
++    """Row r: LayerNorm(k_raw) -> bf16 into IK[pos + r]; the gate row (fp32) -> bf16 into IG[pos + r].
++    patches/0065: rows live at (position mod NR), NR the caches' rows (the capacity, or a ring)."""
+ 
+     r = tl.program_id(0)
+     P = tl.load(POS).to(tl.int64)
+@@ -39,13 +52,15 @@ def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, eps, D: tl.constexpr):
+     xc = x - mean
+     var = tl.sum(xc * xc, axis=0) / D
+     y = xc / tl.sqrt(var + eps) * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
+-    tl.store(IK + (P + r) * D + d, y.to(tl.bfloat16))
+-    tl.store(IG + (P + r) * D + d, tl.load(GR + r * D + d).to(tl.bfloat16))
++    slot = (P + r) % NR
++    tl.store(IK + slot * D + d, y.to(tl.bfloat16))
++    tl.store(IG + slot * D + d, tl.load(GR + r * D + d).to(tl.bfloat16))
+ 
+ 
+ @triton.jit
+-def _pool_keys(IK, IG, APE, PK, POS, R, D: tl.constexpr):
+-    """Program i: pool p = pos // 4 + i if it is complete within the window (ends at or before pos + R - 1)."""
++def _pool_keys(IK, IG, APE, PK, POS, R, NR, D: tl.constexpr):
++    """Program i: pool p = pos // 4 + i if it is complete within the window (ends at or before pos + R - 1).
++    patches/0065: the pool's rows at (position mod NR)."""
+ 
+     i = tl.program_id(0)
+     P = tl.load(POS).to(tl.int64)
+@@ -53,20 +68,24 @@ def _pool_keys(IK, IG, APE, PK, POS, R, D: tl.constexpr):
+     if 4 * p + 3 > P + R - 1:
+         return
+     d = tl.arange(0, D)
+-    l0 = tl.load(IG + (4 * p + 0) * D + d).to(tl.float32) + tl.load(APE + 0 * D + d).to(tl.float32)
+-    l1 = tl.load(IG + (4 * p + 1) * D + d).to(tl.float32) + tl.load(APE + 1 * D + d).to(tl.float32)
+-    l2 = tl.load(IG + (4 * p + 2) * D + d).to(tl.float32) + tl.load(APE + 2 * D + d).to(tl.float32)
+-    l3 = tl.load(IG + (4 * p + 3) * D + d).to(tl.float32) + tl.load(APE + 3 * D + d).to(tl.float32)
++    s0 = (4 * p + 0) % NR
++    s1 = (4 * p + 1) % NR
++    s2 = (4 * p + 2) % NR
++    s3 = (4 * p + 3) % NR
++    l0 = tl.load(IG + s0 * D + d).to(tl.float32) + tl.load(APE + 0 * D + d).to(tl.float32)
++    l1 = tl.load(IG + s1 * D + d).to(tl.float32) + tl.load(APE + 1 * D + d).to(tl.float32)
++    l2 = tl.load(IG + s2 * D + d).to(tl.float32) + tl.load(APE + 2 * D + d).to(tl.float32)
++    l3 = tl.load(IG + s3 * D + d).to(tl.float32) + tl.load(APE + 3 * D + d).to(tl.float32)
+     m = tl.maximum(tl.maximum(l0, l1), tl.maximum(l2, l3))
+     e0 = tl.exp(l0 - m)
+     e1 = tl.exp(l1 - m)
+     e2 = tl.exp(l2 - m)
+     e3 = tl.exp(l3 - m)
+     s = ((e0 + e1) + e2) + e3
+-    k0 = tl.load(IK + (4 * p + 0) * D + d).to(tl.float32)
+-    k1 = tl.load(IK + (4 * p + 1) * D + d).to(tl.float32)
+-    k2 = tl.load(IK + (4 * p + 2) * D + d).to(tl.float32)
+-    k3 = tl.load(IK + (4 * p + 3) * D + d).to(tl.float32)
++    k0 = tl.load(IK + s0 * D + d).to(tl.float32)
++    k1 = tl.load(IK + s1 * D + d).to(tl.float32)
++    k2 = tl.load(IK + s2 * D + d).to(tl.float32)
++    k3 = tl.load(IK + s3 * D + d).to(tl.float32)
+     t0 = ((e0 / s).to(tl.bfloat16).to(tl.float32) * k0).to(tl.bfloat16).to(tl.float32)
+     t1 = ((e1 / s).to(tl.bfloat16).to(tl.float32) * k1).to(tl.bfloat16).to(tl.float32)
+     t2 = ((e2 / s).to(tl.bfloat16).to(tl.float32) * k2).to(tl.bfloat16).to(tl.float32)
+@@ -76,11 +95,16 @@ def _pool_keys(IK, IG, APE, PK, POS, R, D: tl.constexpr):
+ 
+ def index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, ape: torch.Tensor,
+                  ik: torch.Tensor, ig: torch.Tensor, pk: torch.Tensor, pos: torch.Tensor) -> None:
+-    """Window rows' index keys and gates into the caches at pos.., then every pool the window completes."""
++    """Window rows' index keys and gates into the caches at pos.., then every pool the window completes.
++    patches/0065: ``ik``/``ig`` may be rings (``State.index_ring``): rows at position mod their row count. A pool
++    reads its rows only when the window completes it, so a ring keeps the window's rows and the 3 before it."""
+ 
+     R = k_raw.shape[0]
+-    _index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, pos, 1e-6, D=128, num_warps=1)
+-    _pool_keys[(R // 4 + 2,)](ik, ig, ape, pk, pos, R, D=128, num_warps=1)
++    NR = ik.shape[0]
++    if ig.shape[0] != NR or R + POOL - 1 > NR:
++        raise ValueError(f"index_update: a {R}-row window in index caches of {NR} / {ig.shape[0]} rows")
++    _index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, pos, NR, 1e-6, D=128, num_warps=1)
++    _pool_keys[(R // 4 + 2,)](ik, ig, ape, pk, pos, R, NR, D=128, num_warps=1)
+ 
+ 
+ @triton.jit
+@@ -114,6 +138,9 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, H: tl.constexpr, D: tl.
+     tl.store(OUT + r * NP + p, s, mask=p < NP)
+ 
+ 
++_SCORES = _scores
++
++
+ def _heads(qi: torch.Tensor, wts: torch.Tensor) -> dict:
+     """patches/0050: ``_scores``' head arguments from the tensors (qi [R, NH x D], wts [R, NH])."""
+ 
+@@ -126,19 +153,30 @@ def _heads(qi: torch.Tensor, wts: torch.Tensor) -> dict:
+ 
+ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
+                   pos_dev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+-    """Each row's attended tokens: [R, 2051] int32 ascending (-1 padded) and how many, for rows past 2050."""
++    """Each row's attended tokens: [R, 2051] int32 ascending (-1 padded) and how many, for rows past 2050.
++
++    patches/0065: windows of more than ``SMALL_ROWS`` rows (prefill chunks) select through ``select_pools_blocked``
++    (the same set, bounded scratch, no full sort); decode/verify/MTP windows keep the path below."""
+ 
+-    scores = torch.empty((R, np_max), dtype=torch.float32, device=qi.device)
+     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
+         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
++    # (a test's stand-in for ``_scores`` keeps the path it stands in for)
++    if R > SMALL_ROWS and SELECT == "blocked" and _scores is _SCORES and blocked_ok(qi.device, wts.shape[1]):
++        pools = select_pools_blocked(qi, wts, pk, pos, R, np_max, pos_dev)
++        return _tokens(pools, pos, R, qi.device)
++    scores = torch.empty((R, np_max), dtype=torch.float32, device=qi.device)
+     _scores[(R, triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, np_max, 128 ** -0.5,
+                                          BP=64, num_warps=4, **_heads(qi, wts))
+     order = torch.sort(scores, dim=1, descending=True, stable=True).indices[:, :TOPK_POOLS]
+     pools = torch.sort(order, dim=1).values                                            # ascending pool index
+-    width = TOPK_POOLS * POOL + POOL - 1
++    return _tokens(pools, pos, R, qi.device)
++
++
++def _tokens(pools: torch.Tensor, pos: int, R: int, dev) -> tuple[torch.Tensor, torch.Tensor]:
++    """Rows' ascending selected pools [R, 512] -> (tokens [R, 2051] int32, counts [R] int32)."""
++
+     # every row at once (the same lists a per-row loop builds): the selected pools' tokens in ascending order, then
+     # the visible tokens of the incomplete last pool; a dense row (at most TOPK_POOLS complete pools) gets count 0
+-    dev = qi.device
+     q = pos + torch.arange(R, device=dev, dtype=torch.int64)                         # [R] absolute positions
+     npool = (q + 1) // POOL
+     sparse_row = npool > TOPK_POOLS
+@@ -267,6 +305,172 @@ def select_tokens_dev(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos
+     return tokens, counts
+ 
+ 
++# -- patches/0065: prefill selection in row blocks (bounded scratch, tile-shared scoring, no full sort) ------------
++#
++# Upstream scores every row against ``np_max`` pools into an [R, np_max] fp32 buffer and stable-sorts all of it
++# (values, int64 indices and the sort's own buffers: ~36 bytes an entry, 9.7 GB at R = 1024 rows and a 1M-token
++# cache, kept by the caching allocator afterwards). ``select_pools_blocked`` gives every row the same 512 pools:
++#
++# - rows go in blocks of at most ``SELECT_MB`` of scratch, and each block scores only up to its last row's complete
++#   pools (rounded up to 64, at least 512): the pools cut off are -inf with higher indices than every kept pool,
++#   so they rank after all of them (the argument of ``pool_bucket`` above, per block);
++# - ``_scores_rows`` runs ``_scores``' per-row arithmetic unchanged (the same [heads, 128] x [128, 64] tensor-core
++#   dot, the same epilogue and head sum, on the same shapes and warps) for ``BRB`` rows a program, loading each
++#   64-pool tile once for all of them instead of once a row. Each dot output depends only on its own query row
++#   and pool, and the head sum only on its own column, so every score has ``_scores``' bits; ``blocked_ok`` checks
++#   that on the device once (bit for bit, else the sort path is used). The score leaves as the 0050 key's upper
++#   half: an int32 ordered as the stable descending sort orders floats (-0.0 == +0.0, NaN above +inf);
++# - the 512th largest key t of a row (``torch.topk`` over the int32 keys: its value is exact whatever its
++#   algorithm), then ``_gather_sel`` lists, in pool order, every pool with key > t and the lowest-index pools with
++#   key == t until 512: exactly the first 512 of the stable descending sort, already ascending.
++
++SMALL_ROWS = 8           # windows up to this many rows (decode, verify, MTP) keep the sorted path
++BRB = 16                 # rows a scoring program serves with one pool tile
++SELECT = os.environ.get("GLM53_TF_SELECT", "blocked").strip() or "blocked"
++if SELECT not in ("blocked", "sort"):
++    raise ValueError(f"GLM53_TF_SELECT must be blocked or sort, not {SELECT!r}")
++SELECT_MB = int(os.environ.get("GLM53_TF_SELECT_MB", "256") or 256)
++_KEY_NONE = -2147483648  # below every score's key (-inf maps to -2139095041)
++
++
++@triton.jit
++def _score_key(s):
++    """fp32 score -> int32 ordered as the stable descending sort orders scores (``_keys``' upper half)."""
++
++    b = s.to(tl.int32, bitcast=True)
++    b = tl.where(s == 0.0, 0, b)
++    b = tl.where(s != s, 0x7FC00000, b)
++    return tl.where(b < 0, b ^ 0x7FFFFFFF, b)
++
++
++@triton.jit
++def _scores_rows(QI, W, w_stride, PK, OUT, POS, R, NP, row0, scale, H: tl.constexpr, D: tl.constexpr,
++                 BP: tl.constexpr, BRB: tl.constexpr, NH: tl.constexpr = 32,
++                 WS: tl.constexpr = 1.0 / 5.656854249492381, KEYS: tl.constexpr = True):
++    """Program (row block, pool block): rows row0 + rb BRB .. (< R) of the window, each exactly as ``_scores``
++    program (r, pb) computes it, against one pool tile loaded for all of them; row r's result goes to row
++    r - row0 of OUT [*, NP] (int32 keys, or with KEYS=False the fp32 scores, for the check)."""
++
++    rb = tl.program_id(0)
++    pb = tl.program_id(1)
++    P = tl.load(POS)
++    p = pb * BP + tl.arange(0, BP)
++    d = tl.arange(0, D)
++    hh = tl.arange(0, H)
++    r_first = row0 + rb * BRB
++    r_last = tl.minimum(r_first + BRB, R) - 1
++    nmax = (P + r_last + 1) // 4
++    # pools past a row's own count score -inf below, so loading up to the block's last row changes no kept score
++    k = tl.load(PK + p[:, None] * D + d[None, :], mask=(p < nmax)[:, None], other=0.0).to(tl.bfloat16)  # [BP, D]
++    for i in range(BRB):
++        r = r_first + i
++        if r < R:
++            npool = (P + r + 1) // 4
++            if NH == 32:                                                              # GLM-5.3: _scores' code
++                q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :]).to(tl.bfloat16)
++                w = tl.load(W + r * w_stride + hh).to(tl.float32) * (1.0 / 5.656854249492381)
++            else:
++                hm = hh < NH
++                q = tl.load(QI + (r * NH + hh[:, None]) * D + d[None, :], mask=hm[:, None], other=0.0).to(tl.bfloat16)
++                w = tl.load(W + r * w_stride + hh, mask=hm, other=0.0).to(tl.float32) * WS
++            dots = tl.dot(q, tl.trans(k))                                             # [H, BP] fp32
++            s = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
++            s = tl.where(p < npool, s, float("-inf"))
++            dst = OUT + (r - row0).to(tl.int64) * NP + p
++            if KEYS:
++                tl.store(dst, _score_key(s), mask=p < NP)
++            else:
++                tl.store(dst, s, mask=p < NP)
++
++
++@triton.jit
++def _gather_sel(KEYS, T, NEED, OUT, NP, K: tl.constexpr, BLOCK: tl.constexpr):
++    """Program r: the pools with key > T[r], then the first NEED[r] (lowest index) with key == T[r], listed in
++    pool order into OUT[r, :K] (exactly K of them)."""
++
++    r = tl.program_id(0).to(tl.int64)
++    t = tl.load(T + r)
++    need = tl.load(NEED + r)
++    n_eq = 0
++    n_sel = 0
++    for start in range(0, NP, BLOCK):
++        p = start + tl.arange(0, BLOCK)
++        k = tl.load(KEYS + r * NP + p, mask=p < NP, other=-2147483648)
++        gt = k > t
++        eq = k == t
++        eqc = tl.cumsum(eq.to(tl.int32), axis=0) + n_eq
++        sel = gt | (eq & (eqc <= need))
++        selc = tl.cumsum(sel.to(tl.int32), axis=0) + n_sel
++        tl.store(OUT + r * K + selc - 1, p, mask=sel)
++        n_eq += tl.sum(eq.to(tl.int32), axis=0)
++        n_sel += tl.sum(sel.to(tl.int32), axis=0)
++
++
++def _launch_rows(qi, wts, pk, out, pos_dev, R, NP, row0, n, keys: bool = True) -> None:
++    _scores_rows[(triton.cdiv(n, BRB), triton.cdiv(NP, 64))](qi, wts, wts.stride(0), pk, out, pos_dev, row0 + n, NP,
++                                                            row0, 128 ** -0.5, BP=64, BRB=BRB, KEYS=keys,
++                                                            num_warps=4, **_heads(qi, wts))
++
++
++def block_rows(R: int, np_max: int) -> int:
++    """Rows a selection block holds: its int32 keys within GLM53_TF_SELECT_MB (a multiple of BRB, at least BRB)."""
++
++    rows = (SELECT_MB << 20) // (4 * max(np_max, 1))
++    return max(BRB, min(R, rows) // BRB * BRB)
++
++
++def select_pools_blocked(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
++                         pos_dev: torch.Tensor, rows: int | None = None) -> torch.Tensor:
++    """Every row's 512 pools, ascending ([R, 512] int32): the first 512 of the stable descending sort of
++    ``select_tokens``' scores over ``np_max`` pools (np_max >= every row's complete pools), in row blocks."""
++
++    dev = qi.device
++    pools = torch.empty((R, TOPK_POOLS), dtype=torch.int32, device=dev)
++    step = rows or block_rows(R, np_max)
++    for r0 in range(0, R, step):
++        n = min(step, R - r0)
++        need_np = (pos + r0 + n) // POOL                     # the block's last row's complete pools
++        npc = min(np_max, max(TOPK_POOLS, triton.cdiv(need_np, 64) * 64))
++        if npc < TOPK_POOLS:
++            raise ValueError(f"select_pools_blocked: {np_max} pools to score, fewer than {TOPK_POOLS}")
++        keys = torch.empty((n, npc), dtype=torch.int32, device=dev)
++        _launch_rows(qi, wts, pk, keys, pos_dev, R, npc, r0, n)
++        top = torch.topk(keys, TOPK_POOLS, dim=1, largest=True, sorted=False).values
++        t = top.min(dim=1).values.contiguous()
++        need = (TOPK_POOLS - (top > t[:, None]).sum(dim=1)).to(torch.int32)
++        _gather_sel[(n,)](keys, t, need, pools[r0:r0 + n], npc, K=TOPK_POOLS, BLOCK=1024, num_warps=4)
++        del keys, top                    # before the next block's: one block's scratch at a time
++    return pools
++
++
++_BLOCKED_OK: dict = {}
++
++
++def blocked_ok(device, nh: int = 32) -> bool:
++    """Once per device: ``_scores_rows`` gives ``_scores``' fp32 bits on random rows (bit for bit), else the
++    selection keeps upstream's sorted path (and says so)."""
++
++    key = (str(device), nh)
++    if key not in _BLOCKED_OK:
++        g = torch.Generator(device="cpu").manual_seed(65)
++        R, NP, pos = 40, 1024, 3900
++        qi = torch.randn((R, nh * 128), generator=g).to(device=device, dtype=torch.bfloat16)
++        wts = torch.randn((R, nh), generator=g).to(device=device, dtype=torch.bfloat16)
++        pk = torch.randn((NP + 2, 128), generator=g).to(device=device, dtype=torch.bfloat16)
++        pos_dev = torch.tensor([pos], dtype=torch.int32, device=device)
++        ref = torch.empty((R, NP), dtype=torch.float32, device=device)
++        _scores[(R, triton.cdiv(NP, 64))](qi, wts, wts.stride(0), pk, ref, pos_dev, R, NP, 128 ** -0.5, BP=64,
++                                          num_warps=4, **_heads(qi, wts))
++        got = torch.empty((R, NP), dtype=torch.float32, device=device)
++        _launch_rows(qi, wts, pk, got, pos_dev, R, NP, 0, R, keys=False)
++        ok = bool(torch.equal(ref.view(torch.int32), got.view(torch.int32)))
++        if not ok:
++            print("[tensorfold] patches/0065: row-block index scores differ from _scores' bits on this device; "
++                  "prefill selection keeps the sorted path", flush=True)
++        _BLOCKED_OK[key] = ok
++    return _BLOCKED_OK[key]
++
++
+ @triton.jit
+ def _gtile(q, k, v, m, l, o, valid, SCALE: tl.constexpr):
+     scores = tl.dot(q, tl.trans(k)).to(tl.float32) * SCALE

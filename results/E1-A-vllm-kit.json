@@ -1,0 +1,704 @@
+{
+ "label": "A-vllm-kit",
+ "base": "http://127.0.0.1:8000",
+ "model": "GLM-5.3-Flash-EXL3",
+ "started": "2026-09-27T10:00:35+0700",
+ "args": {
+  "base": "http://127.0.0.1:8000",
+  "model": "GLM-5.3-Flash-EXL3",
+  "key": "",
+  "suites": "tf,tweet,kit,ctx",
+  "reps": 5,
+  "long_tokens": 512,
+  "ctx": "2000,8000,32000",
+  "extra": "{}",
+  "label": "A-vllm-kit",
+  "out": "results/E1-A-vllm-kit.json"
+ },
+ "suites": {
+  "tf": [
+   {
+    "prompt": "code",
+    "temperature": 1.0,
+    "tokens": 64,
+    "runs": [
+     {
+      "ttft_s": 0.17223601199930272,
+      "decode_s": 2.4803167850004684,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 25.39998131730101,
+      "sha256": "c0e380cc9d608481",
+      "text_head": " Your answer should include: - A brief explanation of what the Fibonacci sequence is - A complete Python code snippet that prints the first n Fibonacci numbers "
+     },
+     {
+      "ttft_s": 0.18368415300028573,
+      "decode_s": 1.550062221999724,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 40.64352972793838,
+      "sha256": "9aed8b2f5d5e18a5",
+      "text_head": " | Medium\n\nThe Fibonacci sequence is a series of numbers where each number is the sum of the two preceding ones. It starts with 0 and 1, so the sequence goes: 0"
+     },
+     {
+      "ttft_s": 0.17933564799932356,
+      "decode_s": 1.5664935040003911,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 40.21721114011353,
+      "sha256": "343f07a88d6b103f",
+      "text_head": " Your function should take an integer n as input and return the n-th Fibonacci number.\n\nFibonacci sequence: 0, 1, 1, 2, 3, 5, 8, 13, 21, ...\n\nPython function:\n\n"
+     },
+     {
+      "ttft_s": 0.19138176599972212,
+      "decode_s": 2.301555802000621,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 27.37278841783346,
+      "sha256": "b072b9bf9c71a60b",
+      "text_head": " Also, add a function to calculate the Fibonacci sequence up to a given number n and print the results.\n# Fibonacci Sequence\n# Fibonacci sequence: each number i"
+     },
+     {
+      "ttft_s": 0.19015653200040106,
+      "decode_s": 1.7899107769999318,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 35.197285143784796,
+      "sha256": "569d695473329750",
+      "text_head": " Write a short Python function that computes the Fibonacci sequence and explain it.\n\nRead less\n\nRead less\n\nWrite a Python function that takes a number and retur"
+     }
+    ],
+    "median_tps": 35.2,
+    "min_tps": 25.4,
+    "max_tps": 40.64
+   },
+   {
+    "prompt": "chat",
+    "temperature": 1.0,
+    "tokens": 64,
+    "runs": [
+     {
+      "ttft_s": 0.24985238299996126,
+      "decode_s": 2.413291947000289,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 26.105420058401435,
+      "sha256": "c274b31adb288a34",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## Plain English Explanation\n\nA **GPU (Graphics Processing Unit)** is a computer chip with thousands of tiny processors that c"
+     },
+     {
+      "ttft_s": 0.230698835000112,
+      "decode_s": 2.2130306939998263,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 28.46774794891523,
+      "sha256": "a61bb7001a321b1f",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## The Big Picture\n\nImagine you need to multiply two grids of numbers together. A **CPU** is like a brilliant mathematician wh"
+     },
+     {
+      "ttft_s": 0.2343494759998066,
+      "decode_s": 2.241076386999339,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 28.11149158746573,
+      "sha256": "391d67548fc6616f",
+      "text_head": "# How GPUs Handle Matrix Multiplication\n\n## The Big Picture\n\nA GPU is like a factory with thousands of workers, while a CPU is like a few brilliant managers. Wh"
+     },
+     {
+      "ttft_s": 0.23091909199956717,
+      "decode_s": 2.3278033739998136,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 27.064141543771576,
+      "sha256": "2a0c7f44e2c00deb",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## The Big Idea in Plain English\n\nImagine you need to multiply two large grids of numbers \u2014 say, two 1,000 \u00d7 1,000 matrices. T"
+     },
+     {
+      "ttft_s": 0.23895806400014408,
+      "decode_s": 2.4430417690000468,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 25.78752471587349,
+      "sha256": "c787105b54ce9fda",
+      "text_head": "# Matrix Multiplication on a GPU\n\n## The Big Picture\n\nA GPU is like a huge factory floor with thousands of workers, while a CPU is more like a few dozen highly "
+     }
+    ],
+    "median_tps": 27.06,
+    "min_tps": 25.79,
+    "max_tps": 28.47
+   },
+   {
+    "prompt": "code",
+    "temperature": 0.0,
+    "tokens": 64,
+    "runs": [
+     {
+      "ttft_s": 0.17737451199991483,
+      "decode_s": 1.5039885550004328,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 41.88861663244629,
+      "sha256": "309411e36ae011a1",
+      "text_head": " Fibonacci sequence: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, ... The next number is found by adding up the two numbers before it. The sequence starts with"
+     },
+     {
+      "ttft_s": 0.16710763600076461,
+      "decode_s": 1.393639107999661,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 45.20539043312734,
+      "sha256": "309411e36ae011a1",
+      "text_head": " Fibonacci sequence: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, ... The next number is found by adding up the two numbers before it. The sequence starts with"
+     },
+     {
+      "ttft_s": 0.18111727900031838,
+      "decode_s": 1.3967051189993072,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 45.10615672772604,
+      "sha256": "309411e36ae011a1",
+      "text_head": " Fibonacci sequence: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, ... The next number is found by adding up the two numbers before it. The sequence starts with"
+     },
+     {
+      "ttft_s": 0.16974862100050814,
+      "decode_s": 1.562427548999949,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 40.321869670260185,
+      "sha256": "8e413dc448f81940",
+      "text_head": " Fibonacci sequence: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, ... Each number is the sum of the two preceding ones. The sequence starts with 0 and 1. The Fibonacci sequ"
+     },
+     {
+      "ttft_s": 0.1770191559999148,
+      "decode_s": 1.5733531930000026,
+      "prompt_tokens": 14,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 40.04186744609727,
+      "sha256": "8e413dc448f81940",
+      "text_head": " Fibonacci sequence: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, ... Each number is the sum of the two preceding ones. The sequence starts with 0 and 1. The Fibonacci sequ"
+     }
+    ],
+    "median_tps": 41.89,
+    "min_tps": 40.04,
+    "max_tps": 45.21
+   },
+   {
+    "prompt": "chat",
+    "temperature": 0.0,
+    "tokens": 64,
+    "runs": [
+     {
+      "ttft_s": 0.23004942199986544,
+      "decode_s": 2.6759365649995743,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 23.54315899114373,
+      "sha256": "0dfb00de3fd35635",
+      "text_head": "# How GPUs Do Matrix Multiplication\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, where each problem is completely inde"
+     },
+     {
+      "ttft_s": 0.23481018300026335,
+      "decode_s": 2.7594466860000466,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 22.830663958694412,
+      "sha256": "0dfb00de3fd35635",
+      "text_head": "# How GPUs Do Matrix Multiplication\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, where each problem is completely inde"
+     },
+     {
+      "ttft_s": 0.23565745599989896,
+      "decode_s": 2.881896058000166,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 21.860607992821777,
+      "sha256": "795e4dbaa0fb4a96",
+      "text_head": "# How GPUs Do Matrix Multiplication\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, where each problem is completely inde"
+     },
+     {
+      "ttft_s": 0.23258437699951173,
+      "decode_s": 2.900033072000042,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 21.723890188794055,
+      "sha256": "1559bdd59b578a13",
+      "text_head": "# How GPUs Do Matrix Multiplication\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, where each problem is completely inde"
+     },
+     {
+      "ttft_s": 0.2348161390000314,
+      "decode_s": 2.7393643400000656,
+      "prompt_tokens": 32,
+      "tokens": 64,
+      "finish": "length",
+      "decode_tps": 22.998036106434274,
+      "sha256": "b345930fa4af0985",
+      "text_head": "# How GPUs Do Matrix Multiplication\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of paperwork where every page needs the same calculation do"
+     }
+    ],
+    "median_tps": 22.83,
+    "min_tps": 21.72,
+    "max_tps": 23.54
+   }
+  ],
+  "tweet": [
+   {
+    "prompt": "sequence",
+    "temperature": 0.0,
+    "tokens": 512,
+    "runs": [
+     {
+      "ttft_s": 0.23041692900005728,
+      "decode_s": 7.453156397999919,
+      "prompt_tokens": 32,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 68.56155603243865,
+      "sha256": "d818e829ca0df5af",
+      "text_head": "2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163,"
+     },
+     {
+      "ttft_s": 0.23663788299927546,
+      "decode_s": 7.571056653000596,
+      "prompt_tokens": 32,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 67.49388142505552,
+      "sha256": "d818e829ca0df5af",
+      "text_head": "2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163,"
+     },
+     {
+      "ttft_s": 0.22780548900027497,
+      "decode_s": 7.7121639400002095,
+      "prompt_tokens": 32,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 66.25896492547669,
+      "sha256": "ed894be3c90f4453",
+      "text_head": "2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163,"
+     },
+     {
+      "ttft_s": 0.2455618379999578,
+      "decode_s": 7.373895200999868,
+      "prompt_tokens": 32,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 69.29851673654252,
+      "sha256": "d818e829ca0df5af",
+      "text_head": "2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163,"
+     },
+     {
+      "ttft_s": 0.23268706799990468,
+      "decode_s": 7.934204821000094,
+      "prompt_tokens": 32,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 64.40468976141068,
+      "sha256": "0ad056b48ed74c62",
+      "text_head": "2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163,"
+     }
+    ],
+    "median_tps": 67.49,
+    "min_tps": 64.4,
+    "max_tps": 69.3
+   },
+   {
+    "prompt": "code",
+    "temperature": 0.0,
+    "tokens": 512,
+    "runs": [
+     {
+      "ttft_s": 0.2806515140000556,
+      "decode_s": 12.298260714999742,
+      "prompt_tokens": 49,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 41.55059092028777,
+      "sha256": "d013e7bd51c2e990",
+      "text_head": "# LRU Cache Implementation\n\n```python\n\"\"\"\nlru_cache.py\n\nA thread-safe LRU (Least Recently Used) cache implementation with\nget, put, delete, and resize operation"
+     },
+     {
+      "ttft_s": 0.24828172300021834,
+      "decode_s": 12.300319527000283,
+      "prompt_tokens": 49,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 41.543636234677486,
+      "sha256": "cbb55b5f74b45605",
+      "text_head": "# LRU Cache Implementation\n\n```python\n\"\"\"\nlru_cache.py\n\nA thread-safe LRU (Least Recently Used) cache implementation with\nget, put, delete, and resize operation"
+     },
+     {
+      "ttft_s": 0.28084706400022696,
+      "decode_s": 12.059892791000493,
+      "prompt_tokens": 49,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 42.371852623874545,
+      "sha256": "aa7044f3274ed2f1",
+      "text_head": "# LRU Cache Implementation\n\n```python\n\"\"\"\nlru_cache.py\n\nA thread-safe LRU (Least Recently Used) cache implementation with\nget, put, delete, and resize operation"
+     },
+     {
+      "ttft_s": 0.2618208470003083,
+      "decode_s": 11.967225546999543,
+      "prompt_tokens": 49,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 42.69995564077251,
+      "sha256": "d35f9ed19a4081bc",
+      "text_head": "# LRU Cache Implementation\n\n```python\n\"\"\"\nlru_cache.py\n\nA thread-safe LRU (Least Recently Used) cache implementation with\nget, put, delete, and resize operation"
+     },
+     {
+      "ttft_s": 0.2661955730000045,
+      "decode_s": 11.06395929900009,
+      "prompt_tokens": 49,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 46.185997814198565,
+      "sha256": "7085bb1e65a8ff1e",
+      "text_head": "# LRU Cache Implementation\n\n```python\n\"\"\"\nlru_cache.py\n\nA thread-safe LRU (Least Recently Used) cache implementation with\nget, put, delete, and resize operation"
+     }
+    ],
+    "median_tps": 42.37,
+    "min_tps": 41.54,
+    "max_tps": 46.19
+   },
+   {
+    "prompt": "json",
+    "temperature": 0.0,
+    "tokens": 512,
+    "runs": [
+     {
+      "ttft_s": 0.267850152000392,
+      "decode_s": 10.34644372099956,
+      "prompt_tokens": 54,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 49.3889508104948,
+      "sha256": "38cbd67b11692d63",
+      "text_head": "```json\n[\n  {\n    \"id\": 1,\n    \"first_name\": \"Ava\",\n    \"last_name\": \"Thompson\",\n    \"email\": \"ava.thompson@company.com\",\n    \"department\": \"Engineering\",\n    \""
+     },
+     {
+      "ttft_s": 0.26515655200000765,
+      "decode_s": 10.131432990000576,
+      "prompt_tokens": 54,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 50.43709024225318,
+      "sha256": "f59592d87d6bd3e9",
+      "text_head": "```json\n[\n  {\n    \"id\": 1,\n    \"first_name\": \"Ava\",\n    \"last_name\": \"Thompson\",\n    \"email\": \"ava.thompson@company.com\",\n    \"department\": \"Engineering\",\n    \""
+     },
+     {
+      "ttft_s": 0.2660227639998993,
+      "decode_s": 10.303139503000239,
+      "prompt_tokens": 54,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 49.596533158771514,
+      "sha256": "9980662553f3b7bd",
+      "text_head": "```json\n[\n  {\n    \"id\": 1,\n    \"first_name\": \"Ava\",\n    \"last_name\": \"Thompson\",\n    \"email\": \"ava.thompson@company.com\",\n    \"department\": \"Engineering\",\n    \""
+     },
+     {
+      "ttft_s": 0.2654083650004395,
+      "decode_s": 9.489569683999434,
+      "prompt_tokens": 54,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 53.84859556504527,
+      "sha256": "907781bea2d6d832",
+      "text_head": "```json\n[\n  {\n    \"id\": 1,\n    \"first_name\": \"Ava\",\n    \"last_name\": \"Thompson\",\n    \"email\": \"ava.thompson@company.com\",\n    \"department\": \"Engineering\",\n    \""
+     },
+     {
+      "ttft_s": 0.2637920329998451,
+      "decode_s": 9.902542560999791,
+      "prompt_tokens": 54,
+      "tokens": 512,
+      "finish": "length",
+      "decode_tps": 51.60290873300805,
+      "sha256": "2e01619bbdbb4920",
+      "text_head": "```json\n[\n  {\n    \"id\": 1,\n    \"first_name\": \"Ava\",\n    \"last_name\": \"Thompson\",\n    \"email\": \"ava.thompson@company.com\",\n    \"department\": \"Engineering\",\n    \""
+     }
+    ],
+    "median_tps": 50.44,
+    "min_tps": 49.39,
+    "max_tps": 53.85
+   }
+  ],
+  "kit": [
+   {
+    "prompt": "hashmap",
+    "temperature": 0.0,
+    "tokens": 200,
+    "runs": [
+     {
+      "ttft_s": 0.23489674299980834,
+      "decode_s": 6.551696902999538,
+      "prompt_tokens": 40,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 30.37381047174093,
+      "sha256": "ab72305f232b94d4",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table or dictionary) is one of the most important data structures in computer science. "
+     },
+     {
+      "ttft_s": 0.23121584599994094,
+      "decode_s": 7.001596538999365,
+      "prompt_tokens": 40,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 28.42208900378029,
+      "sha256": "39297db998eda40a",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table) is one of the most important data structures in computer science. It provides ne"
+     },
+     {
+      "ttft_s": 0.24457418500060157,
+      "decode_s": 6.272463390999292,
+      "prompt_tokens": 40,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 31.725972332585666,
+      "sha256": "82b4212542c66c51",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table or dictionary) is one of the most important data structures in computer science. "
+     },
+     {
+      "ttft_s": 0.2285983040001156,
+      "decode_s": 6.635452280000209,
+      "prompt_tokens": 40,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 29.99041988438409,
+      "sha256": "80061f1c3461b146",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table) is one of the most important data structures in computer science. It provides ne"
+     },
+     {
+      "ttft_s": 0.2294794319996072,
+      "decode_s": 6.783259310000176,
+      "prompt_tokens": 40,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 29.336929476752502,
+      "sha256": "1dc5c5138b30f07b",
+      "text_head": "# How a Hash Map Works: A Complete Guide\n\nA hash map (also called a hash table or dictionary) is one of the most important data structures in computer science. "
+     }
+    ],
+    "median_tps": 29.99,
+    "min_tps": 28.42,
+    "max_tps": 31.73
+   },
+   {
+    "prompt": "structured",
+    "temperature": 0.0,
+    "tokens": 200,
+    "runs": [
+     {
+      "ttft_s": 0.2193862199992509,
+      "decode_s": 2.7346073840008103,
+      "prompt_tokens": 34,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 72.77095833364467,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     },
+     {
+      "ttft_s": 0.23077010399993014,
+      "decode_s": 2.7422642009996707,
+      "prompt_tokens": 34,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 72.56777079591971,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     },
+     {
+      "ttft_s": 0.21782818399969983,
+      "decode_s": 2.7224448959996153,
+      "prompt_tokens": 34,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 73.09606166589904,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     },
+     {
+      "ttft_s": 0.2189766880001116,
+      "decode_s": 2.742441413999586,
+      "prompt_tokens": 34,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 72.56308156088473,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     },
+     {
+      "ttft_s": 0.21921251700041466,
+      "decode_s": 2.735735491000014,
+      "prompt_tokens": 34,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 72.74095052488354,
+      "sha256": "f7ca616514a60fd5",
+      "text_head": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 5"
+     }
+    ],
+    "median_tps": 72.74,
+    "min_tps": 72.56,
+    "max_tps": 73.1
+   },
+   {
+    "prompt": "essay",
+    "temperature": 0.0,
+    "tokens": 200,
+    "runs": [
+     {
+      "ttft_s": 0.2985172720000264,
+      "decode_s": 7.500572432999434,
+      "prompt_tokens": 61,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 26.531308347144527,
+      "sha256": "b2b2795e7cc407c0",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nLarge la"
+     },
+     {
+      "ttft_s": 0.27513227599956736,
+      "decode_s": 7.617293151000013,
+      "prompt_tokens": 61,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 26.124765852535806,
+      "sha256": "9f2f14a844acd88b",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction\n\nAutoregressive large language models (LLMs) generate text"
+     },
+     {
+      "ttft_s": 0.2757117029996152,
+      "decode_s": 7.690657852000186,
+      "prompt_tokens": 61,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 25.875549768248252,
+      "sha256": "530d53a8c9ccbc95",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nLarge la"
+     },
+     {
+      "ttft_s": 0.2876980999999432,
+      "decode_s": 7.347190333999606,
+      "prompt_tokens": 61,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 27.08518371698014,
+      "sha256": "3037a7f0652a8228",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nLarge la"
+     },
+     {
+      "ttft_s": 0.2773863550000897,
+      "decode_s": 7.809734466999544,
+      "prompt_tokens": 61,
+      "tokens": 200,
+      "finish": "length",
+      "decode_tps": 25.481019981010274,
+      "sha256": "8cd0d9bb0f32222f",
+      "text_head": "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nLarge la"
+     }
+    ],
+    "median_tps": 26.12,
+    "min_tps": 25.48,
+    "max_tps": 27.09
+   }
+  ],
+  "ctx": [
+   {
+    "ctx": 2000,
+    "prompt_tokens": 1788,
+    "cold": {
+     "ttft_s": 1.862598636000257,
+     "decode_s": 3.9376710039996397,
+     "prompt_tokens": 1788,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 64.75909230125802,
+     "sha256": "3590819ec245c024",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "warm": {
+     "ttft_s": 0.3219816250002623,
+     "decode_s": 4.275582751999536,
+     "prompt_tokens": 1788,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 59.64099277010734,
+     "sha256": "65342b9562bf036b",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "prefill_tps": 959.9
+   },
+   {
+    "ctx": 8000,
+    "prompt_tokens": 7052,
+    "cold": {
+     "ttft_s": 5.264155427999867,
+     "decode_s": 3.934709297000154,
+     "prompt_tokens": 7052,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 64.80783731454152,
+     "sha256": "c8cea79c03179a2c",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "warm": {
+     "ttft_s": 0.1844724030006546,
+     "decode_s": 4.6088252849995115,
+     "prompt_tokens": 7052,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 55.328632402264525,
+     "sha256": "b7dfeff6f1a90206",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "prefill_tps": 1339.6
+   },
+   {
+    "ctx": 32000,
+    "prompt_tokens": 28052,
+    "cold": {
+     "ttft_s": 19.374644208000063,
+     "decode_s": 3.9012634829996387,
+     "prompt_tokens": 28052,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 65.36343959109712,
+     "sha256": "2ac106c6ed0dc59f",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "warm": {
+     "ttft_s": 0.2763087000002997,
+     "decode_s": 4.0021776749999844,
+     "prompt_tokens": 28052,
+     "tokens": 256,
+     "finish": "length",
+     "decode_tps": 63.715312189382246,
+     "sha256": "2ac106c6ed0dc59f",
+     "text_head": "The committee is reviewing quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse.\n\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11"
+    },
+    "prefill_tps": 1447.9
+   }
+  ]
+ },
+ "finished": "2026-09-27T10:06:27+0700"
+}

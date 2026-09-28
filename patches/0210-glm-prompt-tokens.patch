@@ -1,0 +1,348 @@
+diff --git c/src/tensorfold/cuda/server.py i/src/tensorfold/cuda/server.py
+index 3a5bd80..88e04a9 100644
+--- c/src/tensorfold/cuda/server.py
++++ i/src/tensorfold/cuda/server.py
+@@ -345,6 +345,11 @@ class App:
+                 return str(exc)
+         return None
+ 
++    def prompt_ids(self, text: str) -> list[int]:
++        """The rendered prompt's token ids (patches/0210: a family's app may reuse ones it already has)."""
++
++        return self.tok.encode(text, add_special_tokens=False).ids
++
+     def sampling_for(self, body: dict[str, Any], prompt: list[int]):
+         """Keyed sampling (the seed, else one drawn from the prompt), or None for greedy decoding."""
+ 
+@@ -366,7 +371,7 @@ class App:
+             text = self.template.render(body["messages"], tools=tools, enable_thinking=thinking, extra=kwargs)
+         else:
+             text = body["prompt"]
+-        prompt = self.tok.encode(text, add_special_tokens=False).ids
++        prompt = self.prompt_ids(text)             # patches/0210
+         max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens)
+         sampling = self.sampling_for(body, prompt)
+         out: list[int] = []
+diff --git c/src/tensorfold/families/glm5_next/cuda/app.py i/src/tensorfold/families/glm5_next/cuda/app.py
+index e04e277..0c07647 100644
+--- c/src/tensorfold/families/glm5_next/cuda/app.py
++++ i/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -20,6 +20,10 @@ numbers right against 5-6/6 garbled with thinking off (their PR #279).
+ 
+ With thinking off, a chat renders the way GLM-5.3's thinking-off template does: the checkpoint's template always
+ opens a think block, so it gets an empty ``<think></think>`` and no reasoning-effort line.
++
++patches/0210: a request's prompt is encoded once (``check`` hands its ids to ``run``), and with GLM53_TF_TOKCACHE (on
++unless ``0``; ``verify`` checks every reuse against a full encode) only the text after the longest special-token
++prefix a recent prompt shares is encoded (``prompt_tokens.py``). Only rank 0 tokenizes; rank 1 receives the ids.
+ """
+ 
+ from __future__ import annotations
+@@ -29,6 +33,8 @@ from typing import Any, Callable
+ 
+ from tensorfold.cuda.server import App
+ 
++from .prompt_tokens import Memo, PromptTokens
++
+ # patches/0150: OpenAI ``reasoning_effort`` -> (enable_thinking, the template's reasoning_effort or None: its default)
+ EFFORTS: dict[str, tuple[bool, str | None]] = {
+     "none": (False, None), "minimal": (False, None), "low": (True, "low"), "medium": (True, "high"),
+@@ -91,6 +97,8 @@ class GlmApp(App):
+         super().__init__(engine, model_dir, served, **kwargs)
+         self.template = ThinkingOffTemplate(self.template)
+         self.effort_field, self.default_effort = effort_env()       # patches/0150
++        self.prompt_tokens = PromptTokens(self.tok, model_dir / "tokenizer.json")   # patches/0210
++        self.prompt_memo = Memo()
+         if getattr(engine, "batch", None) is not None:
+             # GLM53_TF_BATCH (patches/0030): the engine queues concurrent requests itself, so ``App.run`` must not
+             # serialize them
+@@ -114,7 +122,9 @@ class GlmApp(App):
+                                         extra=kwargs)
+         else:
+             text = body.get("prompt") or ""
+-        prompt = len(self.tok.encode(text, add_special_tokens=False).ids)
++        ids = self.prompt_tokens.encode(text)                       # patches/0210: ``run`` reuses these
++        self.prompt_memo.put(text, ids)
++        prompt = len(ids)
+         asked = body.get("max_tokens") or body.get("max_completion_tokens")
+         need = prompt + (int(asked) if asked else 1)
+         if need <= limit:
+@@ -123,6 +133,12 @@ class GlmApp(App):
+         return (f"this request needs a {need}-token context ({detail}), and this server was started for {limit}: "
+                 f"restart both ranks with --context {need} or more")
+ 
++    def prompt_ids(self, text: str) -> list[int]:
++        """patches/0210: the ids ``check`` encoded for this text on this request thread, else from the cache."""
++
++        ids = self.prompt_memo.take(text)
++        return ids if ids is not None else self.prompt_tokens.encode(text)
++
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+         apply_effort(body, field=self.effort_field, default=self.default_effort,
+                      default_thinking=self.default_thinking)           # patches/0150 (validated by ``check``)
+diff --git c/src/tensorfold/families/glm5_next/cuda/prompt_tokens.py i/src/tensorfold/families/glm5_next/cuda/prompt_tokens.py
+new file mode 100644
+index 0000000..b7fff10
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/prompt_tokens.py
+@@ -0,0 +1,260 @@
++"""patches/0210: the prompt's token ids, encoded once a request and incrementally across a conversation's turns.
++
++``check`` (the context limit) and ``run`` both need the rendered prompt's ids; ``Memo`` hands ``run`` the ids
++``check`` computed for the same text on the same request thread, so a request encodes once (the HF tokenizer takes
++~34 ms at 40k tokens, ~113 ms at 128k).
++
++``PromptTokens`` (GLM53_TF_TOKCACHE, default ``1``; ``0`` off; ``verify`` also runs the full encode, logs and uses it
++on any difference) keeps the ids of the last ``GLM53_TF_TOKCACHE_ENTRIES`` (32) prompts. A new prompt reuses the ids
++of the longest cached text it shares up to a *cut*: the end of a special token (``<|user|>``, ``<|assistant|>``,
++``<|observation|>``, ``<|system|>``, ...), and encodes only the text after it.
++
++Why the ids are exactly the full encode's: ``tokenizers`` first splits the raw text on its added tokens (Aho-Corasick,
++leftmost-longest, over the raw text since these tokens are ``normalized: false``) and turns each match into its id;
++only the text *between* matches goes through the normalizer, the pre-tokenizer and BPE, one piece at a time. So when
++the text ``P`` before a cut ends in a special-token match and no added token can match across the cut, the pieces of
++``P + R`` are the pieces of ``P`` followed by the pieces of ``R``, and ``encode(P + R) = encode(P) + encode(R)``.
++``_unsafe`` refuses a tokenizer for which that argument does not hold (a normalizer, a ``Metaspace`` pre-tokenizer
++that prepends only to the first piece, added tokens with ``lstrip``/``rstrip``/``single_word``/``normalized``) and
++drops a cut token that another added token could overlap across the cut (one starting with a suffix of it, or one
++containing it followed by more text). GLM-5.3's tokenizer: no normalizer, ``Split`` (regex) + ``ByteLevel``
++(``use_regex: false``) pre-tokenizers, every added token plain, so all 18 special tokens cut.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++import sys
++import threading
++import time
++from array import array
++from collections import OrderedDict
++from pathlib import Path
++from typing import Any
++
++_MODES = {"0": "off", "1": "on", "verify": "verify"}
++
++
++def tokcache_env() -> tuple[str, int]:
++    """(mode: off | on | verify, entries), validated."""
++
++    raw = (os.environ.get("GLM53_TF_TOKCACHE", "1").strip().lower() or "1")
++    if raw not in _MODES:
++        raise ValueError(f"GLM53_TF_TOKCACHE={raw!r}: expected 0, 1 or verify")
++    entries = int(os.environ.get("GLM53_TF_TOKCACHE_ENTRIES", "32") or "32")
++    if entries < 1:
++        raise ValueError(f"GLM53_TF_TOKCACHE_ENTRIES={entries}: expected 1 or more")
++    return _MODES[raw], entries
++
++
++def _walk(node: Any):
++    if isinstance(node, dict):
++        yield node
++        for v in node.values():
++            yield from _walk(v)
++    elif isinstance(node, list):
++        for v in node:
++            yield from _walk(v)
++
++
++def _unsafe(spec: dict[str, Any]) -> str | None:
++    """Why this tokenizer.json cannot be encoded piecewise at special tokens, or None."""
++
++    if spec.get("normalizer") is not None:
++        return "it has a normalizer"
++    for node in _walk(spec.get("pre_tokenizer")):
++        if node.get("type") == "Metaspace" and node.get("prepend_scheme", "always") == "first":
++            return "its Metaspace pre-tokenizer prepends to the first piece only"
++    for t in spec.get("added_tokens") or []:
++        if t.get("lstrip") or t.get("rstrip") or t.get("single_word") or t.get("normalized"):
++            return f"added token {t.get('content')!r} has lstrip/rstrip/single_word/normalized"
++    return None
++
++
++def cut_tokens(spec: dict[str, Any]) -> dict[int, str]:
++    """{id: content} of the special tokens after which the text can be encoded apart: no added token overlaps one
++    across its end (starts with a suffix of it, or contains it followed by more text)."""
++
++    added = [t["content"] for t in spec.get("added_tokens") or []]
++    cuts = {}
++    for t in spec.get("added_tokens") or []:
++        s = t["content"]
++        if not t.get("special") or not s:
++            continue
++        suffixes = [s[-k:] for k in range(1, len(s) + 1)]
++        if any(len(o) > len(sfx) and o.startswith(sfx) for o in added for sfx in suffixes):
++            continue
++        if any(s in o[:-1] and o.find(s) + len(s) < len(o) for o in added):
++            continue
++        cuts[int(t["id"])] = s
++    return cuts
++
++
++class _Entry:
++    __slots__ = ("text", "ids", "cuts", "at")
++
++    def __init__(self, text: str, ids: array, cuts: list[tuple[int, int]]):
++        self.text, self.ids, self.cuts = text, ids, cuts      # cuts: (char end, token count) ascending
++        self.at = [c for c, _ in cuts]
++
++
++class PromptTokens:
++    """``encode(text) -> list[int]``: ``tok.encode(text, add_special_tokens=False).ids``, from the cache when it can."""
++
++    def __init__(self, tok, tokenizer_json: Path | str | None, *, mode: str | None = None,
++                 entries: int | None = None, log=None) -> None:
++        if mode is None or entries is None:
++            env_mode, env_entries = tokcache_env()
++            mode, entries = mode or env_mode, entries or env_entries
++        self.tok = tok
++        self.mode = mode
++        self.entries = entries
++        self.log = log or (lambda msg: print(f"[tensorfold] tokcache: {msg}", file=sys.stderr, flush=True))
++        self.lru: OrderedDict[int, _Entry] = OrderedDict()
++        self.lock = threading.Lock()
++        self.stats = {"full": 0, "hit": 0, "hit_tokens": 0, "mismatch": 0}
++        self.cuts: dict[int, str] = {}
++        self.pattern: re.Pattern | None = None
++        self.added: re.Pattern | None = None
++        if self.mode == "off":
++            return
++        why = None
++        if tokenizer_json is None:
++            why = "no tokenizer.json"
++        else:
++            spec = json.loads(Path(tokenizer_json).read_text())
++            why = _unsafe(spec)
++            if why is None:
++                self.cuts = cut_tokens(spec)
++                self.cut_contents = frozenset(self.cuts.values())
++                if not self.cuts:
++                    why = "no special token is a safe cut"
++                else:
++                    contents = sorted({t["content"] for t in spec["added_tokens"]}, key=len, reverse=True)
++                    self.added = re.compile("|".join(map(re.escape, contents)))
++        if why:
++            self.log(f"off: {why}")
++            self.mode = "off"
++
++    # -- the cache ---------------------------------------------------------------------------------------------
++
++    def _cuts_of(self, text: str, ids: list[int], base_char: int, base_tok: int) -> list[tuple[int, int]] | None:
++        """(char end, token count) after each cut token of ``ids`` (the encoding of ``text``), shifted by the bases;
++        None when the text's added-token matches do not line up with the ids (then nothing is cached)."""
++
++        cut_ids = self.cuts
++        lo = min(cut_ids)
++        hi = max(cut_ids)
++        at = [i for i, t in enumerate(ids) if lo <= t <= hi and t in cut_ids]
++        if not at:
++            return []
++        # every added-token match in the text, leftmost-longest as the tokenizer makes them; those of cut tokens must
++        # pair one to one, in order, with the cut ids
++        found = [m for m in self.added.finditer(text) if m.group() in self.cut_contents]
++        if len(found) != len(at):
++            return None
++        out = []
++        for m, i in zip(found, at):
++            if m.group() != cut_ids[ids[i]]:
++                return None
++            out.append((base_char + m.end(), base_tok + i + 1))
++        return out
++
++    def _lookup(self, text: str) -> tuple[_Entry | None, int]:
++        """The cached entry sharing the longest cut prefix with ``text``, and the index of that cut (+1)."""
++
++        best, best_n, best_c = None, 0, 0
++        with self.lock:
++            candidates = list(self.lru.values())
++        for e in reversed(candidates):              # most recent first
++            if not e.cuts or e.cuts[-1][0] <= best_c:
++                continue
++            if text.startswith(e.text):
++                n = len(e.cuts)
++            else:
++                # the largest cut whose prefix ``text`` shares, by bisection; ``lo``: cuts known to be shared
++                lo, hi = 0, len(e.cuts)
++                known = 0
++                while lo < hi:
++                    mid = (lo + hi + 1) // 2
++                    end = e.at[mid - 1]
++                    if text.startswith(e.text[known:end], known):
++                        lo, known = mid, end
++                    else:
++                        hi = mid - 1
++                n = lo
++            if n and e.at[n - 1] > best_c:
++                best, best_n, best_c = e, n, e.at[n - 1]
++        return best, best_n
++
++    def _store(self, text: str, ids: array, cuts: list[tuple[int, int]] | None) -> None:
++        if not cuts:
++            return
++        key = hash(text)
++        with self.lock:
++            self.lru.pop(key, None)
++            self.lru[key] = _Entry(text, ids, cuts)
++            while len(self.lru) > self.entries:
++                self.lru.popitem(last=False)
++
++    def _full(self, text: str) -> list[int]:
++        return self.tok.encode(text, add_special_tokens=False).ids
++
++    def encode(self, text: str) -> list[int]:
++        if self.mode == "off":
++            return self._full(text)
++        e, n = self._lookup(text)
++        if e is None:
++            ids = self._full(text)
++            self.stats["full"] += 1
++            self._store(text, array("i", ids), self._cuts_of(text, ids, 0, 0))
++            return ids
++        if e.text == text:                              # the same prompt again
++            self.stats["hit"] += 1
++            self.stats["hit_tokens"] += len(e.ids)
++            return e.ids.tolist()
++        char, count = e.cuts[n - 1]
++        rest = text[char:]
++        tail = self._full(rest) if rest else []
++        whole = e.ids[:count]
++        whole.extend(tail)
++        ids = whole.tolist()
++        self.stats["hit"] += 1
++        self.stats["hit_tokens"] += count
++        if self.mode == "verify":
++            full = self._full(text)
++            if full != ids:
++                self.stats["mismatch"] += 1
++                first = next((i for i, (a, b) in enumerate(zip(full, ids)) if a != b), min(len(full), len(ids)))
++                self.log(f"MISMATCH: cached prefix {count} tokens / {char} chars, full {len(full)} vs incremental "
++                         f"{len(ids)} tokens, first difference at token {first}; using the full encode")
++                self._store(text, array("i", full), self._cuts_of(text, full, 0, 0))
++                return full
++        tail_cuts = self._cuts_of(rest, tail, char, count) if rest else []
++        self._store(text, whole, None if tail_cuts is None else e.cuts[:n] + tail_cuts)
++        return ids
++
++
++class Memo:
++    """The ids ``check`` encoded, for ``run`` on the same request thread when it renders the same text."""
++
++    def __init__(self) -> None:
++        self.local = threading.local()
++
++    def put(self, text: str, ids: list[int]) -> None:
++        self.local.last = (text, ids)
++
++    def take(self, text: str) -> list[int] | None:
++        last = getattr(self.local, "last", None)
++        self.local.last = None
++        if last is not None and (last[0] is text or last[0] == text):
++            return last[1]
++        return None
++
++
++def timed(fn, *args) -> tuple[Any, float]:
++    t0 = time.perf_counter()
++    out = fn(*args)
++    return out, (time.perf_counter() - t0) * 1e3

@@ -1,0 +1,441 @@
+{
+ "args": {
+  "base": "http://127.0.0.1:8080",
+  "model": "GLM-5.3-Flash-Uncensored",
+  "modes": "agree,needle",
+  "corpus": [
+   "docs",
+   "vendor/TensorFold/src"
+  ],
+  "long": 20,
+  "tokens": 256,
+  "needle_ctx": "28000,112000",
+  "trials": 10,
+  "trials_long": 4,
+  "extra": "{}",
+  "out": "results/A1/fp8ab.json"
+ },
+ "t": 1790519959.245511,
+ "agree": [
+  {
+   "name": "chat",
+   "prompt_tokens": 25,
+   "identical": false,
+   "diverge_char": 101,
+   "ttft": [
+    0.20439508900017245,
+    0.17319365900038974
+   ],
+   "heads": [
+    "# Matrix Multiplication on a GPU\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of math problems to solve, and each problem is completely independent of the others. You could solve t",
+    "# Matrix Multiplication on a GPU\n\n## The Plain-English Explanation\n\nImagine you have a huge stack of homework to grade, and each problem is completely independent of the others. You could grade them a"
+   ]
+  },
+  {
+   "name": "sequence",
+   "prompt_tokens": 25,
+   "identical": true,
+   "diverge_char": null,
+   "ttft": [
+    0.17950149699754547,
+    0.1748789819976082
+   ],
+   "heads": [
+    "2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199,",
+    "2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199,"
+   ]
+  },
+  {
+   "name": "code",
+   "prompt_tokens": 42,
+   "identical": false,
+   "diverge_char": 28,
+   "ttft": [
+    0.22131564799929038,
+    0.2309743560035713
+   ],
+   "heads": [
+    "# LRU Cache Implementation\n\nHere's a complete Python module implementing an LRU (Least Recently Used) cache, followed by comprehensive pytest tests.\n\n## `lru_cache.py`\n\n```python\n\"\"\"\nLRU Cache impleme",
+    "# LRU Cache Implementation\n\n## `lru_cache.py`\n\n```python\n\"\"\"An LRU (Least Recently Used) cache with O(1) operations.\n\nThis module provides a thread-unsafe LRU cache built on Python's\n``dict`` (which p"
+   ]
+  },
+  {
+   "name": "json",
+   "prompt_tokens": 47,
+   "identical": false,
+   "diverge_char": 546,
+   "ttft": [
+    0.2320987210041494,
+    0.22525507699901937
+   ],
+   "heads": [
+    "```json\n[\n  {\n    \"id\": 1,\n    \"first_name\": \"Aria\",\n    \"last_name\": \"Whitfield\",\n    \"email\": \"aria.whitfield@company.com\",\n    \"department\": \"Engineering\",\n    \"title\": \"Senior Software Engineer\",\n",
+    "```json\n[\n  {\n    \"id\": 1,\n    \"first_name\": \"Aria\",\n    \"last_name\": \"Whitfield\",\n    \"email\": \"aria.whitfield@company.com\",\n    \"department\": \"Engineering\",\n    \"title\": \"Senior Software Engineer\",\n"
+   ]
+  },
+  {
+   "name": "hashmap",
+   "prompt_tokens": 33,
+   "identical": false,
+   "diverge_char": 3,
+   "ttft": [
+    0.20664410699828295,
+    0.21525653000571765
+   ],
+   "heads": [
+    "# How a Hash Map Works: A Complete Guide\n\n## 1. The Core Concept\n\nA hash map (also called a hash table or dictionary) is a data structure that stores key-value pairs and provides near-constant-time lo",
+    "# Hash Maps: A Complete Explanation\n\nA hash map (also called a hash table or dictionary) is a data structure that stores key-value pairs and provides near-constant-time lookup, insertion, and deletion"
+   ]
+  },
+  {
+   "name": "structured",
+   "prompt_tokens": 27,
+   "identical": true,
+   "diverge_char": null,
+   "ttft": [
+    0.1820710739993956,
+    0.24557567399460822
+   ],
+   "heads": [
+    "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70",
+    "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70"
+   ]
+  },
+  {
+   "name": "essay",
+   "prompt_tokens": 54,
+   "identical": false,
+   "diverge_char": 304,
+   "ttft": [
+    0.2545500330015784,
+    0.2398586829949636
+   ],
+   "heads": [
+    "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nAutoregressive large language models generate te",
+    "# Speculative Decoding and the Hidden Cost of Failed Drafts: A Technical Analysis\n\n## 1. Introduction: The Latency Problem in Autoregressive Inference\n\nAutoregressive large language models generate te"
+   ]
+  },
+  {
+   "name": "edit0",
+   "prompt_tokens": 1463,
+   "identical": true,
+   "diverge_char": null,
+   "ttft": [
+    0.2829299989971332,
+    1.4999191879978753
+   ],
+   "heads": [
+    "```python\n#!/usr/bin/env python3\n\"\"\"One benchmark client for every GLM-5.3-Flash engine we compare (vLLM kit, TensorFold).\n\nStandard library only, so it runs on a bare host. Every suite streams throug",
+    "```python\n#!/usr/bin/env python3\n\"\"\"One benchmark client for every GLM-5.3-Flash engine we compare (vLLM kit, TensorFold).\n\nStandard library only, so it runs on a bare host. Every suite streams throug"
+   ]
+  },
+  {
+   "name": "edit1",
+   "prompt_tokens": 1460,
+   "identical": true,
+   "diverge_char": null,
+   "ttft": [
+    0.28038778199697845,
+    0.2771240479996777
+   ],
+   "heads": [
+    "```python\n#!/usr/bin/env python3\n\"\"\"One benchmark client for every GLM-5.3-Flash engine we compare (vLLM kit, TensorFold).\n\nStandard library only, so it runs on a bare host. Every suite streams throug",
+    "```python\n#!/usr/bin/env python3\n\"\"\"One benchmark client for every GLM-5.3-Flash engine we compare (vLLM kit, TensorFold).\n\nStandard library only, so it runs on a bare host. Every suite streams throug"
+   ]
+  },
+  {
+   "name": "edit2",
+   "prompt_tokens": 1461,
+   "identical": true,
+   "diverge_char": null,
+   "ttft": [
+    0.2935859680001158,
+    0.2815495549948537
+   ],
+   "heads": [
+    "```python\n#!/usr/bin/env python3\n\"\"\"One benchmark client for every GLM-5.3-Flash engine we compare (vLLM kit, TensorFold).\n\nStandard library only, so it runs on a bare host. Every suite streams throug",
+    "```python\n#!/usr/bin/env python3\n\"\"\"One benchmark client for every GLM-5.3-Flash engine we compare (vLLM kit, TensorFold).\n\nStandard library only, so it runs on a bare host. Every suite streams throug"
+   ]
+  },
+  {
+   "name": "long0-8000",
+   "prompt_tokens": 6552,
+   "identical": false,
+   "diverge_char": 1,
+   "ttft": [
+    6.789993897000386,
+    6.380344651995983
+   ],
+   "heads": [
+    "# DFlashProposer \u2014 Design Summary\n\n## Role and contract\n\n`DFlashProposer` is the **lane-engine's speculative proposer**. It wraps a `DFlashDrafter` (a DFlash2-style draft model) and exposes the engine",
+    "## Summary of Design Decisions\n\nThe text describes a **speculative decoding engine** for MLX (Apple Silicon) with a **DFlash2 drafter**, built around a lane-tiled quantized transformer. The key design"
+   ]
+  },
+  {
+   "name": "long1-9052",
+   "prompt_tokens": 8852,
+   "identical": false,
+   "diverge_char": 37,
+   "ttft": [
+    9.76948202499625,
+    8.042448038999282
+   ],
+   "heads": [
+    "<function>\n<name>Config.read</name>\n<summary>Parses config.json (merging text_config) into a Config with all architecture, quantization, and n-gram settings.</summary>\n</function>\n<function>\n<name>Con",
+    "<function>\n<name>Config.read</name>\n<description>Parses config.json (including text_config) into a Config with all architecture and quantization fields.</description>\n</function>\n<function>\n<name>Conf"
+   ]
+  },
+  {
+   "name": "long2-10105",
+   "prompt_tokens": 7399,
+   "identical": false,
+   "diverge_char": 71,
+   "ttft": [
+    7.768745777000731,
+    6.0425477999961
+   ],
+   "heads": [
+    "Looking at this code, I can identify several problems it addresses and how they're solved:\n\n## 1. **Slow sequential token generation (the core problem)**\n\n**Problem:** LLM inference generates tokens o",
+    "Looking at this code, I can identify several problems it addresses and their solutions:\n\n## 1. **Slow prefill on repeated conversations (KV cache reuse)**\n\n**Problem:** Every request re-prefills the e"
+   ]
+  },
+  {
+   "name": "long3-11157",
+   "prompt_tokens": 12668,
+   "identical": false,
+   "diverge_char": 34,
+   "ttft": [
+    13.132705755000643,
+    10.258521507996193
+   ],
+   "heads": [
+    "# Exactness Guarantees\n\nThe kernel set claims to be **bit-exact with the reference implementation** (MLX's `mx.fast.rope`, `mx.fast.scaled_dot_product_attention`, and the quantized matmul path). Here ",
+    "# Exactness Guarantees\n\nThe kernels above are written so that, for a given set of weights, the output is **bit-identical to the reference implementation** (the plain PyTorch/MLX model), not merely clo"
+   ]
+  },
+  {
+   "name": "long4-12210",
+   "prompt_tokens": 11894,
+   "identical": false,
+   "diverge_char": 0,
+   "ttft": [
+    12.970375711003726,
+    9.616231676001917
+   ],
+   "heads": [
+    "The code above is a patch-series design document for a CUDA inference engine (TensorFold) targeting GLM-5.3 on GB10 hardware. Here's my review.\n\n## Strengths\n\n**1. The exactness discipline is exemplar",
+    "# Review\n\nThis is a well-organized patch series with a clear engineering narrative. The strongest aspects:\n\n**Strengths**\n\n1. **Exactness discipline is exemplary.** Nearly every patch states precisely"
+   ]
+  },
+  {
+   "name": "long5-13263",
+   "prompt_tokens": 11865,
+   "identical": false,
+   "diverge_char": 2,
+   "ttft": [
+    12.45151085499674,
+    9.548705656998209
+   ],
+   "heads": [
+    "# Design decisions in the text\n\n## Overall architecture\n\n1. **Streaming tool-call parsing as a state machine.** `ToolCallStreamer` tracks position in the decoded text and emits OpenAI-style `tool_call",
+    "# Summary of Design Decisions\n\n## Core Architecture\n\n**TensorFold** is a local inference server for Apple Silicon (MLX) and NVIDIA GPUs (CUDA), with a plugin architecture where each model family is a "
+   ]
+  },
+  {
+   "name": "long6-14315",
+   "prompt_tokens": 11491,
+   "identical": false,
+   "diverge_char": 0,
+   "ttft": [
+    11.420379373994365,
+    9.308203382999636
+   ],
+   "heads": [
+    "# Functions in `dflash_drafter.py`\n\n- **`_vendor()`** \u2014 Loads the vendored z-lab DFlash2 MLX module by file path, caching it in `sys.modules`.\n- **`_dflash_attend(attn, x, x_ctx, rope, cache, masks)`*",
+    "<think>\nThe user wants me to list every function defined in the provided code with a one-line description. Let me go through the code carefully and identify all function definitions.\n\nLet me scan thro"
+   ]
+  },
+  {
+   "name": "long7-15368",
+   "prompt_tokens": 13306,
+   "identical": false,
+   "diverge_char": 73,
+   "ttft": [
+    14.100211732999014,
+    10.70478527600062
+   ],
+   "heads": [
+    "The text is a set of Python source files for a CUDA inference engine for a Qwen-family model (Qwen3.8 \"Flash Next\"), built on Triton kernels. It's dense, but the problems it describes and their soluti",
+    "The text is a set of Python source files for a CUDA inference engine for Qwen3.8-style models (a \"Flash Next\" engine in a project called TensorFold). It doesn't describe problems in prose \u2014 the proble"
+   ]
+  },
+  {
+   "name": "long8-16421",
+   "prompt_tokens": 18354,
+   "identical": false,
+   "diverge_char": 61,
+   "ttft": [
+    16.515809705997526,
+    16.625564007998037
+   ],
+   "heads": [
+    "Looking at this code, the exactness guarantees are stated in a few docstrings and comments. Let me trace through each one carefully.\n\n## The core claim: bit-exactness at any batch size\n\nThe central gu",
+    "Looking at this code, the exactness guarantees are stated in the docstrings and comments. Let me trace through each one carefully.\n\n## The core claim\n\nThe kernels claim to produce **bit-identical resu"
+   ]
+  },
+  {
+   "name": "long9-17473",
+   "prompt_tokens": 16866,
+   "identical": false,
+   "diverge_char": 143,
+   "ttft": [
+    15.79258172599657,
+    13.602028419998533
+   ],
+   "heads": [
+    "# Review: TensorFold Qwen3.8-27B CUDA Backend\n\n## Overall\n\nThis is an ambitious, well-documented inference engine: a 4-bit row-invariant matmul, a CUDA GDN tree kernel, and a two-rank NCCL engine with",
+    "# Review: TensorFold Qwen3.8-27B CUDA Backend\n\n## Overall\n\nThis is an ambitious, well-documented inference engine: a 4-bit row-invariant matmul in Triton, a custom CUDA GDN tree kernel, a two-rank NCC"
+   ]
+  },
+  {
+   "name": "long10-18526",
+   "prompt_tokens": 18898,
+   "identical": false,
+   "diverge_char": 316,
+   "ttft": [
+    18.6849592580038,
+    15.953413695002382
+   ],
+   "heads": [
+    "# Summary of Design Decisions\n\n## Overall Architecture\nThe text describes **TensorFold**, an inference engine for Qwen3.8-family models (dense `qwen3_5` and sparse/MoE `qwen4_exp`), with parallel impl",
+    "# Summary of Design Decisions\n\n## Overall Architecture\nThe text describes **TensorFold**, an inference engine for Qwen3.8-family models (dense `qwen3_5` and sparse/MoE `qwen4_exp`), with parallel impl"
+   ]
+  },
+  {
+   "name": "long11-19578",
+   "prompt_tokens": 20374,
+   "identical": false,
+   "diverge_char": 0,
+   "ttft": [
+    20.718851926998468,
+    16.9936853399995
+   ],
+   "heads": [
+    "# Functions defined in the file\n\n## `lane_attention.py`\n\n- **`_single_half(source: str) -> str`** \u2014 Rewrites a 256-column kernel source into its 128-column variant by removing the second output half (",
+    "Here are the functions defined in the file, with one-line descriptions:\n\n**`_one`** \u2014 Runs a single query row through `mx.fast.scaled_dot_product_attention` over exactly the keys the serial step at th"
+   ]
+  },
+  {
+   "name": "long12-20631",
+   "prompt_tokens": 18309,
+   "identical": false,
+   "diverge_char": 0,
+   "ttft": [
+    16.89321788399684,
+    15.843243092000193
+   ],
+   "heads": [
+    "The text is a set of Python source files from a project called **TensorFold** \u2014 an inference engine for running large language models on Apple Silicon Macs (MLX) and CUDA GPUs. The files cover several",
+    "# What the text describes, and how each problem is solved\n\nThe text is the source of **TensorFold**, a local inference engine for Apple Silicon (MLX/Metal) and CUDA. It is organized as a set of family"
+   ]
+  },
+  {
+   "name": "long13-21684",
+   "prompt_tokens": 17295,
+   "identical": false,
+   "diverge_char": 0,
+   "ttft": [
+    15.458186331001343,
+    16.388161173003027
+   ],
+   "heads": [
+    "# Exactness Guarantees in TensorFold\n\nThe codebase makes a strong claim: **drafted decoding produces byte-identical output to serial (one-token-per-round) decoding.** Here's how that's achieved and wh",
+    "Looking at the code, the exactness guarantee is the central design claim, and it's stated in several places. Let me trace through what the code actually says and how the pieces connect.\n\n## The core c"
+   ]
+  },
+  {
+   "name": "long14-22736",
+   "prompt_tokens": 17230,
+   "identical": false,
+   "diverge_char": 144,
+   "ttft": [
+    16.832064515998354,
+    13.83818665400031
+   ],
+   "heads": [
+    "**Review: TensorFold lane engine**\n\n**What's good**\n\n- The core idea is genuinely interesting: batching heterogeneous streams (prefill, decode, speculative windows) into one shared forward with per-ro",
+    "**Review: TensorFold lane engine**\n\n**What's good**\n\n- The core idea is genuinely interesting: batching heterogeneous streams (prefill, decode, forked lanes, tool calls) into one shared forward with p"
+   ]
+  },
+  {
+   "name": "long15-23789",
+   "prompt_tokens": 21166,
+   "identical": false,
+   "diverge_char": 2,
+   "ttft": [
+    20.675654842998483,
+    18.762686065005255
+   ],
+   "heads": [
+    "# Summary of Design Decisions\n\n## 1. Overall architecture: TensorFold as a serving layer\n\nTensorFold is a Python package (v0.3.4) that serves LLMs behind an OpenAI-compatible endpoint, with a family-p",
+    "# TensorFold: Design Summary\n\n## What it is\n\nTensorFold is a fast, exact LLM decoding engine behind an OpenAI-compatible endpoint, running on Apple Silicon (MLX) and NVIDIA GPUs (CUDA). The core invar"
+   ]
+  },
+  {
+   "name": "long16-24842",
+   "prompt_tokens": 22268,
+   "identical": false,
+   "diverge_char": 0,
+   "ttft": [
+    20.9425939549983,
+    17.689253182004904
+   ],
+   "heads": [
+    "# Functions in the Flash Next CUDA family\n\n## `attention.py`\n\n- `AttnScratch.__init__` \u2014 allocates the partial buffers for the chunked attention (and the QSA block-selection scratch when the cache exc",
+    "Functions in the provided code:\n\n**`Config.read`** \u2014 Parses a `config.json` file into a `Config` dataclass, extracting model dimensions, GDN/attention parameters, RoPE settings, and EOS token ids.\n\n**"
+   ]
+  },
+  {
+   "name": "long17-25894",
+   "prompt_tokens": 27574,
+   "identical": false,
+   "diverge_char": 63,
+   "ttft": [
+    26.76770873500209,
+    24.651303225000447
+   ],
+   "heads": [
+    "# What the text describes, and how each problem is solved\n\nThe document is a patch log for a TensorFold-based serving stack for **GLM-5.3-Flash** (a 314B MoE model) on a 2\u00d7GB10 (DGX Spark) node, TP=2.",
+    "# What the text describes, and how each problem is solved\n\nThe text is a set of engineering documents for serving **GLM-5.3-Flash** (a 314B MoE model) on a 2\u00d7DGX Spark (GB10) node with TensorFold, a C"
+   ]
+  },
+  {
+   "name": "long18-26947",
+   "prompt_tokens": 23530,
+   "identical": false,
+   "diverge_char": 2,
+   "ttft": [
+    21.609634444997937,
+    19.579529635004292
+   ],
+   "heads": [
+    "# Exactness guarantees in the code above\n\nThe codebase makes a very specific promise, stated in several places (the `qwen3_5` family docstring, the CUDA `__init__`, the `NemotronH` docstring, and the ",
+    "# The Exactness Guarantee, Explained\n\n## The core promise\n\nEvery kernel on the verify path gives a row the same bits whether it runs **alone** (serial decoding) or as **one of up to 128 rows of a veri"
+   ]
+  },
+  {
+   "name": "long19-28000",
+   "prompt_tokens": 26022,
+   "identical": false,
+   "diverge_char": 0,
+   "ttft": [
+    23.162445248999575,
+    20.75853220999852
+   ],
+   "heads": [
+    "# Review: TensorFold CUDA Backend (Qwen3.8-27B)\n\n## Overview\n\nThis is a substantial, well-engineered CUDA/Triton implementation of a speculative-decoding inference engine for Qwen3.8-27B, including a ",
+    "Looking at this codebase, I see a CUDA inference engine for Qwen3.8-27B with speculative decoding, 4-bit quantization, and tensor parallelism. Let me review the key components.\n\n**Strengths:**\n\nThe `q"
+   ]
+  }
+ ]
+}
