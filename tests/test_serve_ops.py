@@ -44,6 +44,7 @@ class Engine:
         self.health = (200, {"ok": True})
         self.metrics = ""
         self.requests: list[dict] = []
+        self.model_extra: dict = {}                     # e.g. max_model_len, when the image reports it
 
     def reply(self, body: dict) -> dict:
         self.requests.append(body)
@@ -77,7 +78,7 @@ def engine():
 
         def do_GET(self):
             if self.path == "/v1/models":
-                self._send(200, {"data": [{"id": "fake"}]})
+                self._send(200, {"data": [dict({"id": "fake"}, **state.model_extra)]})
             elif self.path == "/health":
                 self._send(*state.health)
             elif self.path == "/metrics":
@@ -199,6 +200,8 @@ case "$1" in
 run)
     name=""; prev=""
     for a in "$@"; do [[ "$prev" == --name ]] && name=$a; prev=$a; done
+    # the preflight's RoCE marker probe (docker run --rm ... --entrypoint test IMAGE -e MARK)
+    [[ " $* " == *" --entrypoint test "* ]] && { [[ -f "$FAKE_STATE/roce-mark" ]]; exit; }
     printf '%s\n' "$@" > "$FAKE_STATE/args.$name"
     echo "${FAKE_RUN_STATE:-true}" > "$FAKE_STATE/c.$name"; echo cid ;;
 rm) for n in "${@:2}"; do [[ "$n" == -f ]] || rm -f "$FAKE_STATE/c.$n"; done ;;
@@ -231,6 +234,13 @@ case "$*" in
 esac
 """
 
+FAKE_IP = r"""#!/usr/bin/env bash
+# fake ip: `ip -o -4 addr show dev X` for the netdevs in FAKE_NETDEVS (default eth9) at FAKE_IP_ADDR
+dev="${@: -1}"
+[[ " ${FAKE_NETDEVS-eth9} " == *" $dev "* ]] || { echo "Device \"$dev\" does not exist." >&2; exit 1; }
+echo "5: $dev    inet ${FAKE_IP_ADDR:-10.0.0.1}/24 brd 10.0.0.255 scope global $dev\       valid_lft forever"
+"""
+
 FAKE_JOURNAL = r"""#!/usr/bin/env bash
 [[ -f "$FAKE_STATE/klog" ]] && cat "$FAKE_STATE/klog"
 exit 0
@@ -246,13 +256,13 @@ def kit(tmp_path, engine):
     (repo / "config").mkdir()
     for f in ("serve.sh", "canary.py", "xid.py"):
         shutil.copy(ROOT / "scripts" / f, repo / "scripts" / f)
-    (repo / "config" / "tensorfold.env").write_text(
+    (repo / "config" / "prod.env").write_text(
         "WORKER_SSH=fake-worker\nHEAD_IP=10.0.0.1\nNCCL_SOCKET_IFNAME=eth9\nNCCL_IB_HCA=fakehca0\n"
         "HEAD_HF=/tmp/hf\nWORKER_HF=/tmp/hf\nMODEL_PATH=/m\nIMAGE=fake:img\nSERVED_NAME=fake\n")
     bin_ = tmp_path / "bin"
     bin_.mkdir()
     for name, text in (("docker", FAKE_DOCKER), ("ssh", FAKE_SSH), ("nvidia-smi", FAKE_SMI),
-                       ("journalctl", FAKE_JOURNAL)):
+                       ("journalctl", FAKE_JOURNAL), ("ip", FAKE_IP)):
         (bin_ / name).write_text(text)
         (bin_ / name).chmod(0o755)
     state = tmp_path / "state"
@@ -268,8 +278,9 @@ def kit(tmp_path, engine):
                               capture_output=True, timeout=timeout)
 
     kit = SimpleKit(run, state, tmp_path / "ops", engine)
+    kit.repo = repo
     kit.cfg_no_head = tmp_path / "nohead.env"
-    kit.cfg_no_head.write_text((repo / "config" / "tensorfold.env").read_text().replace("HEAD_IP=10.0.0.1\n", ""))
+    kit.cfg_no_head.write_text((repo / "config" / "prod.env").read_text().replace("HEAD_IP=10.0.0.1\n", ""))
     return kit
 
 
@@ -490,3 +501,100 @@ def test_watch_drafter_rate_alert(kit):
     assert "ALERT: drafter: 1.00 tokens a round over 1000 rounds" in r.stdout
     kit.engine.metrics = _metrics(10, 5, 1)                          # server restarted: reseed, no alert
     assert "drafter" not in kit.run("watch", "--once", WATCH_MIN_TPR=1.5, WATCH_TPR_ROUNDS=500).stdout
+
+
+# -- the config and the context it serves (docs/TRYING.md "Context smaller than expected") ------------------------------
+def test_default_config_is_prod(kit):
+    r = kit.run("status")
+    assert r.returncode == 0, r.stderr
+    (kit.repo / "config" / "prod.env").rename(kit.repo / "config" / "tensorfold.env")
+    r = kit.run("start")
+    assert r.returncode == 2 and "no config/prod.env" in r.stderr and "cp config/prod.env.example" in r.stderr
+    assert "CONFIG=config/tensorfold.env" in r.stderr and "docker run" not in kit.calls()
+    r = kit.run("status", CONFIG="config/tensorfold.env")          # the old file still works when named
+    assert r.returncode == 0, r.stderr
+
+
+def test_missing_config_points_at_prod(kit, tmp_path):
+    r = kit.run("start", CONFIG=str(tmp_path / "nope.env"))
+    assert r.returncode == 2 and "no config file" in r.stderr and "config/prod.env.example" in r.stderr
+    assert "docker run" not in kit.calls()
+
+
+def test_context_line_and_short_context_warning(kit):
+    r = kit.run("start", CONTEXT="32768")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "CONTEXT=32768 tokens a request" in r.stdout
+    assert "warning: CONTEXT=32768: a request past 32768 tokens" in r.stdout and "config/prod.env.example" in r.stdout
+    r = kit.run("start")
+    assert "warning: CONTEXT is not set: the engine serves 2,051 tokens" in r.stdout
+    r = kit.run("start", CONTEXT="1048576", GLM53_TF_LATENT_KV="1", GLM53_TF_KV_DTYPE="fp8", GLM53_TF_BATCH="4",
+                GLM53_TF_KV_POOL_TOKENS="1048576")
+    assert r.returncode == 0 and "warning" not in r.stdout
+    assert "CONTEXT=1048576 tokens a request (prompt + max_tokens), KV cache latent fp8, GLM53_TF_BATCH=4, " \
+           "GLM53_TF_KV_POOL_TOKENS=1048576" in r.stdout
+
+
+def test_long_context_on_per_head_kv_is_refused(kit):
+    r = kit.run("start", CONTEXT="262144")
+    assert r.returncode == 1 and "not starting: CONTEXT=262144 cannot load" in r.stdout
+    assert "GLM53_TF_LATENT_KV=1" in r.stdout and "docker run" not in kit.calls()
+    r = kit.run("start", CONTEXT="98304")                    # may fit: a warning only
+    assert r.returncode == 0 and "per-head KV cache" in r.stdout
+    r = kit.run("start", CONTEXT="262144", FORCE_CONTEXT="1")
+    assert r.returncode == 0
+    r = kit.run("start", CONTEXT="lots")
+    assert r.returncode == 1 and "expected a token count" in r.stdout
+
+
+def test_ready_reports_the_context(kit):
+    r = kit.run("start", CONTEXT="1048576", GLM53_TF_LATENT_KV="1")          # an image without max_model_len
+    assert r.returncode == 0 and "serving up to 1048576 tokens a request (CONTEXT in" in r.stdout
+    kit.engine.model_extra = {"max_model_len": 1048576, "context_length": 1048576}
+    r = kit.run("start", CONTEXT="1048576", GLM53_TF_LATENT_KV="1")
+    assert r.returncode == 0 and "serving up to 1048576 tokens a request (max_model_len)" in r.stdout
+
+
+# -- preflight: the checks AGENTS.md lists ------------------------------------------------------------------------------
+def test_preflight_link_checks(kit):
+    r = kit.run("preflight")
+    assert r.returncode == 0 and "preflight ok" in r.stdout, r.stdout + r.stderr
+    r = kit.run("preflight", FAKE_NETDEVS="eth8")
+    assert r.returncode == 1 and "no IPv4 address on NCCL_SOCKET_IFNAME=eth9 on the head" in r.stdout
+    assert "ibdev2netdev" in r.stdout
+    r = kit.run("preflight", FAKE_IP_ADDR="10.0.0.2")
+    assert r.returncode == 1 and "HEAD_IP=10.0.0.1 is not an address of eth9 on the head (it has: 10.0.0.2/24)" in r.stdout
+
+
+def test_preflight_weights(kit, tmp_path):
+    hf = tmp_path / "hf"
+    snap = "/hub/models--org--Model-EXL3/snapshots/abc123"
+    cfg = tmp_path / "weights.env"                                 # HEAD_HF / WORKER_HF come from the config only
+    cfg.write_text((kit.repo / "config" / "prod.env").read_text().replace("/tmp/hf", str(hf)))
+    extra = dict(CONFIG=str(cfg), MODEL_PATH="/root/.cache/huggingface" + snap)
+    r = kit.run("preflight", **extra)
+    assert r.returncode == 1 and "the weights are not in the head's HF cache" in r.stdout
+    assert "hf download org/Model-EXL3 --revision abc123 on the head" in r.stdout
+    (hf / snap.lstrip("/")).mkdir(parents=True)
+    (hf / snap.lstrip("/") / "config.json").write_text("{}")
+    r = kit.run("preflight", **extra)
+    assert r.returncode == 0 and "HF cache" not in r.stdout
+    r = kit.run("preflight", DRAFTER="/root/.cache/huggingface/hub/models--org--Draft/snapshots/d1", **extra)
+    assert r.returncode == 1 and "DRAFTER is not in the worker's HF cache" in r.stdout and "DRAFTER= empty" in r.stdout
+
+
+def test_preflight_roce_marker_and_busy_gpu(kit):
+    roce = dict(GLM53_TF_COMM_BACKEND="roce", GLM53_TF_ROCE_MARK="/cache/roce-failed")
+    r = kit.run("preflight", **roce)
+    assert r.returncode == 0 and "marker" not in r.stdout
+    (kit.state / "roce-mark").touch()
+    r = kit.run("preflight", **roce)
+    assert r.returncode == 0 and "RoCE failure marker /cache/roce-failed on the head" in r.stdout
+    assert "--entrypoint rm fake:img -f /cache/roce-failed" in r.stdout
+    r = kit.run("preflight", FAKE_GPU_PIDS="4242")
+    assert r.returncode == 1 and "a CUDA process is running" in r.stdout
+
+
+def test_preflight_memory_warnings(kit):
+    r = kit.run("preflight", MEM_GATE_GIB="100000")
+    assert r.returncode == 0 and "under MEM_GATE_GIB=100000" in r.stdout

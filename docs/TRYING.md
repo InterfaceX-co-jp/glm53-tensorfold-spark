@@ -2,9 +2,10 @@
 
 > Work in progress: knobs and defaults may change. Everything here was run on one pair of DGX Sparks.
 
-All commands run on the head node (rank 0) from the repo checkout. `scripts/serve.sh` reads `config/tensorfold.env`
-unless `CONFIG=path` is set; a non-empty environment variable overrides the same key in the file for one start
-(`CONTEXT=65536 scripts/serve.sh start`). Placeholders: `<worker-ssh>` (ssh target of the worker node, e.g.
+All commands run on the head node (rank 0) from the repo checkout. `scripts/serve.sh` reads `config/prod.env` (the
+production config, copied from `config/prod.env.example`) unless `CONFIG=path` is set; a non-empty environment
+variable overrides the same key in the file for one start (`MAX_TOKENS=16384 scripts/serve.sh start`). Setting up
+from scratch: the README's Quickstart, or [`AGENTS.md`](../AGENTS.md) (step by step, with checks). Placeholders: `<worker-ssh>` (ssh target of the worker node, e.g.
 `user@<worker CX7 address>`), `<head-ip>` (the head's address on the CX7 link), `<head HF cache>` / `<worker HF cache>`
 (absolute paths of each node's `~/.cache/huggingface`).
 
@@ -18,15 +19,19 @@ process is up on either node. Stop vLLM (or anything else) first.
 | **Production** (4 requests, shared pool) | `config/prod.env.example` | up to 1,048,576 a request, 1,048,576 shared by the 4 | 4 | FP8 latent, paged pool | the default: agents with subagents, several sessions at once (~78 tok/s aggregate at 4 streams), the fastest prefill (~1,600 tok/s), NVMe session tier |
 | Single-stream, long context (earlier) | `config/prod-single.env.example` | 524,288 | 1 (others queue) | bf16 latent | one request at a time with bf16 KV (1,266 tok/s prefill at 28k) |
 | 4 x 256k batch (earlier) | `config/prod-batch.env.example` | 262,144 a slot | 4 | FP8 latent | the pre-pool batch config, 4 GiB session store; only if your nodes have more free memory (worker hit 7.3 GiB in stress) |
-| Safe / minimal (upstream-like) | `config/tensorfold.env.example` | 32,768 | 1 | per-head K/V (upstream) | a baseline with few patches active; check a problem against it |
+| Debugging baseline (upstream-like) | `config/minimal.env.example` | 32,768 | 1 | per-head K/V (upstream) | not for normal use: a baseline with few patches active; check a problem against it |
 
 ```bash
 cp config/prod.env.example config/prod.env
 $EDITOR config/prod.env
-CONFIG=config/prod.env scripts/serve.sh build       # image on the head node, copied to the worker
-CONFIG=config/prod.env scripts/serve.sh start
-CONFIG=config/prod.env scripts/serve.sh status      # logs 0 | logs 1 | stop | restart
+scripts/serve.sh build       # image on the head node, copied to the worker
+scripts/serve.sh preflight   # both nodes: ssh, docker, image, link, weights, memory
+scripts/serve.sh start
+scripts/serve.sh status      # logs 0 | logs 1 | stop | restart
 ```
+
+The other configs are files next to it; pass them with `CONFIG=`, e.g. `CONFIG=config/prod-single.env
+scripts/serve.sh start` (and on every other `serve.sh` command while it runs).
 
 ### Single-stream (524k)
 
@@ -65,9 +70,10 @@ without a rebuild: `GLM53_TF_KV_DTYPE=bf16` with `GLM53_TF_SESSION_GIB=0` / `GLM
 slots, or the single-stream config. The memory gate (`MEM_GATE_GIB=108`, `MEM_GATE_DROP_CACHES=1`) needs
 passwordless `sudo -n` on both nodes to drop page caches; without it the 4th slot may not fit at load.
 
-### Safe / minimal
+### Debugging baseline
 
-`config/tensorfold.env.example` turns on only the decode-side patches (4-bit non-expert weights `q4mse`, deeper
+`config/minimal.env.example` (copy to `config/minimal.env`, then `CONFIG=config/minimal.env scripts/serve.sh ...`)
+turns on only the decode-side patches (4-bit non-expert weights `q4mse`, deeper
 DFlash2 drafts, real-text draft calibration, prompt-lookup drafts, `prefill_rows=auto`) at `CONTEXT=32768`, and leaves
 fast prefill, the latent / FP8 KV cache, sessions and batching off. For upstream TensorFold behaviour exactly, also
 set `GLM53_TF_NONEXPERT=bf16`, `GLM53_TF_PREFILL_ROWS=64`, `GLM53_TF_AUTO_FDRAFTS=5`, `GLM53_TF_CALIB=random`
@@ -75,7 +81,7 @@ and `GLM53_TF_LOOKUP=0`, or build an image with only some patches:
 
 ```bash
 docker build -f docker/Dockerfile --build-arg PATCHES="0001 0002 0003 0004" -t glm53-tensorfold:min .
-IMAGE=glm53-tensorfold:min scripts/serve.sh start
+CONFIG=config/minimal.env IMAGE=glm53-tensorfold:min scripts/serve.sh start
 ```
 
 (`serve.sh build` copies the image to the worker; with a manual `docker build`, build it on both nodes or copy it
@@ -84,7 +90,7 @@ with `docker save | ssh <worker-ssh> docker load`.)
 ## 2. Talk to it
 
 ```bash
-B=http://127.0.0.1:8000; M=GLM-5.3-Flash-EXL3     # the prod configs; tensorfold.env.example: :8080, GLM-5.3-Flash-Uncensored
+B=http://127.0.0.1:8000; M=GLM-5.3-Flash-EXL3     # every example config serves this port and name
 curl -s $B/v1/models
 curl -s $B/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "'$M'", "messages": [{"role": "user", "content": "Summarize the CAP theorem in 3 bullets."}],
@@ -218,7 +224,8 @@ prefill, FP8 KV) change replies against other settings, but exactness holds with
 ## 8. Operations
 
 ```bash
-scripts/serve.sh preflight   # config, ssh, image on both nodes, RDMA port ACTIVE, vm.min_free_kbytes parity
+scripts/serve.sh preflight   # CONTEXT, ssh, docker, image, CX7 netdev / HEAD_IP / RDMA port, weights, MemFree, sudo -n,
+                             # CUDA processes, RoCE marker, driver and vm.min_free_kbytes parity, GPU state (both nodes)
 scripts/serve.sh canary      # the post-load probes on demand (fails on degenerate output or a dead drafter)
 scripts/serve.sh xid 2h      # NVIDIA Xid events on both nodes
 scripts/serve.sh watch       # watchdog loop; or the systemd user units in scripts/systemd/
@@ -251,3 +258,55 @@ checks `/health` every minute and, with `WATCH_HEAL=1`, restarts both ranks afte
 | everything | `scripts/serve.sh stop`; start your previous stack (vLLM kit or upstream TensorFold). Old images stay tagged; `IMAGE=<old tag> scripts/serve.sh start` |
 
 Prepared folders and the kernel cache volume (`glm53-tf-cache`) are safe to delete; the next start rebuilds them.
+
+## 10. Context smaller than expected
+
+A request can use `CONTEXT` tokens of the config the pair was started with: prompt **plus** `max_tokens` (the reply
+is reserved up front). Nothing truncates silently; a request past the limit is refused with HTTP 400. Check, in order:
+
+1. **What the server serves.** `scripts/serve.sh start` logs `<config>: CONTEXT=... tokens a request` before it
+   starts and `serving up to N tokens a request` once ready. On a running pair:
+   `docker inspect glm53-tf-r0 | grep -o 'CONTEXT=[0-9]*'`. The production config serves 1,048,576.
+2. **Which config.** `serve.sh` reads `config/prod.env` unless `CONFIG=` is set. `config/minimal.env.example` is the
+   **debugging baseline: `CONTEXT=32768`**, one request at a time and the upstream per-head KV cache (~390 KB a token
+   a rank). Raising its `CONTEXT` does not get far: past ~100k tokens that cache does not fit next to the weights
+   (`serve.sh` refuses more than 131,072 on it). For long context use `config/prod.env` (`CONTEXT=1048576`, FP8
+   latent KV at 7.4 KB a token, the shared pool) and leave `CONFIG` unset. An older checkout's `config/tensorfold.env`
+   is not read any more unless named.
+3. **The client.** Tell the client the real window, and keep its reply budget (`max_tokens`) well under it: see
+   [Client settings](#client-settings) below. If long sessions fail only in one client, its context setting is the
+   first suspect.
+4. **Memory.** A node short of free memory at load (a desktop session, other containers, page cache: the load's
+   rules read MemFree, not MemAvailable) makes the production config start with fewer slots (the log says
+   `only N sequence(s) fit`): fewer concurrent requests, not a shorter context; each request can still grow to
+   `CONTEXT` through the shared pool. A load that does not fit fails ("rank 0 exited"); it never shrinks `CONTEXT`.
+   Stop what else runs on the Sparks, and keep `MEM_GATE_GIB` / `MEM_GATE_DROP_CACHES` from the example.
+
+Measured on production (2026-09-29, `config/prod.env`): single prompts of 63k and 120k tokens, and two 9-turn
+conversations growing by ~15k tokens a turn to 143k (thinking off, and thinking on with `max_tokens` 32,000 as
+opencode sends it): every turn answered correctly, resumed all but the last turn's new tokens from the session
+store (~11-12 s a turn), no refusals or waits.
+
+Coming (a server patch in testing, not in this tree yet): `/v1/models` reporting the context as `max_model_len`, so
+clients that read it configure themselves, and over-long requests answered with OpenAI's `context_length_exceeded`
+error code and message ("This model's maximum context length is N tokens. However, you requested M tokens ...").
+Until then the 400 (`invalid_request_error`) carries the engine's own message: "this request needs a M-token context
+(P prompt tokens plus max_tokens R), and this server was started for N: ...". If R is large, the client's reply
+budget is what hit the limit.
+
+### Client settings
+
+Production serves `http://127.0.0.1:8000/v1`, model `GLM-5.3-Flash-EXL3`, a **1,048,576-token** context window.
+Suggested maximum output: **32,768** tokens (the config's `MAX_TOKENS`). What to set, and what a client shows when a
+request does not fit:
+
+| Client | Where | Set | If a request exceeds the window |
+| --- | --- | --- | --- |
+| opencode | `~/.config/opencode/opencode.json`, the model's `limit` (README Quickstart has the whole entry) | `"limit": {"context": 1048576, "output": 32768}` | without `limit.context` opencode never compacts a long session; it sends `max_tokens` = `limit.output` (capped at 32,000), which counts against the context. Past the window the session stops with the server's 400 message |
+| Continue | the model entry in `config.yaml` (`defaultCompletionOptions`) or `config.json` | `contextLength: 1048576`, `maxTokens: 32768` | an unknown model defaults to a 32,768-token context: Continue drops older messages to fit that, so long sessions lose context without an error. Past the server window: the server's 400 message |
+| Cline / Roo Code | provider "OpenAI Compatible", model info | context window 1048576, max output tokens 32768 | the default (128,000) makes Cline condense or truncate the conversation early; past the server window the task shows an API request failed with the 400 message |
+| Open WebUI | Admin, Connections, OpenAI API: `http://127.0.0.1:8000/v1` | nothing required (its context options are for Ollama); set Max Tokens in the model's advanced params if you want a shorter reply budget | the chat shows the server's 400 error text |
+| Anything OpenAI-compatible | base URL, API key any string | context window 1,048,576; max output 32,768 or less | HTTP 400 with an `error.message` naming the requested and allowed tokens |
+
+The four requests of the production config share one 1,048,576-token pool: one request can use all of it; several
+long ones at once wait for pages or spill idle sessions to the store (they are not refused).

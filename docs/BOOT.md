@@ -72,7 +72,7 @@ measures it with 1, 4, 8 and 16 threads.
 ## Using it
 
 One-time, with the server stopped (needs each node's GPU for a few minutes; same `IMAGE` and `GLM53_TF_NONEXPERT`
-as serving, from `config/tensorfold.env` or exports):
+as serving, from `config/prod.env` or exports):
 
 ```
 scripts/serve.sh stop

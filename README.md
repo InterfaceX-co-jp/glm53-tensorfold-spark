@@ -22,12 +22,95 @@ included here. See [Licensing](#licensing).
 
 SPDX-License-Identifier: Apache-2.0 (this project's own code, scripts, benchmarks and docs; see [Licensing](#licensing)).
 
+## Quickstart
+
+This runs exactly the production config the numbers below come from (`config/prod.env.example`: 4 concurrent
+requests, a 1,048,576-token context). AI coding agents: follow [`AGENTS.md`](AGENTS.md), which has the same steps
+with checks and fixes.
+
+**Prerequisites** (details in [Requirements](#requirements)): two DGX Sparks cabled CX7 to CX7 with an IP address on
+the link on each; Docker with the NVIDIA runtime on both; passwordless `ssh` from the head node to the worker (and
+passwordless `sudo -n` on both for the memory gate); the weights in each node's Hugging Face cache (gated repo:
+request access first):
+
+```bash
+hf download neko-legends/GLM-5.3-Flash-Uncensored-EXL3 --revision 07135ec082f8f11f7a71e4244a4e5167a0f96277   # both nodes
+hf download incoai/GLM-5.3-Flash-DFlash2 --revision 7d74cdd881ed7e32c31175984a67823127b66cfe   # optional drafter, CC BY-NC-ND 4.0
+```
+
+**On the head node:**
+
+```bash
+git clone --recurse-submodules https://github.com/jayleaton/glm53-tensorfold-spark
+cd glm53-tensorfold-spark
+cp config/prod.env.example config/prod.env
+$EDITOR config/prod.env
+```
+
+Fill in these four fields and change nothing else:
+
+| Field | Value |
+| --- | --- |
+| `WORKER_SSH` | ssh target of the worker, e.g. `user@<worker CX7 address>` |
+| `HEAD_IP` | the head's IPv4 address on the CX7 link (`ip -br addr show <netdev>`) |
+| `HEAD_HF` / `WORKER_HF` | absolute path of each node's `~/.cache/huggingface` |
+
+Check `NCCL_SOCKET_IFNAME` / `NCCL_IB_HCA` against `ibdev2netdev` (the usual Spark names are preset), and set
+`DRAFTER=` empty if you did not download the drafter.
+
+```bash
+scripts/serve.sh build       # build the image here, copy it to the worker
+scripts/serve.sh preflight   # checks both nodes; fix what it reports
+scripts/serve.sh start       # first start: 8+ min (compiles kernels, loads, writes prepared weights); later ~25-40 s
+```
+
+`serve.sh` reads `config/prod.env` by default; no `CONFIG=` needed.
+
+**Verify:**
+
+```bash
+scripts/serve.sh status                 # both containers Up, /v1/models and /health answer
+curl -s http://127.0.0.1:8000/v1/models
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "GLM-5.3-Flash-EXL3", "max_tokens": 1024,
+  "messages": [{"role": "user", "content": "Write a Python function that reverses a linked list."}]}'
+```
+
+**Clients:** base URL `http://127.0.0.1:8000/v1`, model `GLM-5.3-Flash-EXL3`, any API key. Set the context window
+to **1,048,576** and the maximum output to **32,768** (Continue, Cline, Open WebUI and others:
+[client settings](docs/TRYING.md#client-settings)). opencode (`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "glm-tf": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "GLM-5.3-Flash (TensorFold)",
+      "options": { "baseURL": "http://127.0.0.1:8000/v1" },
+      "models": {
+        "GLM-5.3-Flash-EXL3": {
+          "name": "GLM-5.3-Flash",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": { "context": 1048576, "output": 32768 }
+        }
+      }
+    }
+  }
+}
+```
+
+Without `limit.context` opencode never compacts a long session. The API has no authentication and binds to
+`127.0.0.1`; put a reverse proxy with auth in front of it before exposing it. Stop with `scripts/serve.sh stop`.
+Long prompts refused or cut short: [Context smaller than expected](docs/TRYING.md#10-context-smaller-than-expected).
+
 ## Contents
 
+- [Quickstart](#quickstart)
 - [Benchmarks](#benchmarks)
 - [Real-agent use](#real-agent-use)
 - [Requirements](#requirements)
-- [Quickstart](#quickstart)
 - [Ways to run it](#ways-to-run-it)
 - [Knobs](#knobs)
 - [Limits and negatives](#limits-and-negatives)
@@ -166,30 +249,9 @@ arguments. Every failure is a case where the model made a different, reasonable 
 expects: `edit_file` reads the file before editing it (a `read` call where the case expects `edit`), and with
 thinking on `multi_turn_chain` takes another step first.
 
-opencode provider entry (`~/.config/opencode/opencode.json`), for the production configs (port 8000):
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "glm-tf": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "GLM-5.3-Flash (TensorFold)",
-      "options": { "baseURL": "http://127.0.0.1:8000/v1" },
-      "models": {
-        "GLM-5.3-Flash-EXL3": {
-          "name": "GLM-5.3-Flash",
-          "tool_call": true,
-          "reasoning": true,
-          "limit": { "context": 1048576, "output": 32768 }
-        }
-      }
-    }
-  }
-}
-```
-
-Set `limit.context` to the server's `CONTEXT` (1048576 for the production config, 524288 for single-stream). In the
+The opencode provider entry is in the [Quickstart](#quickstart). Set `limit.context` to the server's `CONTEXT`
+(1048576 for the production config, 524288 for single-stream): without it opencode never compacts a long session,
+and it sends `max_tokens` = `limit.output` (capped at 32,000), which counts against the context. In the
 production config the four requests share one 1,048,576-token pool: one request can use all of it, but four long
 ones together wait for pages or spill idle sessions to the store.
 
@@ -198,8 +260,8 @@ ones together wait for pages or spill idle sessions to the store.
 - Two DGX Sparks (GB10, 128 GB unified memory each) connected by a QSFP cable between their ConnectX-7 ports, with
   the link configured (an IP address on one CX7 netdev per node; the RDMA device visible in `ibv_devices`).
 - Docker with the NVIDIA Container Toolkit on both nodes (stock DGX OS has both).
-- Passwordless `ssh` from the head node to the worker, as a user that can run `docker` there. The batch config's
-  memory gate also drops page caches with `sudo -n` on both nodes.
+- Passwordless `ssh` from the head node to the worker, as a user that can run `docker` there. The production
+  config's memory gate also drops page caches with `sudo -n` on both nodes.
 - The weights in each node's Hugging Face cache, same revision on both (the repo is gated: request access on its
   model card first):
 
@@ -214,40 +276,13 @@ ones together wait for pages or spill idle sessions to the store.
   for the NVMe session tier (`GLM53_TF_SESSION_DISK_GIB`).
 - Network access at build time to pull `nvcr.io/nvidia/pytorch:26.07-py3`. At run time the container is offline.
 
-## Quickstart
-
-On the head node (rank 0):
-
-```bash
-git clone --recurse-submodules <this repo> glm53-tensorfold-spark
-cd glm53-tensorfold-spark
-cp config/prod.env.example config/prod.env        # production (4 requests, 1M pool); or prod-single.env.example
-$EDITOR config/prod.env      # <worker-ssh>, <head-ip>, the two HF cache paths; check NCCL_SOCKET_IFNAME / NCCL_IB_HCA
-export CONFIG=config/prod.env
-
-scripts/serve.sh build       # build the image here, copy it to the worker (docker save | ssh docker load)
-scripts/prepare.sh           # optional: write the prepared weight folders once (restarts then take ~35 s)
-scripts/serve.sh start       # rank 1 on the worker, then rank 0 here; waits for /v1/models, canary, warm-up
-scripts/serve.sh status
-curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "GLM-5.3-Flash-EXL3",
-  "messages": [{"role": "user", "content": "Write a Python function that reverses a linked list."}],
-  "max_tokens": 1024
-}'
-scripts/serve.sh stop
-```
-
-The first start compiles kernels into a Docker volume and calibrates the drafter costs; later starts reuse both. The
-API has no authentication and binds to `127.0.0.1` by default; put a reverse proxy with auth in front of it before
-exposing it.
-
 ## Ways to run it
 
-[`docs/TRYING.md`](docs/TRYING.md) covers: the production config (4 requests, shared 1M pool), single-stream long
-context (524k), 4 x 256k batch (FP8 KV), a safe
-upstream-like baseline, per-request knob A/B (`tf_knobs`), draft policies (`model@policy`), reasoning effort,
-sessions, fast boot, how to benchmark (`glmbench`, `multiturn`, `quality`, `toolcall_harness`), how to check
-exactness, and how to roll back.
+The production config is the default and the one to run. [`docs/TRYING.md`](docs/TRYING.md) also covers:
+single-stream long context (524k), 4 x 256k batch (FP8 KV), the 32k debugging baseline (`config/minimal.env.example`),
+per-request knob A/B (`tf_knobs`), draft policies (`model@policy`), reasoning effort, sessions, fast boot, how to
+benchmark (`glmbench`, `multiturn`, `quality`, `toolcall_harness`), how to check exactness, how to roll back, what to
+check when the context is smaller than expected, and client settings (opencode, Continue, Cline, Open WebUI).
 
 ## Knobs
 
@@ -331,7 +366,8 @@ Before publishing a fork: `scripts/check-public.sh` scans the tree for private I
 | `patches/` | engine patches, applied in order at image build |
 | `docker/` | Dockerfile, entrypoint, compose file |
 | `scripts/` | `serve.sh` (build / start / stop / status / logs / canary / watchdog / gpucheck), `prepare.sh`, `gpuwatch.py` (GB10 clock / slow-state watch), `traffic-report.py` (request-log summary), systemd units, `check-public.sh` |
-| `config/` | `*.env.example`: node, weights and serving settings |
+| `config/` | `prod.env.example` (production, the default), earlier configs, `minimal.env.example` (32k debugging baseline) |
+| `AGENTS.md` | step-by-step setup for AI coding agents: checks, commands, expected logs, failures and fixes |
 | `bench/` | benchmark clients, MMLU-200 subset, tool-call harness, shared-prefix bench, draft-policy and lookup simulators |
 | `tests/` | patch tests (GPU) and launcher tests (host) |
 | `results/` | raw benchmark JSON and the test windows' scripts (W1-W10); logs omitted |

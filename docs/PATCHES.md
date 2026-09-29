@@ -800,7 +800,7 @@ reply, `GlmEngine.cache`), so an agent switching between sessions (opencode's su
 re-prefilled the whole context on every switch: ~34 s at 30k tokens, ~115 s at 100k. The vLLM kit keeps ~14
 conversations cached (97%+ prefix hits).
 
-**Change.** `GLM53_TF_SESSION_GIB=N` (default 0: off, upstream behaviour; `config/tensorfold.env.example` and
+**Change.** `GLM53_TF_SESSION_GIB=N` (default 0: off, upstream behaviour; `config/minimal.env.example` and
 `docker/compose.yaml` set 12) keeps a store of session entries per rank (`families/glm5_next/cuda/sessions.py`,
 design in `docs/SESSIONS-DESIGN.md`):
 

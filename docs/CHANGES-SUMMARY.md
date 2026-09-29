@@ -153,5 +153,8 @@ image lacks it (0230). Memory notes: the worker node binds; a 314k needle right 
 | kernel cache volume | torch extensions, Triton and the CUDA JIT cache persist across restarts | on |
 | `docker/compose.yaml` | the same container per node via Docker Compose | alternative |
 | config placeholder guard | `serve.sh` / `prepare.sh` refuse a config that still contains `<placeholders>` | on |
+| production config by default | `serve.sh` / `prepare.sh` read `config/prod.env` unless `CONFIG` is set and point at `config/prod.env.example` when it is missing; the 32k template is `config/minimal.env.example` (debugging baseline); `AGENTS.md` walks an AI coding agent through setup | on |
+| context visibility | `serve.sh start` logs the `CONTEXT` it will serve, warns on a short or unset `CONTEXT`, refuses `CONTEXT` > 131,072 on the per-head KV cache (`FORCE_CONTEXT=1` overrides), and logs the context once ready (docs/TRYING.md section 10) | on |
+| preflight checks | `serve.sh preflight` also checks docker, the CX7 netdev address and `HEAD_IP`, the weights / drafter snapshots, MemFree, `sudo -n`, CUDA processes and the RoCE failure marker on both nodes, with the fix in each message | on |
 | `scripts/check-public.sh` | scans the tree for private IPs, hostnames, keys and tokens before publishing | tool |
 | benchmarks (`bench/`) | `glmbench.py` (decode / prefill / exactness), `multiturn.py` (sessions, follow-ups, concurrency, stall, slots, memory stress), `quality.py` (MMLU-200 + refusals), `toolcall_harness.py`, `fp8ab.py` (reply agreement / needle A/B) | tool |

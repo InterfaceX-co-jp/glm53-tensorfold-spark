@@ -1,11 +1,14 @@
 # One TensorFold rank per node, as an alternative to scripts/serve.sh (the primary path, which also ships the
 # image to the worker, starts both ranks in order and waits for the API). Same image, flags and environment.
 #
-# Values come from the same config file serve.sh reads, via --env-file (paths are relative to the repo root):
+# Values come from a serve.sh config file, via --env-file (paths are relative to the repo root). Only the keys listed
+# under x-env below reach the containers: that covers the 32k debugging baseline (config/minimal.env.example), NOT the
+# production config (its latent / FP8 KV, batching, pool and RoCE knobs are missing here; CONTEXT=1048576 without them
+# does not fit). Run production with scripts/serve.sh.
 #
-#   worker (rank 1) first:  docker compose --env-file config/tensorfold.env -f docker/compose.yaml --profile rank1 up -d
-#   head   (rank 0):        docker compose --env-file config/tensorfold.env -f docker/compose.yaml --profile rank0 up -d
-#   stop (each node):       docker compose --env-file config/tensorfold.env -f docker/compose.yaml --profile rank0 --profile rank1 down
+#   worker (rank 1) first:  docker compose --env-file config/minimal.env -f docker/compose.yaml --profile rank1 up -d
+#   head   (rank 0):        docker compose --env-file config/minimal.env -f docker/compose.yaml --profile rank0 up -d
+#   stop (each node):       docker compose --env-file config/minimal.env -f docker/compose.yaml --profile rank0 --profile rank1 down
 #
 # Each node needs the image (docker compose ... build, or scripts/serve.sh build) and the weights in its own HF cache.
 # Container and volume names match serve.sh, so `scripts/serve.sh status|logs|stop` work on either path.

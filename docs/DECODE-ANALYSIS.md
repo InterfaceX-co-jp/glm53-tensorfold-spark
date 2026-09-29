@@ -128,7 +128,7 @@ decay faster with depth than a constant r, and 6.4 ms a draft makes misjudging c
 - `DFLASH_POLICY`/`EXL3_AUTO` (`fc5:0.3`, the no-MTP / BF16-EXL3 paths) are unchanged, so upstream's
   `test_cuda_cli.py` still holds. `GRAPH_ROWS` stays 1..6: the recipe's direct timings of eager 7- and 8-row
   windows (65.6, 69.2 ms) sit on the fitted line, so graphing them would buy little for more capture memory.
-- `docker/compose.yaml`, `scripts/serve.sh` and `config/tensorfold.env.example` pass the knob to both ranks.
+- `docker/compose.yaml`, `scripts/serve.sh` and `config/minimal.env.example` pass the knob to both ranks.
 
 **Exactness.** The knob changes only how many DFlash2 candidates a round sends to verification. Every emitted
 token is still `sample_rows` of the verify window's row at its absolute position (argmax of logit/T plus
