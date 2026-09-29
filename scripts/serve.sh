@@ -5,14 +5,30 @@
 #   scripts/serve.sh start      preflight, memory gate, rank 1 on the worker, then rank 0 here; waits for /v1/models,
 #                               then runs the canary (scripts/canary.py)
 #   scripts/serve.sh restart    stop, then start
-#   scripts/serve.sh stop | status | logs [0|1] | canary | xid [SINCE] | watch [--once] | preflight
+#   scripts/serve.sh preflight  read-only checks of both nodes before a start (AGENTS.md): config, ssh, docker, image,
+#                               CX7 netdev / address / RDMA port, weights, memory, CUDA processes, RoCE marker
+#   scripts/serve.sh stop | status | logs [0|1] | canary | xid [SINCE] | watch [--once]
 #   scripts/serve.sh gpucheck   GB10 clock / power / slow-state check of both nodes (scripts/gpuwatch.py check);
 #                               non-zero when a node is degraded or was recently slow: gate benchmark runs on it
 #
-# Configuration: config/tensorfold.env (override with CONFIG=path).
+# Configuration: config/prod.env, the production config (cp config/prod.env.example config/prod.env and fill it in).
+# CONFIG=path reads another file, e.g. CONFIG=config/minimal.env for the 32k debugging baseline.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-CONFIG="${CONFIG:-config/tensorfold.env}"
+CONFIG="${CONFIG:-config/prod.env}"
+if [[ ! -f "$CONFIG" ]]; then
+    if [[ "$CONFIG" == config/prod.env ]]; then
+        echo "[glm53-tf] no config/prod.env. Create it from the production example: cp config/prod.env.example" \
+             "config/prod.env, then set WORKER_SSH, HEAD_IP, HEAD_HF and WORKER_HF (README Quickstart, AGENTS.md)" >&2
+        [[ ! -f config/tensorfold.env ]] || echo "[glm53-tf] config/tensorfold.env (the old default, usually the 32k" \
+             "baseline) is no longer read unless CONFIG=config/tensorfold.env is set" >&2
+    else
+        echo "[glm53-tf] no config file $CONFIG. The production config: cp config/prod.env.example config/prod.env" \
+             "and leave CONFIG unset (README Quickstart, AGENTS.md)" >&2
+    fi
+    exit 2
+fi
+export CONFIG
 # A non-empty caller export wins over the same key in the config file:
 #   CONTEXT=32768 GLM53_TF_NONEXPERT=q4mse scripts/serve.sh start
 caller_env=$(env | grep -E '^(HEAD_PREPARED|WORKER_PREPARED|HEAD_SESSIONS|WORKER_SESSIONS|CONTEXT|MTP_DRAFTS|NO_DRAFTS|IMAGE|PORT|HOST|DRAFTER|MODEL_PATH|EXTRA_ARGS|SERVED_NAME|MAX_TOKENS|CPUSET|HEAD_CPUSET|WORKER_CPUSET|CANARY[A-Z_]*|MEM_GATE_[A-Z_]+|START_ATTEMPTS|READY_TIMEOUT|LOG_MAX_[A-Z]+|WATCH_[A-Z_]+|GPUWATCH_[A-Z_]+|WARMUP_LENGTHS|PREFLIGHT|NCCL_PASSTHROUGH|GLM53_TF_[A-Z0-9_]+)=.' || true)
@@ -21,7 +37,7 @@ set -a; source "$CONFIG"; set +a
 while IFS= read -r kv; do [[ -n "$kv" ]] && export "${kv?}"; done <<< "$caller_env"
 # refuse a config that still holds the example's <placeholders>
 for _k in WORKER_SSH HEAD_IP HEAD_HF WORKER_HF MODEL_PATH; do
-    if [[ "${!_k:-}" == *"<"*">"* ]]; then echo "[glm53-tf] $CONFIG: set $_k (still '${!_k}')" >&2; exit 2; fi
+    if [[ "${!_k:-}" == *"<"*">"* ]]; then echo "[glm53-tf] $CONFIG: set $_k (still '${!_k}'; AGENTS.md step 3)" >&2; exit 2; fi
 done
 
 NAME="${NAME:-glm53-tf}"
@@ -67,6 +83,34 @@ WORKER_SESSIONS="${WORKER_SESSIONS:-${WORKER_HF%/*}/glm53-tf/sessions}"
 IMAGE_ID="${IMAGE_ID:-}"
 log() { echo "[glm53-tf] $*"; }
 wssh() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "$@"; }
+
+# The context a request can use comes from the config (docs/TRYING.md, "Context smaller than expected"). One line
+# at start says what this config serves; a short CONTEXT warns; a long CONTEXT on the per-head KV cache
+# (GLM53_TF_LATENT_KV unset or 0: ~390 KB a token a rank) cannot load next to the weights and is refused unless
+# FORCE_CONTEXT=1. Returns 1 to refuse.
+context_check() {
+    local ctx="${CONTEXT:-}" latent="${GLM53_TF_LATENT_KV:-0}"
+    if [[ -n "$ctx" && ! "$ctx" =~ ^[0-9]+$ ]]; then log "CONTEXT=$ctx: expected a token count"; return 1; fi
+    log "$CONFIG: CONTEXT=${ctx:-unset} tokens a request (prompt + max_tokens), KV cache $(
+        [[ "$latent" == 1 ]] && echo "latent ${GLM53_TF_KV_DTYPE:-bf16}" || echo "per-head (GLM53_TF_LATENT_KV=0)"),"\
+        "GLM53_TF_BATCH=${GLM53_TF_BATCH:-1}, GLM53_TF_KV_POOL_TOKENS=${GLM53_TF_KV_POOL_TOKENS:-off}"
+    local long="for long context use the production config: cp config/prod.env.example config/prod.env and leave CONFIG unset (CONTEXT=1048576)"
+    if [[ -z "$ctx" ]]; then
+        log "warning: CONTEXT is not set: the engine serves 2,051 tokens a request; $long"
+    elif (( ctx <= 65536 )); then
+        log "warning: CONTEXT=$ctx: a request past $ctx tokens (prompt + max_tokens) gets HTTP 400; $long"
+    fi
+    if [[ "$latent" != 1 && -n "$ctx" ]] && (( ctx > 65536 )); then
+        log "CONTEXT=$ctx with the per-head KV cache (GLM53_TF_LATENT_KV=0): ~390 KB a token a rank, about" \
+            "$(( ctx * 390 / 1048576 )) GiB a rank of KV cache; past ~100k tokens it does not fit next to the weights." \
+            "Set GLM53_TF_LATENT_KV=1 and GLM53_TF_KV_DTYPE=fp8 (7.4 KB a token, as config/prod.env.example does)"
+        if (( ctx > 131072 )) && [[ "${FORCE_CONTEXT:-0}" != 1 ]]; then
+            log "not starting: CONTEXT=$ctx cannot load with the per-head KV cache (FORCE_CONTEXT=1 starts anyway)"
+            return 1
+        fi
+    fi
+    return 0
+}
 
 run_args() { # $1 = rank, $2 = host HF cache dir
     local rank=$1 hf=$2 prep sess
@@ -141,15 +185,57 @@ mem_gate() {
     done
 }
 
-preflight() { # read-only checks; non-zero on a problem a retry cannot fix
-    local bad=0 st wst h w
+on_node() { # $1 = head | worker, then a command line (one string): run it on that node
+    local n=$1; shift
+    if [[ "$n" == head ]]; then bash -c "$*"; else wssh "$*"; fi
+}
+
+link_addrs() { # $1 = head | worker: the IPv4 addresses (a.b.c.d/nn) on NCCL_SOCKET_IFNAME, space-separated
+    on_node "$1" "ip -o -4 addr show dev '$NCCL_SOCKET_IFNAME'" 2>/dev/null | awk '{printf "%s ", $4}' || true
+}
+
+weights_missing() { # $1 = head | worker, $2 = that node's HF cache, $3 = container path, $4 = file to look for:
+    # prints the host path when the snapshot is not in that node's cache (paths outside the HF mount: not checked)
+    local p="$3"
+    [[ "$p" == /root/.cache/huggingface/* ]] || return 0
+    local host="$2${p#/root/.cache/huggingface}"
+    on_node "$1" "test -e '$host/$4'" 2>/dev/null || echo "$host"
+}
+
+hf_hint() { # $1 = container path of a snapshot: the matching `hf download` command
+    local repo="${1#*/models--}" rev="${1##*/snapshots/}"
+    repo="${repo%%/*}"; echo "hf download ${repo/--//} --revision ${rev%%/*}"
+}
+
+preflight() { # read-only checks (AGENTS.md lists them); non-zero on a problem a retry cannot fix
+    local bad=0 st wst h w a node miss mark
     for v in WORKER_SSH HEAD_IP NCCL_SOCKET_IFNAME NCCL_IB_HCA MODEL_PATH HEAD_HF WORKER_HF; do
         [[ -n "${!v:-}" ]] || { log "preflight: $v is not set in $CONFIG"; bad=1; }
     done
     [[ $bad == 0 ]] || return 1
-    wssh true || { log "preflight: cannot ssh to $WORKER_SSH"; return 1; }
+    wssh true || { log "preflight: cannot ssh to $WORKER_SSH: passwordless ssh from the head is needed (ssh-copy-id $WORKER_SSH)"; return 1; }
+    docker info >/dev/null 2>&1 || { log "preflight: docker does not answer on the head (service running? user in the docker group?)"; bad=1; }
+    wssh docker info >/dev/null 2>&1 || { log "preflight: docker does not answer on the worker as $WORKER_SSH (service running? user in the docker group?)"; bad=1; }
     docker image inspect "$IMAGE" >/dev/null 2>&1 || { log "preflight: no image $IMAGE here (scripts/serve.sh build)"; bad=1; }
-    wssh docker image inspect "$IMAGE" >/dev/null 2>&1 || { log "preflight: no image $IMAGE on the worker"; bad=1; }
+    wssh docker image inspect "$IMAGE" >/dev/null 2>&1 || { log "preflight: no image $IMAGE on the worker (scripts/serve.sh build ships it)"; bad=1; }
+    [[ -n "$(ls -A vendor/TensorFold 2>/dev/null)" ]] \
+        || log "preflight: warning: vendor/TensorFold is empty: git submodule update --init (serve.sh build needs it)"
+    # the CX7 link: NCCL_SOCKET_IFNAME carries an address on both nodes, HEAD_IP is the head's
+    if command -v ip >/dev/null 2>&1; then
+        for node in head worker; do
+            a=$(link_addrs "$node")
+            if [[ -z "$a" ]]; then
+                log "preflight: no IPv4 address on NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME on the $node: set it to the CX7" \
+                    "netdev that carries the link (ibdev2netdev: '$NCCL_IB_HCA port 1 ==> <netdev> (Up)'; ip -br addr)"
+                bad=1
+            elif [[ "$node" == head && "$HEAD_IP" =~ ^[0-9]+(\.[0-9]+){3}$ && " $a" != *" $HEAD_IP/"* ]]; then
+                log "preflight: HEAD_IP=$HEAD_IP is not an address of $NCCL_SOCKET_IFNAME on the head (it has: ${a% })"
+                bad=1
+            fi
+        done
+    else
+        log "preflight: warning: no 'ip' command here; cannot check NCCL_SOCKET_IFNAME / HEAD_IP"
+    fi
     # the RDMA port of the link must be up on both nodes (a down port shows as an NCCL timeout minutes into the load)
     st=$(cat "/sys/class/infiniband/$NCCL_IB_HCA/ports/1/state" 2>/dev/null || echo "")
     wst=$(wssh cat "/sys/class/infiniband/$NCCL_IB_HCA/ports/1/state" 2>/dev/null || echo "")
@@ -168,6 +254,40 @@ preflight() { # read-only checks; non-zero on a problem a retry cannot fix
     w=$(wssh nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)
     [[ "$h" == "$w" ]] || log "preflight: warning: NVIDIA driver differs (head ${h:-?}, worker ${w:-?})"
     [[ "$h $w" != *590.* ]] || log "preflight: warning: driver 590.x (a GB10 CUDA-graph deadlock is reported on 590; 580.x is the known-good line)"
+    # the weights (and the drafter, when set) in both nodes' HF caches, same snapshot
+    for node in head worker; do
+        [[ "$node" == head ]] && h="$HEAD_HF" || h="$WORKER_HF"
+        miss=$(weights_missing "$node" "$h" "$MODEL_PATH" config.json)
+        [[ -z "$miss" ]] || { log "preflight: the weights are not in the $node's HF cache ($miss): $(hf_hint "$MODEL_PATH") on the $node"; bad=1; }
+        if [[ -n "${DRAFTER:-}" ]]; then
+            miss=$(weights_missing "$node" "$h" "$DRAFTER" .)
+            [[ -z "$miss" ]] || { log "preflight: DRAFTER is not in the $node's HF cache ($miss): $(hf_hint "$DRAFTER")" \
+                "on the $node (CC BY-NC-ND 4.0, non-commercial), or set DRAFTER= empty for MTP drafts only"; bad=1; }
+        fi
+    done
+    # memory: the load's slot rule reads MemFree; other workloads or page cache cost the 4th batch slot
+    h=$(memfree); w=$(memfree_worker)
+    if [[ "$MEM_GATE_GIB" -gt 0 ]] && [[ "${h:-0}" -lt "$MEM_GATE_GIB" || "${w:-0}" -lt "$MEM_GATE_GIB" ]]; then
+        log "preflight: warning: MemFree ${h} / ${w:-?} GiB (head / worker) under MEM_GATE_GIB=$MEM_GATE_GIB: stop other" \
+            "workloads (vLLM, other containers, a desktop session); start waits up to ${MEM_GATE_TIMEOUT}s for it"
+    fi
+    if [[ "$MEM_GATE_DROP_CACHES" == 1 ]]; then
+        sudo -n true 2>/dev/null || log "preflight: warning: no passwordless sudo -n on the head: the memory gate cannot drop page caches"
+        wssh sudo -n true 2>/dev/null || log "preflight: warning: no passwordless sudo -n on the worker: the memory gate cannot drop page caches"
+    fi
+    if gpu_busy; then log "preflight: a CUDA process is running on a node (nvidia-smi): stop the other stack (vLLM, ...) first"; bad=1; fi
+    # a RoCE failure at run time leaves a marker in the cache volume; the next start then serves on NCCL
+    mark="${GLM53_TF_ROCE_MARK:-}"
+    if [[ "${GLM53_TF_COMM_BACKEND:-}" == roce && "$mark" == /cache/* ]]; then
+        local probe="docker run --rm --network none -v $NAME-cache:/cache --entrypoint test $IMAGE -e $mark"
+        for node in head worker; do
+            if on_node "$node" "$probe" >/dev/null 2>&1; then
+                log "preflight: warning: RoCE failure marker $mark on the $node: the next start serves on NCCL (decode" \
+                    "~4-11% slower). After fixing the link, delete it on both nodes: docker run --rm -v $NAME-cache:/cache" \
+                    "--entrypoint rm $IMAGE -f $mark (docs/ROCE-FIX.md)"
+            fi
+        done
+    fi
     gpu_state "$GPUWATCH_PREFLIGHT" || bad=1
     return $bad
 }
@@ -238,7 +358,15 @@ start_once() { # 0: ready; 1: failed (containers left for the caller to inspect 
         sleep 1
     done
     log "ready after $(( $(date +%s) - t0 )) s"
-    curl -s "$BASE/v1/models"; echo
+    local models mml
+    models=$(curl -s "$BASE/v1/models" || true); echo "$models"
+    # an image that reports the context in /v1/models (max_model_len) is believed; otherwise the config's CONTEXT
+    mml=$(grep -oE '"max_model_len": *[0-9]+' <<< "$models" | grep -oE '[0-9]+$' || true)
+    if [[ -n "$mml" ]]; then
+        log "serving up to $mml tokens a request (max_model_len): set your client's context window to it"
+    else
+        log "serving up to ${CONTEXT:-2051} tokens a request (CONTEXT in $CONFIG): set your client's context window to it"
+    fi
     run_canary || { log "canary failed (CANARY=strict)"; return 2; }
 }
 
@@ -261,6 +389,7 @@ take_lock() { # one start at a time; the watchdog stands down while it is held. 
 cmd_start() {
     take_lock
     if gpu_busy; then log "a CUDA process is running on a node; stop the other stack first"; exit 1; fi
+    context_check || exit 1
     run_preflight || { log "preflight failed; not starting (PREFLIGHT=strict)"; exit 1; }
     local attempt=1
     while :; do
@@ -412,7 +541,8 @@ canary)
 xid)
     cmd_xid "${2:--1h}" ;;
 preflight)
-    preflight && log "preflight ok" ;;
+    rc=0; context_check || rc=1; preflight || rc=1
+    if [[ $rc == 0 ]]; then log "preflight ok"; else log "preflight: problems above (AGENTS.md, common failures)"; exit 1; fi ;;
 gpucheck)   # for benchmark runs: strict unless GPUWATCH_PREFLIGHT says otherwise; exits 1 on any problem
     mode="${GPUWATCH_PREFLIGHT:-on}"; [[ "$mode" == on ]] && mode=strict
     gpu_state "$mode" && log "gpucheck ok" ;;

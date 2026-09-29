@@ -797,7 +797,7 @@ def read_env_file(path: Path) -> dict[str, str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("cmd", choices=["watch", "check", "status"])
-    ap.add_argument("--config", default=os.environ.get("CONFIG", str(ROOT / "config" / "tensorfold.env")),
+    ap.add_argument("--config", default=os.environ.get("CONFIG", str(ROOT / "config" / "prod.env")),
                     help="serve.sh config file: WORKER_SSH and PORT are read from it")
     ap.add_argument("--nodes", default=os.environ.get("GPUWATCH_NODES", ""),
                     help="name=local|name=ssh:user@host,... (default: head=local,worker=ssh:$WORKER_SSH)")

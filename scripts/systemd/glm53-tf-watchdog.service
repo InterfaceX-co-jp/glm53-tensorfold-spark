@@ -17,7 +17,7 @@ After=network-online.target docker.service
 Type=oneshot
 # edit: the checkout of this repo on the head node
 WorkingDirectory=%h/glm53-tensorfold-spark
-Environment=CONFIG=config/tensorfold.env
+Environment=CONFIG=config/prod.env
 # Environment=WATCH_HEAL=1
 # Environment=WATCH_ALERT=%h/bin/notify
 ExecStart=/usr/bin/env bash scripts/serve.sh watch --once

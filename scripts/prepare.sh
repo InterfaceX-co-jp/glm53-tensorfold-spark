@@ -8,7 +8,7 @@
 #   scripts/prepare.sh --force    rewrite them
 #   scripts/prepare.sh status     list the prepared folders on both nodes
 #
-# Same config as scripts/serve.sh (config/tensorfold.env, CONFIG=path, caller exports win). A folder is keyed by the
+# Same config as scripts/serve.sh (config/prod.env, CONFIG=path, caller exports win). A folder is keyed by the
 # checkpoint, the rank, GLM53_TF_NONEXPERT, torch and the source of the weight-building code, so prepare with the
 # IMAGE and GLM53_TF_NONEXPERT you serve with; a start with another key ignores the folder (and, with
 # GLM53_TF_PREPARED_WRITE=1, serve.sh's default, writes its own after loading from the checkpoint).
@@ -16,7 +16,12 @@
 # key; serve/prepare keep the newest two keys a rank.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-CONFIG="${CONFIG:-config/tensorfold.env}"
+CONFIG="${CONFIG:-config/prod.env}"
+if [[ ! -f "$CONFIG" ]]; then
+    echo "[glm53-tf] no config file $CONFIG. The production config: cp config/prod.env.example config/prod.env" \
+         "and fill it in (README Quickstart, AGENTS.md)" >&2
+    exit 2
+fi
 caller_env=$(env | grep -E '^(HEAD_PREPARED|WORKER_PREPARED|IMAGE|DRAFTER|MODEL_PATH|GLM53_TF_[A-Z0-9_]+)=.' || true)
 # shellcheck disable=SC1090
 set -a; source "$CONFIG"; set +a

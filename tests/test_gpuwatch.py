@@ -521,12 +521,15 @@ def kit(tmp_path, fakes):
     (repo / "config").mkdir()
     for f in ("serve.sh", "xid.py", "canary.py", "gpuwatch.py"):
         shutil.copy(ROOT / "scripts" / f, repo / "scripts" / f)
-    (repo / "config" / "tensorfold.env").write_text(
+    (repo / "config" / "prod.env").write_text(
         "WORKER_SSH=fake-worker\nHEAD_IP=head-cx7\nNCCL_SOCKET_IFNAME=eth9\nNCCL_IB_HCA=fakehca0\n"
         "HEAD_HF=/tmp/hf\nWORKER_HF=/tmp/hf\nMODEL_PATH=/m\nIMAGE=fake:img\nPORT=9\n")
     docker = tmp_path / "bin" / "docker"
     docker.write_text(FAKE_DOCKER)
     docker.chmod(0o755)
+    ip = tmp_path / "bin" / "ip"                                  # the preflight's link check: eth9 has an address
+    ip.write_text("#!/usr/bin/env bash\necho \"5: eth9    inet 198.51.100.7/24 scope global eth9\"\n")
+    ip.chmod(0o755)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GLM53_TF_", "GPUWATCH_", "WATCH_", "PREFLIGHT"))}
     env.update(STATE_DIR=str(fakes.state))
 
