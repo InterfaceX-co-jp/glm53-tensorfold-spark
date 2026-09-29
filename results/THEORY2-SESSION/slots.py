@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""W13 (copy of W12's slots.py): lone requests one after another (a fresh prompt each: the batcher gives a lone fresh request the least recently
+"""W16 (copy of W12's slots.py): lone requests one after another (a fresh prompt each: the batcher gives a lone fresh request the least recently
 admitted free slot, so 8 cover slots 0-3 twice): slot, decode tok/s, round kinds. slots.py OUT [N]"""
 import json, sys, time, urllib.request
 TOPICS = ["the history of the printing press", "how a heat pump works", "the life cycle of a star",
@@ -10,7 +10,7 @@ rows = []
 for i in range(n):
     body = {"model": "GLM-5.3-Flash-EXL3", "max_tokens": 384, "temperature": 0, "top_p": 1, "ignore_eos": True,
             "chat_template_kwargs": {"enable_thinking": False},
-            "messages": [{"role": "user", "content": f"[w13 slot probe {i}] Explain {TOPICS[i % len(TOPICS)]} in detail."}]}
+            "messages": [{"role": "user", "content": f"[w16 slot probe {i}] Explain {TOPICS[i % len(TOPICS)]} in detail."}]}
     r = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions", data=json.dumps(body).encode(),
                                headers={"Content-Type": "application/json"})
     d = json.load(urllib.request.urlopen(r, timeout=900))

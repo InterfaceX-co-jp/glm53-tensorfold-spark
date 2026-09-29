@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# W13 per-load set (W12's ab.sh, trimmed per THEORY-2 §6): ab.sh TAG [full|short]
+# W16 per-load set (W12's ab.sh, trimmed per THEORY-2 §6): ab.sh TAG [full|short]
 #   gates : warm-up, exact 10/10 (drafted == serial), batchexact 4/4 (batched == alone), transcripts (== load C's,
 #           and == W9 A when results/W9/transcripts-A.log exists), ab.py 24.5k / 98k once (reply sha
 #           8794a3463259cc2f + prefill tok/s), every glmbench reply hash == load C's (summary.py);

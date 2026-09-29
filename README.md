@@ -24,20 +24,25 @@ SPDX-License-Identifier: Apache-2.0 (this project's own code, scripts, benchmark
 
 ## What's new (2026-09-30)
 
-Patches 0420-0560 (14 new, 71 in total), test windows W11-W15 {{W16_W17_WINDOWS: ", W16-W17"}}, and the RigMark
-receipts. The production config (`config/prod.env.example`) is W15's: image b7 = patches 0001-0490 + 0500 + 0540
-{{FINAL_PROD_CHANGE: or the W16 / W17 update, if one is adopted tonight}}. Full list: [`docs/CHANGES-SUMMARY.md`](docs/CHANGES-SUMMARY.md#update-2026-09-30-patches-0420-0560-test-windows-w11-w15);
-measurements: [`docs/RESULTS.md`](docs/RESULTS.md) W11-W15.
+Patches 0420-0560 (14 new, 71 in total), test windows W11-W17, and the RigMark receipts. The production config
+(`config/prod.env.example`) is W17's: image b9 = patches 0001-0490 + 0500 + 0540 + 0550 + 0560, with 0560's
+multi-slot prefill on (`GLM53_TF_MULTI_PREFILL=1`) and 0550 built in but off. Full list: [`docs/CHANGES-SUMMARY.md`](docs/CHANGES-SUMMARY.md#update-2026-09-30-patches-0420-0560-test-windows-w11-w17);
+measurements: [`docs/RESULTS.md`](docs/RESULTS.md) W11-W17.
 
-**RigMark, release config, 3 runs averaged** ({{AVG_RUN_DATE}}; receipts in [`results/rigmark/`](results/rigmark/README.md)):
+**RigMark, release config, 3 runs averaged** (2026-09-30, image b9; receipts in [`results/rigmark/`](results/rigmark/README.md)):
 
 | RigMark (mean of 3 runs' medians) | TensorFold (this release) | vLLM TP2 k=7 (Alex Ellis, published) |
 |---|---:|---:|
-| Code / prose / structured decode tok/s | **{{AVG_CODE_TPS}} / {{AVG_PROSE_TPS}} / {{AVG_STRUCT_TPS}}** | 44.0 / 18.9 / 64.9 |
-| C1 / C2 / C4 aggregate tok/s | **{{AVG_C1}} / {{AVG_C2}} / {{AVG_C4}}** | 31.6 / 42.0 / 66.1 |
-| Cold prefill 8K / 32K / 64K tok/s | {{AVG_COLD_8K}} / {{AVG_COLD_32K}} / {{AVG_COLD_64K}} | **1,813 / 1,908 / 1,922** |
-| Warm replay of an identical prompt, TTFT 8K / 32K / 64K s | **{{AVG_REPLAY_TTFT_8K}} / {{AVG_REPLAY_TTFT_32K}} / {{AVG_REPLAY_TTFT_64K}}** | 4.52 / 2.97 / 5.77 |
-| C4 per-stream TTFT s | {{AVG_C4_TTFT}} | **0.81** |
+| Code / prose / structured decode tok/s | **67.9 / 43.0 / 88.8** | 44.0 / 18.9 / 64.9 |
+| C1 / C2 / C4 aggregate tok/s | **53.1 / 70.1 / 91.0** | 31.6 / 42.0 / 66.1 |
+| Cold prefill 8K / 32K / 64K tok/s | 1,560 / 1,634 / 1,620 | **1,813 / 1,908 / 1,922** |
+| Warm replay of an identical prompt, TTFT 8K / 32K / 64K s | **0.22 / 0.25 / 0.27** | 4.52 / 2.97 / 5.77 |
+| C4 per-stream TTFT s | 0.89 | **0.81** |
+
+Run-to-run spread (min-max of the 3 runs): code 67.4-68.6, prose 42.2-43.5, structured 88.6-89.0, C4 89.5-92.1,
+cold 64K 1,618-1,621, replay TTFT 64K 0.27-0.27, C4 TTFT 0.88-0.89. Where we are behind: **cold prefill** (0.84-0.86x
+of vLLM) and **C4 time to first token** (0.89 vs 0.81 s). Different weights than Alex's runs (abliterated EXL3 4-bit
+here, NVFP4 there), so this is not a strict RigMark comparison; see [`results/rigmark/`](results/rigmark/README.md).
 
 - **Image input, with GLM-5.3-Flash's own vision tower** (patch 0500, on in production since W15). The checkpoint
   ships a BF16 vision tower (24 blocks, 1.13 GB) that the text-only stack ignored; rank 0 now runs it and the prompt
@@ -62,8 +67,8 @@ measurements: [`docs/RESULTS.md`](docs/RESULTS.md) W11-W15.
   because GLM-5.3-Flash is a hybrid (KDA linear attention + MLA): vLLM can restore the recurrent KDA state only at
   page-aligned checkpoints and rounds a hit down to a whole block, so a replay recomputes several thousand tokens
   (~8.2k / 5.7k / 11.1k at 8K / 32K / 64K from Alex's receipts; nothing is reused at 8K).
-- **RigMark baseline and W15 validation receipts.** The W13 baseline (image b5) and two W15 runs on the new
-  production (image b7), all 15/15 gates, with receipts, cards, request logs and the comparison with Alex Ellis's
+- **RigMark receipts.** The release run above (3 runs on image b9), the W13 baseline (image b5) and two W15 runs
+  (image b7), all 15/15 gates, with receipts, cards, request logs and the comparison with Alex Ellis's
   published vLLM runs: [`results/rigmark/`](results/rigmark/README.md). W15 against W13: replay 24-44x faster, decode,
   concurrency and cold prefill within run-to-run noise (cold 8K -2%). Turnkey runs: `scripts/rigmark/`,
   [`docs/RIGMARK.md`](docs/RIGMARK.md).
@@ -76,12 +81,18 @@ measurements: [`docs/RESULTS.md`](docs/RESULTS.md) W11-W15.
   6.4 GiB for ~35 s during a 314k prompt: torch's caching allocator keeping a new segment every ~4k tokens for a
   growing prefill buffer) and page cache silently serializing concurrent requests during a large file copy. Patch
   0550 fixes both (one pre-grown scratch buffer, an allocator trim, admission that counts reclaimable page cache;
-  same bits). {{W16_0550_STATUS: "Measured in W16: ... adopted / not adopted" or "offline and off by default until its GPU run"}}
+  same bits). **Measured in W17: built into the production image but not adopted (off).** Its memory results held
+  (the 314k needle's dip 1.7 instead of 4.0 GiB), but with it on the first long prefill after a burst of short
+  requests ran up to 9.8% slower in 2 of 4 prefill pairs, never seen with it off; next step: the same run with only
+  its allocator trim off.
   ([`docs/MEMORY-SAFETY.md`](docs/MEMORY-SAFETY.md)).
 - **Multi-prompt prefill** (patch 0560, `GLM53_TF_MULTI_PREFILL`): several waiting prompts prefilled in one forward
   (the routed experts read once for all of them), each with the bits it gets alone; estimated C4 first tokens
-  ~0.6-0.8 s (now 1.6-1.9 s) and 1.7-2.8x prefill throughput on bursts of short prompts.
-  {{W16_0560_STATUS: "Measured in W16: ..., adopted" or "offline and off by default until its GPU run"}}
+  ~0.6-0.8 s (then 1.6-1.9 s) and 1.7-2.8x prefill throughput on bursts of short prompts. **Measured in W17 and
+  adopted (`GLM53_TF_MULTI_PREFILL=1`)**: same bits everywhere (92/92 grouped replies == the same request alone on the
+  real model, batchexact, transcripts, N1, 13/13 glmbench hashes), C4 first tokens 1.64 -> 0.82 s with thinking on,
+  C2 -18%, prefill and decode unchanged; on RigMark C4 aggregate 81.8-82.8 -> 91.0 tok/s and C4 per-stream TTFT
+  1.63-1.91 -> 0.89 s. Cost: -0.5 GiB on the worker in the 4 x 250k stress.
   ([`docs/MULTI-PREFILL.md`](docs/MULTI-PREFILL.md)).
 - **Decode +2.5-3%** (W12): L2 prefetch of the next kernels' weights in every decode path (patch 0460,
   `GLM53_TF_L2PF=1`, 8 MiB a site; 1 stream +2.5%, lone requests +3.2%) and CUDA graphs captured after 8 sightings
@@ -110,13 +121,22 @@ measurements: [`docs/RESULTS.md`](docs/RESULTS.md) W11-W15.
 - **0420 trimmed draft vocabulary**: estimated +0.5-0.8% at 1 stream with a list built from real agent traffic;
   the list shipped here is built from public text (the original came from private sessions) and covers fewer reply
   tokens (79% at 16k ids against 90%), so it is off ([`docs/DRAFT-VOCAB.md`](docs/DRAFT-VOCAB.md)).
-- **C4 time to first token with thinking on** is still 1.6-1.9 s against vLLM's 0.8 s: 0540's early first token
-  helps only without thinking (median 1.46 -> 0.93 s), because the first thinking token carries no visible text.
-  {{W16_C4_NOTE: update if 0560 was adopted}}
+- **C4 time to first token with thinking on** was 1.6-1.9 s against vLLM's 0.8 s after 0540 alone: its early first
+  token helps only without thinking (median 1.46 -> 0.93 s), because the first thinking token carries no visible text.
+  0560 (above) brought it to 0.89 s on RigMark, still 0.08 s behind.
 - **Rebase onto TensorFold 0.3.6.2: not done.** Its new EXL3 kernels do not reach the GLM path, their two ideas are
   already inside 0440, and the rebase is a multi-day port with no expected speed gain; it is deferred to after
   RigMark ([`docs/UPSTREAM-0362-AUDIT.md`](docs/UPSTREAM-0362-AUDIT.md)). We stay on 0.3.4 + patches.
-- {{WHAT_DIDNT_WORK_W16: 0510 / 0520 / 0530 (THEORY-2 prototypes) and the DFlash drafter test, from W16 / W17, or remove}}
+- **W16, nothing adopted.** The THEORY-2 prototypes on the production stack: 0510 lone-slot graphs (+0.4% at 4
+  streams, under its bar) and split verify graphs (1 stream -0.5%; the real verify graph launch is only ~11-14 us), 0520's
+  fused hyper-connection kernel (failed its microbenchmark gate: 0.58x at 1 row, so no server load), 0530's HTTP-thread
+  pinning with locked clocks (+0.7%, inside the noise band that a trace-only load also showed, and confounded with the
+  clock lock). All within +0.4 to +1.1% of the control, i.e. noise. Two probes passed and feed the next build (a
+  3.5 MB size limit for 0440's dense kernel; a memory-pipeline design at 232 GB/s).
+- **Drafter comparison (W16): no change.** The modal-labs GLM-5.3-Flash DFlash drafter drafts our abliterated target
+  worse (tokens a round -8% prose, -9% code, -18% agent; glmbench -2.5%) and was not adopted; incoai's newer
+  `bf582e4e` is at parity with the production `7d74cdd` (acceptance within +-0.01, greedy decode -2 to -3% on prose /
+  code, +2.8% on agent), not a win, so production keeps `7d74cdd`. Every arm returned the same replies.
 
 ## Quickstart
 
@@ -242,8 +262,8 @@ Long prompts refused or cut short: [Context smaller than expected](docs/TRYING.m
 
 [RigMark](https://github.com/alexellis/rigmark) standard suite, unmodified settings (receipts and details in
 [`results/rigmark/`](results/rigmark/README.md)). The release run (3 rounds averaged) is in
-[What's new](#whats-new-2026-09-30); the W13 baseline (image b5) and the two W15 validation runs (image b7, this
-release's production config):
+[What's new](#whats-new-2026-09-30) (image b9, this release's production config); the W13 baseline (image b5) and
+the two W15 validation runs (image b7):
 
 | RigMark (median) | W13 baseline | W15 run 1 / run 2 | vLLM TP2 (Alex Ellis, published) |
 |---|---:|---:|---:|
@@ -263,11 +283,11 @@ Different weights and drafter policy than Alex's runs; see the notes in [`result
 ## Benchmarks
 
 All our numbers are on the **abliterated** checkpoint `neko-legends/GLM-5.3-Flash-Uncensored-EXL3` @ `07135ec0`, on
-one pair of DGX Sparks (GB10, TP=2), 2026-09-27 to 2026-09-29. The tables below are from test window W10
+one pair of DGX Sparks (GB10, TP=2), 2026-09-27 to 2026-09-30. The tables below are from test window W10
 (2026-09-29 04:20); since then W12 added +2.5% decode at 1 stream and +2.8% at 4 streams (81.2 tok/s aggregate), W15
 image input and warm replay with every text gate unchanged (reply hashes equal, prefill 24.5k / 98k ~1,605-1,610
-tok/s). Full tables and methodology: [`docs/RESULTS.md`](docs/RESULTS.md) (sections W6-W15 for the current
-production config); raw JSON and the window scripts in [`results/`](results/).
+tok/s), and W17 multi-slot prefill (4 streams 82.8 tok/s aggregate, mean of 3 runs; same reply hashes). Full tables
+and methodology: [`docs/RESULTS.md`](docs/RESULTS.md) (sections W6-W17 for the current production config); raw JSON and the window scripts in [`results/`](results/).
 
 ### (a) Ours vs the vLLM production kit, same weights, same client
 
@@ -450,8 +470,9 @@ Main groups:
 | API / context | 0490, 0160 | on by default: `max_model_len` in `/v1/models`, `context_length_exceeded` 400s, `POST /tokenize`, token-id prompts; `GLM53_TF_REASONING_FIELDS=reasoning\|reasoning_content\|both` |
 | Per request | 0090-0093 | `"tf_knobs": {...}` in the request body |
 | Serving / ops | 0002, 0140, 0150, 0160, 0210, 0300 | prepared folders, `/health`, `/metrics`, `reasoning_effort`, `stop`, prompt-token cache, request log (`GLM53_TF_REQUEST_LOG`, no text) |
-| Measured, not adopted (off) | 0240 (bits 1-2), 0260, 0270, 0280, 0330, 0340, 0400, 0410, 0440, 0450, 0370's `GLM53_TF_CPU_PIN`, 0460's RoCE latency knobs | see [Limits](#limits-and-negatives) |
-| Offline / tools, off {{W16_OFF_ROW: update after W16 / W17}} | 0420 (draft vocabulary), 0430 (drafter-training records), 0470 (8-bit non-experts), 0510 (lone-slot graphs, split verify graphs, graph probe), 0520 (fused hyper-connection kernel), 0530 (HTTP-thread pinning, RoCE trace dump), 0550 (memory safety), 0560 (multi-prompt prefill) | `docs/PATCHES.md` |
+| Multi-slot prefill | 0560 | `GLM53_TF_MULTI_PREFILL=1` (a round's prefill pieces in one forward; W17) |
+| Measured, not adopted (off) | 0240 (bits 1-2), 0260, 0270, 0280, 0330, 0340, 0400, 0410, 0440, 0450, 0370's `GLM53_TF_CPU_PIN`, 0460's RoCE latency knobs, 0510 / 0520 / 0530 (W16), 0550 (W17: in the image, `GLM53_TF_ADMIT_MEM=free`, `GLM53_TF_SELECT_SCRATCH=off`, `GLM53_TF_ALLOC_TRIM_GB=0`) | see [Limits](#limits-and-negatives) |
+| Offline / tools, off | 0420 (draft vocabulary), 0430 (drafter-training records), 0470 (8-bit non-experts) | `docs/PATCHES.md` |
 
 ## Limits and negatives
 
@@ -462,9 +483,9 @@ Main groups:
 | 4 concurrent streams | ~78 tok/s aggregate (median; 70-80 across runs) | Reederey87 publishes 63-66 warm; **MiaAI-Lab publishes 146.5 aggregate on 4-stream structured output** (base weights, their client), higher than anything we measured at 4 streams (`docs/RESEARCH-NIGHT.md` §5) |
 | Context | 4 requests share one 1,048,576-token pool: a request can grow to 1M, but not four at once (admission waits or spills idle sessions to the store) | 850k-1M in one context |
 | KV precision | **FP8** latent KV: greedy replies diverge from bf16 KV within the first 0-78 tokens on 15 of 20 prompts (quality checks above held; long-session recall checked by needle at 314k-358k only) | FP8 KV too |
-| Memory margin | with the vision tower on the head node both nodes now bind: the 4 x 250k stress bottoms at 8.27 / 8.28 GiB MemAvailable (W15), and a 314k needle right after the stress and MMLU dipped to **6.39 / 6.42 GiB** for ~35 s (under our 8 GiB target, no OOM; explained and bounded by 0550, docs/MEMORY-SAFETY.md {{W16_0550_STATUS_SHORT}}); a large file copy on the head node can serialize concurrent requests (page cache; 0550). 8,192-row prefill chunks (+~4% prefill) were rejected for memory | - |
+| Memory margin | **the 8 GiB stress gate failed for every config in W17**, the previous production config (b7) included: after a heavier warm-up (~200 short requests before the gates) the 4 x 250k stress bottomed at **7.50 / 6.92 GiB** MemAvailable (head / worker; b7 7.47 / 7.41) and a 314k needle right after the stress and MMLU at **6.04 / 5.46 GiB** (b7 6.21 / 5.81), no OOM and no engine error in any load (W15's lighter sequence gave b7 8.27 / 8.28). A lone prompt far beyond 314k still grows the allocator's prefill key blocks (docs/MEMORY-SAFETY.md, ~16 GiB bound at 1M); 0550 bounds it but is off until its prefill slowdown is isolated, and a ~900k prompt beside 3 busy slots has not been tested. A large file copy on the head node can serialize concurrent requests (page cache; `serve.sh start` now drops the page cache and checks the slot count). 8,192-row prefill chunks (+~4% prefill) were rejected for memory | - |
 | API | no `logprobs`, `n > 1` rejected, images yes (0500) but no video; in single-stream mode a `stop` match ends the reply but the engine keeps decoding silently to EOS / `max_tokens` before the next queued request starts | full OpenAI surface of vLLM |
-| Maturity | **work in progress**: one pair of Sparks, one checkpoint, three days of measurements (W1-W15) | production kits with many contributors |
+| Maturity | **work in progress**: one pair of Sparks, one checkpoint, four days of measurements (W1-W17) | production kits with many contributors |
 
 Other negatives and trade-offs, measured:
 
@@ -519,7 +540,7 @@ Before publishing a fork: `scripts/check-public.sh` scans the tree for private I
 | `bench/` | benchmark clients, MMLU-200 subset and full MMLU (`mmlu_full.py`), KL divergence (`divergence.py`), long-prompt exactness (`longexact.py`), tool-call harness, shared-prefix bench, draft-policy and lookup simulators, draft-vocabulary study and public ranking (`draftvocab.py`, `draftvocab_public.py`), page-cache probe |
 | `train/` | drafter training (MTP head and DFlash2 distillation from 0430 records, a PyTorch reference of both, offline acceptance evaluation; docs/DRAFTER-TRAINING.md) |
 | `tests/` | patch tests (GPU) and launcher tests (host) |
-| `results/` | raw benchmark JSON and the test windows' scripts (W1-W15), RigMark receipts (`rigmark/`), synthetic test images (`W14/img/`); logs omitted |
+| `results/` | raw benchmark JSON and the test windows' scripts (W1-W17), the release run (`FINAL-20260930/`), RigMark receipts (`rigmark/`), synthetic test images (`W14/img/`); logs omitted |
 | `docs/` | results, patch notes, design and analysis notes |
 
 ## Licensing

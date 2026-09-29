@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# W13 step 1 (THEORY-2 §6 1a-1d): the no-server probes on ONE node, prod stopped, clocks locked by run.sh.
+# W16 step 1 (THEORY-2 §6 1a-1d): the no-server probes on ONE node, prod stopped, clocks locked by run.sh.
 #   probes-node.sh head|worker [only-steps]
 # head: CPU suites of 0510 / 0520 / 0530 in the image, littles (item 8), bench_decode_cold --mode both (item 7).
 # worker: glprobe plain / under nsys graph / node tracing (item 2), the 0510 GPU test (split + lone: same bits),
 #        hc_fused bits + microbench (item 3, when 0520's files exist).
-# Every step is a fresh container under `timeout` (new kernels can hang). Logs: results/W13/probes-<node>/ (SUMMARY:
+# Every step is a fresh container under `timeout` (new kernels can hang). Logs: results/W16/probes-<node>/ (SUMMARY:
 # one line a step). Works from either repo copy (head ~/..., worker $HOME/...).
 node=$1; only=${2:-}
 if [[ $node == head ]]; then cd $HOME/glm53-tensorfold-spark; else cd $HOME/glm53-tensorfold-spark; fi
-O=$PWD/results/W13/probes-$node; mkdir -p "$O"
-IMG=${IMAGE:-glm53-tensorfold:b6}
+O=$PWD/results/W16/probes-$node; mkdir -p "$O"
+IMG=${IMAGE:-glm53-tensorfold:b8}
 run() { # name timeout "docker args" cmd...
     local n=$1 t=$2 e=$3; shift 3
     if [[ -n "$only" && " $only " != *" $n "* ]]; then return 0; fi
     local t0=$(date +%s)
-    docker rm -f w13-$n > /dev/null 2>&1
-    docker run --rm --name w13-$n --gpus all --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK \
+    docker rm -f w16-$n > /dev/null 2>&1
+    docker run --rm --name w16-$n --gpus all --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK \
         --network host --ipc host -v glm53-tf-cache:/cache -e PYTHONDONTWRITEBYTECODE=1 $e \
         -v "$PWD/tests:/work/tests" -v "$PWD/results/THEORY2-SESSION:/work/results/THEORY2-SESSION" -v "$O:/out" \
         --entrypoint bash "$IMG" -c "pip install -q pytest >/dev/null 2>&1; nvidia-smi --query-gpu=clocks.sm,clocks.mem,memory.used --format=csv,noheader; cd /work && PYTHONPATH=/src/TensorFold/src:/src/TensorFold/tests/cuda:/work/tests/cuda:/work/tests timeout -k 30 $t $*" \
         > "$O/$n.log" 2>&1
     local rc=$?
-    docker rm -f w13-$n > /dev/null 2>&1
+    docker rm -f w16-$n > /dev/null 2>&1
     echo "$(date +%T) $n rc=$rc $(( $(date +%s) - t0 ))s :: $(grep -E 'GATE|passed|failed|rror' "$O/$n.log" | tail -2 | tr '\n' ' ' | cut -c1-240)" | tee -a "$O/SUMMARY"
     return $rc
 }

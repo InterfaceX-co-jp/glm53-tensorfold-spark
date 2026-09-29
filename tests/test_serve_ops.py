@@ -213,7 +213,9 @@ inspect)
         *) cat "$FAKE_STATE/c.$n" ;;
     esac ;;
 image) exit 0 ;;
-logs) echo "log of ${@: -1}" ;;
+logs) echo "log of ${@: -1}"
+    # rank 0's boot line (patches/0290) that serve.sh's slot check reads
+    [[ "${@: -1}" == *-r0 ]] && echo "[tf] context: 1048576 tokens a request, ${FAKE_SLOTS:-4} request slot(s)" ;;
 ps) ls "$FAKE_STATE" | sed -n 's/^c\.//p' ;;
 esac
 """
@@ -533,6 +535,16 @@ def test_context_line_and_short_context_warning(kit):
     assert r.returncode == 0 and "warning" not in r.stdout
     assert "CONTEXT=1048576 tokens a request (prompt + max_tokens), KV cache latent fp8, GLM53_TF_BATCH=4, " \
            "GLM53_TF_KV_POOL_TOKENS=1048576" in r.stdout
+
+
+def test_start_checks_the_request_slot_count(kit):
+    r = kit.run("start", GLM53_TF_BATCH="4", CANARY="off")
+    assert r.returncode == 0 and "request slots: 4 (GLM53_TF_BATCH=4)" in r.stdout
+    # a start that comes up short (page cache after a big file read, W16) restarts, then fails with exit 3
+    r = kit.run("start", GLM53_TF_BATCH="4", CANARY="off", FAKE_SLOTS="1", SLOT_RETRIES="1")
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "rank 0 started with 1 request slot(s), GLM53_TF_BATCH=4" in r.stdout
+    assert "restarting (1 of 1)" in r.stdout and "still short of request slots after 1 restart(s)" in r.stdout
 
 
 def test_long_context_on_per_head_kv_is_refused(kit):

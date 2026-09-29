@@ -1,0 +1,13 @@
+<repo>/results/W16/roce-K: ops r0 45056 r1 45056, paired 45056
+  transport mean    4.62 us  p50    2.66  p90   11.74  (n 45056)
+  skew      mean   29.08 us  p50   14.14  p90   60.32  (n 45056)
+  waiting beyond transport, us an exchange: r0 11.84, r1 17.24; rank 0 late on 58% of exchanges
+  r0: stage p50 3.01, wait p50 8.38, copy p50 5.18, total p50 19.17, notice p50 1790472939017646.0, post p50 0.27
+  r1: stage p50 2.91, wait p50 12.93, copy p50 5.25, total p50 22.08, notice p50 1790472939353742.5, post p50 0.26
+<repo>/results/W16/roce-CT: ops r0 8192 r1 8192, paired 8192
+  transport mean    5.21 us  p50    2.98  p90   12.83  (n 8192)
+  skew      mean   42.63 us  p50   19.04  p90   96.10  (n 8192)
+  waiting beyond transport, us an exchange: r0 17.92, r1 24.71; rank 0 late on 57% of exchanges
+  r0: stage p50 2.69, wait p50 9.73, copy p50 5.57, total p50 20.93, notice p50 1790472939020117.0, post p50 0.38
+  r1: stage p50 2.72, wait p50 16.22, copy p50 5.47, total p50 26.37, notice p50 1790472939351636.0, post p50 0.29
+GATE item6 (skew wait -25%): load 29.08 vs control 42.63 us an exchange (r0 + r1): +32% lower -> PASS (or 1s / 4s >= +0.7%: summary.py)

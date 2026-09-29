@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""W13 request driver for the nsys load (standard library only; prod API on 127.0.0.1:8000). Non-streaming, so each
+"""W16 request driver for the nsys load (standard library only; prod API on 127.0.0.1:8000). Non-streaming, so each
 reply carries the engine's per-request stats (``tensorfold``: rounds, round_kinds incl. resident / capture / graph /
 eager counts, decode_s). One JSON line a request is appended to OUT.
 

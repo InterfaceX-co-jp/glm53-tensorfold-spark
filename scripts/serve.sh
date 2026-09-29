@@ -57,6 +57,14 @@ MEM_GATE_TIMEOUT="${MEM_GATE_TIMEOUT:-600}"
 MEM_GATE_DROP_CACHES="${MEM_GATE_DROP_CACHES:-0}"   # 1: while waiting, `sync; echo 1 > drop_caches` (sudo -n) on both nodes
 WARMUP_LENGTHS="${WARMUP_LENGTHS:-}"          # e.g. "4096 16384": after the canary, prefill prompts of about these lengths
 START_ATTEMPTS="${START_ATTEMPTS:-1}"         # a failed start (a rank exited, not ready, strict canary) tears down and retries
+# W16/W17: page cache left by a big file operation (docker load / save of an image) can make the engine's fit check
+# find less free device memory at load and silently start with fewer batch slots than GLM53_TF_BATCH. Before a
+# launch, drop the page cache (`sync; echo 3 > drop_caches`, sudo -n) on a node whose MemAvailable - MemFree is at
+# least START_DROP_CACHES_GIB (0: never; default 4 when MEM_GATE_DROP_CACHES=1, else 0). After /v1/models answers,
+# rank 0's `context: ... N request slot(s)` line must show N >= GLM53_TF_BATCH; if it is short, stop, drop the caches
+# and start again, at most SLOT_RETRIES times (default 2), then fail (exit 3, the short server left serving).
+START_DROP_CACHES_GIB="${START_DROP_CACHES_GIB:-$([[ "$MEM_GATE_DROP_CACHES" == 1 ]] && echo 4 || echo 0)}"
+SLOT_RETRIES="${SLOT_RETRIES:-2}"
 READY_TIMEOUT="${READY_TIMEOUT:-0}"           # seconds to wait for /v1/models (0: no limit; first start compiles kernels)
 LOG_MAX_SIZE="${LOG_MAX_SIZE:-}"              # e.g. 200m: docker json-file log rotation per container (empty: docker's default)
 LOG_MAX_FILE="${LOG_MAX_FILE:-3}"
@@ -183,6 +191,36 @@ mem_gate() {
         fi
         sleep 10
     done
+}
+
+# page cache (GiB, integer): MemAvailable - MemFree, on the head / the worker
+cache_gib() { awk '/^MemFree:/ {f=$2} /^MemAvailable:/ {a=$2} END {printf "%d", (a-f)/1048576}' /proc/meminfo; }
+cache_gib_worker() { wssh "awk '/^MemFree:/ {f=\$2} /^MemAvailable:/ {a=\$2} END {printf \"%d\", (a-f)/1048576}' /proc/meminfo" 2>/dev/null || true; }
+
+drop_caches_if_needed() { # $1 = force: drop on both nodes regardless of the threshold
+    local force=${1:-0} h w
+    [[ "$force" == 1 || "$START_DROP_CACHES_GIB" -gt 0 ]] || return 0
+    h=$(cache_gib); w=$(cache_gib_worker)
+    if [[ "$force" == 1 || "${h:-0}" -ge "$START_DROP_CACHES_GIB" ]]; then
+        sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null && log "dropped the head's page cache (${h} GiB)" \
+            || log "drop_caches: sudo -n refused on the head"
+    fi
+    if [[ "$force" == 1 || "${w:-0}" -ge "$START_DROP_CACHES_GIB" ]]; then
+        wssh "sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'" 2>/dev/null && log "dropped the worker's page cache (${w:-?} GiB)" \
+            || log "drop_caches: refused on the worker"
+    fi
+}
+
+# rank 0's slot count from its boot line `context: ... N request slot(s)` (empty until it is printed)
+slots_r0() { docker logs "$NAME-r0" 2>&1 | grep -oE '[0-9]+ request slot\(s\)' | tail -1 | grep -oE '^[0-9]+' || true; }
+
+check_slots() { # 0: rank 0 has >= GLM53_TF_BATCH slots (or no batching / no line within 60 s); 3: fewer
+    local want=${GLM53_TF_BATCH:-1} n="" i
+    [[ "$want" -gt 1 ]] || return 0
+    for i in $(seq 1 60); do n=$(slots_r0); [[ -n "$n" ]] && break; sleep 1; done
+    if [[ -z "$n" ]]; then log "no 'request slot(s)' line from rank 0 within 60 s; not checked"; return 0; fi
+    if [[ "$n" -lt "$want" ]]; then log "rank 0 started with $n request slot(s), GLM53_TF_BATCH=$want"; return 3; fi
+    log "request slots: $n (GLM53_TF_BATCH=$want)"
 }
 
 on_node() { # $1 = head | worker, then a command line (one string): run it on that node
@@ -327,8 +365,10 @@ run_canary() { # 0: pass or off; 1: failed
     return 0
 }
 
-start_once() { # 0: ready; 1: failed (containers left for the caller to inspect or remove); 2: the canary failed
+start_once() { # 0: ready; 1: failed (containers left for the caller to inspect or remove); 2: the canary failed;
+    # 3: fewer request slots than GLM53_TF_BATCH (serving)
     stop_both
+    drop_caches_if_needed "${FORCE_DROP:-0}"
     mem_gate
     IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo "$IMAGE")   # same id after save | load
     # both ranks at once (rank 1 waits for rank 0's TCP store either way); patches/0140
@@ -367,6 +407,7 @@ start_once() { # 0: ready; 1: failed (containers left for the caller to inspect 
     else
         log "serving up to ${CONTEXT:-2051} tokens a request (CONTEXT in $CONFIG): set your client's context window to it"
     fi
+    check_slots || return 3
     run_canary || { log "canary failed (CANARY=strict)"; return 2; }
 }
 
@@ -391,11 +432,19 @@ cmd_start() {
     if gpu_busy; then log "a CUDA process is running on a node; stop the other stack first"; exit 1; fi
     context_check || exit 1
     run_preflight || { log "preflight failed; not starting (PREFLIGHT=strict)"; exit 1; }
-    local attempt=1
+    local attempt=1 slot_try=0
     while :; do
         local rc=0
         start_once || rc=$?
         [[ $rc != 0 ]] || return 0
+        if [[ $rc == 3 ]]; then
+            if (( slot_try >= SLOT_RETRIES )); then
+                log "still short of request slots after $slot_try restart(s); leaving it serving, start failed"; exit 3
+            fi
+            slot_try=$((slot_try + 1))
+            log "too few request slots: dropping the page caches on both nodes and restarting ($slot_try of $SLOT_RETRIES)"
+            FORCE_DROP=1; continue
+        fi
         if (( attempt >= START_ATTEMPTS )); then
             if [[ $rc == 2 ]]; then     # a degenerate engine must not keep serving
                 log "stopping both ranks: they loaded but failed the canary (last logs in $STATE_DIR/canary-fail-r{0,1}.log)"

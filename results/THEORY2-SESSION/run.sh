@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# THEORY2-SESSION = W13: the GPU session of docs/THEORY-2.md §6 in one script. Run on the head node from the repo copy
-# ($HOME/glm53-tensorfold-spark), as head, inside tmux/nohup. Logs: results/W13/ (session.log first).
+# THEORY2-SESSION = W16: the GPU session of docs/THEORY-2.md §6 in one script. Run on the head node from the repo copy
+# ($HOME/glm53-tensorfold-spark), as head, inside tmux/nohup. Logs: results/W16/ (session.log first).
 #
-#   run.sh build          BEFORE the window (prod keeps serving): image $IMAGE (b6 = b5 + 0510 / 0520 / 0530) built
+#   run.sh build          BEFORE the window (prod keeps serving): image $IMAGE (b8 = b7 + 0510 / 0520 / 0530) built
 #                         here from patches/ and shipped to the worker node; then `run.sh sync`
 #   run.sh sync           tests/, patches/, results/THEORY2-SESSION/ -> the worker node's copy (tar over ssh)
 #   run.sh all            the whole window: open -> probes -> loads -> restore (restore also on any exit / signal)
@@ -49,7 +49,7 @@ open_window() {
     log "window open: lease refresher pid $(cat $STATE/lease.pid) (tied to pid $owner, max $WINDOW_MAX_MIN min); watchdog timer $(timer)"
     health_ok && log "prod before: $(curl -s -m 10 $B/v1/models | head -c 200)"
     CONFIG=config/prod.env scripts/serve.sh stop > "$R/stop-prod.log" 2>&1
-    clear_w13
+    clear_w16
     for i in $(seq 1 30); do
         [[ -z "$(gpu_apps)" && -z "$(wssh nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)" ]] && break
         sleep 5
@@ -62,7 +62,7 @@ open_window() {
 restore() {
     [[ -f $STATE/restored ]] && return 0
     log "restore: prod from config/prod.env"
-    clear_w13
+    clear_w16
     set_clocks "$PROD_CLOCKS"
     local ok=0 answer https rc
     for attempt in 1 2; do
@@ -104,8 +104,8 @@ probes() {
     IMAGE=$IMAGE bash "$T2/probes-node.sh" head > "$R/probes-head.out" 2>&1
     wait $p2
     mkdir -p "$R/probes-worker"
-    scp -q -r "$W:$REPO2/results/W13/probes-worker/." "$R/probes-worker/" 2>/dev/null
-    rm -f "$R"/probes-worker/*.nsys-rep 2>/dev/null   # (reports stay on the worker node: $REPO2/results/W13/probes-worker/)
+    scp -q -r "$W:$REPO2/results/W16/probes-worker/." "$R/probes-worker/" 2>/dev/null
+    rm -f "$R"/probes-worker/*.nsys-rep 2>/dev/null   # (reports stay on the worker node: $REPO2/results/W16/probes-worker/)
     set_clocks "$PROD_CLOCKS"
     log "probes done:"; cat "$R/probes-head/SUMMARY" "$R/probes-worker/SUMMARY" 2>/dev/null | tee -a "$R/session.log" >&2
 }
@@ -113,8 +113,8 @@ probes() {
 # -- loads ------------------------------------------------------------------------------------------------------------
 collect_trace() { # collect_trace NAME: the two ranks' RoCE dumps + graph probe / resident lines, then the dumps removed
     local n=$1
-    docker exec glm53-tf-r0 sh -c "cat /sessions/w13-roce-$n-r0.jsonl 2>/dev/null; rm -f /sessions/w13-roce-$n-r0.jsonl" > "$R/roce-$n-r0.jsonl"
-    wssh "docker exec glm53-tf-r1 sh -c 'cat /sessions/w13-roce-$n-r1.jsonl 2>/dev/null; rm -f /sessions/w13-roce-$n-r1.jsonl'" > "$R/roce-$n-r1.jsonl"
+    docker exec glm53-tf-r0 sh -c "cat /sessions/w16-roce-$n-r0.jsonl 2>/dev/null; rm -f /sessions/w16-roce-$n-r0.jsonl" > "$R/roce-$n-r0.jsonl"
+    wssh "docker exec glm53-tf-r1 sh -c 'cat /sessions/w16-roce-$n-r1.jsonl 2>/dev/null; rm -f /sessions/w16-roce-$n-r1.jsonl'" > "$R/roce-$n-r1.jsonl"
     docker logs glm53-tf-r0 2>&1 | grep -E 'graph probe|resident rounds|trace dump' > "$R/lines-$n-r0.txt"
     wssh docker logs glm53-tf-r1 2>&1 | grep -E 'graph probe|resident rounds|trace dump' > "$R/lines-$n-r1.txt"
     log "$n: RoCE dumps $(wc -l < "$R/roce-$n-r0.jsonl") / $(wc -l < "$R/roce-$n-r1.jsonl") lines; probe lines $(wc -l < "$R/lines-$n-r0.txt")"
@@ -124,18 +124,19 @@ TRACE="GLM53_TF_ROCE_TRACE=4096 GLM53_TF_ROCE_TRACE_EVERY=65536"
 one_load() {
     local n=$1
     case $n in
-    C|C2)  bash "$T2/load.sh" "$n" plain && health_ok && bash "$T2/ab.sh" "$n" full ;;
+    # W16: the control is prod as it runs (config/prod.env on image b7, vision on); every other load is b8
+    C|C2)  bash "$T2/load.sh" "$n" plain IMAGE=${CTRL_IMAGE:-glm53-tensorfold:b7} && health_ok && bash "$T2/ab.sh" "$n" full ;;
     # prod (W12, 5c4da18) already has L2PF=1 / L2PF_MB=8 / BATCH_CAPTURE_AFTER=8: L adds only the graph policy;
     # L1 (optional) also captures lone keys on first sight (the 8 sightings delay only lone slots 1-3 under lone)
     L)     bash "$T2/load.sh" L plain GLM53_TF_BATCH_GRAPHS=lone && health_ok && bash "$T2/ab.sh" L full ;;
     L1)    bash "$T2/load.sh" L1 plain GLM53_TF_BATCH_GRAPHS=lone GLM53_TF_BATCH_CAPTURE_AFTER=1 && health_ok \
                && bash "$T2/ab.sh" L1 full ;;
-    CT)    bash "$T2/load.sh" CT plain $TRACE GLM53_TF_ROCE_TRACE_DUMP=/sessions/w13-roce-CT GLM53_TF_GRAPH_PROBE=100 \
+    CT)    bash "$T2/load.sh" CT plain $TRACE GLM53_TF_ROCE_TRACE_DUMP=/sessions/w16-roce-CT GLM53_TF_GRAPH_PROBE=100 \
                && health_ok && bash "$T2/ab.sh" CT short
            collect_trace CT
            python3 "$T2/rocetrace.py" "$R/roce-CT" --json "$R/rocetrace-CT.json" > "$R/rocetrace-CT.txt" 2>&1 ;;
     K)     set_clocks "$LOCK_CLOCKS"; clocks K
-           bash "$T2/load.sh" K plain $TRACE GLM53_TF_ROCE_TRACE_DUMP=/sessions/w13-roce-K GLM53_TF_CPU_PIN=http \
+           bash "$T2/load.sh" K plain $TRACE GLM53_TF_ROCE_TRACE_DUMP=/sessions/w16-roce-K GLM53_TF_CPU_PIN=http \
                && health_ok && { docker exec glm53-tf-r0 sh -c 'ps -L -o tid,psr,comm -p 1 2>/dev/null; for t in /proc/[0-9]*/task/*; do echo "$(cat $t/comm) $(grep Cpus_allowed_list $t/status | cut -f2)"; done | sort | uniq -c' > "$R/threads-K-r0.txt" 2>&1
                                  bash "$T2/ab.sh" K full; }
            collect_trace K
@@ -160,21 +161,21 @@ gr() { # item 9: GPU_ROUND=resident + ONE nsys window (graph-level) on greedy tf
     bash "$T2/load.sh" GR nsys GLM53_TF_GPU_ROUND=${GR_MODE:-resident} GLM53_TF_RESIDENT_REPORT=10 && health_ok || return 1
     $Q tfcode "$R/gr-warm.jsonl" 1 > /dev/null 2>&1; $Q conc "$R/gr-warm.jsonl" 4 64 > /dev/null 2>&1
     $Q tfcode "$R/gr-ctl.jsonl" 3 > "$R/gr-ctl.log" 2>&1; $Q conc "$R/gr-ctl.jsonl" 4 384 >> "$R/gr-ctl.log" 2>&1
-    docker exec glm53-tf-r0 nsys start --session=w13 --sample=none --cpuctxsw=none --force-overwrite=true -o /w13/out/gr-r0 &
-    wssh docker exec glm53-tf-r1 nsys start --session=w13 --sample=none --cpuctxsw=none --force-overwrite=true -o /w13/out/gr-r1 &
+    docker exec glm53-tf-r0 nsys start --session=w16 --sample=none --cpuctxsw=none --force-overwrite=true -o /w16/out/gr-r0 &
+    wssh docker exec glm53-tf-r1 nsys start --session=w16 --sample=none --cpuctxsw=none --force-overwrite=true -o /w16/out/gr-r1 &
     wait; sleep 2
     $Q tfcode "$R/gr-cap.jsonl" 3 > "$R/gr-cap.log" 2>&1; sleep 2
     $Q conc "$R/gr-cap.jsonl" 4 384 >> "$R/gr-cap.log" 2>&1; sleep 2
-    docker exec glm53-tf-r0 nsys stop --session=w13 &
-    wssh docker exec glm53-tf-r1 nsys stop --session=w13 &
+    docker exec glm53-tf-r0 nsys stop --session=w16 &
+    wssh docker exec glm53-tf-r1 nsys stop --session=w16 &
     wait
     for i in $(seq 1 120); do
-        if [[ -f /var/tmp/w13/out/gr-r0.nsys-rep ]] && wssh test -f /var/tmp/w13/out/gr-r1.nsys-rep \
+        if [[ -f /var/tmp/w16/out/gr-r0.nsys-rep ]] && wssh test -f /var/tmp/w16/out/gr-r1.nsys-rep \
            && ! pgrep -f QdstrmImporter > /dev/null && ! wssh pgrep -f QdstrmImporter > /dev/null; then break; fi
         sleep 5
     done
     collect_trace GR
-    log "GR: reports $(ls -la /var/tmp/w13/out/gr-r0.nsys-rep 2>&1 | awk '{print $5, $NF}') / worker $(wssh ls -la /var/tmp/w13/out/gr-r1.nsys-rep 2>&1 | awk '{print $5, $NF}') (export offline, not on a prod node)"
+    log "GR: reports $(ls -la /var/tmp/w16/out/gr-r0.nsys-rep 2>&1 | awk '{print $5, $NF}') / worker $(wssh ls -la /var/tmp/w16/out/gr-r1.nsys-rep 2>&1 | awk '{print $5, $NF}') (export offline, not on a prod node)"
     cat "$R/gr-ctl.log" "$R/gr-cap.log" | tee -a "$R/session.log" >&2
 }
 
@@ -210,10 +211,12 @@ all)
     SESSION_PID=$$
     [[ "${NO_RESTORE:-0}" == 1 ]] || trap 'restore' EXIT
     trap 'log "signal: restoring"; exit 1' INT TERM HUP
-    log "W13 session: image $IMAGE, loads [$LOADS], max $SESSION_MAX_MIN min"
+    log "W16 session: image $IMAGE, loads [$LOADS], max $SESSION_MAX_MIN min"
     open_window || exit 1
     probes
     loads $LOADS
+    # W16: more work inside the same window before the restore (Part B: results/W16/drafters.sh)
+    if [[ -n "${AFTER_LOADS:-}" ]]; then log "after loads: $AFTER_LOADS"; bash -c "$AFTER_LOADS" >> "$R/after-loads.out" 2>&1; log "after loads rc=$?"; fi
     log "session done after $(elapsed_min) min (restore follows)" ;;
 *) sed -n '2,20p' "$0" ;;
 esac

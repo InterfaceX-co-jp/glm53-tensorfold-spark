@@ -1,0 +1,1280 @@
+{
+ "all|all|f": {
+  "rounds": 3222,
+  "mean_depth": 6.95,
+  "tokens_a_round": 4.102,
+  "a_cond": [
+   0.796,
+   0.778,
+   0.782,
+   0.818,
+   0.825,
+   0.814,
+   0.854
+  ],
+  "attempted": [
+   3222,
+   2555,
+   1985,
+   1552,
+   1267,
+   1043,
+   849
+  ],
+  "p_cum": [
+   0.796,
+   0.619,
+   0.485,
+   0.397,
+   0.328,
+   0.267,
+   0.228
+  ]
+ },
+ "all|all|m": {
+  "rounds": 4016,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.29,
+  "a_cond": [
+   0.847,
+   0.776,
+   0.732,
+   0.645
+  ],
+  "attempted": [
+   4016,
+   3394,
+   2630,
+   1920
+  ],
+  "p_cum": [
+   0.847,
+   0.657,
+   0.481,
+   0.31
+  ]
+ },
+ "all|greedy|f": {
+  "rounds": 1582,
+  "mean_depth": 6.95,
+  "tokens_a_round": 4.153,
+  "a_cond": [
+   0.796,
+   0.778,
+   0.793,
+   0.835,
+   0.838,
+   0.797,
+   0.864
+  ],
+  "attempted": [
+   1582,
+   1255,
+   974,
+   771,
+   643,
+   537,
+   428
+  ],
+  "p_cum": [
+   0.796,
+   0.619,
+   0.49,
+   0.41,
+   0.344,
+   0.274,
+   0.237
+  ]
+ },
+ "all|greedy|m": {
+  "rounds": 1992,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.297,
+  "a_cond": [
+   0.84,
+   0.777,
+   0.753,
+   0.649
+  ],
+  "attempted": [
+   1992,
+   1671,
+   1294,
+   972
+  ],
+  "p_cum": [
+   0.84,
+   0.653,
+   0.491,
+   0.319
+  ]
+ },
+ "all|sampled|f": {
+  "rounds": 1640,
+  "mean_depth": 6.94,
+  "tokens_a_round": 4.053,
+  "a_cond": [
+   0.797,
+   0.778,
+   0.773,
+   0.8,
+   0.811,
+   0.832,
+   0.843
+  ],
+  "attempted": [
+   1640,
+   1300,
+   1011,
+   781,
+   624,
+   506,
+   421
+  ],
+  "p_cum": [
+   0.797,
+   0.62,
+   0.48,
+   0.384,
+   0.312,
+   0.26,
+   0.219
+  ]
+ },
+ "all|sampled|m": {
+  "rounds": 2024,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.284,
+  "a_cond": [
+   0.854,
+   0.776,
+   0.711,
+   0.64
+  ],
+  "attempted": [
+   2024,
+   1723,
+   1336,
+   948
+  ],
+  "p_cum": [
+   0.854,
+   0.662,
+   0.471,
+   0.302
+  ]
+ },
+ "agent|all|f": {
+  "rounds": 1095,
+  "mean_depth": 6.94,
+  "tokens_a_round": 5.762,
+  "a_cond": [
+   0.897,
+   0.904,
+   0.908,
+   0.926,
+   0.904,
+   0.899,
+   0.894
+  ],
+  "attempted": [
+   1095,
+   975,
+   881,
+   800,
+   741,
+   670,
+   602
+  ],
+  "p_cum": [
+   0.897,
+   0.81,
+   0.737,
+   0.684,
+   0.619,
+   0.556,
+   0.497
+  ]
+ },
+ "agent|all|m": {
+  "rounds": 1580,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.992,
+  "a_cond": [
+   0.937,
+   0.901,
+   0.837,
+   0.726
+  ],
+  "attempted": [
+   1580,
+   1477,
+   1328,
+   1110
+  ],
+  "p_cum": [
+   0.937,
+   0.844,
+   0.707,
+   0.513
+  ]
+ },
+ "agent|greedy|f": {
+  "rounds": 522,
+  "mean_depth": 6.95,
+  "tokens_a_round": 5.967,
+  "a_cond": [
+   0.906,
+   0.913,
+   0.918,
+   0.942,
+   0.922,
+   0.892,
+   0.915
+  ],
+  "attempted": [
+   522,
+   470,
+   429,
+   394,
+   371,
+   342,
+   305
+  ],
+  "p_cum": [
+   0.906,
+   0.827,
+   0.761,
+   0.718,
+   0.662,
+   0.59,
+   0.54
+  ]
+ },
+ "agent|greedy|m": {
+  "rounds": 771,
+  "mean_depth": 3.98,
+  "tokens_a_round": 4.04,
+  "a_cond": [
+   0.929,
+   0.916,
+   0.857,
+   0.741
+  ],
+  "attempted": [
+   771,
+   715,
+   652,
+   559
+  ],
+  "p_cum": [
+   0.929,
+   0.851,
+   0.73,
+   0.541
+  ]
+ },
+ "agent|sampled|f": {
+  "rounds": 573,
+  "mean_depth": 6.94,
+  "tokens_a_round": 5.574,
+  "a_cond": [
+   0.888,
+   0.895,
+   0.898,
+   0.911,
+   0.886,
+   0.905,
+   0.872
+  ],
+  "attempted": [
+   573,
+   505,
+   452,
+   406,
+   370,
+   328,
+   297
+  ],
+  "p_cum": [
+   0.888,
+   0.794,
+   0.716,
+   0.653,
+   0.58,
+   0.525,
+   0.458
+  ]
+ },
+ "agent|sampled|m": {
+  "rounds": 809,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.947,
+  "a_cond": [
+   0.944,
+   0.887,
+   0.817,
+   0.711
+  ],
+  "attempted": [
+   809,
+   762,
+   676,
+   551
+  ],
+  "p_cum": [
+   0.944,
+   0.838,
+   0.685,
+   0.487
+  ]
+ },
+ "code|all|f": {
+  "rounds": 700,
+  "mean_depth": 6.95,
+  "tokens_a_round": 4.387,
+  "a_cond": [
+   0.874,
+   0.809,
+   0.793,
+   0.779,
+   0.795,
+   0.762,
+   0.803
+  ],
+  "attempted": [
+   700,
+   612,
+   492,
+   390,
+   302,
+   240,
+   183
+  ],
+  "p_cum": [
+   0.874,
+   0.707,
+   0.56,
+   0.437,
+   0.346,
+   0.265,
+   0.213
+  ]
+ },
+ "code|all|m": {
+  "rounds": 887,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.463,
+  "a_cond": [
+   0.9,
+   0.793,
+   0.749,
+   0.603
+  ],
+  "attempted": [
+   887,
+   797,
+   630,
+   469
+  ],
+  "p_cum": [
+   0.9,
+   0.713,
+   0.534,
+   0.321
+  ]
+ },
+ "code|greedy|f": {
+  "rounds": 349,
+  "mean_depth": 6.95,
+  "tokens_a_round": 4.401,
+  "a_cond": [
+   0.88,
+   0.818,
+   0.767,
+   0.796,
+   0.808,
+   0.762,
+   0.763
+  ],
+  "attempted": [
+   349,
+   307,
+   249,
+   191,
+   151,
+   122,
+   93
+  ],
+  "p_cum": [
+   0.88,
+   0.719,
+   0.55,
+   0.439,
+   0.354,
+   0.27,
+   0.206
+  ]
+ },
+ "code|greedy|m": {
+  "rounds": 444,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.459,
+  "a_cond": [
+   0.896,
+   0.776,
+   0.779,
+   0.609
+  ],
+  "attempted": [
+   444,
+   398,
+   308,
+   238
+  ],
+  "p_cum": [
+   0.896,
+   0.696,
+   0.542,
+   0.329
+  ]
+ },
+ "code|sampled|f": {
+  "rounds": 351,
+  "mean_depth": 6.96,
+  "tokens_a_round": 4.373,
+  "a_cond": [
+   0.869,
+   0.8,
+   0.819,
+   0.764,
+   0.781,
+   0.763,
+   0.844
+  ],
+  "attempted": [
+   351,
+   305,
+   243,
+   199,
+   151,
+   118,
+   90
+  ],
+  "p_cum": [
+   0.869,
+   0.695,
+   0.569,
+   0.434,
+   0.339,
+   0.26,
+   0.22
+  ]
+ },
+ "code|sampled|m": {
+  "rounds": 443,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.467,
+  "a_cond": [
+   0.903,
+   0.81,
+   0.72,
+   0.597
+  ],
+  "attempted": [
+   443,
+   399,
+   322,
+   231
+  ],
+  "p_cum": [
+   0.903,
+   0.731,
+   0.526,
+   0.314
+  ]
+ },
+ "prose|all|f": {
+  "rounds": 1427,
+  "mean_depth": 6.95,
+  "tokens_a_round": 2.689,
+  "a_cond": [
+   0.681,
+   0.632,
+   0.593,
+   0.619,
+   0.603,
+   0.481,
+   0.625
+  ],
+  "attempted": [
+   1427,
+   968,
+   612,
+   362,
+   224,
+   133,
+   64
+  ],
+  "p_cum": [
+   0.681,
+   0.43,
+   0.255,
+   0.158,
+   0.095,
+   0.045,
+   0.028
+  ]
+ },
+ "prose|all|m": {
+  "rounds": 1549,
+  "mean_depth": 3.99,
+  "tokens_a_round": 2.475,
+  "a_cond": [
+   0.725,
+   0.6,
+   0.507,
+   0.437
+  ],
+  "attempted": [
+   1549,
+   1120,
+   672,
+   341
+  ],
+  "p_cum": [
+   0.725,
+   0.435,
+   0.221,
+   0.097
+  ]
+ },
+ "prose|greedy|f": {
+  "rounds": 711,
+  "mean_depth": 6.96,
+  "tokens_a_round": 2.699,
+  "a_cond": [
+   0.674,
+   0.619,
+   0.632,
+   0.651,
+   0.62,
+   0.411,
+   0.667
+  ],
+  "attempted": [
+   711,
+   478,
+   296,
+   186,
+   121,
+   73,
+   30
+  ],
+  "p_cum": [
+   0.674,
+   0.417,
+   0.263,
+   0.171,
+   0.106,
+   0.043,
+   0.029
+  ]
+ },
+ "prose|greedy|m": {
+  "rounds": 777,
+  "mean_depth": 3.99,
+  "tokens_a_round": 2.467,
+  "a_cond": [
+   0.719,
+   0.599,
+   0.524,
+   0.411
+  ],
+  "attempted": [
+   777,
+   558,
+   334,
+   175
+  ],
+  "p_cum": [
+   0.719,
+   0.431,
+   0.226,
+   0.093
+  ]
+ },
+ "prose|sampled|f": {
+  "rounds": 716,
+  "mean_depth": 6.94,
+  "tokens_a_round": 2.679,
+  "a_cond": [
+   0.689,
+   0.645,
+   0.557,
+   0.585,
+   0.583,
+   0.567,
+   0.588
+  ],
+  "attempted": [
+   716,
+   490,
+   316,
+   176,
+   103,
+   60,
+   34
+  ],
+  "p_cum": [
+   0.689,
+   0.443,
+   0.248,
+   0.145,
+   0.085,
+   0.048,
+   0.028
+  ]
+ },
+ "prose|sampled|m": {
+  "rounds": 772,
+  "mean_depth": 3.98,
+  "tokens_a_round": 2.483,
+  "a_cond": [
+   0.731,
+   0.601,
+   0.491,
+   0.464
+  ],
+  "attempted": [
+   772,
+   562,
+   338,
+   166
+  ],
+  "p_cum": [
+   0.731,
+   0.439,
+   0.216,
+   0.101
+  ]
+ },
+ "requests": [
+  {
+   "name": "chat",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 42.8,
+   "tpr": 2.716,
+   "mix": {
+    "MTP": 141
+   }
+  },
+  {
+   "name": "chat",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 41.65,
+   "tpr": 2.66,
+   "mix": {
+    "MTP": 144
+   }
+  },
+  {
+   "name": "essay",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 35.7,
+   "tpr": 2.28,
+   "mix": {
+    "MTP": 168
+   }
+  },
+  {
+   "name": "essay",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 34.25,
+   "tpr": 2.189,
+   "mix": {
+    "MTP": 175
+   }
+  },
+  {
+   "name": "hashmap",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 43.29,
+   "tpr": 2.736,
+   "mix": {
+    "MTP": 140
+   }
+  },
+  {
+   "name": "hashmap",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 44.28,
+   "tpr": 2.816,
+   "mix": {
+    "MTP": 136
+   }
+  },
+  {
+   "name": "tides",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 42.53,
+   "tpr": 2.678,
+   "mix": {
+    "MTP": 143
+   }
+  },
+  {
+   "name": "tides",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 44.07,
+   "tpr": 2.775,
+   "mix": {
+    "MTP": 138
+   }
+  },
+  {
+   "name": "letter",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 33.17,
+   "tpr": 2.07,
+   "mix": {
+    "MTP": 185
+   }
+  },
+  {
+   "name": "letter",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 33.95,
+   "tpr": 2.14,
+   "mix": {
+    "MTP": 179
+   }
+  },
+  {
+   "name": "code-lru",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 52.95,
+   "tpr": 3.389,
+   "mix": {
+    "MTP": 113
+   }
+  },
+  {
+   "name": "code-lru",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 53.36,
+   "tpr": 3.45,
+   "mix": {
+    "MTP": 111
+   }
+  },
+  {
+   "name": "code-fib",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 56.34,
+   "tpr": 3.648,
+   "mix": {
+    "MTP": 105
+   }
+  },
+  {
+   "name": "code-fib",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 56.71,
+   "tpr": 3.683,
+   "mix": {
+    "MTP": 104
+   }
+  },
+  {
+   "name": "code-go",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 49.21,
+   "tpr": 3.192,
+   "mix": {
+    "MTP": 120
+   }
+  },
+  {
+   "name": "code-go",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 47.54,
+   "tpr": 3.089,
+   "mix": {
+    "MTP": 124
+   }
+  },
+  {
+   "name": "code-ts",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 55.31,
+   "tpr": 3.613,
+   "mix": {
+    "MTP": 106
+   }
+  },
+  {
+   "name": "code-ts",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 55.88,
+   "tpr": 3.683,
+   "mix": {
+    "MTP": 104
+   }
+  },
+  {
+   "name": "agent-rename",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 768,
+   "tps": 66.69,
+   "tpr": 4.62,
+   "mix": {
+    "MTP": 166
+   }
+  },
+  {
+   "name": "agent-rename",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 768,
+   "tps": 66.25,
+   "tpr": 4.593,
+   "mix": {
+    "MTP": 167
+   }
+  },
+  {
+   "name": "agent-log",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 768,
+   "tps": 67.42,
+   "tpr": 4.648,
+   "mix": {
+    "MTP": 165
+   }
+  },
+  {
+   "name": "agent-log",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 768,
+   "tps": 62.01,
+   "tpr": 4.285,
+   "mix": {
+    "MTP": 179
+   }
+  },
+  {
+   "name": "agent-diff",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 428,
+   "tps": 58.03,
+   "tpr": 3.917,
+   "mix": {
+    "MTP": 109
+   }
+  },
+  {
+   "name": "agent-diff",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 507,
+   "tps": 54.86,
+   "tpr": 3.693,
+   "mix": {
+    "MTP": 137
+   }
+  },
+  {
+   "name": "agent-json",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 768,
+   "tps": 67.14,
+   "tpr": 4.168,
+   "mix": {
+    "MTP": 184
+   }
+  },
+  {
+   "name": "agent-json",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 768,
+   "tps": 66.09,
+   "tpr": 4.124,
+   "mix": {
+    "MTP": 186
+   }
+  },
+  {
+   "name": "agent-plan",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 40.46,
+   "tpr": 2.605,
+   "mix": {
+    "MTP": 147
+   }
+  },
+  {
+   "name": "agent-plan",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 42.36,
+   "tpr": 2.736,
+   "mix": {
+    "MTP": 140
+   }
+  },
+  {
+   "name": "chat",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 39.07,
+   "tpr": 2.969,
+   "mix": {
+    "DFlash2": 129
+   }
+  },
+  {
+   "name": "chat",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 38.6,
+   "tpr": 2.924,
+   "mix": {
+    "DFlash2": 131
+   }
+  },
+  {
+   "name": "essay",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 32.81,
+   "tpr": 2.487,
+   "mix": {
+    "DFlash2": 154
+   }
+  },
+  {
+   "name": "essay",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 31.67,
+   "tpr": 2.409,
+   "mix": {
+    "DFlash2": 159
+   }
+  },
+  {
+   "name": "hashmap",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 45.22,
+   "tpr": 3.389,
+   "mix": {
+    "DFlash2": 113
+   }
+  },
+  {
+   "name": "hashmap",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 41.08,
+   "tpr": 3.114,
+   "mix": {
+    "DFlash2": 123
+   }
+  },
+  {
+   "name": "tides",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 40.4,
+   "tpr": 2.992,
+   "mix": {
+    "DFlash2": 128
+   }
+  },
+  {
+   "name": "tides",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 41.61,
+   "tpr": 3.089,
+   "mix": {
+    "DFlash2": 124
+   }
+  },
+  {
+   "name": "letter",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 27.56,
+   "tpr": 2.048,
+   "mix": {
+    "DFlash2": 187
+   }
+  },
+  {
+   "name": "letter",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 28.6,
+   "tpr": 2.14,
+   "mix": {
+    "DFlash2": 179
+   }
+  },
+  {
+   "name": "code-lru",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 61.71,
+   "tpr": 4.671,
+   "mix": {
+    "DFlash2": 82
+   }
+  },
+  {
+   "name": "code-lru",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 60.76,
+   "tpr": 4.614,
+   "mix": {
+    "DFlash2": 83
+   }
+  },
+  {
+   "name": "code-fib",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 69.07,
+   "tpr": 5.319,
+   "mix": {
+    "DFlash2": 72
+   }
+  },
+  {
+   "name": "code-fib",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 72.3,
+   "tpr": 5.551,
+   "mix": {
+    "DFlash2": 69
+   }
+  },
+  {
+   "name": "code-go",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 47.08,
+   "tpr": 3.613,
+   "mix": {
+    "DFlash2": 106
+   }
+  },
+  {
+   "name": "code-go",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 44.72,
+   "tpr": 3.482,
+   "mix": {
+    "DFlash2": 110
+   }
+  },
+  {
+   "name": "code-ts",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 55.56,
+   "tpr": 4.303,
+   "mix": {
+    "DFlash2": 89
+   }
+  },
+  {
+   "name": "code-ts",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 54.18,
+   "tpr": 4.303,
+   "mix": {
+    "DFlash2": 89
+   }
+  },
+  {
+   "name": "agent-rename",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 768,
+   "tps": 91.74,
+   "tpr": 7.67,
+   "mix": {
+    "DFlash2": 100
+   }
+  },
+  {
+   "name": "agent-rename",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 768,
+   "tps": 92.16,
+   "tpr": 7.67,
+   "mix": {
+    "DFlash2": 100
+   }
+  },
+  {
+   "name": "agent-log",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 768,
+   "tps": 92.86,
+   "tpr": 7.747,
+   "mix": {
+    "DFlash2": 99
+   }
+  },
+  {
+   "name": "agent-log",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 768,
+   "tps": 80.5,
+   "tpr": 6.67,
+   "mix": {
+    "DFlash2": 115
+   }
+  },
+  {
+   "name": "agent-diff",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 428,
+   "tps": 73.44,
+   "tpr": 6.014,
+   "mix": {
+    "DFlash2": 71
+   }
+  },
+  {
+   "name": "agent-diff",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 507,
+   "tps": 61.35,
+   "tpr": 4.961,
+   "mix": {
+    "DFlash2": 102
+   }
+  },
+  {
+   "name": "agent-json",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 768,
+   "tps": 81.75,
+   "tpr": 5.992,
+   "mix": {
+    "DFlash2": 128
+   }
+  },
+  {
+   "name": "agent-json",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 768,
+   "tps": 77.99,
+   "tpr": 5.681,
+   "mix": {
+    "DFlash2": 135
+   }
+  },
+  {
+   "name": "agent-plan",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 39.85,
+   "tpr": 3.089,
+   "mix": {
+    "DFlash2": 124
+   }
+  },
+  {
+   "name": "agent-plan",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 41.58,
+   "tpr": 3.165,
+   "mix": {
+    "DFlash2": 121
+   }
+  }
+ ]
+}

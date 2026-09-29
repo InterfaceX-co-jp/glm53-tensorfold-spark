@@ -1,0 +1,42 @@
+class        temp     arm      rounds  depth tok/rnd  a_j (conditional, positions 1..)
+all          all      DFlash2    3201   6.95   4.129  0.80 0.78 0.78 0.81 0.83 0.82 0.85   (n [3201, 2563, 1985, 1552, 1260, 1049, 859])
+all          greedy   DFlash2    1578   6.95   4.163  0.80 0.78 0.79 0.83 0.85 0.82 0.84   (n [1578, 1256, 976, 765, 633, 537, 442])
+all          sampled  DFlash2    1623   6.94   4.096  0.81 0.77 0.78 0.80 0.82 0.81 0.86   (n [1623, 1307, 1009, 787, 627, 512, 417])
+agent        all      DFlash2    1101   6.94   5.730  0.90 0.90 0.91 0.91 0.90 0.91 0.89   (n [1101, 983, 886, 808, 733, 657, 599])
+agent        greedy   DFlash2     526   6.94   5.922  0.90 0.91 0.93 0.93 0.91 0.92 0.89   (n [526, 472, 427, 397, 369, 336, 310])
+agent        sampled  DFlash2     575   6.93   5.555  0.90 0.90 0.90 0.89 0.88 0.90 0.90   (n [575, 511, 459, 411, 364, 321, 289])
+code         all      DFlash2     681   6.95   4.508  0.89 0.80 0.82 0.80 0.82 0.75 0.79   (n [681, 605, 479, 392, 312, 254, 191])
+code         greedy   DFlash2     340   6.94   4.515  0.89 0.81 0.80 0.80 0.82 0.76 0.77   (n [340, 302, 244, 195, 154, 127, 96])
+code         sampled  DFlash2     341   6.96   4.501  0.89 0.78 0.84 0.80 0.81 0.75 0.81   (n [341, 303, 235, 197, 158, 127, 95])
+prose        all      DFlash2    1419   6.95   2.705  0.69 0.64 0.57 0.61 0.65 0.50 0.62   (n [1419, 975, 620, 352, 215, 138, 69])
+prose        greedy   DFlash2     712   6.97   2.695  0.68 0.63 0.57 0.64 0.69 0.49 0.64   (n [712, 482, 305, 173, 110, 74, 36])
+prose        sampled  DFlash2     707   6.94   2.714  0.70 0.64 0.57 0.59 0.61 0.52 0.61   (n [707, 493, 315, 179, 105, 64, 33])
+
+chat           prose       T=0.0 tokens   384  37.58 tok/s  tok/round 2.88  arms {'f': 133}
+chat           prose       T=1.0 tokens   384  39.61 tok/s  tok/round 2.992  arms {'f': 128}
+essay          prose       T=0.0 tokens   384  33.54 tok/s  tok/round 2.553  arms {'f': 150}
+essay          prose       T=1.0 tokens   384  32.14 tok/s  tok/round 2.471  arms {'f': 155}
+hashmap        prose       T=0.0 tokens   384  44.86 tok/s  tok/round 3.36  arms {'f': 114}
+hashmap        prose       T=1.0 tokens   384  42.49 tok/s  tok/round 3.192  arms {'f': 120}
+tides          prose       T=0.0 tokens   384  40.61 tok/s  tok/round 3.04  arms {'f': 126}
+tides          prose       T=1.0 tokens   384  41.55 tok/s  tok/round 3.089  arms {'f': 124}
+letter         prose       T=0.0 tokens   384  27.24 tok/s  tok/round 2.026  arms {'f': 189}
+letter         prose       T=1.0 tokens   384  28.47 tok/s  tok/round 2.128  arms {'f': 180}
+code-lru       code        T=0.0 tokens   384  61.92 tok/s  tok/round 4.728  arms {'f': 81}
+code-lru       code        T=1.0 tokens   384  59.86 tok/s  tok/round 4.56  arms {'f': 84}
+code-fib       code        T=0.0 tokens   384  71.67 tok/s  tok/round 5.551  arms {'f': 69}
+code-fib       code        T=1.0 tokens   384  77.38 tok/s  tok/round 5.892  arms {'f': 65}
+code-go        code        T=0.0 tokens   384  47.18 tok/s  tok/round 3.613  arms {'f': 106}
+code-go        code        T=1.0 tokens   384  47.36 tok/s  tok/round 3.718  arms {'f': 103}
+code-ts        code        T=0.0 tokens   384  58.81 tok/s  tok/round 4.56  arms {'f': 84}
+code-ts        code        T=1.0 tokens   384  55.01 tok/s  tok/round 4.303  arms {'f': 89}
+agent-rename   agent       T=0.0 tokens   768  89.93 tok/s  tok/round 7.594  arms {'f': 101}
+agent-rename   agent       T=1.0 tokens   768  90.74 tok/s  tok/round 7.594  arms {'f': 101}
+agent-log      agent       T=0.0 tokens   768  91.27 tok/s  tok/round 7.67  arms {'f': 100}
+agent-log      agent       T=1.0 tokens   768  79.19 tok/s  tok/round 6.612  arms {'f': 116}
+agent-diff     agent       T=0.0 tokens   428  71.11 tok/s  tok/round 5.849  arms {'f': 73}
+agent-diff     agent       T=1.0 tokens   507  60.11 tok/s  tok/round 4.913  arms {'f': 103}
+agent-json     agent       T=0.0 tokens   768  82.89 tok/s  tok/round 6.087  arms {'f': 126}
+agent-json     agent       T=1.0 tokens   768  78.46 tok/s  tok/round 5.724  arms {'f': 134}
+agent-plan     agent       T=0.0 tokens   384  39.36 tok/s  tok/round 3.04  arms {'f': 126}
+agent-plan     agent       T=1.0 tokens   384  41.91 tok/s  tok/round 3.165  arms {'f': 121}

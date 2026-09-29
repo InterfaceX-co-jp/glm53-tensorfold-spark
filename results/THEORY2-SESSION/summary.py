@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""W13: every load against the control(s) and the THEORY-2 §4 gates, from results/W13 only (standard library).
+"""W16: every load against the control(s) and the THEORY-2 §4 gates, from results/W16 only (standard library).
 
-  python3 results/THEORY2-SESSION/summary.py [results/W13] > results/W13/summary.txt
+  python3 results/THEORY2-SESSION/summary.py [results/W16] > results/W16/summary.txt
 
 Controls = loads named C, C2, ... (the mean of those present). Per load: exact n/n, batchexact, ab.py reply sha,
 glmbench reply hashes == control C's (every run of every cell: greedy and seeded sampled replies are deterministic),
@@ -16,7 +16,7 @@ import statistics
 import sys
 from pathlib import Path
 
-R = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "W13"
+R = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "W16"
 SHA = "8794a3463259cc2f"
 
 
@@ -103,7 +103,7 @@ def main():
     sv = [s for s in (slots(t) for t in ctrl_tags) if s]
     sc = statistics.mean(sv) if sv else None
     ref_sha = G["C"][1] if "C" in G else G[ctrl_tags[0]][1]
-    print(f"W13 loads {L}; controls {ctrl_tags}. Speed: % vs the controls' mean.")
+    print(f"W16 loads {L}; controls {ctrl_tags}. Speed: % vs the controls' mean.")
     code_like = [c for c in cells if any(k in c for k in ("code:0.0", "structured", "edit"))]
     prose = [c for c in cells if any(k in c for k in ("chat:0.0", "essay", "hashmap"))]
     samp = [c for c in cells if c.endswith(":1.0")]

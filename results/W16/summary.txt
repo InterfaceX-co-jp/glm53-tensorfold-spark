@@ -1,0 +1,24 @@
+W16 loads ['C', 'L', 'CT', 'K', 'VS']; controls ['C']. Speed: % vs the controls' mean.
+load    exact bexact  ab sha  hashes=C  1s geo code-like  prose sampled   4s agg (n)   slots
+C       10/10    4/4      ok     10/10   +0.0%     +0.0%  +0.0%   +0.0%    +0.0% (6)   +0.0%
+L       10/10    4/4      ok     10/10   +0.8%     +1.4%  +0.2%   -0.1%   +34.0% (6)   +0.5%
+CT          -      -       -       0/7   -3.3%     -2.0%  -4.8%   -2.2%   +35.0% (3)   +nan%
+K       10/10    4/4      ok     10/10   +0.3%     +0.6%  -0.0%   +0.1%   +34.4% (6)   +0.4%
+VS      10/10    4/4      ok     10/10   +0.0%     +0.5%  -0.3%   -0.6%   +34.2% (6)   -0.6%
+
+GATE item1 L (BATCH_GRAPHS=lone on prod's CAPTURE_AFTER=8 + L2PF): 4s +34.0% (>= +0.7), lone slots +0.5% (>= -0.5), 1s +0.8% (>= 0), bits True, hashes 10/10 -> PASS
+GATE item6 K (lgc 2250 + CPU_PIN=http + trace): 1s +0.3% / 4s +34.4% (either >= +0.7) -> PASS (or the skew gate in rocetrace-K.txt)
+GATE item2 VS (VERIFY_SPLIT): 1s +0.0% (>= +0.4), bits True, hashes 10/10 -> FAIL (graph probe lines: boot-*-r0.log / docker logs)
+
+per cell (tok/s): control mean, then each load's % vs it
+cell                            ctrl      L     CT      K     VS
+tf:code:1.0                     47.0   +0.5   -3.2   +0.9   +0.9
+tf:chat:1.0                     45.4   -0.6   -1.1   -0.7   -2.0
+tf:code:0.0                     83.0   +1.4   -0.7   +0.3   +0.0
+tf:chat:0.0                     48.1   +0.3   -5.5   +0.2   -0.1
+kit:hashmap:0.0                 55.6   +0.4   -7.2   -0.2   -0.4
+kit:structured:0.0             104.2   +0.3   -3.2   +0.1   +0.1
+kit:essay:0.0                   47.2   -0.1   -1.7   -0.1   -0.5
+edit:edit-rename:0.0           113.8   +1.0      -   +1.3   +1.1
+edit:edit-comments:0.0          95.7   +4.3      -   +2.2   +2.6
+edit:edit-print-to-log:0.0     117.5   +0.2      -   -1.0   -1.2

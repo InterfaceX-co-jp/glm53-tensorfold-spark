@@ -1,0 +1,6 @@
+<repo>/results/W16/roce-CT: ops r0 8192 r1 8192, paired 8192
+  transport mean    5.21 us  p50    2.98  p90   12.83  (n 8192)
+  skew      mean   42.63 us  p50   19.04  p90   96.10  (n 8192)
+  waiting beyond transport, us an exchange: r0 17.92, r1 24.71; rank 0 late on 57% of exchanges
+  r0: stage p50 2.69, wait p50 9.73, copy p50 5.57, total p50 20.93, notice p50 1790472939020117.0, post p50 0.38
+  r1: stage p50 2.72, wait p50 16.22, copy p50 5.47, total p50 26.37, notice p50 1790472939351636.0, post p50 0.29

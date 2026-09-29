@@ -1,5 +1,11 @@
 # Memory safety: the long-prefill dip and page cache at admission (patches/0550)
 
+> **Update 2026-09-30 (W17, docs/RESULTS.md):** measured on the GPU in image b9 and **not adopted**: the GPU tests
+> passed, the page-cache probe passed and the 314k needle's dip was 1.7 instead of 4.0 GiB, but the first long prefill
+> after a burst of short requests ran up to 9.8% slower in 2 of 4 prefill pairs. Production (image b9) has 0550 built
+> in with its knobs off (`GLM53_TF_ADMIT_MEM=free`, `GLM53_TF_SELECT_SCRATCH=off`, `GLM53_TF_ALLOC_TRIM_GB=0`). Next:
+> the same sequence with only the trim off.
+
 Status (2026-09-29): written and tested offline (CPU, Triton's interpreter; no GPU run). Production is unchanged
 (image b7 = patches through 0490 + 0500 + 0540). 0550 applies to the b7 stack and to the whole stack through 0540.
 Line numbers below are in the b7 tree with 0550 applied (`src/tensorfold/families/glm5_next/cuda/`).

@@ -5,6 +5,10 @@ through **one** forward: their rows stacked, every per-sequence part per slot, t
 of them. Each request's bits are those of its piece prefilled alone. Offline work (no GPU run yet): knob **off** by
 default, CPU tests pass, the GPU plan is §9. `docs/REPLAY-TTFT.md` §2 has the analysis this implements.
 
+> **Update 2026-09-30 (W17, docs/RESULTS.md):** measured on the GPU and **adopted** (`GLM53_TF_MULTI_PREFILL=1` in
+> `config/prod.env.example`, image b9): 92/92 grouped replies equal to the same request alone, C4 per-stream first
+> tokens 1.64 -> 0.82 s with thinking on (RigMark 3-run mean 0.89 s), prefill and decode unchanged.
+
 ## 1. Why
 
 A short prompt's prefill is weight-read bound. A fast chunk of R rows reads every routed expert that one of its rows

@@ -2,27 +2,51 @@
 
 Three sets of receipts, newest first:
 
-1. **{{AVG_RUN_LABEL}}: the 3-round averaged run on the release config** ({{AVG_RUN_DATE}}, image {{AVG_IMAGE}}):
-   `{{AVG_RUN_DIRS}}`. See [below](#release-run-3-rounds-averaged).
-2. **W15 validation (2026-09-29, image b7 = patches 0001-0490 + 0500 + 0540, `config/prod.env.example` of this
-   release):** two full standard-suite runs, [`tensorfold-20260929-w15/`](tensorfold-20260929-w15/) and
+1. **W17 release run: the 3-round averaged run on the release config** (2026-09-30, image b9 = patches 0001-0490 +
+   0500 + 0540 + 0550 + 0560, `config/prod.env.example` of this release): [`tensorfold-20260930-w17-final-r1/`](tensorfold-20260930-w17-final-r1/),
+   [`-r2/`](tensorfold-20260930-w17-final-r2/), [`-r3/`](tensorfold-20260930-w17-final-r3/). See [below](#release-run-3-rounds-averaged).
+2. **W15 validation (2026-09-29, image b7 = patches 0001-0490 + 0500 + 0540, the previous production config):** two full standard-suite runs, [`tensorfold-20260929-w15/`](tensorfold-20260929-w15/) and
    [`tensorfold-20260929-w15-run2/`](tensorfold-20260929-w15-run2/). See [below](#w15-validation-runs-2026-09-29).
 3. **The W13 baseline (2026-09-29, image b5 = patches through 0490):** [`tensorfold-20260929/`](tensorfold-20260929/),
    the section after that.
 
 ## Release run (3 rounds, averaged)
 
-{{AVG_RUN_SECTION: method (3 back-to-back standard-suite runs, fresh comparison IDs, prod serving, no restart), mean
-and min-max of each row below, the receipts' sha256, anything that differed from W15}}
+Production after W17 (image b9: W15's config plus 0560's multi-slot prefill on, `GLM53_TF_MULTI_PREFILL=1`; 0550 in
+the image but off), serving, not restarted after the adopt. Three back-to-back RigMark standard-suite runs
+(2026-09-30 02:59-03:37 local, 572 / 571 / 577 s), RigMark pinned at `c5a0db01b054` (clean), `reasoning_effort` low, a new
+comparison ID a run (`2026-09-glm53-exl3-2xspark-tensorfold-w17-final-r1` / `-r2` / `-r3`) so no run could replay
+another's prompts from the NVMe session tier. Each run was followed by glmbench, the multiturn concurrency bench and
+ab.py before the next (`results/FINAL-20260930/final.sh`; all numbers: `results/FINAL-20260930/summary.md`). All three
+valid: 15/15 basic output gates each.
 
-| RigMark (mean of 3 runs' medians) | TensorFold release | vLLM TP2 k=7 (Alex) |
+Each directory: the receipt JSON + `.sha256` (r1 `fbaf073b7eb5075e...`, r2 `bbc1af3785d6da9f...`, r3
+`4dca115c5ac4a5a7...`), the card, `command.txt` (the directories were renamed after the runs, so it names
+`tensorfold-20260929-195957` / `-201355` / `-202752`), `metadata.json`, `preflight.json`, `models.json` and
+`requests.jsonl` (the server's request log of the run, cut by the run's start / finish time: token counts, cache source,
+timings; no text). Every replay row in each log is `cached` = n - 64 (8,128 / 32,704 / 65,472) from the slot, 9/9 a
+run. RigMark's `run.log` is not included.
+
+The table: mean of the three runs' medians, with min-max in brackets.
+
+| RigMark (mean of 3 runs' medians, min-max) | TensorFold release (b9) | vLLM TP2 k=7 (Alex) |
 |---|---:|---:|
-| Code / prose / structured decode tok/s | {{AVG_CODE_TPS}} / {{AVG_PROSE_TPS}} / {{AVG_STRUCT_TPS}} | 44.0 / 18.9 / 64.9 |
-| Cold prefill 8K / 32K / 64K tok/s | {{AVG_COLD_8K}} / {{AVG_COLD_32K}} / {{AVG_COLD_64K}} | 1,813 / 1,908 / 1,922 |
-| Immediate replay 8K / 32K / 64K tok/s | {{AVG_REPLAY_8K}} / {{AVG_REPLAY_32K}} / {{AVG_REPLAY_64K}} | 1,812 / 11,046 / 11,364 |
-| Replay TTFT 8K / 32K / 64K s | {{AVG_REPLAY_TTFT_8K}} / {{AVG_REPLAY_TTFT_32K}} / {{AVG_REPLAY_TTFT_64K}} | 4.52 / 2.97 / 5.77 |
-| C1 / C2 / C4 aggregate tok/s | {{AVG_C1}} / {{AVG_C2}} / {{AVG_C4}} | 31.6 / 42.0 / 66.1 |
-| C4 per-stream TTFT s | {{AVG_C4_TTFT}} | 0.81 |
+| Code / prose / structured decode tok/s | **67.9** (67.4-68.6) / **43.0** (42.2-43.5) / **88.8** (88.6-89.0) | 44.0 / 18.9 / 64.9 |
+| Cold prefill 8K / 32K / 64K tok/s | 1,560 (1,556-1,562) / 1,634 (1,631-1,637) / 1,620 (1,618-1,621) | **1,813 / 1,908 / 1,922** |
+| Immediate replay 8K / 32K / 64K tok/s | **36,474** (35,856-37,185) / **132,814** (129,084-136,610) / **243,980** (242,167-246,603) | 1,812 / 11,046 / 11,364 |
+| Replay TTFT 8K / 32K / 64K s | **0.22** (0.22-0.23) / **0.25** (0.24-0.25) / **0.27** (0.27-0.27) | 4.52 / 2.97 / 5.77 |
+| C1 / C2 / C4 aggregate tok/s | **53.1** (52.1-53.9) / **70.1** (68.8-70.9) / **91.0** (89.5-92.1) | 31.6 / 42.0 / 66.1 |
+| C1 / C2 / C4 per-stream TTFT s | **0.49** (0.49-0.50) / **0.65** (0.64-0.66) / 0.89 (0.88-0.89) | 0.60 / 0.68 / **0.81** |
+| Code / prose / structured TTFT s | 0.50 / 0.41 / 0.47 | 0.60 / 0.49 / 0.47 |
+
+Against W15 (b7, same RigMark, table below): C4 aggregate 91.0 vs 81.8 / 82.8 (+10%), C2 70.1 vs 67.0 / 67.3 (+4%), C2
+per-stream TTFT 0.65 vs 0.95 / 0.76 s and C4 0.89 vs 1.63 / 1.91 s, all from 0560's grouped prefill (several waiting
+prompts' prefill pieces in one forward, each with the bits it gets alone). Decode, cold prefill and replay are
+unchanged within run-to-run noise. Where we are still behind Alex's vLLM receipt: cold prefill (0.84-0.86x; RigMark's
+grid-aligned token-id prompts, our own chat-prompt bench gives ~1,606-1,610 tok/s) and C4 per-stream TTFT (0.89 vs
+0.81 s). The "Read this before comparing" notes under the W13 baseline apply here too: different weights (abliterated
+EXL3 4-bit here, LibertAIDAI NVFP4 there), drafter policy, context limit (1M vs 262k), protocol, day and machines;
+reasoning is single-counted since W15.
 
 ## W15 validation runs (2026-09-29)
 

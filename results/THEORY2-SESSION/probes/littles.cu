@@ -787,7 +787,11 @@ int main(int argc, char **argv) {
     for (auto k : {(const void *)cpa_kernel<2>, (const void *)cpa_kernel<3>, (const void *)cpa_kernel<4>,
                    (const void *)cpa_kernel<6>, (const void *)cpa_kernel<8>, (const void *)bulk_kernel<2>,
                    (const void *)bulk_kernel<3>, (const void *)bulk_kernel<4>})
-        CK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, optin));
+    {   // W16 fix: the dynamic limit is the opt-in size minus the kernel's static shared memory (bulk_kernel: 128 B)
+        cudaFuncAttributes fa;
+        CK(cudaFuncGetAttributes(&fa, k));
+        CK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, optin - (int)fa.sharedSizeBytes));
+    }
 
     // ---- latk alone ------------------------------------------------------------------------------------------------
     {
@@ -1086,7 +1090,7 @@ int main(int argc, char **argv) {
                         const void *k = S == 2 ? (const void *)bulk_kernel<2> : S == 3 ? (const void *)bulk_kernel<3>
                                                                                         : (const void *)bulk_kernel<4>;
                         const size_t dsm = (size_t)S * CH;
-                        if ((int)dsm > optin || occupancy(k, 256, dsm) < C) continue;
+                        if ((int)dsm + 128 > optin ||   /* W16: + bulk_kernel's 128 B static shared memory */ occupancy(k, 256, dsm) < C) continue;
                         const int grid = g_sms * C;
                         auto nck_for = [&, grid, CH](int scale) {
                             int n = std::max(1, (int)llround(TARGET / ((double)grid * CH))) * scale;

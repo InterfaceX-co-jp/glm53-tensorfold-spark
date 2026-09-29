@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""W13: the RoCE per-exchange trace of a load (patches/0530 GLM53_TF_ROCE_TRACE_DUMP; 0460's ring) -> transport vs
+"""W16: the RoCE per-exchange trace of a load (patches/0530 GLM53_TF_ROCE_TRACE_DUMP; 0460's ring) -> transport vs
 skew, THEORY-2 §1.4's table measured in-server without nsys (idea 6's gate). Standard library only.
 
   rocetrace.py PREFIX [--vs PREFIX2] [--json OUT]

@@ -1,8 +1,10 @@
-# THEORY2-SESSION (W13): the GPU session of docs/THEORY-2.md §6
+# THEORY2-SESSION (W16): the GPU session of docs/THEORY-2.md §6
+
+> Relabelled for W16 (2026-09-29): prepared as W13 on b5, run as W16 on image b8 = b7 (prod) + 0510 / 0520 / 0530, control C = prod as it runs (config/prod.env, image b7). Results: results/W16/ and docs/RESULTS.md W16.
 
 Everything the ≤ 2 h prototype window needs, prepared offline (no GPU was used to build it). One script,
 `run.sh`, runs it on the head node: no-server probes on both nodes in parallel, then the server loads, then prod restored.
-Logs go to `results/W13/` (`session.log` first, `summary.txt` at the end).
+Logs go to `results/W16/` (`session.log` first, `summary.txt` at the end).
 
 ## What is new for it
 
@@ -35,23 +37,23 @@ All knobs are off by default: an image with 0510 / 0520 / 0530 and no new env se
    Only these paths: the copy on the head node has its own `config/prod.env` (the restore and the control C use it; as of
    W12, 5c4da18: b5 + L2PF=1, L2PF_MB=8, BATCH_CAPTURE_AFTER=8) and W12's files. `bench_decode_cold.py` imports
    `tests/cuda/bench_decode_kernels.py` with W12's `load_inline` fix (committed in 5c4da18; check it is on the head node).
-2. On the head node: `bash results/THEORY2-SESSION/run.sh build` (docker build of `glm53-tensorfold:b6` from every patch,
-   shipped to the worker node; check `results/W13/build.log` lists `applying patches/0510..0530`), then
+2. On the head node: `bash results/THEORY2-SESSION/run.sh build` (docker build of `glm53-tensorfold:b8` from every patch,
+   shipped to the worker node; check `results/W16/build.log` lists `applying patches/0510..0530`), then
    `bash results/THEORY2-SESSION/run.sh sync` (tests, patches and this directory to the worker node's `~/...` copy).
-   The first start of b6 re-measures the calibration (~100 s); prepared weight folders are reused.
+   The first start of b8 re-measures the calibration (~100 s); prepared weight folders are reused.
 
 ## The window
 
 ```
 cd ~/glm53-tensorfold-spark
-tmux new -s w13 'bash results/THEORY2-SESSION/run.sh all 2>&1 | tee -a results/W13/run.out'
+tmux new -s w16 'bash results/THEORY2-SESSION/run.sh all 2>&1 | tee -a results/W16/run.out'
 ```
 
 | phase | time | what | decides |
 | --- | ---: | --- | --- |
 | open | 2 min | wait for 0 requests in flight (FORCE=1 overrides), lease + refresher (tied to this script's pid), watchdog timer stopped, prod stopped, GPUs empty on both nodes, clocks logged | |
 | probes | ~25 min | clocks `-lgc 2250,2250` both nodes; **worker**: glprobe plain / nsys `graph` / nsys `node`, the 0510 GPU test, 0520 bits + microbench; **head** (same time): CPU suites in the image, littles, bench_decode_cold `--mode both`; clocks back to `300,2250` | items 2, 3, 7, 8 (GATE lines in `probes-*/SUMMARY` and logs) |
-| load C | ~13 min | control = prod env as of W12 (5c4da18: L2PF=1, L2PF_MB=8, BATCH_CAPTURE_AFTER=8) on b6 — full set | baseline |
+| load C | ~13 min | control = prod env as of W12 (5c4da18: L2PF=1, L2PF_MB=8, BATCH_CAPTURE_AFTER=8) on b8 — full set | baseline |
 | load L | ~13 min | `BATCH_GRAPHS=lone` on top of prod — full set (optional `L1`: + `BATCH_CAPTURE_AFTER=1`, add it to LOADS) | item 1, re-based on W12: prod's CAPTURE_AFTER=8 already took +2.0% at 4s and G0 cost lone slots 1-3 -3.1%, so: 4s ≥ +0.7% over C (beyond the ±0.5% spread), lone slots ≥ -0.5%, 1s ≥ 0 |
 | load CT | ~7 min | control + `ROCE_TRACE=4096` + dump + `GRAPH_PROBE=100` — glmbench tf,kit x1, conc x3 | the skew baseline; the REAL verify graph's launch exposure (`lines-CT-r0.txt`) |
 | load K | ~14 min | `-lgc 2250,2250` + `CPU_PIN=http` + trace + dump — full set; thread affinities in `threads-K-r0.txt` | item 6: skew wait -25% (`rocetrace-K.txt`) or 1s / 4s ≥ +0.7% |
@@ -78,13 +80,13 @@ Single phases (the lease refresher then runs for `WINDOW_MAX_MIN` without a pid 
   signal of `run.sh all` (EXIT trap).
 - Restore starts prod from `config/prod.env` with no IMAGE / knob overrides (`env -u IMAGE`), retries once, and
   re-arms the watchdog even if verification fails (then it says so loudly: check `scripts/serve.sh logs 0`).
-- Every probe container is `w13-*` under `timeout`; leftovers are removed at restore.
-- nsys reports stay on the nodes (`/var/tmp/w13/out/`, `results/W13/probes-worker/*.nsys-rep` on the worker node); export them
+- Every probe container is `w16-*` under `timeout`; leftovers are removed at restore.
+- nsys reports stay on the nodes (`/var/tmp/w16/out/`, `results/W16/probes-worker/*.nsys-rep` on the worker node); export them
   on a workstation, never on a prod node (THEORY-2 §8).
 
 ## Reading the results
 
-- `results/W13/summary.txt`: every load vs C (1-stream geo-mean, code-like, prose, sampled, 4-stream aggregate over 6
+- `results/W16/summary.txt`: every load vs C (1-stream geo-mean, code-like, prose, sampled, 4-stream aggregate over 6
   reps, lone slots), the bit gates (exact, batchexact, ab sha, hashes == C) and the GATE lines for L / K / VS.
 - `probes-head/SUMMARY`, `probes-worker/SUMMARY` + `littles.log`, `cold.log`, `glp-*.log`, `hcbench.log`: GATE lines
   for items 8, 7, 2, 3.

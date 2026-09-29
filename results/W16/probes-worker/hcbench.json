@@ -1,0 +1,392 @@
+{
+ "argv": [
+  "/work/tests/cuda/bench_hc_fused.py",
+  "--json",
+  "/out/hcbench.json"
+ ],
+ "errors": [],
+ "rows": {
+  "1": {
+   "rows": 1,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 25.60800313949585,
+    "fused rg1": 19.365330537160236,
+    "fused rg1 pdl": 14.887988567352295
+   },
+   "hot_us": {
+    "triton": 10.10933332145214,
+    "fused rg1": 9.43999985853831,
+    "fused rg1 pdl": 9.27466650803884
+   },
+   "triton_us": 25.60800313949585,
+   "best": "fused rg1 pdl",
+   "fused_us": 14.887988567352295,
+   "ratio": 0.5813803007697304
+  },
+  "2": {
+   "rows": 2,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true,
+    "fused rg2": true,
+    "fused rg2 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 16.090671221415203,
+    "fused rg1": 14.861345291137695,
+    "fused rg1 pdl": 15.378673871358236,
+    "fused rg2": 16.474664211273193,
+    "fused rg2 pdl": 17.12799072265625
+   },
+   "hot_us": {
+    "triton": 10.32533310353756,
+    "fused rg1": 10.81066702802976,
+    "fused rg1 pdl": 10.709332923094431,
+    "fused rg2": 11.509332805871964,
+    "fused rg2 pdl": 11.391999820868174
+   },
+   "triton_us": 16.090671221415203,
+   "best": "fused rg1",
+   "fused_us": 14.861345291137695,
+   "ratio": 0.923600083964093
+  },
+  "3": {
+   "rows": 3,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true,
+    "fused rg2": true,
+    "fused rg2 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 16.272008419036865,
+    "fused rg1": 15.99733034769694,
+    "fused rg1 pdl": 16.14399751027425,
+    "fused rg2": 16.733328501383465,
+    "fused rg2 pdl": 17.06133286158244
+   },
+   "hot_us": {
+    "triton": 10.343999912341436,
+    "fused rg1": 11.551999797423681,
+    "fused rg1 pdl": 11.389333754777908,
+    "fused rg2": 11.882666498422623,
+    "fused rg2 pdl": 11.736000577608744
+   },
+   "triton_us": 16.272008419036865,
+   "best": "fused rg1",
+   "fused_us": 15.99733034769694,
+   "ratio": 0.9831195962866774
+  },
+  "4": {
+   "rows": 4,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true,
+    "fused rg2": true,
+    "fused rg2 pdl": true,
+    "fused rg4": true,
+    "fused rg4 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 16.909321149190266,
+    "fused rg1": 16.74399773279826,
+    "fused rg1 pdl": 16.975998878479004,
+    "fused rg2": 18.5813307762146,
+    "fused rg2 pdl": 18.642663955688477,
+    "fused rg4": 22.04000949859619,
+    "fused rg4 pdl": 22.2053329149882
+   },
+   "hot_us": {
+    "triton": 11.202666908502579,
+    "fused rg1": 11.992000043392181,
+    "fused rg1 pdl": 11.84800018866857,
+    "fused rg2": 12.925333033005396,
+    "fused rg2 pdl": 12.752000242471695,
+    "fused rg4": 14.826666563749313,
+    "fused rg4 pdl": 14.733333140611649
+   },
+   "triton_us": 16.909321149190266,
+   "best": "fused rg1",
+   "fused_us": 16.74399773279826,
+   "ratio": 0.9902229418358452
+  },
+  "6": {
+   "rows": 6,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true,
+    "fused rg2": true,
+    "fused rg2 pdl": true,
+    "fused rg4": true,
+    "fused rg4 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 18.26133330663045,
+    "fused rg1": 20.909349123636883,
+    "fused rg1 pdl": 21.14933729171753,
+    "fused rg2": 20.093321800231934,
+    "fused rg2 pdl": 19.885321458180744,
+    "fused rg4": 22.584001223246258,
+    "fused rg4 pdl": 23.554662863413494
+   },
+   "hot_us": {
+    "triton": 11.437332878510157,
+    "fused rg1": 15.17066607872645,
+    "fused rg1 pdl": 15.098666151364645,
+    "fused rg2": 13.58666643500328,
+    "fused rg2 pdl": 13.442666580279669,
+    "fused rg4": 15.655999382336935,
+    "fused rg4 pdl": 15.461333096027374
+   },
+   "triton_us": 18.26133330663045,
+   "best": "fused rg2 pdl",
+   "fused_us": 19.885321458180744,
+   "ratio": 1.0889304260691985
+  },
+  "8": {
+   "rows": 8,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true,
+    "fused rg2": true,
+    "fused rg2 pdl": true,
+    "fused rg4": true,
+    "fused rg4 pdl": true,
+    "fused rg8": true,
+    "fused rg8 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 18.629332383473713,
+    "fused rg1": 23.402671019236248,
+    "fused rg1 pdl": 23.461341857910156,
+    "fused rg2": 21.55466874440511,
+    "fused rg2 pdl": 22.050658861796062,
+    "fused rg4": 24.69601233800252,
+    "fused rg4 pdl": 25.127987066904705,
+    "fused rg8": 32.024006048838295,
+    "fused rg8 pdl": 32.33599662780762
+   },
+   "hot_us": {
+    "triton": 12.01333353916804,
+    "fused rg1": 16.77600045998891,
+    "fused rg1 pdl": 16.626667231321335,
+    "fused rg2": 14.757333944241205,
+    "fused rg2 pdl": 14.618666221698126,
+    "fused rg4": 16.778666526079178,
+    "fused rg4 pdl": 16.682667036851246,
+    "fused rg8": 21.554666260878246,
+    "fused rg8 pdl": 21.672000487645466
+   },
+   "triton_us": 18.629332383473713,
+   "best": "fused rg2",
+   "fused_us": 21.55466874440511,
+   "ratio": 1.1570285129233346
+  },
+  "12": {
+   "rows": 12,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true,
+    "fused rg2": true,
+    "fused rg2 pdl": true,
+    "fused rg4": true,
+    "fused rg4 pdl": true,
+    "fused rg8": true,
+    "fused rg8 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 21.776000658671062,
+    "fused rg1": 30.567983786265057,
+    "fused rg1 pdl": 29.879987239837646,
+    "fused rg2": 29.034654299418133,
+    "fused rg2 pdl": 29.695987701416016,
+    "fused rg4": 28.170665105183918,
+    "fused rg4 pdl": 28.13867727915446,
+    "fused rg8": 34.36799844106039,
+    "fused rg8 pdl": 34.89867846171061
+   },
+   "hot_us": {
+    "triton": 13.682667165994644,
+    "fused rg1": 21.47999902566274,
+    "fused rg1 pdl": 21.29333217938741,
+    "fused rg2": 19.7200005253156,
+    "fused rg2 pdl": 19.581332802772522,
+    "fused rg4": 17.653333644072216,
+    "fused rg4 pdl": 17.501333107550938,
+    "fused rg8": 22.48000105222066,
+    "fused rg8 pdl": 22.272000710169475
+   },
+   "triton_us": 21.776000658671062,
+   "best": "fused rg4 pdl",
+   "fused_us": 28.13867727915446,
+   "ratio": 1.2921875655780632
+  },
+  "16": {
+   "rows": 16,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true,
+    "fused rg2": true,
+    "fused rg2 pdl": true,
+    "fused rg4": true,
+    "fused rg4 pdl": true,
+    "fused rg8": true,
+    "fused rg8 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 23.047983646392822,
+    "fused rg1": 36.42932573954264,
+    "fused rg1 pdl": 36.5333358446757,
+    "fused rg2": 32.749334971110024,
+    "fused rg2 pdl": 33.14133485158285,
+    "fused rg4": 32.088001569112144,
+    "fused rg4 pdl": 32.14399019877116,
+    "fused rg8": 39.437333742777504,
+    "fused rg8 pdl": 39.40532604853312
+   },
+   "hot_us": {
+    "triton": 15.821332732836405,
+    "fused rg1": 29.394666353861492,
+    "fused rg1 pdl": 28.914667665958405,
+    "fused rg2": 24.127999941507976,
+    "fused rg2 pdl": 22.05866575241089,
+    "fused rg4": 19.762666275103886,
+    "fused rg4 pdl": 19.674666225910187,
+    "fused rg8": 24.59999918937683,
+    "fused rg8 pdl": 24.853333830833435
+   },
+   "triton_us": 23.047983646392822,
+   "best": "fused rg4",
+   "fused_us": 32.088001569112144,
+   "ratio": 1.3922259778301322
+  },
+  "32": {
+   "rows": 32,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true,
+    "fused rg2": true,
+    "fused rg2 pdl": true,
+    "fused rg4": true,
+    "fused rg4 pdl": true,
+    "fused rg8": true,
+    "fused rg8 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 36.99733813603719,
+    "fused rg1": 61.14933888117472,
+    "fused rg1 pdl": 61.13600730895996,
+    "fused rg2": 53.7839929262797,
+    "fused rg2 pdl": 53.9626677831014,
+    "fused rg4": 49.87200101216634,
+    "fused rg4 pdl": 50.141334533691406,
+    "fused rg8": 53.207993507385254,
+    "fused rg8 pdl": 53.38400602340698
+   },
+   "hot_us": {
+    "triton": 24.44000045458476,
+    "fused rg1": 46.02933426698049,
+    "fused rg1 pdl": 45.869335532188416,
+    "fused rg2": 36.43999993801117,
+    "fused rg2 pdl": 36.25866770744324,
+    "fused rg4": 30.775999029477436,
+    "fused rg4 pdl": 30.477332572142284,
+    "fused rg8": 33.402666449546814,
+    "fused rg8 pdl": 33.38133295377096
+   },
+   "triton_us": 36.99733813603719,
+   "best": "fused rg4",
+   "fused_us": 49.87200101216634,
+   "ratio": 1.3479888966279066
+  },
+  "64": {
+   "rows": 64,
+   "same_bits_by_rg": {
+    "fused rg1": true,
+    "fused rg1 pdl": true,
+    "fused rg2": true,
+    "fused rg2 pdl": true,
+    "fused rg4": true,
+    "fused rg4 pdl": true,
+    "fused rg8": true,
+    "fused rg8 pdl": true
+   },
+   "same_bits": true,
+   "cold_us": {
+    "triton": 63.149333000183105,
+    "fused rg1": 109.8373532295227,
+    "fused rg1 pdl": 108.81600777308147,
+    "fused rg2": 95.90665499369304,
+    "fused rg2 pdl": 95.90401252110799,
+    "fused rg4": 89.63201443354289,
+    "fused rg4 pdl": 90.03734588623047,
+    "fused rg8": 89.75732326507568,
+    "fused rg8 pdl": 90.1706616083781
+   },
+   "hot_us": {
+    "triton": 36.320000886917114,
+    "fused rg1": 78.38933169841766,
+    "fused rg1 pdl": 78.21333408355713,
+    "fused rg2": 64.72533444563548,
+    "fused rg2 pdl": 64.60266808668773,
+    "fused rg4": 54.69333132108053,
+    "fused rg4 pdl": 54.4053316116333,
+    "fused rg8": 49.773335456848145,
+    "fused rg8 pdl": 49.49066539605459
+   },
+   "triton_us": 63.149333000183105,
+   "best": "fused rg4",
+   "fused_us": 89.63201443354289,
+   "ratio": 1.4193659722943233
+  }
+ },
+ "device": "NVIDIA GB10",
+ "torch": "2.13.0a0+9186a08b2c.nv26.07",
+ "triton": "3.7.1",
+ "clocks": "2242 MHz, 3003 MHz, 2418 MHz",
+ "self_check": "ok",
+ "pdl": [
+  false,
+  true
+ ],
+ "gate": {
+  "pass": false,
+  "same_bits": true,
+  "ratios": {
+   "1": 0.5813803007697304,
+   "2": 0.923600083964093,
+   "3": 0.9831195962866774,
+   "4": 0.9902229418358452,
+   "6": 1.0889304260691985,
+   "8": 1.1570285129233346,
+   "12": 1.2921875655780632,
+   "16": 1.3922259778301322
+  },
+  "worst_rows": 16,
+  "worst": 1.3922259778301322,
+  "geomean": 1.0214283019739425
+ },
+ "seconds": 8.31907171200146,
+ "saving_ms_a_round": {
+  "1": 0.9648013114929199,
+  "4": 0.014879107475280548,
+  "8": -0.2632802724838257
+ },
+ "recommend": {
+  "GLM53_TF_HC_CUDA_RG": 1,
+  "GLM53_TF_HC_CUDA_PDL": 0
+ }
+}
