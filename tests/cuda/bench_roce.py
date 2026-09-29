@@ -31,7 +31,10 @@ Modes (default ``bench``):
             two nodes like ``bench``. Run it per CX7 function (GLM53_TF_ROCE_HCA=<name>) and striped over both
 
 Knobs: GLM53_TF_ROCE_* as in the engine (GLM53_TF_ROCE_HCAS=1 to compare with one CX7 function; the largest size
-sets GLM53_TF_ROCE_MAX_KB unless it is set). NCCL: NCCL_SOCKET_IFNAME / NCCL_IB_HCA / NCCL_PROTO as for serving.
+sets GLM53_TF_ROCE_MAX_KB unless it is set). patches/0460's latency knobs (GLM53_TF_ROCE_STRIPE_KB / _INLINE /
+_LAZY_CQ / _LEAN) apply to every mode; ``--trace N`` (bench) keeps the last N ops' timestamps of each size's RoCE graph
+run and prints the components per size: stage, wait, copy, total, the proxy's notice / post, and across both ranks
+transport (the smaller wait of the two ranks per op) and skew (docs/PREFETCH-COMM.md). NCCL: NCCL_SOCKET_IFNAME / NCCL_IB_HCA / NCCL_PROTO as for serving.
 """
 
 from __future__ import annotations
@@ -187,6 +190,10 @@ def bench(args) -> None:
             g = _graph(fn, args.ops)
             base.barrier()
             res[f"{name}_graph_us"] = round(_time_graph(g, args.reps, args.ops), 2)
+            if name == "roce" and getattr(rt, "trace_buf", None) is not None:      # patches/0460
+                mine_rows = rt.trace_rows()
+                both = roce.exchange(base, mine_rows)
+                res["trace"] = roce.trace_summary(both[args.rank], both[1 - args.rank])
             if z is not None:
                 tail = (lambda: z.add_(yf[:xf.numel()]))
                 base.barrier()
@@ -208,6 +215,11 @@ def bench(args) -> None:
         per_step = [(r["bytes"], (r["nccl_graph_us"] - r["roce_graph_us"]) * 90 / 1e3) for r in rows]
         print("saved a 90-exchange step (graph): " + ", ".join(f"{b} B: {ms:.2f} ms" for b, ms in per_step))
         print("stats:", json.dumps(rt.snapshot()), flush=True)
+        for r in rows:                                   # patches/0460
+            if "trace" in r:
+                t = r["trace"]
+                print(f"trace {r['bytes']} B (graph ops, us p50/p90): " +
+                      ", ".join(f"{k} {v['p50_us']}/{v['p90_us']}" for k, v in t.items()), flush=True)
     if not all(r["bits_equal"] for r in rows):
         sys.exit(1)
 
@@ -490,7 +502,10 @@ def main() -> None:
     ap.add_argument("--minutes", type=float, default=10.0)
     ap.add_argument("--loop", action="store_true", help="stress: one node, both ranks in this process (NIC loopback)")
     ap.add_argument("--check", type=int, default=10000, help="stress: synchronize and check every this many ops")
+    ap.add_argument("--trace", type=int, default=0, help="patches/0460 bench: timestamp ring (a power of two, e.g. 4096)")
     args = ap.parse_args()
+    if args.trace:
+        os.environ["GLM53_TF_ROCE_TRACE"] = str(args.trace)
     if args.mode == "stress":
         if "--iters" not in sys.argv:
             args.iters = 100000

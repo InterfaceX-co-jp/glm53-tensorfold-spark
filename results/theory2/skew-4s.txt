@@ -1,0 +1,26 @@
+exchanges: rank 0 30974, rank 1 30974
+gather us: rank 0 mean 32.5 (median 17.6), rank 1 mean 39.4 (median 22.9); transport = min of the pair: mean 13.7, median 11.8; skew = |difference|: mean 44.5, median 20.9, p90 96.0
+
+block time difference rank0 - rank1 (us), by block kind (what precedes the exchange):
+  moe        n  12313  block mean  1407.9 us  diff mean  +9.33  mean |diff|  44.83  sd 100.18  (|diff| / block 3.2%)
+  kda        n   9923  block mean   837.2 us  diff mean  +4.85  mean |diff|  25.43  sd  80.52  (|diff| / block 3.0%)
+  dense-only n   8737  block mean   588.9 us  diff mean  +5.80  mean |diff|  29.26  sd  82.88  (|diff| / block 5.0%)
+
+per family: sd of the rank0 - rank1 difference per block (us) and its mean (systematic part):
+  other    sd 27468.93  mean -187.59
+  idle     sd 23017.68  mean +132.12
+  experts  sd  87.44  mean  +8.38
+  dense    sd  27.21  mean  +1.52
+  kda      sd  21.68  mean  +4.57
+  hc       sd   8.64  mean  +0.05
+  router   sd   5.69  mean  +0.17
+
+within-rank spread of identical work: dense-only blocks, grouped by kernel signature (count of kernels)
+  rank 0 dense~240 us: n 2127  mean 267.4  sd 144.79 (54.2%)  p5 243.0  p95 271.9
+  rank 0 dense~200 us: n 1584  mean 594.7  sd 279.50 (47.0%)  p5 406.9  p95 608.7
+  rank 0 dense~180 us: n 1282  mean 432.0  sd 267.67 (62.0%)  p5 367.8  p95 573.7
+  rank 0 dense~80 us: n 1165  mean 110.3  sd 3.29 (3.0%)  p5 105.0  p95 115.3
+  rank 1 dense~240 us: n 1985  mean 259.1  sd 109.88 (42.4%)  p5 243.1  p95 271.0
+  rank 1 dense~200 us: n 1515  mean 581.7  sd 144.47 (24.8%)  p5 468.4  p95 605.3
+  rank 1 dense~180 us: n 1411  mean 428.8  sd 201.89 (47.1%)  p5 365.0  p95 577.1
+  rank 1 dense~80 us: n 1120  mean 110.8  sd 2.55 (2.3%)  p5 106.4  p95 114.8

@@ -1,0 +1,20 @@
+12:49:20 start worker
+12:49:27 off-pf rc=0 7s :: 190 passed, 2 skipped in 3.80s
+12:49:31 off-gr rc=0 4s :: 2 passed, 10 skipped in 1.32s
+13:06:53 g-unit KILLED after ~18 min in test_the_load_check_passes_on_this_gpu (rows=65536: host choose_rows CPU-bound, GPU idle); before it 1 passed, 8 skipped (interpreter-only), 8 passed (replay_slots / chain_slots KDA fold bitwise)
+13:07:59 start worker
+13:10:23 start worker
+13:25:29 g-unit rc=139 906s :: 
+13:25:33 g-resident rc=0 4s :: 
+13:26:21 g-bpar rc=1 48s :: 5 failed, 21 passed in 45.15s
+13:27:43 g-bsess rc=1 82s :: 5 failed, 23 passed in 79.82s (0:01:19)
+13:27:54 g-overlap rc=0 11s :: 29 passed in 8.37s
+13:27:54 worker tests done
+13:37:55 start worker
+13:38:08 g-unit0 rc=1 13s :: 7 failed, 10 passed, 8 skipped in 10.19s
+13:38:08 worker tests done
+# W12 note (13:40): the killed / rc=139 g-unit runs were in test_the_load_check_passes_on_this_gpu, but not because of
+# the host sampler: test_gpu_round_patches.py sets TRITON_INTERPRET=1 by default at import, so on the GPU node the
+# Triton kernels (libm, the draw) ran in Triton's CPU interpreter (100% CPU, GPU idle; faulthandler's dump at 900 s
+# segfaulted in the interpreter shim). The same self_check(rows=65536) takes 3 s on the GPU (sampler.py probe). g-unit0
+# reruns the module with TRITON_INTERPRET=0. The 8 skips are the interpreter-only tests (they passed offline).

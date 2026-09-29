@@ -1,0 +1,1507 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/app.py w/src/tensorfold/families/glm5_next/cuda/app.py
+index 5ea181b..8cf6eab 100644
+--- i/src/tensorfold/families/glm5_next/cuda/app.py
++++ w/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -28,6 +28,13 @@ prefix a recent prompt shares is encoded (``prompt_tokens.py``). Only rank 0 tok
+ patches/0300: GLM53_TF_REQUEST_LOG=<file> appends one JSON line per request (sizes, cache source, timings, finish,
+ hashes of token ids; never text) on this, the serving rank (``reqlog.py``).
+ 
++patches/0500: GLM53_TF_VISION=1 takes images in chat messages (``image_url`` parts: ``data:`` URLs and, unless
++GLM53_TF_VISION_FETCH=0, http(s) URLs; ``vision_prep.py``): each renders as ``<|begin_of_image|><|image|>
++<|end_of_image|>`` (``VisionTemplate``), the image's rows replace its ``<|image|>`` as virtual ids (so every
++token-keyed cache tells images apart), and the engine gets the preprocessed images through ``request.vision``. An
++image problem (fetch, size, decode, count) is an HTTP 400 before anything streams. ``usage.prompt_tokens`` counts the
++image rows, as vLLM does; ``/tokenize`` returns them as ``<|image|>`` ids.
++
+ patches/0490: a request past the context gets HTTP 400 with OpenAI's ``context_length_exceeded`` code and wording
+ ("This model's maximum context length is N tokens. However, you requested ..."), which agent clients recognise and
+ answer by compacting; ``/v1/models`` reports the limit as ``max_model_len`` / ``context_length``; the load prints one
+@@ -44,6 +51,7 @@ from tensorfold.cuda.server import App, context_problem
+ 
+ from .prompt_tokens import Memo, PromptTokens
+ from . import reqlog as reqlog_mod
++from . import vision_prep
+ 
+ # patches/0150: OpenAI ``reasoning_effort`` -> (enable_thinking, the template's reasoning_effort or None: its default)
+ EFFORTS: dict[str, tuple[bool, str | None]] = {
+@@ -102,6 +110,26 @@ class ThinkingOffTemplate:
+         return text
+ 
+ 
++class VisionTemplate:
++    """patches/0500: the chat template with image parts rendered as the vision template renders them
++    (``<|begin_of_image|><|image|><|end_of_image|>``); the images it kept, in prompt order, are left for the calling
++    thread (``local.rendered``: (text, refs))."""
++
++    def __init__(self, inner, host: "vision_prep.Host", local) -> None:
++        self.inner = inner
++        self.host = host
++        self.local = local
++
++    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
++        if not vision_prep.count_images(messages):
++            self.local.rendered = None
++            return self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
++        text, refs = self.host.render(self.inner, messages, tools=tools, enable_thinking=enable_thinking,
++                                      extra=extra)
++        self.local.rendered = (text, refs)
++        return text
++
++
+ def context_summary(engine) -> str:
+     """patches/0490: one line with what decides how long a request can be: the context limit (CONTEXT, the limit
+     ``/v1/models`` reports as ``max_model_len``), the KV cache format, the batch slots and the shared KV pool."""
+@@ -124,9 +152,28 @@ def context_summary(engine) -> str:
+ 
+ 
+ class GlmApp(App):
++    vision = None                                   # patches/0500: ``vision_prep.Host`` with GLM53_TF_VISION=1
++
++    @property
++    def _vis(self):
++        """patches/0500: this request thread's image state (``ready``: check's work for run; ``rendered``)."""
++
++        local = self.__dict__.get("_vis_local")
++        if local is None:
++            import threading as _threading
++
++            local = self.__dict__.setdefault("_vis_local", _threading.local())
++        return local
++
+     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
+         super().__init__(engine, model_dir, served, **kwargs)
+         self.template = ThinkingOffTemplate(self.template)
++        self.vision = vision_prep.Host(model_dir) if vision_prep.enabled() else None      # patches/0500
++        if self.vision is not None:
++            self.template = VisionTemplate(self.template, self.vision, self._vis)
++            s = self.vision.s
++            print(f"[tensorfold] vision (patches/0500): image_url parts on; {s.min_tokens}-{s.budget(None)} tokens an "
++                  f"image, at most {s.max_images} a request; URL fetch {'on' if s.fetch else 'off'}", flush=True)
+         self.effort_field, self.default_effort = effort_env()       # patches/0150
+         self.prompt_tokens = PromptTokens(self.tok, model_dir / "tokenizer.json")   # patches/0210
+         self.prompt_memo = Memo()
+@@ -153,11 +200,27 @@ class GlmApp(App):
+         problem = apply_effort(body, field=self.effort_field, default=self.default_effort,
+                                default_thinking=self.default_thinking) or super().check(body)   # patches/0150
+         limit = getattr(self.engine, "limit", None)
+-        if problem or limit is None:
++        self._vis.ready = None
++        if problem:
++            return problem
++        chat = "messages" in body
++        if self.vision is not None and chat and vision_prep.count_images(body.get("messages")):
++            try:                                    # patches/0500: fetch, decode and preprocess now: errors are 400s
++                text, req = self._vision_request(body)
++            except (vision_prep.VisionError, ValueError) as exc:
++                from tensorfold.cuda.server import Problem
++
++                return Problem(str(exc), param="messages")
++            ids = self._vis.ready[3]
++            self.prompt_memo.put(text, ids)             # patches/0210: ``run`` reuses them
++            if limit is None:
++                return None
++            asked = body.get("max_tokens") or body.get("max_completion_tokens")
++            return context_problem(len(ids) + req.extra, int(asked) if asked else None, limit, chat=True)
++        if limit is None:
+             return problem
+         kwargs = dict(body.get("chat_template_kwargs") or {})
+         thinking = bool(kwargs.pop("enable_thinking", self.default_thinking))
+-        chat = "messages" in body
+         if chat:
+             text = self.template.render(body["messages"], tools=body.get("tools") or [], enable_thinking=thinking,
+                                         extra=kwargs)
+@@ -175,11 +238,50 @@ class GlmApp(App):
+         # patches/0490: OpenAI's context_length_exceeded (code, wording) instead of a message only people could read
+         return context_problem(prompt, int(asked) if asked else None, limit, chat=chat)
+ 
++    def _vision_request(self, body: dict[str, Any]) -> tuple[str, "vision_prep.Request"]:
++        """patches/0500: (the rendered text, its images preprocessed) for a chat request with images, made once a
++        request thread (``check`` makes it, ``run`` reuses it)."""
++
++        ready = getattr(self._vis, "ready", None)
++        if ready is not None and ready[0] is body:
++            return ready[1], ready[2]
++        kwargs = dict(body.get("chat_template_kwargs") or {})
++        thinking = bool(kwargs.pop("enable_thinking", self.default_thinking))
++        text = self.template.render(body["messages"], tools=body.get("tools") or [], enable_thinking=thinking,
++                                    extra=kwargs)
++        rendered = getattr(self._vis, "rendered", None)
++        refs = rendered[1] if rendered is not None and rendered[0] == text else []
++        req = self.vision.request(refs)
++        ids = self.prompt_tokens.encode(text)
++        vision_prep.expand(ids, req.images, self.vision.s)          # the placeholders check out (raises otherwise)
++        self._vis.ready = (body, text, req, ids)
++        return text, req
++
++    def _with_images(self, text: str, ids: list[int]) -> list[int]:
++        """patches/0500: a rendered prompt's ids with its images' rows (virtual ids); the engine gets the images."""
++
++        req = None
++        rendered = getattr(self._vis, "rendered", None) if self.vision is not None else None
++        if rendered is not None and rendered[0] == text:
++            ready = getattr(self._vis, "ready", None)
++            req = ready[2] if ready is not None and ready[1] == text else self.vision.request(rendered[1])
++            ids = vision_prep.expand(ids, req.images, self.vision.s)
++        self._set_vision(req)
++        return ids
++
++    def _set_vision(self, req) -> None:
++        """patches/0500: the images the engine encodes for this thread's request (None: none)."""
++
++        local = getattr(self.engine, "request", None)
++        if local is not None:
++            local.vision = req
++
+     def prompt_ids(self, text: str) -> list[int]:
+         """patches/0210: the ids ``check`` encoded for this text on this request thread, else from the cache."""
+ 
+         ids = self.prompt_memo.take(text)
+         ids = ids if ids is not None else self.prompt_tokens.encode(text)
++        ids = self._with_images(text, list(ids))                    # patches/0500
+         if self.reqlog is not None:                     # patches/0300: the request's prompt, before it runs
+             self._rl.ticket = self.reqlog.begin(ids)
+         return ids
+@@ -188,6 +290,7 @@ class GlmApp(App):
+         """patches/0490: a token-ID prompt, logged as ``prompt_ids`` logs a rendered one (0300)."""
+ 
+         ids = super().given_ids(ids)
++        self._set_vision(None)                                      # patches/0500: token prompts carry no images
+         if self.reqlog is not None:
+             self._rl.ticket = self.reqlog.begin(ids)
+         return ids
+@@ -197,7 +300,13 @@ class GlmApp(App):
+         render as a chat request with the same body renders them."""
+ 
+         apply_effort(body, field=self.effort_field, default=self.default_effort, default_thinking=self.default_thinking)
+-        return super().tokenize(body)
++        self._vis.rendered = None
++        ids = super().tokenize(body)
++        rendered = getattr(self._vis, "rendered", None)
++        if self.vision is not None and rendered is not None and isinstance(body.get("messages"), list):
++            req = self.vision.request(rendered[1])                  # patches/0500: each image as its rows
++            ids = vision_prep.expand(ids, req.images, self.vision.s, virtual=False)
++        return ids
+ 
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+         from . import cpupin
+@@ -205,6 +314,10 @@ class GlmApp(App):
+         cpupin.http_thread()                    # patches/0370 (GLM53_TF_CPU_PIN): a name for ps, ``nice`` when set
+         apply_effort(body, field=self.effort_field, default=self.default_effort,
+                      default_thinking=self.default_thinking)           # patches/0150 (validated by ``check``)
++        self._set_vision(None)                                      # patches/0500: set by ``prompt_ids``
++        self._vis.rendered = None
++        if self.vision is not None and chat and vision_prep.count_images(body.get("messages")):
++            self._vision_request(body)                              # made by ``check`` on this thread already
+         model = str(body.get("model") or "")
+         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
+         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
+diff --git i/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+index 7dca8ec..dd0317b 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batch.py
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -135,6 +135,7 @@ from . import draftvocab                                                   # pat
+ from . import batchplan, comm as comm_mod, decode_v2 as dv2, glue, kda as kda_mod, kvpool, latent, qmm, sparse
+ from .attention import attention, kv_write
+ from . import l2pf                                                           # patches/0460
++from . import vision as vision_mod                                           # patches/0500
+ from .forward import State, _join, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+ 
+ BACKLOG = 32                     # committed rows a drafter may lag behind before they are taken early
+@@ -697,6 +698,7 @@ class Job:
+     submitted: float = 0.0
+     echo: dict = field(default_factory=dict)      # the response's ``tf_knobs``
+     stats: dict = field(default_factory=dict)
++    vision: Any = None                            # patches/0500: the prompt's image rows (``vision.Table``) or None
+     sess: Any = None                              # patches/0180: the admission's ``sessions.Plan`` (store on)
+ 
+ 
+@@ -1443,13 +1445,17 @@ class Batcher:
+                 with self.cv:
+                     self.cv.notify()
+ 
+-    def generate(self, prompt, max_tokens, sampling, on_tokens, draft: bool = True) -> dict[str, Any]:
+-        """``GlmEngine.generate`` in batch mode (the calling thread's policy, stop-at-EOS, knobs and priority)."""
++    def generate(self, prompt, max_tokens, sampling, on_tokens, draft: bool = True, vis=None) -> dict[str, Any]:
++        """``GlmEngine.generate`` in batch mode (the calling thread's policy, stop-at-EOS, knobs and priority;
++        patches/0500: ``vis``, the prompt's image rows, encoded by the calling thread before the job is queued)."""
+ 
+         req = self.g.request
+         job = self._job(prompt, max_tokens, sampling, draft, getattr(req, "policy", None),
+                         bool(getattr(req, "stop_eos", True)), getattr(req, "knobs", None),
+                         bool(getattr(req, "background", False)))
++        job.vision = vis
++        if vis is not None and self.g.vision is not None:
++            job.stats["vision"] = dict(self.g.vision.last)
+         self._submit([job])
+         self._collect(job, on_tokens)
+         job.stats.update(policy=job.spec, drafts=job.draft, tf_knobs=job.echo)
+@@ -1532,6 +1538,7 @@ class Batcher:
+                 jobs = []
+                 for slot, cached, header in admits:
+                     job = self._job_from(header, self.g._share(None))
++                    job.vision = vision_mod.exchange(self.g, job.prompt, None)     # patches/0500: rank 0's image rows
+                     if self.store is not None:          # patches/0180: rank 0's session plan, after its digest check
+                         job.sess = self.store.follow(self.g._share(None))
+                         if job.sess.disk is not None and self.kvp is None:   # patches/0250: rank 1's read starts now
+@@ -1629,6 +1636,7 @@ class Batcher:
+             self.g._share([len(spills), *spills])
+         for _, _, job in admits:
+             self.g._share(job.prompt)
++            job.vision = vision_mod.exchange(self.g, job.prompt, job.vision)    # patches/0500 (no image rows: nothing)
+             if self.store is not None:                  # patches/0180: the plan, with rank 0's store digest
+                 self.g._share(job.sess.encode(self.store.index.digest()))
+         return cancels, admits, pieces
+@@ -1885,8 +1893,9 @@ class Batcher:
+                 end = batchplan.piece_end(seq.done, n, solo, grid)
+                 e.checkpoints = seq.marks           # patches/0180: the store's marks inside this piece
+                 try:
+-                    first = prefill(e, job.prompt[:end], job.sampling, mtp=use_mtp, drafter=drafter,
+-                                    resume=seq.resume)
++                    with vision_mod.active(job.vision):     # patches/0500: the prompt's image rows (None: none)
++                        first = prefill(e, job.prompt[:end], job.sampling, mtp=use_mtp, drafter=drafter,
++                                        resume=seq.resume)
+                 finally:
+                     e.checkpoints = ()
+                 saves = list(getattr(e, "mark_snaps", ()) or ()) if job.draft else []
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -247,11 +247,16 @@
+         width = draftvocab.head_for(self.w, "mtp", full).n
+         dense = self.st.mtp_len + n <= self.w.cfg.dense_limit
+         graphs = None if self.graphs is None else self.graphs.mtp_full if full else self.graphs.mtp
+-        g = graphs.get(n) if graphs is not None and not self.mbuf.zero_first and dense else None
++        # patches/0500: a prefill's image rows (virtual ids) get their rows from ``glue.embed``'s substitution, which a
++        # CUDA graph cannot do (a replay would read the ids as vocabulary rows, out of bounds): such rows run eager
++        from . import vision
++
++        eager = vision.ACTIVE is not None and vision.has_vids(next_tokens)
++        g = graphs.get(n) if graphs is not None and not self.mbuf.zero_first and dense and not eager else None
+         if g is not None:
+             g.replay()
+             return self.mbuf.logits[:1, :width]
+-        npb = None if self.mbuf.zero_first else self._long_bucket(self.st.mtp_len, n)
++        npb = None if self.mbuf.zero_first or eager else self._long_bucket(self.st.mtp_len, n)
+         if npb is not None:                  # patches/0050
+             w, st, b = self.w, self.st, self.mbuf
+             key = ("mtp", n, npb, "full") if full else ("mtp", n, npb)
+diff --git i/src/tensorfold/families/glm5_next/cuda/draftvocab.py w/src/tensorfold/families/glm5_next/cuda/draftvocab.py
+index 0c416ca..4c7cc52 100644
+--- i/src/tensorfold/families/glm5_next/cuda/draftvocab.py
++++ w/src/tensorfold/families/glm5_next/cuda/draftvocab.py
+@@ -256,6 +256,8 @@ def track(w, st, tokens: Sequence[int]) -> None:
+     if listed is None:
+         listed = t[2] = _listed(dv, w)
+     for tok in list(tokens)[-dv.s.fb_window:]:
++        if int(tok) >= (1 << 24):                   # patches/0500: an image row (a virtual id) is not text
++            continue
+         miss = int(tok) not in listed
+         if len(q) == q.maxlen:
+             t[1] -= q[0]
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index 5cf1cbe..c6e6896 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -178,6 +178,8 @@ def _ints_f64(lo: int, hi: int) -> float:
+ class GlmEngine:
+     """GLM-5.3-Flash on two ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
++    vision = None                           # patches/0500: rank 0's ``vision.Encoder`` with GLM53_TF_VISION=1
++
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
+                  drafter: Path | None = None, context: int = 0, serial_only: bool = False, comm=None) -> None:
+         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
+@@ -259,6 +261,18 @@ class GlmEngine:
+                              "would decode one token: pull the draft model on both machines (--drafter), or pass "
+                              "--no-drafts to both for the serial reference")
+         self.w = w
++        # patches/0500: GLM53_TF_VISION=1: rank 0 loads the vision tower (BF16, ~1.13 GB) and encodes a request's
++        # images; rank 1 needs none (it receives the rows with the prompt, whatever its own setting)
++        from . import vision_prep
++
++        self.vision = None
++        if rank == 0 and vision_prep.enabled():
++            from .vision import Encoder
++
++            self.vision = Encoder(model_dir)
++            fastboot.mark("vision tower", f"{self.vision.tower.nbytes / 1e9:.2f} GB on the GPU")
++            print(f"[tensorfold] vision (patches/0500): image input on, tower {self.vision.tower.nbytes / 1e9:.2f} "
++                  "GB on rank 0", flush=True)
+         # patches/0420: GLM53_TF_DRAFT_VOCAB: the drafters' heads over a token list (before the drafter, the engine and
+         # their CUDA graphs); it changes which graphs exist and what a round drafts, so both ranks must agree
+         from . import draftvocab
+@@ -930,7 +944,7 @@ class GlmEngine:
+         self.cache = self.cache[-1:] + [snap]
+ 
+     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
+-             code: list[int], hit, draft: bool, sess=None) -> dict[str, Any]:
++             code: list[int], hit, draft: bool, sess=None, vis=None) -> dict[str, Any]:
+         from .decode import (DepthPolicy, DrafterChoice, auto_decode, dflash_decode, mtp_decode, prefill,
+                              serial_decode, take_snapshot)
+ 
+@@ -952,8 +966,11 @@ class GlmEngine:
+         if store is not None:                       # patches/0110
+             store.begin(hit, cut)
+             self.e.checkpoints = sess.marks if sess is not None and draft else ()
++        from . import vision as vision_mod
++
+         try:
+-            first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit)
++            with vision_mod.active(vis):            # patches/0500: the prompt's image rows (None: none)
++                first = prefill(self.e, prompt, sampling, mtp=use_mtp, drafter=drafter, resume=hit)
+         finally:
+             self.e.checkpoints = ()
+         prefill_s = time.perf_counter() - t0
+@@ -1051,12 +1068,26 @@ class GlmEngine:
+             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
+         return stats
+ 
++    def _vision_table(self, prompt: list[int]):
++        """patches/0500: rank 0, before a request is queued or shared: its images' rows as a ``vision.Table`` (the
++        calling thread's ``request.vision``, a ``vision_prep.Request``), or None for a prompt without image rows."""
++
++        from .vision_prep import has_vids
++
++        req = getattr(self.request, "vision", None)
++        if not has_vids(prompt):
++            return None
++        if req is None or self.vision is None:
++            raise ValueError("a prompt with image rows needs GLM53_TF_VISION=1 on rank 0 and the request's images")
++        return self.vision.table(req)
++
+     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True) -> dict[str, Any]:
+         """Rank 0: one request, mirrored by rank 1 (``follow``). ``draft=False``: serial decoding and a fresh
+         prefill, the reference drafted replies must equal."""
+ 
++        vis = self._vision_table(prompt)     # patches/0500: the request's images encoded (rank 0), or None
+         if self.batch is not None:          # patches/0120: the request's knobs, policy and priority travel with it
+-            return self.batch.generate(prompt, max_tokens, sampling, on_tokens, draft)
++            return self.batch.generate(prompt, max_tokens, sampling, on_tokens, draft, vis=vis)
+         # patches/0090: the request's knobs (validated), everything else at this rank's current (load-time) values
+         asked = self.parse_knobs(getattr(self.request, "knobs", None))
+         if len(prompt) >= self.limit:
+@@ -1116,6 +1147,9 @@ class GlmEngine:
+                   *knobs_mod.encode(values)] + code          # patches/0090: the knobs rank 1 applies
+         self._share(header)
+         self._share(list(prompt))
++        from . import vision as vision_mod
++
++        vis = vision_mod.exchange(self, prompt, vis)        # patches/0500: the image rows to rank 1 (none: nothing)
+         if self.store is not None:          # patches/0110: the plan, and rank 0's store digest for rank 1 to check
+             self._share(sess.encode(self.store.index.digest()))
+         self._adopt(table)
+@@ -1128,7 +1162,7 @@ class GlmEngine:
+         try:
+             with cpupin.serving_request(), self._knobs(values):
+                 stats = self._run(list(prompt), max_tokens, sampling, stop_eos, emitter or on_tokens, code, hit,
+-                                  draft, sess)
++                                  draft, sess, vis)
+         except BaseException:
+             if emitter is not None:
+                 emitter.close(raise_error=False)
+@@ -1136,6 +1170,8 @@ class GlmEngine:
+         if emitter is not None:
+             emitter.close()                 # every token delivered (or the callback's exception) before the stats
+         stats.update(policy=spec, drafts=draft)
++        if vis is not None and self.vision is not None:
++            stats["vision"] = dict(self.vision.last)       # patches/0500
+         if self.store is not None:          # patches/0110
+             stats["sessions"] = self.store.describe()
+         stats["tf_knobs"] = dict(values, lookup=look[0], lookup_min=look[1],
+@@ -1164,6 +1200,9 @@ class GlmEngine:
+             self.depth_cost, code = code[0], code[1:]  # patches/0071: rank 0's cost-depth flag
+             values, code = knobs_mod.decode(code)       # patches/0090: rank 0's knobs for this request
+             prompt = self._share(None)
++            from . import vision as vision_mod
++
++            vis = vision_mod.exchange(self, prompt, None)        # patches/0500: rank 0's image rows, if any
+             sess = self.store.follow(self._share(None)) if self.store is not None else None     # patches/0110
+             self._adopt(table)
+             temperature = _ints_f64(t_lo, t_hi)
+@@ -1185,4 +1224,4 @@ class GlmEngine:
+                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
+             with self._knobs(values):
+                 self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+-                          sess)
++                          sess, vis)
+diff --git i/src/tensorfold/families/glm5_next/cuda/glue.py w/src/tensorfold/families/glm5_next/cuda/glue.py
+index d9e8f50..6360923 100644
+--- i/src/tensorfold/families/glm5_next/cuda/glue.py
++++ w/src/tensorfold/families/glm5_next/cuda/glue.py
+@@ -21,6 +21,8 @@ import torch
+ import triton
+ import triton.language as tl
+ 
++from . import vision  # patches/0500: image rows in the embedding (``vision.ACTIVE``)
++
+ # fixed K split of the mixing dots (a function of the shape only; changing it changes bits for every row alike)
+ HC_BLOCKS = 16
+ 
+@@ -72,14 +74,23 @@ def _embed_b16(IDS, W, OUT, D: tl.constexpr, COPIES: tl.constexpr):
+ 
+ 
+ def embed(ids: torch.Tensor, table, dims: int, copies: int, out: torch.Tensor) -> torch.Tensor:
+-    """Token rows of the embedding: a 4-bit (words, scales, biases) table or a BF16 [V, D] tensor."""
++    """Token rows of the embedding: a 4-bit (words, scales, biases) table or a BF16 [V, D] tensor.
+ 
++    patches/0500: inside a prefill whose prompt has image rows (``vision.ACTIVE``), their virtual ids (>= 2^24) read
++    row 0 here and get the vision tower's rows after; otherwise nothing changes."""
++
++    vt = None
++    if vision.ACTIVE is not None:
++        vt, ids_in = vision.embed_ids(ids)
++        ids, orig = ids_in, ids
+     rows = ids.shape[0]
+     if isinstance(table, torch.Tensor):
+         _embed_b16[(rows, dims // 64)](ids, table, out, D=dims, COPIES=copies, num_warps=1)
+-        return out
+-    w, s, b = table
+-    _embed[(rows, dims // 64)](ids, w, s, b, out, D=dims, COPIES=copies, num_warps=1)
++    else:
++        w, s, b = table
++        _embed[(rows, dims // 64)](ids, w, s, b, out, D=dims, COPIES=copies, num_warps=1)
++    if vt is not None:
++        vt.fixup(orig, out, copies, dims)
+     return out
+ 
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/lookup.py w/src/tensorfold/families/glm5_next/cuda/lookup.py
+index 97574d9..8004af2 100644
+--- i/src/tensorfold/families/glm5_next/cuda/lookup.py
++++ w/src/tensorfold/families/glm5_next/cuda/lookup.py
+@@ -37,6 +37,7 @@ from typing import Sequence
+ LOOKUP_KIND = 20                  # policy code kind of ``lN[:M]``: [20, N, M, 0]
+ DEFAULT_MIN = 3                   # ``lN``'s match threshold when M is not given
+ from . import deep as _deep                     # patches/0380
++from .vision_prep import VBASE                   # patches/0500: virtual ids of image rows
+ 
+ MAX_DRAFTS = _deep.DRAFTS         # a verify window holds the pending token and up to 7 drafts (0380: up to 15)
+ CANDIDATES = 64                   # earlier occurrences of the suffix's n-gram examined a round (most recent first)
+@@ -187,7 +188,11 @@ class SuffixIndex:
+         length, end = self.match()
+         if end < 0 or length < min_match or count <= 0:
+             return [], length
+-        return self.copy(end, count), length
++        out = self.copy(end, count)
++        for i, d in enumerate(out):        # patches/0500: an image row's virtual id is never a token to draft
++            if d >= VBASE:
++                return out[:i], length
++        return out, length
+ 
+ 
+ _last: list[SuffixIndex] = []         # the previous request's index (prompt and reply), for the next turn
+diff --git i/src/tensorfold/families/glm5_next/cuda/vision.py w/src/tensorfold/families/glm5_next/cuda/vision.py
+new file mode 100644
+index 0000000..78adaf4
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/vision.py
+@@ -0,0 +1,416 @@
++"""patches/0500: image input for GLM-5.3-Flash, engine side (GLM53_TF_VISION=1, rank 0's vision tower).
++
++**The language model needs nothing but embeddings.** GLM-5.3-Flash's LM is NoPE throughout (``qk_rope_head_dim`` 0:
++MLA attention and the DSA indexer rotate nothing, the KDA layers have no positions) and transformers'
++``Glm5NextModel.forward`` passes plain ``arange`` positions that no layer reads: no M-RoPE, no 3D positions. An
++image is its vision rows ``masked_scatter``-ed into ``inputs_embeds`` at the ``<|image|>`` positions (then
++expanded over the 4 hyper-connection streams like any token's embedding). ``vision_prep.py`` puts one virtual id
++(>= ``VBASE``) at each such position; ``glue.embed`` asks this module for those rows (``ACTIVE``, set around a
++prefill whose prompt has them), so every forward path that embeds prompt rows (exact, fast, lean, pipelined,
++row-split, the batcher's pieces, the MTP head's absorb) gets the image rows with no change of its own.
++
++**The tower** (``Tower``: ``Glm5NextVisionModel`` in PyTorch, BF16, rank 0 only, 1.13 GB): a linear patch embedding
++(the Conv3d over [3, 2, 14, 14] with stride = kernel, as a matmul; the image's frame is duplicated over the temporal
++pair by the processor), 24 pre-norm blocks (RMSNorm; qkv with bias, per-head RMSNorm of q and k, a 2D axial RoPE over
++the whole head: h then w positions over 16 frequencies of base 10000; full bidirectional attention within the image,
++no windows; SwiGLU MLP 1024 -> 4096 with the gate clamped at 10 and up at +-10), a final RMSNorm, the 2 x 2 spatial
++merge as a Conv2d (again a matmul over the merge window, 4096 inputs -> 4096) and the merger (proj, LayerNorm, GELU,
++the clamped SwiGLU 4096 -> 10240 -> 4096). Attention runs per image through ``scaled_dot_product_attention`` (flash on
++GB10: no N^2 memory at 32k patches). ``tests/test_vision.py`` checks it against transformers' model on CPU.
++
++**Both ranks** need the rows: rank 0 encodes (``Encoder``, with a cache of recent images' rows by digest) and ships
++them after the prompt (``exchange``: the sorted ids, then the rows as int32 words, through the engine's all-gather);
++rank 1 needs no tower. A prompt without virtual ids exchanges nothing, so text requests are unchanged, whatever the
++knob.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import math
++import os
++import threading
++from collections import OrderedDict
++from pathlib import Path
++from typing import Any, Sequence
++
++import torch
++import torch.nn.functional as F
++
++from .vision_prep import VBASE, has_vids
++
++PREFIX = "model.visual."
++ACTIVE: "Table | None" = None           # the table ``glue.embed`` substitutes rows from (None: nothing to do)
++_ACTIVE_LOCK = threading.Lock()
++
++
++# -- the table the embedding reads -----------------------------------------------------------------------------------
++class Table:
++    """Virtual ids -> rows: ``keys`` sorted int32 [K] and ``rows`` bf16 [K, D], on the device."""
++
++    def __init__(self, keys: torch.Tensor, rows: torch.Tensor) -> None:
++        if keys.ndim != 1 or rows.ndim != 2 or keys.shape[0] != rows.shape[0]:
++            raise ValueError("vision table: keys [K] and rows [K, D]")
++        self.keys = keys.to(torch.int32).contiguous()
++        self.rows = rows.contiguous()
++        self.n = int(keys.shape[0])
++
++    def clamp(self, ids: torch.Tensor) -> torch.Tensor:
++        """``ids`` with every virtual id replaced by 0 (a valid row for the embedding kernel to read)."""
++
++        return torch.where(ids >= VBASE, torch.zeros_like(ids), ids)
++
++    def fixup(self, ids: torch.Tensor, out: torch.Tensor, copies: int, dims: int) -> None:
++        """Overwrite the embedded rows of ``out`` ([R, copies * D]) whose id is in the table with the table's row, in
++        every stream copy. Device-side only (no host sync), so it can follow any eager embedding."""
++
++        R = int(ids.shape[0])
++        if R == 0 or self.n == 0:
++            return
++        pos = torch.searchsorted(self.keys, ids.to(torch.int32).contiguous()).clamp_(max=self.n - 1)
++        hit = self.keys[pos] == ids
++        rows = self.rows[pos].to(out.dtype)
++        o = out.view(R, copies, dims)
++        o.copy_(torch.where(hit[:, None, None], rows[:, None, :].expand(R, copies, dims), o))
++
++
++@contextlib.contextmanager
++def active(table: "Table | None"):
++    """``glue.embed`` substitutes ``table``'s rows inside this block (nothing when ``table`` is None)."""
++
++    global ACTIVE
++    if table is None:
++        yield
++        return
++    with _ACTIVE_LOCK:
++        prev, ACTIVE = ACTIVE, table
++    try:
++        yield
++    finally:
++        with _ACTIVE_LOCK:
++            ACTIVE = prev
++
++
++def embed_ids(ids: torch.Tensor) -> tuple["Table | None", torch.Tensor]:
++    """For ``glue.embed``: (the active table, the ids its kernel may read). None outside a vision prefill and while a
++    CUDA graph is captured (graphs only ever see decode rows, which are vocabulary ids)."""
++
++    t = ACTIVE
++    if t is None or torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        return None, ids
++    return t, t.clamp(ids)
++
++
++# -- rank 0 <-> rank 1 -----------------------------------------------------------------------------------------------
++CHUNK_ROWS = 1024                        # rows a gather: 8 MB of bf16 sent, 16 MB received
++DEVICE = "cuda"                          # where rank 1 receives the rows (tests: "cpu")
++
++
++def exchange(g, prompt: Sequence[int], table: "Table | None") -> "Table | None":
++    """After the prompt: rank 0's table for the prompt's virtual ids, on both ranks (``g``: the ``GlmEngine``, whose
++    ``_share`` and ``comm`` carry it). Nothing is exchanged for a prompt without virtual ids (both ranks see the same
++    prompt, so both skip). Rank 1 checks the ids it receives are its prompt's."""
++
++    if not has_vids(prompt):
++        return None
++    want = sorted({int(t) for t in prompt if int(t) >= VBASE})
++    if g.rank == 0:
++        if table is None:
++            raise RuntimeError("a prompt with image rows but no vision table on rank 0")
++        keys = [int(k) for k in table.keys.tolist()]
++        if keys != want:
++            raise RuntimeError("rank 0's vision table does not match the prompt's image rows")
++        dims = int(table.rows.shape[1])
++        g._share([len(keys), dims])
++        g._share(keys)
++        rows = table.rows.to(torch.bfloat16).contiguous()
++    else:
++        count, dims = g._share(None)
++        keys = g._share(None)
++        if keys != want or count != len(keys):
++            raise RuntimeError("rank 1: the vision table rank 0 sent does not match the prompt's image rows")
++        rows = torch.empty((count, dims), dtype=torch.bfloat16, device=DEVICE)
++    words = dims // 2                                    # bf16 pairs as int32 (the all-gather's integer path)
++    for a in range(0, len(keys), CHUNK_ROWS):
++        b = min(len(keys), a + CHUNK_ROWS)
++        mine = rows[a:b].view(torch.int32).reshape(-1) if g.rank == 0 else \
++            torch.zeros(((b - a) * words,), dtype=torch.int32, device=DEVICE)
++        got = torch.empty((2 * (b - a) * words,), dtype=torch.int32, device=rows.device)
++        g.comm.all_gather(mine.contiguous(), got)
++        if g.rank != 0:
++            rows[a:b].view(torch.int32).copy_(got[:(b - a) * words].view(b - a, words))
++    if g.rank == 0:
++        return table
++    return Table(torch.tensor(keys, dtype=torch.int32, device=DEVICE), rows)
++
++
++# -- the vision tower -------------------------------------------------------------------------------------------------
++class Tower:
++    """``Glm5NextVisionModel`` (inference only): ``encode(pixels, grid)`` -> the image's LM rows [N / 4, 4096]."""
++
++    def __init__(self, cfg: dict, tensors: dict[str, torch.Tensor], *, device="cuda", dtype=torch.bfloat16) -> None:
++        self.hidden = int(cfg.get("hidden_size", 1024))
++        self.heads = int(cfg.get("num_heads", 16))
++        self.head_dim = self.hidden // self.heads
++        self.depth = int(cfg.get("depth", 24))
++        self.out = int(cfg.get("out_hidden_size", 4096))
++        self.merge = int(cfg.get("spatial_merge_size", 2))
++        self.patch = int(cfg.get("patch_size", 14))
++        self.temporal = int(cfg.get("temporal_patch_size", 2))
++        self.channels = int(cfg.get("in_channels", 3))
++        self.eps = float(cfg.get("rms_norm_eps", 1e-5))
++        self.limit = float(cfg.get("swiglu_limit", 10.0))
++        rope = cfg.get("rope_parameters") or {}
++        self.theta = float(rope.get("rope_theta", 10000.0))
++        if (rope.get("rope_type") or "axial") != "axial":
++            raise ValueError("vision_config: only the axial rope is supported")
++        if cfg.get("hidden_act", "silu") != "silu":
++            raise ValueError("vision_config: hidden_act must be silu")
++        self.device, self.dtype = torch.device(device), dtype
++
++        def t(name: str) -> torch.Tensor:
++            x = tensors[PREFIX + name]
++            return x.to(device=self.device, dtype=dtype).contiguous()
++
++        D = self.hidden
++        self.patch_w = t("patch_embed.proj.weight").reshape(D, -1)          # [D, 3 * 2 * 14 * 14]
++        self.patch_b = t("patch_embed.proj.bias")
++        self.blocks = []
++        for i in range(self.depth):
++            p = f"blocks.{i}."
++            self.blocks.append({k: t(p + k) for k in (
++                "norm1.weight", "norm2.weight", "attn.qkv.weight", "attn.qkv.bias", "attn.proj.weight",
++                "attn.proj.bias", "attn.q_norm.weight", "attn.k_norm.weight", "mlp.gate_proj.weight",
++                "mlp.gate_proj.bias", "mlp.up_proj.weight", "mlp.up_proj.bias", "mlp.down_proj.weight",
++                "mlp.down_proj.bias")})
++        self.post_norm = t("post_layernorm.weight")
++        self.down_w = t("downsample.weight").reshape(self.out, -1)          # [out, D * m * m] (C, kh, kw)
++        self.down_b = t("downsample.bias")
++        self.m_proj = t("merger.proj.weight")
++        self.m_ln_w = t("merger.post_projection_norm.weight")
++        self.m_ln_b = t("merger.post_projection_norm.bias")
++        self.m_gate = t("merger.gate_proj.weight")
++        self.m_up = t("merger.up_proj.weight")
++        self.m_down = t("merger.down_proj.weight")
++        spatial = self.head_dim // 2
++        self.inv_freq = 1.0 / (self.theta ** (torch.arange(0, spatial, 2, dtype=torch.float) / spatial))
++        self.inv_freq = self.inv_freq.to(self.device)
++
++    @property
++    def nbytes(self) -> int:
++        n = 0
++        for v in vars(self).values():
++            if isinstance(v, torch.Tensor):
++                n += v.numel() * v.element_size()
++        for blk in self.blocks:
++            n += sum(v.numel() * v.element_size() for v in blk.values())
++        return n
++
++    @classmethod
++    def load(cls, model_dir: Path, *, device="cuda", dtype=torch.bfloat16) -> "Tower":
++        """The checkpoint's ``model.visual.*`` tensors (BF16 in GLM-5.3-Flash's checkpoints, one shard)."""
++
++        from safetensors import safe_open
++
++        model_dir = Path(model_dir)
++        cfg = json.loads((model_dir / "config.json").read_text())
++        vcfg = dict(cfg.get("vision_config") or {})
++        if not vcfg:
++            raise ValueError(f"{model_dir}/config.json has no vision_config: this checkpoint has no vision tower")
++        index = model_dir / "model.safetensors.index.json"
++        if index.exists():
++            wmap = json.loads(index.read_text())["weight_map"]
++            files: dict[str, list[str]] = {}
++            for name, f in wmap.items():
++                if name.startswith(PREFIX):
++                    files.setdefault(f, []).append(name)
++        else:
++            files = {"model.safetensors": None}
++        tensors: dict[str, torch.Tensor] = {}
++        for f, names in files.items():
++            with safe_open(str(model_dir / f), framework="pt", device="cpu") as h:
++                for name in names if names is not None else [k for k in h.keys() if k.startswith(PREFIX)]:
++                    tensors[name] = h.get_tensor(name)
++        if not tensors:
++            raise ValueError(f"{model_dir}: no {PREFIX}* tensors (a text-only checkpoint)")
++        return cls(vcfg, tensors, device=device, dtype=dtype)
++
++    # -- pieces (transformers' op order) --
++    def _rms(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++        dt = x.dtype
++        h = x.to(torch.float32)
++        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
++        return w * h.to(dt)
++
++    def _rope(self, gh: int, gw: int) -> tuple[torch.Tensor, torch.Tensor]:
++        """cos, sin [N, head_dim] for the patches in the processor's order (merge windows, row-major inside)."""
++
++        m = self.merge
++        hpos, wpos = torch.meshgrid(torch.arange(gh, device=self.device), torch.arange(gw, device=self.device),
++                                    indexing="ij")
++        shape = (gh // m, m, gw // m, m)
++        hpos = hpos.reshape(shape).transpose(1, 2).flatten()
++        wpos = wpos.reshape(shape).transpose(1, 2).flatten()
++        pos = torch.stack([hpos, wpos], dim=-1)[..., None].float()             # [N, 2, 1]
++        freqs = pos * self.inv_freq.float()                                     # [N, 2, F]
++        cos, sin = freqs.cos(), freqs.sin()
++
++        def recompose(f):
++            hw = torch.cat([f[:, 0], f[:, 1]], dim=-1)
++            return torch.cat([hw, hw], dim=-1)
++        return recompose(cos), recompose(sin)
++
++    @staticmethod
++    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
++        h = x.shape[-1] // 2
++        return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
++
++    def _swiglu(self, x, gw, gb, uw, ub, dw, db) -> torch.Tensor:
++        gate = F.linear(x, gw, gb).clamp(max=self.limit)
++        up = F.linear(x, uw, ub).clamp(min=-self.limit, max=self.limit)
++        return F.linear(F.silu(gate) * up, dw, db)
++
++    def _block(self, x: torch.Tensor, blk: dict, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
++        N = x.shape[0]
++        H, hd = self.heads, self.head_dim
++        h = self._rms(x, blk["norm1.weight"])
++        q, k, v = F.linear(h, blk["attn.qkv.weight"], blk["attn.qkv.bias"]).reshape(N, 3, H, hd).permute(
++            1, 0, 2, 3).unbind(0)
++        q = self._rms(q, blk["attn.q_norm.weight"])
++        k = self._rms(k, blk["attn.k_norm.weight"])
++        c, s = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
++        qf, kf = q.float(), k.float()
++        q = ((qf * c) + (self._rotate_half(qf) * s)).to(x.dtype)
++        k = ((kf * c) + (self._rotate_half(kf) * s)).to(x.dtype)
++        q, k, v = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))            # [1, H, N, hd]
++        a = F.scaled_dot_product_attention(q, k, v, scale=hd ** -0.5)
++        a = a.transpose(1, 2).reshape(N, -1)
++        x = x + F.linear(a, blk["attn.proj.weight"], blk["attn.proj.bias"])
++        h = self._rms(x, blk["norm2.weight"])
++        return x + self._mlp_rows(h, blk)
++
++    def _mlp_rows(self, h: torch.Tensor, blk: dict, chunk: int = 8192) -> torch.Tensor:
++        """The block's MLP, row-chunked (rows are independent; the chunk rule is fixed, so the bits are too)."""
++
++        args = (blk["mlp.gate_proj.weight"], blk["mlp.gate_proj.bias"], blk["mlp.up_proj.weight"],
++                blk["mlp.up_proj.bias"], blk["mlp.down_proj.weight"], blk["mlp.down_proj.bias"])
++        if h.shape[0] <= chunk:
++            return self._swiglu(h, *args)
++        return torch.cat([self._swiglu(h[a:a + chunk], *args) for a in range(0, h.shape[0], chunk)])
++
++    @torch.no_grad()
++    def encode(self, pixels: torch.Tensor, grid: Sequence[int]) -> torch.Tensor:
++        """One image's patches [N, 3 * 2 * 14 * 14] (``vision_prep.preprocess``) and grid (1, gh, gw) -> its LM rows
++        [N / merge^2, out_hidden] in the prompt's order."""
++
++        t, gh, gw = (int(v) for v in grid)
++        if t != 1 or gh % self.merge or gw % self.merge or pixels.shape[0] != gh * gw:
++            raise ValueError(f"vision: patches {tuple(pixels.shape)} do not fit the grid {tuple(grid)}")
++        x = pixels.to(device=self.device, dtype=self.dtype)
++        x = F.linear(x, self.patch_w, self.patch_b)
++        cos, sin = self._rope(gh, gw)
++        for blk in self.blocks:
++            x = self._block(x, blk, cos, sin)
++        x = self._rms(x, self.post_norm)
++        m = self.merge
++        x = x.view(-1, m, m, self.hidden).permute(0, 3, 1, 2).reshape(-1, self.hidden * m * m)
++        x = F.linear(x, self.down_w, self.down_b)
++        x = F.linear(x, self.m_proj)
++        x = F.gelu(F.layer_norm(x, (self.out,), self.m_ln_w, self.m_ln_b, 1e-5))
++        return self._swiglu(x, self.m_gate, None, self.m_up, None, self.m_down, None)
++
++    @staticmethod
++    def flops(grid: Sequence[int], cfg: dict | None = None) -> float:
++        """Forward FLOPs of one image (matmuls and attention; 2 a multiply-add)."""
++
++        cfg = cfg or {}
++        D = int(cfg.get("hidden_size", 1024))
++        I = int(cfg.get("intermediate_size", 4096))
++        O = int(cfg.get("out_hidden_size", 4096))
++        P = int(cfg.get("projection_intermediate_size", 10240))
++        depth = int(cfg.get("depth", 24))
++        m = int(cfg.get("spatial_merge_size", 2))
++        k = int(cfg.get("in_channels", 3)) * int(cfg.get("temporal_patch_size", 2)) * int(cfg.get("patch_size", 14)) ** 2
++        _, gh, gw = (int(v) for v in grid)
++        N = gh * gw
++        T = N // (m * m)
++        per_block = 2 * N * D * (3 * D + D + 3 * I) + 4 * N * N * D
++        return (2 * N * k * D + depth * per_block + 2 * T * (D * m * m) * O + 2 * T * (O * O + 3 * O * P))
++
++
++# -- rank 0: images -> a table ----------------------------------------------------------------------------------------
++class Encoder:
++    """Rank 0's tower plus a cache of recent images' rows (GLM53_TF_VISION_CACHE_MB, default 256, host memory; keyed by
++    the image digest, so a conversation's earlier images are not encoded again every turn)."""
++
++    def __init__(self, model_dir: Path, *, device="cuda") -> None:
++        self.tower = Tower.load(model_dir, device=device)
++        self.cfg = json.loads((Path(model_dir) / "config.json").read_text()).get("vision_config") or {}
++        self.cache: OrderedDict[bytes, torch.Tensor] = OrderedDict()
++        self.cache_bytes = 0
++        self.cache_cap = int(float(os.environ.get("GLM53_TF_VISION_CACHE_MB", "256") or 256) * 1024 * 1024)
++        self.lock = threading.Lock()
++        self.last: dict[str, Any] = {}
++        self.stream = None
++        self.run_lock = threading.Lock()
++
++    def rows(self, prep) -> torch.Tensor:
++        """One ``vision_prep.Prepared`` image's rows on the device (the cache's, or encoded now)."""
++
++        with self.lock:
++            hit = self.cache.get(prep.digest)
++            if hit is not None:
++                self.cache.move_to_end(prep.digest)
++                return hit.to(self.tower.device, non_blocking=False)
++        out = self.tower.encode(prep.pixels, prep.grid)
++        if out.shape[0] != prep.tokens:
++            raise RuntimeError(f"vision: {out.shape[0]} rows for an image of {prep.tokens} tokens")
++        if self.cache_cap > 0:
++            host = out.to("cpu")
++            with self.lock:
++                self.cache[prep.digest] = host
++                self.cache_bytes += host.numel() * host.element_size()
++                while self.cache_bytes > self.cache_cap and self.cache:
++                    _, old = self.cache.popitem(last=False)
++                    self.cache_bytes -= old.numel() * old.element_size()
++        return out
++
++    def table(self, request) -> Table:
++        """A ``vision_prep.Request``'s images -> the ``Table`` of their virtual ids (sorted) and rows."""
++
++        import time
++
++        t0 = time.perf_counter()
++        cuda = self.tower.device.type == "cuda"
++        if cuda and getattr(self, "stream", None) is None:
++            self.stream = torch.cuda.Stream()
++        # one request's images at a time (bounded memory), on its own stream (the batch loop may be running a round
++        # meanwhile), waited for before the table is used
++        with self.run_lock, (torch.cuda.stream(self.stream) if cuda else contextlib.nullcontext()):
++            table, keys, encoded = self._table(request)
++            if cuda:
++                self.stream.synchronize()
++        self.last = {"images": len(request.images), "rows": len(keys), "encoded": encoded,
++                     "vision_s": round(time.perf_counter() - t0, 4)}
++        return table
++
++    def _table(self, request):
++        keys, parts, encoded, seen = [], [], 0, set()
++        for prep in request.images:
++            if prep.digest in seen:                 # the same image twice: the same ids, the same rows
++                continue
++            seen.add(prep.digest)
++            cached = prep.digest in self.cache
++            r = self.rows(prep)
++            encoded += 0 if cached else 1
++            keys.extend(prep.vids)
++            parts.append(r)
++        rows = torch.cat(parts) if len(parts) > 1 else parts[0]
++        order = sorted(range(len(keys)), key=keys.__getitem__)
++        uniq = [keys[i] for i in order]
++        if len(set(uniq)) != len(uniq):
++            raise RuntimeError("vision: two image rows share a virtual id")
++        idx = torch.tensor(order, dtype=torch.long, device=rows.device)
++        table = Table(torch.tensor(uniq, dtype=torch.int32, device=rows.device), rows.index_select(0, idx))
++        return table, keys, encoded
+diff --git i/src/tensorfold/families/glm5_next/cuda/vision_prep.py w/src/tensorfold/families/glm5_next/cuda/vision_prep.py
+new file mode 100644
+index 0000000..f3af0bf
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/vision_prep.py
+@@ -0,0 +1,587 @@
++"""patches/0500: image input for GLM-5.3-Flash, host side (rank 0's HTTP threads; no GPU).
++
++- **Content parts.** OpenAI chat messages may carry ``{"type": "image_url", "image_url": {"url": ..., "detail": ...}}``
++  parts (also the string form ``"image_url": "..."``, ``input_image`` and ``image``). ``data:`` URLs (base64) and, with
++  GLM53_TF_VISION_FETCH=1 (the default), ``http(s)`` URLs; nothing else (no ``file:``).
++- **Fetch and decode** (``load_bytes``, ``decode``): at most GLM53_TF_VISION_MAX_BYTES a download (default 20 MB),
++  GLM53_TF_VISION_FETCH_TIMEOUT seconds (default 10), at most GLM53_TF_VISION_MAX_PIXELS decoded pixels (default
++  64 M: decompression bombs are refused before decoding). Converted to RGB as vLLM's media loader does it: RGBA / LA
++  / transparent palettes composited on white, anything else ``convert("RGB")``.
++- **Preprocessing** (``preprocess``): transformers' ``Glm5NextImageProcessor`` (the torchvision backend, which HF's
++  ``AutoProcessor`` and vLLM load) step for step: ``smart_resize`` to the processor's token budget (``min_image_tokens``
++  16 to ``max_image_tokens`` 8,000 tokens of 28 x 28 pixels), bicubic antialiased resize of the uint8 image to the
++  content size (aspect kept, never upscaled once the image meets the minimum), zero padding to the aligned canvas,
++  fused rescale / normalize ``(x - 255 mean) / (255 std)`` in float32, and the patch layout (merge-window major,
++  the frame duplicated over the temporal patch). ``tests/test_vision_prep.py`` checks the pixels and token counts
++  against transformers on CPU.
++- **The prompt** (``markup`` / ``expand``): each image part renders as ``<|begin_of_image|><|image|><|end_of_image|>``
++  (what the checkpoint family's vision chat template emits; this checkpoint's template renders a "you cannot see
++  images" reminder instead, so the parts are replaced before the template runs), then the one ``<|image|>`` of each
++  image becomes its N = grid_h x grid_w / 4 rows.
++- **Virtual token ids** (``vids``): the N rows of an image are not N copies of ``<|image|>`` (154854) but ids at or
++  above ``VBASE`` (2^24, far past the 154,880-token vocabulary) derived from the image: a SHA-256 of the
++  preprocessed canvas, the grid and the processor settings, then a 31-bit hash of (that digest, row index) per row.
++  Every cache keyed by token ids (the engine's snapshots, the session store, the prefix share, the NVMe tier, the
++  request log's hashes) therefore tells two images apart with no change to it, and shares state between requests
++  only where the image is the same. The engine's embedding (``vision.py``) turns those ids into the vision tower's
++  rows; nothing else reads them (the lookup drafter never proposes one).
++"""
++
++from __future__ import annotations
++
++import base64
++import binascii
++import hashlib
++import io
++import json
++import math
++import os
++import secrets
++import threading
++import urllib.parse
++import urllib.request
++from collections import OrderedDict
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Sequence
++
++VBASE = 1 << 24                        # every virtual id is >= this (the vocabulary is 154,880)
++VLIMIT = (1 << 31) - 1                 # ids travel as int32
++VSPAN = VLIMIT - VBASE                 # ~2^31 values
++IMAGE_TYPES = ("image_url", "input_image", "image")
++VERSION = b"tensorfold-glm5-vision/1"
++
++
++class VisionError(ValueError):
++    """A request's image problem (HTTP 400)."""
++
++
++def is_vid(t: int) -> bool:
++    return VBASE <= int(t) <= VLIMIT
++
++
++def has_vids(ids: Sequence[int]) -> bool:
++    return any(int(t) >= VBASE for t in ids)
++
++
++# -- settings ----------------------------------------------------------------------------------------------------
++def _env_int(name: str, default: int) -> int:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return default
++    try:
++        return int(float(raw))
++    except ValueError:
++        raise ValueError(f"{name}={raw!r}: expected a number") from None
++
++
++def enabled() -> bool:
++    raw = os.environ.get("GLM53_TF_VISION", "0").strip() or "0"
++    if raw not in ("0", "1"):
++        raise ValueError(f"GLM53_TF_VISION={raw!r}: expected 0 or 1")
++    return raw == "1"
++
++
++@dataclass
++class Settings:
++    """The processor (``processor_config.json``), the special ids (``config.json``) and the server's limits."""
++
++    mean: tuple[float, float, float] = (0.48145466, 0.4578275, 0.40821073)
++    std: tuple[float, float, float] = (0.26862954, 0.26130258, 0.27577711)
++    patch: int = 14
++    merge: int = 2
++    temporal: int = 2
++    min_tokens: int = 16
++    max_tokens: int = 8000
++    rescale: float = 1 / 255
++    image_token: int = 154854
++    begin_token: int = 154830
++    end_token: int = 154831
++    vision_config: dict = field(default_factory=dict)
++    # server limits (GLM53_TF_VISION_*)
++    max_images: int = 8
++    cap_tokens: int = 0                # 0: the processor's max_image_tokens
++    low_tokens: int = 0                # detail="low": 0 = ignored (as vLLM)
++    fetch: bool = True
++    fetch_timeout: float = 10.0
++    max_bytes: int = 20 * 1024 * 1024
++    max_pixels: int = 64 * 1024 * 1024
++
++    @classmethod
++    def read(cls, model_dir: Path | None = None) -> "Settings":
++        s = cls()
++        if model_dir is not None:
++            model_dir = Path(model_dir)
++            p = model_dir / "processor_config.json"
++            if p.exists():
++                ip = json.loads(p.read_text()).get("image_processor", {})
++                s.mean = tuple(float(v) for v in ip.get("image_mean", s.mean))
++                s.std = tuple(float(v) for v in ip.get("image_std", s.std))
++                s.patch = int(ip.get("patch_size", s.patch))
++                s.merge = int(ip.get("merge_size", s.merge))
++                s.temporal = int(ip.get("temporal_patch_size", s.temporal))
++                s.min_tokens = int(ip.get("min_image_tokens", s.min_tokens))
++                s.max_tokens = int(ip.get("max_image_tokens", s.max_tokens))
++                if int(ip.get("patch_expand_factor", 1)) != 1:
++                    raise ValueError("processor_config.json: patch_expand_factor != 1 is not supported")
++                if not ip.get("do_rescale", True):
++                    s.rescale = 1.0
++            c = model_dir / "config.json"
++            if c.exists():
++                cfg = json.loads(c.read_text())
++                s.image_token = int(cfg.get("image_token_id", s.image_token))
++                s.begin_token = int(cfg.get("image_start_token_id", s.begin_token))
++                s.end_token = int(cfg.get("image_end_token_id", s.end_token))
++                s.vision_config = dict(cfg.get("vision_config") or {})
++        s.max_images = _env_int("GLM53_TF_VISION_MAX_IMAGES", s.max_images)
++        s.cap_tokens = _env_int("GLM53_TF_VISION_MAX_TOKENS", 0)
++        s.low_tokens = _env_int("GLM53_TF_VISION_LOW_TOKENS", 0)
++        s.fetch = (os.environ.get("GLM53_TF_VISION_FETCH", "1").strip() or "1") != "0"
++        s.fetch_timeout = float(os.environ.get("GLM53_TF_VISION_FETCH_TIMEOUT", "10") or 10)
++        s.max_bytes = _env_int("GLM53_TF_VISION_MAX_BYTES", s.max_bytes)
++        s.max_pixels = _env_int("GLM53_TF_VISION_MAX_PIXELS", s.max_pixels)
++        if s.cap_tokens < 0 or s.low_tokens < 0 or s.max_images < 1:
++            raise ValueError("GLM53_TF_VISION_MAX_TOKENS / _LOW_TOKENS must be >= 0, _MAX_IMAGES >= 1")
++        return s
++
++    def budget(self, detail: str | None) -> int:
++        """The most tokens an image may take: the processor's maximum, capped by GLM53_TF_VISION_MAX_TOKENS, and by
++        GLM53_TF_VISION_LOW_TOKENS for ``detail: "low"`` when set."""
++
++        most = self.max_tokens
++        if self.cap_tokens:
++            most = min(most, self.cap_tokens)
++        if detail == "low" and self.low_tokens:
++            most = min(most, self.low_tokens)
++        return max(most, self.min_tokens)
++
++    def key(self) -> bytes:
++        """What the embeddings depend on besides the pixels (part of every image digest)."""
++
++        return json.dumps({"mean": self.mean, "std": self.std, "patch": self.patch, "merge": self.merge,
++                           "temporal": self.temporal, "rescale": self.rescale, "vision": self.vision_config},
++                          sort_keys=True).encode()
++
++
++# -- the processor's arithmetic ------------------------------------------------------------------------------------
++def smart_resize(num_frames: int, height: int, width: int, temporal_factor: int = 2, factor: int = 28,
++                 min_pixels: int = 16, max_pixels: int = 8000) -> tuple[int, int]:
++    """transformers ``glm5_next.image_processing_glm5_next.smart_resize`` (min / max given in tokens)."""
++
++    pixels_per_token = temporal_factor * factor ** 2
++    min_pixels *= pixels_per_token
++    max_pixels *= pixels_per_token
++
++    def align(value, f):
++        return math.ceil(value / f) * f
++
++    def fit_within_budget(aligned_frames):
++        minimum_pixels = aligned_frames * factor ** 2
++        if max_pixels < minimum_pixels:
++            raise ValueError(f"max_pixels={max_pixels} is too small. At least {minimum_pixels} pixels are required "
++                             "for one aligned patch.")
++        low, high = 1, height
++        best_height, best_width = factor, factor
++        while low <= high:
++            content_height = (low + high) // 2
++            content_width = max(1, math.floor(width * content_height / height))
++            candidate_height = align(content_height, factor)
++            candidate_width = align(content_width, factor)
++            if aligned_frames * candidate_height * candidate_width <= max_pixels:
++                best_height, best_width = candidate_height, candidate_width
++                low = content_height + 1
++            else:
++                high = content_height - 1
++        return best_height, best_width
++
++    aligned_frames = max(temporal_factor, round(num_frames / temporal_factor) * temporal_factor)
++    aligned_height = align(height, factor)
++    aligned_width = align(width, factor)
++    budget = aligned_frames * aligned_height * aligned_width
++    if budget < min_pixels:
++        scale = math.sqrt(min_pixels / (num_frames * height * width))
++        aligned_height = align(max(1, math.ceil(height * scale)), factor)
++        aligned_width = align(max(1, math.ceil(width * scale)), factor)
++        budget = aligned_frames * aligned_height * aligned_width
++    if budget > max_pixels:
++        aligned_height, aligned_width = fit_within_budget(aligned_frames)
++    return aligned_height, aligned_width
++
++
++def canvas_size(height: int, width: int, s: Settings, max_tokens: int) -> tuple[int, int, int, int]:
++    """(canvas h, canvas w, content h, content w): ``Glm5NextImageProcessor.resize``'s sizes."""
++
++    factor = s.patch * s.merge
++    t = s.temporal
++    target_h, target_w = smart_resize(num_frames=t, height=height, width=width, temporal_factor=t, factor=factor,
++                                      min_pixels=s.min_tokens, max_pixels=max_tokens)
++    scale = min(target_h / height, target_w / width)
++    if t * height * width >= t * factor ** 2 * s.min_tokens:
++        scale = min(1.0, scale)
++    content_h = max(1, min(target_h, math.floor(height * scale)))
++    content_w = max(1, min(target_w, math.floor(width * scale)))
++    return target_h, target_w, content_h, content_w
++
++
++def image_tokens(height: int, width: int, s: Settings, max_tokens: int | None = None) -> int:
++    """The rows an image of this size takes in the prompt (``Glm5NextProcessor._get_num_multimodal_tokens``)."""
++
++    ch, cw, _, _ = canvas_size(height, width, s, s.max_tokens if max_tokens is None else max_tokens)
++    return (ch // s.patch) * (cw // s.patch) // (s.merge ** 2)
++
++
++def _resize_uint8(img, size: tuple[int, int]):
++    """[3, H, W] uint8 -> [3, h, w] uint8, bicubic with antialiasing: torchvision's ``resize`` when installed (what the
++    transformers backend calls), else the same ``interpolate`` call it makes on CPU (native uint8 bicubic)."""
++
++    import torch
++
++    if tuple(img.shape[-2:]) == tuple(size):
++        return img
++    try:
++        from torchvision.transforms.v2 import functional as tvF
++
++        return tvF.resize(img, list(size), interpolation=tvF.InterpolationMode.BICUBIC, antialias=True)
++    except ImportError:
++        out = torch.nn.functional.interpolate(img[None], size=list(size), mode="bicubic", align_corners=False,
++                                              antialias=True)
++        return out[0]
++
++
++@dataclass
++class Prepared:
++    """One image, preprocessed: the patches the tower reads, its grid, rows and digest."""
++
++    pixels: Any                          # torch.float32 [grid_h * grid_w, 3 * temporal * patch * patch]
++    grid: tuple[int, int, int]           # (1, grid_h, grid_w) in patches
++    tokens: int                          # rows in the prompt (grid_h * grid_w / merge^2)
++    digest: bytes                        # SHA-256 of the canvas, the grid and the settings
++    size: tuple[int, int]                # the decoded image's (height, width)
++    vids: list[int] = field(default_factory=list)
++
++
++def preprocess(image, s: Settings, max_tokens: int | None = None) -> Prepared:
++    """A decoded RGB ``PIL.Image`` -> ``Prepared`` exactly as ``Glm5NextImageProcessor`` (torchvision backend)."""
++
++    import numpy as np
++    import torch
++
++    if image.mode != "RGB":
++        image = image.convert("RGB")
++    arr = torch.from_numpy(np.asarray(image, dtype=np.uint8).copy()).permute(2, 0, 1).contiguous()   # pil_to_tensor
++    height, width = int(arr.shape[1]), int(arr.shape[2])
++    most = s.max_tokens if max_tokens is None else max_tokens
++    target_h, target_w, content_h, content_w = canvas_size(height, width, s, most)
++    if (content_h, content_w) != (height, width):
++        arr = _resize_uint8(arr, (content_h, content_w))
++    if (content_h, content_w) != (target_h, target_w):
++        arr = torch.nn.functional.pad(arr, (0, target_w - content_w, 0, target_h - content_h), value=0)
++    canvas = arr.contiguous()
++    # fused rescale + normalize (transformers' TorchvisionBackend.rescale_and_normalize -> tvF.normalize)
++    mean = torch.tensor(s.mean) * (1.0 / s.rescale)
++    std = torch.tensor(s.std) * (1.0 / s.rescale)
++    x = canvas.to(torch.float32)
++    x = (x - mean[:, None, None]) / std[:, None, None]
++    p, m, t = s.patch, s.merge, s.temporal
++    gh, gw = target_h // p, target_w // p
++    x = x.reshape(1, 3, gh // m, m, p, gw // m, m, p).permute(0, 2, 5, 3, 6, 1, 4, 7)
++    x = x.unsqueeze(6).expand(-1, -1, -1, -1, -1, -1, t, -1, -1).reshape(gh * gw, 3 * t * p * p)
++    h = hashlib.sha256(VERSION)
++    h.update(s.key())
++    h.update(json.dumps([target_h, target_w, gh, gw]).encode())
++    h.update(canvas.numpy().tobytes())
++    return Prepared(x.contiguous(), (1, gh, gw), gh * gw // (m * m), h.digest(), (height, width))
++
++
++# -- fetching and decoding -------------------------------------------------------------------------------------------
++def load_bytes(url: str, s: Settings) -> bytes:
++    """A part's image bytes: a ``data:`` URL, or (GLM53_TF_VISION_FETCH=1) an ``http(s)`` download."""
++
++    if not isinstance(url, str) or not url:
++        raise VisionError("an image part needs a URL (image_url.url)")
++    if url.startswith("data:"):
++        head, sep, data = url.partition(",")
++        if not sep:
++            raise VisionError("a data: URL without a comma")
++        if ";base64" not in head:
++            raw = urllib.parse.unquote_to_bytes(data)
++        else:
++            if len(data) > (s.max_bytes * 4) // 3 + 8:
++                raise VisionError(f"image larger than {s.max_bytes} bytes (GLM53_TF_VISION_MAX_BYTES)")
++            try:
++                raw = base64.b64decode(data.strip(), validate=False)
++            except (binascii.Error, ValueError):
++                raise VisionError("the data: URL is not valid base64") from None
++        if len(raw) > s.max_bytes:
++            raise VisionError(f"image larger than {s.max_bytes} bytes (GLM53_TF_VISION_MAX_BYTES)")
++        return raw
++    scheme = urllib.parse.urlsplit(url).scheme.lower()
++    if scheme not in ("http", "https"):
++        raise VisionError(f"image URL scheme {scheme or '(none)'!r}: only data:, http and https are accepted")
++    if not s.fetch:
++        raise VisionError("this server does not fetch image URLs (GLM53_TF_VISION_FETCH=0): send a data: URL")
++    req = urllib.request.Request(url, headers={"User-Agent": "tensorfold-glm53-vision/1"})
++    try:
++        with urllib.request.urlopen(req, timeout=s.fetch_timeout) as r:
++            size = r.headers.get("Content-Length")
++            if size is not None and size.isdigit() and int(size) > s.max_bytes:
++                raise VisionError(f"image larger than {s.max_bytes} bytes (GLM53_TF_VISION_MAX_BYTES)")
++            raw = r.read(s.max_bytes + 1)
++    except VisionError:
++        raise
++    except Exception as exc:                        # URLError, HTTPError, timeouts, ...
++        raise VisionError(f"could not fetch the image URL: {exc}") from None
++    if len(raw) > s.max_bytes:
++        raise VisionError(f"image larger than {s.max_bytes} bytes (GLM53_TF_VISION_MAX_BYTES)")
++    return raw
++
++
++def decode(raw: bytes, s: Settings):
++    """Bytes -> an RGB ``PIL.Image`` (vLLM's conversion: transparency composited on white)."""
++
++    from PIL import Image
++
++    try:
++        img = Image.open(io.BytesIO(raw))
++        w, h = img.size
++        if w * h > s.max_pixels:
++            raise VisionError(f"image of {w}x{h} pixels: more than {s.max_pixels} (GLM53_TF_VISION_MAX_PIXELS)")
++        if getattr(img, "n_frames", 1) > 1:
++            img.seek(0)                              # an animated image: its first frame
++        img.load()
++    except VisionError:
++        raise
++    except Exception as exc:
++        raise VisionError(f"could not decode the image: {exc}") from None
++    return to_rgb(img)
++
++
++def to_rgb(img):
++    from PIL import Image
++
++    if img.mode == "RGB":
++        return img
++    if img.mode == "P" and "transparency" in img.info:
++        img = img.convert("RGBA")
++    if img.mode in ("RGBA", "LA", "PA"):
++        rgba = img.convert("RGBA")
++        bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
++        return Image.alpha_composite(bg, rgba).convert("RGB")
++    return img.convert("RGB")
++
++
++# -- content parts ---------------------------------------------------------------------------------------------------
++@dataclass
++class Ref:
++    """One image part: where it is and how much detail was asked."""
++
++    url: str
++    detail: str | None = None
++
++
++def part_ref(part: Any) -> Ref | None:
++    """An image content part's reference, None for any other part. Raises for a malformed image part."""
++
++    if not isinstance(part, dict) or part.get("type") not in IMAGE_TYPES:
++        return None
++    kind = part["type"]
++    val = part.get("image_url") if kind != "image" else (part.get("image") or part.get("image_url") or part.get("url"))
++    if kind == "input_image" and val is None:
++        val = part.get("url")
++    detail = part.get("detail")
++    if isinstance(val, dict):
++        detail = val.get("detail", detail)
++        val = val.get("url")
++    if not isinstance(val, str) or not val:
++        raise VisionError(f"an {kind} part needs a URL string")
++    return Ref(val, str(detail).lower() if detail is not None else None)
++
++
++def markup(messages: list, nonce: str) -> tuple[list, list[Ref]]:
++    """``messages`` with every image part replaced by a text part holding a sentinel (``sentinel(nonce, i)``), and
++    the image references in that order. The input is not modified."""
++
++    out, refs = [], []
++    for m in messages:
++        content = m.get("content") if isinstance(m, dict) else None
++        if not isinstance(content, list):
++            out.append(m)
++            continue
++        parts = []
++        for part in content:
++            ref = part_ref(part)
++            if ref is None:
++                parts.append(part)
++                continue
++            parts.append({"type": "text", "text": sentinel(nonce, len(refs))})
++            refs.append(ref)
++        out.append(dict(m, content=parts))
++    return out, refs
++
++
++def sentinel(nonce: str, i: int) -> str:
++    return f"\x00tf-image-{nonce}-{i}\x00"
++
++
++def count_images(messages: Any) -> int:
++    if not isinstance(messages, list):
++        return 0
++    n = 0
++    for m in messages:
++        content = m.get("content") if isinstance(m, dict) else None
++        if isinstance(content, list):
++            n += sum(1 for p in content if isinstance(p, dict) and p.get("type") in IMAGE_TYPES)
++    return n
++
++
++def splice(text: str, nonce: str, count: int, s: Settings) -> tuple[str, list[int]]:
++    """The rendered text with each sentinel replaced by ``<|begin_of_image|><|image|><|end_of_image|>``, and the
++    indices of the images the template kept, in prompt order."""
++
++    order = []
++    out = text
++    positions = []
++    for i in range(count):
++        tag = sentinel(nonce, i)
++        at = out.find(tag)
++        if at >= 0:
++            positions.append((at, i))
++    for _, i in sorted(positions):
++        order.append(i)
++    for i in range(count):
++        out = out.replace(sentinel(nonce, i), PLACEHOLDER)
++    if "\x00tf-image-" in out:
++        raise VisionError("an image sentinel survived the chat template")
++    return out, order
++
++
++PLACEHOLDER = "<|begin_of_image|><|image|><|end_of_image|>"
++
++
++# -- virtual ids -----------------------------------------------------------------------------------------------------
++class Registry:
++    """Rank 0's recent virtual ids -> the image digest they were given to (LRU of ``cap`` ids): a new image whose ids
++    meet another image's is derived again with the next salt, so no two images seen in this process share an id."""
++
++    def __init__(self, cap: int = 1 << 18) -> None:
++        self.cap = cap
++        self.owner: OrderedDict[int, bytes] = OrderedDict()
++        self.salts: OrderedDict[bytes, int] = OrderedDict()
++        self.lock = threading.Lock()
++
++    def vids(self, digest: bytes, n: int) -> list[int]:
++        with self.lock:
++            salt = self.salts.get(digest, 0)
++            while True:
++                ids = derive(digest, n, salt)
++                clash = len(set(ids)) != n or any(self.owner.get(v, digest) != digest for v in ids)
++                if not clash:
++                    break
++                salt += 1
++            self.salts[digest] = salt
++            self.salts.move_to_end(digest)
++            while len(self.salts) > self.cap // 16:
++                self.salts.popitem(last=False)
++            for v in ids:
++                self.owner[v] = digest
++                self.owner.move_to_end(v)
++            while len(self.owner) > self.cap:
++                self.owner.popitem(last=False)
++            return ids
++
++
++def derive(digest: bytes, n: int, salt: int = 0) -> list[int]:
++    """Row k of an image: VBASE + a 31-bit hash of (digest, salt, k). Two different images share row k's id with
++    probability 2^-31, and a cached prefix ending j rows into an image matches another image's with 2^-31j."""
++
++    base = hashlib.sha256(digest + salt.to_bytes(4, "little")).digest()
++    out = []
++    for k in range(n):
++        h = hashlib.blake2b(base + k.to_bytes(4, "little"), digest_size=8).digest()
++        out.append(VBASE + int.from_bytes(h, "little") % VSPAN)
++    return out
++
++
++def expand(ids: Sequence[int], images: Sequence[Prepared], s: Settings, *, virtual: bool = True) -> list[int]:
++    """The rendered prompt's ids with each image's single ``<|image|>`` (between ``<|begin_of_image|>`` and
++    ``<|end_of_image|>``) replaced by its rows: its virtual ids, or (``virtual=False``, ``/tokenize``) N image
++    tokens. Every ``<|image|>`` of the prompt must be one of the images' (text cannot smuggle one in)."""
++
++    out: list[int] = []
++    k = 0
++    ids = [int(t) for t in ids]
++    for i, t in enumerate(ids):
++        if t != s.image_token:
++            out.append(t)
++            continue
++        framed = 0 < i < len(ids) - 1 and ids[i - 1] == s.begin_token and ids[i + 1] == s.end_token
++        if k >= len(images) or not framed:
++            raise VisionError("the prompt holds an image placeholder token (<|image|>) that is not an image part")
++        img = images[k]
++        out.extend(img.vids if virtual else [s.image_token] * img.tokens)
++        k += 1
++    if k != len(images):
++        raise VisionError(f"{len(images)} image(s) sent, {k} placed in the prompt by the chat template")
++    return out
++
++
++# -- a request's images ----------------------------------------------------------------------------------------------
++@dataclass
++class Request:
++    """A chat request's images, preprocessed, in prompt order (what the engine's vision tower reads)."""
++
++    images: list[Prepared]
++
++    @property
++    def extra(self) -> int:
++        """Prompt rows the images add past their one placeholder each."""
++
++        return sum(img.tokens - 1 for img in self.images)
++
++
++class Host:
++    """Rank 0's image front end: settings, the id registry, a small cache of decoded / preprocessed images."""
++
++    def __init__(self, model_dir: Path | None) -> None:
++        self.s = Settings.read(model_dir)
++        self.registry = Registry()
++        self.cache: OrderedDict[tuple[str, int], Prepared] = OrderedDict()
++        self.cache_bytes = 0
++        self.cache_cap = _env_int("GLM53_TF_VISION_PREP_MB", 256) * 1024 * 1024
++        self.lock = threading.Lock()
++
++    def prepare_ref(self, ref: Ref) -> Prepared:
++        most = self.s.budget(ref.detail)
++        key = (hashlib.sha256(ref.url.encode()).hexdigest(), most) if ref.url.startswith("data:") else None
++        if key is not None:
++            with self.lock:
++                hit = self.cache.get(key)
++                if hit is not None:
++                    self.cache.move_to_end(key)
++                    return hit
++        img = decode(load_bytes(ref.url, self.s), self.s)
++        prep = preprocess(img, self.s, most)
++        prep.vids = self.registry.vids(prep.digest, prep.tokens)
++        if key is not None:
++            with self.lock:
++                self.cache[key] = prep
++                self.cache_bytes += prep.pixels.numel() * 4
++                while self.cache_bytes > self.cache_cap and len(self.cache) > 1:
++                    _, old = self.cache.popitem(last=False)
++                    self.cache_bytes -= old.pixels.numel() * 4
++        return prep
++
++    def render(self, template, messages: list, *, tools, enable_thinking, extra) -> tuple[str, list[Ref]]:
++        """The chat template's text with image placeholders, and the image references it kept, in prompt order."""
++
++        nonce = secrets.token_hex(6)
++        marked, refs = markup(messages, nonce)
++        if len(refs) > self.s.max_images:
++            raise VisionError(f"{len(refs)} images in one request: at most {self.s.max_images} "
++                              "(GLM53_TF_VISION_MAX_IMAGES)")
++        text = template.render(marked, tools=tools, enable_thinking=enable_thinking, extra=extra)
++        text, order = splice(text, nonce, len(refs), self.s)
++        return text, [refs[i] for i in order]
++
++    def request(self, refs: list[Ref]) -> Request:
++        return Request([self.prepare_ref(r) for r in refs])

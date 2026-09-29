@@ -1,0 +1,838 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/dump.py w/src/tensorfold/families/glm5_next/cuda/dump.py
+index f08b85e..253cacf 100644
+--- i/src/tensorfold/families/glm5_next/cuda/dump.py
++++ w/src/tensorfold/families/glm5_next/cuda/dump.py
+@@ -132,6 +132,14 @@ def arm() -> None:
+                   "token)", flush=True)
+ 
+ 
++def _nonexpert_key() -> str:
++    """The stored non-expert precision (patches/0470: GLM53_TF_NONEXPERT with GLM53_TF_NONEXPERT_MAP resolved)."""
++
++    from . import weights
++
++    return weights.precision_key()
++
++
+ def _hash_ids(ids) -> "hashlib._Hash":
+     h = hashlib.blake2b(digest_size=16)
+     if len(ids):
+@@ -255,7 +263,7 @@ class Dumper:
+                     "taps_are": "mean of the 4 residual streams after each tap layer (DFlash2 taps)",
+                     "lp_are": "log-probabilities of the top-k tokens of the row's next-token distribution, "
+                               "full vocabulary, temperature 1",
+-                    "nonexpert": os.environ.get("GLM53_TF_NONEXPERT", "bf16"),
++                    "nonexpert": _nonexpert_key(),
+                     "model": str(w.meta.get("model_dir", "")), "started": time.time(),
+                     "env": {k: v for k, v in os.environ.items() if k.startswith("GLM53_TF_")}}
+             self.writer = _Writer(d, meta)
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index cd6e5fb..84b811c 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -839,8 +839,10 @@ class GlmEngine:
+ 
+         # EXL3_AUTO was measured with BF16 non-expert weights; stored in 4 bits (GLM53_TF_NONEXPERT) the MTP head is
+         # as cheap as on the MLX checkpoint, so plain ``auto`` chooses between the drafters as it does there
++        from . import weights as weights_mod                  # patches/0470: every class BF16 (NONEXPERT + _MAP)
++
+         if code[0] == 4 and self.drafter is not None and self.w.cfg.quant == "exl3" \
+-                and os.environ.get("GLM53_TF_NONEXPERT", "bf16").strip().lower() == "bf16":
++                and weights_mod.precision_key() == "bf16":
+             return encode_policy(EXL3_AUTO)
+         if self.w.mtp is None and code[0] == depth_mod.OPT_KIND:       # patches/0071: om runs as of
+             return [code[0], code[1], 1, 0]
+diff --git i/src/tensorfold/families/glm5_next/cuda/fast_qmm.py w/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+index 7b2dcbc..483186d 100644
+--- i/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
++++ w/src/tensorfold/families/glm5_next/cuda/fast_qmm.py
+@@ -45,7 +45,7 @@ import triton
+ import triton.language as tl
+ 
+ from . import fp8pf, qmm
+-from .qmm import B16, GS, Q4
++from .qmm import B16, GS, Q4, Q8
+ 
+ # Per rank of GLM-5.3-Flash at TP=2 (N x K):
+ #   KDA  [q|k|v|f_a|g_a|b] 12576x4096, f_b/g_b 4096x128, o_proj 4096x4096
+@@ -219,6 +219,74 @@ def _fb16(X, W, OUT, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.const
+         tl.store(optr, total.to(tl.bfloat16), mask=out_mask)
+ 
+ 
++# -- patches/0470: 8-bit weights (``qmm.Q8``) --------------------------------------------------------------------------
++# ``qmm._q8mm``'s arithmetic per output element (per group of G inputs: one tensor-core dot from zero, times the
++# group's scale, added in group order; ``qmm.q8_split_k``'s slices summed in slice order when ``exact``), over the
++# whole K in one program: ``exact`` gives qmm's bits, ``exact=False`` (fast chunks) one accumulator. Tiles (BM, BN,
++# warps, stages): chosen offline as the largest that compile for sm_121 without spills at every per-rank shape
++# (tests/test_q8_compile.py: a group's dot result and the running sum are two BM x BN fp32 accumulators, the exact
++# variant's slice total a third; 128 x 64 spilled 140 B, 64 x 64 12 B); not yet timed on GB10 (docs/QUALITY-PLAN.md).
++# GLM53_TF_Q8_TILE=bm,bn,warps,stages overrides both (no tile changes bits).
++Q8_TILE_EXACT = (64, 32, 8, 3)
++Q8_TILE_LOOSE = (128, 32, 8, 2)
++
++
++def q8_tile(exact: bool) -> tuple[int, int, int, int]:
++    import os
++
++    v = os.environ.get("GLM53_TF_Q8_TILE", "").strip()
++    if not v:
++        return Q8_TILE_EXACT if exact else Q8_TILE_LOOSE
++    t = tuple(int(p) for p in v.split(","))
++    if len(t) != 4 or t[0] not in (16, 32, 64, 128, 256) or t[1] not in (32, 64, 128, 256):
++        raise ValueError(f"GLM53_TF_Q8_TILE={v!r}: expected bm,bn,warps,stages (bm 16-256, bn 32-256, powers of 2)")
++    return t
++
++
++@triton.jit
++def _fq8(X, W, S, OUT, M, x_stride, N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
++         BN: tl.constexpr, G: tl.constexpr, F32: tl.constexpr):
++    """Program (M tile fastest, column tile): out[BM, BN] over all K with ``qmm._q8mm``'s per-group arithmetic, its K
++    slices summed in slice order (SK = 1: one accumulator)."""
++
++    KG: tl.constexpr = K // G
++    PER: tl.constexpr = KG // SK
++    pid_m, pid_n = _tile(tl.program_id(0), M, N, BM, BN, GROUP_M)
++    rm = pid_m * BM + tl.arange(0, BM)
++    rn = pid_n * BN + tl.arange(0, BN)
++    rk = tl.arange(0, 64)
++    m_ok = rm < M
++    n_ok = rn < N
++    wrow = W + rn[:, None].to(tl.int64) * (K // 4) + tl.arange(0, 16)[None, :]      # int32 words (qmm._q8_unpack)
++    xrow = X + rm[:, None].to(tl.int64) * x_stride + rk[None, :]
++    # qmm's K slices as an order of summation in ONE loop (a static loop a slice unrolled SK copies of the pipelined
++    # body and spilled): the slice sum restarts at each slice's first group and is added to the total at its last
++    total = tl.zeros((BM, BN), dtype=tl.float32)
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    for g in range(KG):
++        p = tl.zeros((BM, BN), dtype=tl.float32)
++        for h in tl.static_range(G // 64):              # qmm._q8mm's 64-input halves: the same k16 mma chain
++            k0 = g * G + h * 64
++            words = tl.load(wrow + k0 // 4, mask=n_ok[:, None], other=0)
++            x = tl.load(xrow + k0, mask=m_ok[:, None], other=0.0)
++            p = tl.dot(x, tl.trans(qmm._q8_unpack(words, BN, 64)), p)
++        s = tl.load(S + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
++        if SK == 1:
++            acc = acc + p * s[None, :]
++        else:
++            acc = tl.where(g % PER == 0, 0.0, acc) + p * s[None, :]
++            last = g % PER == PER - 1
++            total = tl.where(last, tl.where(g < PER, acc, total + acc), total)
++    if SK == 1:
++        total = acc
++    out_mask = m_ok[:, None] & n_ok[None, :]
++    optr = OUT + rm[:, None].to(tl.int64) * N + rn[None, :]
++    if F32:
++        tl.store(optr, total, mask=out_mask)
++    else:
++        tl.store(optr, total.to(tl.bfloat16), mask=out_mask)
++
++
+ def _out(x: torch.Tensor, n: int, out: torch.Tensor | None, f32: bool) -> torch.Tensor:
+     m = x.shape[0]
+     if out is None:
+@@ -247,6 +315,13 @@ def matmul_prefill(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None,
+     out = _out(x, q.n, out, f32)
+     if m == 0:
+         return out
++    if isinstance(q, Q8):                     # patches/0470
++        sk = qmm.q8_split_k(q.n, q.k) if exact else 1
++        bm, bn, warps, stages = q8_tile(exact)
++        grid = (triton.cdiv(m, bm) * triton.cdiv(q.n, bn),)
++        _fq8[grid](x, q.weight.view(torch.int32), q.scales, out, m, x.stride(0), N=q.n, K=k, SK=sk, BM=bm, BN=bn,
++                   G=q.gs, F32=f32, num_warps=warps, num_stages=stages)
++        return out
+     if isinstance(q, B16):
+         if k % qmm.B16_BK:
+             raise ValueError(f"matmul_prefill: K={k} is not a multiple of {qmm.B16_BK}")
+@@ -471,7 +546,8 @@ def matmul_fp8(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *,
+     kernel; qmm below 64 rows) instead. Deterministic and row-independent; not the bf16 kernels' bits."""
+ 
+     m, k = x.shape
+-    if not fp8_eligible(m, q, min_rows):      # patches/0085: ``min_rows`` as for ``matmul_prefill``
++    # patches/0470: 8-bit weights are not e4m3 numbers; an FP8 prefill runs them on the bf16 fast kernel
++    if isinstance(q, Q8) or not fp8_eligible(m, q, min_rows):     # patches/0085: ``min_rows`` as matmul_prefill
+         return matmul_prefill(x, q, xs, out=out, f32=f32, part=part, exact=False, min_rows=min_rows)
+     if k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
+         raise ValueError(f"matmul_fp8: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
+@@ -508,6 +584,8 @@ def fp8_reference(x: torch.Tensor, q: Q4 | B16) -> torch.Tensor:
+     xf = x.float()
+     x8, sx = fp8_row_values(xf)
+     x8 = x8 * sx
++    if isinstance(q, Q8):                     # patches/0470: ``matmul_fp8`` runs them in bf16 (not a model of that)
++        raise TypeError("fp8_reference: 8-bit weights never run on the FP8 kernel")
+     if isinstance(q, B16):
+         winv, ws = b16_fp8_scales(q)
+         w8 = (q.weight.float() * winv[:, None]).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float() * ws[:, None]
+diff --git i/src/tensorfold/families/glm5_next/cuda/fastboot.py w/src/tensorfold/families/glm5_next/cuda/fastboot.py
+index 95c6d94..ead2469 100644
+--- i/src/tensorfold/families/glm5_next/cuda/fastboot.py
++++ w/src/tensorfold/families/glm5_next/cuda/fastboot.py
+@@ -18,7 +18,8 @@ bytes, dtype, shape, stride and offset; the dataclasses around them), in one fol
+ 
+ and the next start reads that folder back instead: the same bits by construction (a stored tensor is the built
+ tensor's bytes), with no conversion at all. The key covers everything that decides the bits: the checkpoint (its
+-revision, file names and sizes, config.json), the rank, GLM53_TF_NONEXPERT, torch's version, the device type and
++revision, file names and sizes, config.json), the rank, GLM53_TF_NONEXPERT (patches/0470: with GLM53_TF_NONEXPERT_MAP
++resolved per module class, ``weights.precision_key``), torch's version, the device type and
+ the source of every function and class that builds the weights (``weights.py``, the quantizers, the EXL3 word
+ layout, the split rules, the drafter's reader), so a patch that changes any of them misses the old folder instead of
+ reading stale weights. A folder whose manifest does not match, or that fails to read, is ignored (the checkpoint
+@@ -143,7 +144,10 @@ WEIGHT_CODE = [f"{PKG}.weights", f"{PKG}.split", f"{PKG}.fastboot:FORMAT",
+                f"{PKG}.qmm:Q4", f"{PKG}.qmm:B16", f"{PKG}.qmm:Experts", f"{PKG}.qmm:tile_words", f"{PKG}.qmm:as_i32",
+                f"{PKG}.qmm:make_q4", f"{PKG}.qmm:stack_q4", f"{PKG}.qmm:make_b16", f"{PKG}.qmm:stack_b16",
+                f"{PKG}.qmm:quantize4", f"{PKG}.qmm:_clip_search", f"{PKG}.qmm:make_experts",
+-               f"{PKG}.exl3_mm:words", f"{PKG}.exl3_mm:Exl3Experts"]
++               f"{PKG}.exl3_mm:words", f"{PKG}.exl3_mm:Exl3Experts",
++               # patches/0470: the 8-bit format and its quantizer
++               f"{PKG}.qmm:Q8", f"{PKG}.qmm:Q8_GS", f"{PKG}.qmm:q8_group", f"{PKG}.qmm:q8_scales",
++               f"{PKG}.qmm:quantize8"]
+ DRAFTER_CODE = [f"{PKG}.fastboot:FORMAT", f"{PKG}.dflash2:DraftLayer", f"{PKG}.dflash2:Drafter.read_weights",
+                 f"{PKG}.dflash2:_quantize4", f"{PKG}.qmm:Q4", f"{PKG}.qmm:tile_words", f"{PKG}.qmm:make_q4",
+                 f"{PKG}.qmm:quantize4", f"{PKG}.qmm:_clip_search"]
+@@ -174,7 +178,7 @@ def weights_key(model_dir: str | Path, rank: int, *, device: str = "cuda", extra
+     from . import weights
+ 
+     key = {"format": FORMAT, "what": "weights", "model": model_rev(model_dir), "files": files_ident(model_dir),
+-           "rank": int(rank), "world": 2, "nonexpert": weights.NONEXPERT, "torch": torch.__version__,
++           "rank": int(rank), "world": 2, "nonexpert": weights.precision_key(), "torch": torch.__version__,
+            "device": str(torch.device(device).type), "code": source_digest(WEIGHT_CODE)}
+     key.update(extra or {})
+     return key
+@@ -728,7 +732,8 @@ def prepare(model_dir: Path, rank: int, drafter: Path | None, root: Path, force:
+     d = folder(root, key)
+     if force:
+         shutil.rmtree(d, ignore_errors=True)
+-    print(f"[tensorfold] prepare rank {rank}: {model_dir} (GLM53_TF_NONEXPERT={weights.NONEXPERT}) -> {d}", flush=True)
++    print(f"[tensorfold] prepare rank {rank}: {model_dir} (non-expert weights {weights.precision_key()}) -> {d}",
++          flush=True)
+     mark("prepare start")
+     w = weights.load(model_dir, rank=rank)
+     mark("weights")
+diff --git i/src/tensorfold/families/glm5_next/cuda/fastpf.py w/src/tensorfold/families/glm5_next/cuda/fastpf.py
+index 1f62d23..5986683 100644
+--- i/src/tensorfold/families/glm5_next/cuda/fastpf.py
++++ w/src/tensorfold/families/glm5_next/cuda/fastpf.py
+@@ -207,7 +207,7 @@ def attach_kda_bf16(w) -> int:
+             continue
+         k = layer.kda
+         if getattr(k, "proj16", None) is None:
+-            dq = qmm.dequantize_q4(k.proj)                   # fp32 s * q + b, [n, K]
++            dq = qmm.dequantize_any(k.proj)                  # fp32 s * q + b (patches/0470: any format), [n, K]
+             k.proj16 = qmm.make_b16(dq)                      # rounded once to nearest even
+             del dq
+         k.proj16.tile = kda_bf16_tile()
+diff --git i/src/tensorfold/families/glm5_next/cuda/l2pf.py w/src/tensorfold/families/glm5_next/cuda/l2pf.py
+index 65418c9..175f68e 100644
+--- i/src/tensorfold/families/glm5_next/cuda/l2pf.py
++++ w/src/tensorfold/families/glm5_next/cuda/l2pf.py
+@@ -204,6 +204,9 @@ def take(items: list, budget: int) -> list[Span]:
+                 left -= sum(h.nbytes for h in heads)
+             else:
+                 add(it.weight)
++        elif hasattr(it, "scales") and hasattr(it, "weight"):        # patches/0470: qmm.Q8 (int8 rows, scales)
++            add(it.scales)
++            add(it.weight)
+         elif hasattr(it, "weight"):
+             add(it.weight)
+     return out
+diff --git i/src/tensorfold/families/glm5_next/cuda/latent.py w/src/tensorfold/families/glm5_next/cuda/latent.py
+index a83699d..32c8591 100644
+--- i/src/tensorfold/families/glm5_next/cuda/latent.py
++++ w/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -64,7 +64,7 @@ import triton.language as tl
+ from . import deep as _deep                                     # patches/0380
+ from . import fp8pf, glue, kvpool, profile, qmm, sparse
+ from . import l2pf                                                  # patches/0460
+-from .qmm import B16, Q4
++from .qmm import B16, Q4, Q8
+ 
+ CHUNK = 512              # keys a program visits (the expanded kernel's chunk: the same chunk counts serve both)
+ # rows whose sparse partials are preallocated (decode/verify/MTP windows; captured steps); patches/0380: the widest
+@@ -324,7 +324,12 @@ def _wtile(W, S, B, n0, g, N: tl.constexpr, K: tl.constexpr, IS_Q4: tl.constexpr
+     words [N/64, K/64, 64, 8], scales and biases [K/64, N]) dequantized exactly (s * q + b), or a BF16 tile."""
+ 
+     nl = tl.arange(0, 64)
+-    if IS_Q4:
++    if IS_Q4 == 2:                                    # patches/0470: 8-bit (``qmm.Q8``: int8 [N, K], scales [K/G, N])
++        j = tl.arange(0, 64)
++        q = tl.load(W + (n0 + nl)[:, None].to(tl.int64) * K + (g * 64 + j)[None, :]).to(tl.float32)
++        s = tl.load(S + ((g * 64) // B) * N + n0 + nl).to(tl.float32)
++        return q * s[:, None]
++    elif IS_Q4:
+         KG: tl.constexpr = K // 64
+         tile = W + (n0 // 64) * (KG * 512) + g * 512
+         rw = tl.arange(0, 8)
+@@ -340,12 +345,17 @@ def _wtile(W, S, B, n0, g, N: tl.constexpr, K: tl.constexpr, IS_Q4: tl.constexpr
+         return tl.load(W + (n0 + nl)[:, None].to(tl.int64) * K + (g * 64 + j)[None, :]).to(tl.float32)
+ 
+ 
+-def _parts(q: Q4 | B16):
++def _parts(q: Q4 | Q8 | B16):
++    """(W, S, B, IS_Q4) for the tile loaders: IS_Q4 True 4-bit, False BF16, 2 8-bit (patches/0470: B is then the
++    group size, a plain int; 64-column tiles never straddle a group, G being 64 or 128)."""
++
+     if isinstance(q, Q4):
+         return q.weight, q.scales, q.biases, True
++    if isinstance(q, Q8):
++        return q.weight, q.scales, int(q.gs), 2
+     if isinstance(q, B16):
+         return q.weight, q.weight, q.weight, False
+-    raise TypeError(f"latent KV: kv_b must be a Q4 or B16 matrix, not {type(q).__name__}")
++    raise TypeError(f"latent KV: kv_b must be a Q4, Q8 or B16 matrix, not {type(q).__name__}")
+ 
+ 
+ @triton.jit
+@@ -452,7 +462,12 @@ def _wcols(W, S, B, n0, g, c0, N: tl.constexpr, K: tl.constexpr, IS_Q4: tl.const
+     element ``_wtile``'s value (s * q + b, or the BF16 value)."""
+ 
+     n = n0 + tl.arange(0, BN)
+-    if IS_Q4:
++    if IS_Q4 == 2:                                    # patches/0470
++        j = tl.arange(0, BK)
++        q = tl.load(W + n[:, None].to(tl.int64) * K + (g * 64 + c0 + j)[None, :]).to(tl.float32)
++        s = tl.load(S + ((g * 64 + c0) // B) * N + n).to(tl.float32)
++        return q * s[:, None]
++    elif IS_Q4:
+         KG: tl.constexpr = K // 64
+         rw = tl.arange(0, BK // 8)
+         words = tl.load(W + ((n // 64) * (KG * 512) + g * 512 + (n % 64) * 8 + c0 // 8)[:, None] + rw[None, :])
+@@ -474,7 +489,11 @@ def _wrows(W, S, B, n0, g, N: tl.constexpr, K: tl.constexpr, IS_Q4: tl.constexpr
+ 
+     n = n0 + tl.arange(0, BK)
+     c = tl.arange(0, 64)
+-    if IS_Q4:
++    if IS_Q4 == 2:                                    # patches/0470
++        q = tl.load(W + n[:, None].to(tl.int64) * K + (g * 64 + c)[None, :]).to(tl.float32)
++        s = tl.load(S + ((g * 64) // B) * N + n).to(tl.float32)
++        return q * s[:, None]
++    elif IS_Q4:
+         KG: tl.constexpr = K // 64
+         rw = tl.arange(0, 8)
+         words = tl.load(W + ((n // 64) * (KG * 512) + g * 512 + (n % 64) * 8)[:, None] + rw[None, :])
+@@ -995,8 +1014,8 @@ def expanded_reference(q: torch.Tensor, lat: torch.Tensor, kv_k: Q4 | B16, kv_v:
+     """fp32 reference on the host side of a test: q [R, H, DQ], cache latents lat [T, L]; row r sees rows
+     0 .. limits[r]. Keys/values expanded per head from kv_b (dequantized, fp32) -> head outputs [R, H DV] fp32."""
+ 
+-    wk = qmm.dequantize_q4(kv_k) if isinstance(kv_k, Q4) else kv_k.weight.float()
+-    wv = qmm.dequantize_q4(kv_v) if isinstance(kv_v, Q4) else kv_v.weight.float()
++    wk = qmm.dequantize_any(kv_k)                                                   # patches/0470: Q8 too
++    wv = qmm.dequantize_any(kv_v)
+     R, H, DQ = q.shape
+     DV = wv.shape[0] // H
+     k = (lat.float() @ wk.t()).view(-1, H, DQ)
+diff --git i/src/tensorfold/families/glm5_next/cuda/overlap.py w/src/tensorfold/families/glm5_next/cuda/overlap.py
+index 38b863e..859b701 100644
+--- i/src/tensorfold/families/glm5_next/cuda/overlap.py
++++ w/src/tensorfold/families/glm5_next/cuda/overlap.py
+@@ -98,8 +98,10 @@ def _mat(q) -> list[torch.Tensor]:
+ 
+     if q is None:
+         return []
+-    if hasattr(q, "scales"):                        # qmm.Q4
++    if hasattr(q, "biases"):                        # qmm.Q4
+         return [q.scales, q.biases, q.weight]
++    if hasattr(q, "scales"):                        # qmm.Q8 (patches/0470)
++        return [q.scales, q.weight]
+     return [q.weight]                               # qmm.B16
+ 
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/qmm.py w/src/tensorfold/families/glm5_next/cuda/qmm.py
+index 3f66c00..a212e5a 100644
+--- i/src/tensorfold/families/glm5_next/cuda/qmm.py
++++ w/src/tensorfold/families/glm5_next/cuda/qmm.py
+@@ -350,7 +350,7 @@ V2 = None
+ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out: torch.Tensor | None = None,
+            f32: bool = False, part: torch.Tensor | None = None) -> torch.Tensor:
+     """x (M, K) bf16 (rows may be strided) @ q.T -> (M, N) bf16, or unrounded fp32 sums with ``f32``. ``q``: a
+-    4-bit matrix, or a BF16 one (``xs`` is then unused)."""
++    4-bit matrix, or a BF16 or (patches/0470) 8-bit one (``xs`` is then unused)."""
+ 
+     global FAST_MM
+     if FAST_MM is not None:          # patches/0080; cleared during the call, so it may fall back on this function
+@@ -369,6 +369,8 @@ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out:
+             return done
+     if isinstance(q, B16):
+         return _matmul_b16(x, q, out=out, f32=f32, part=part)
++    if isinstance(q, Q8):                # patches/0470
++        return _matmul_q8(x, q, out=out, f32=f32, part=part)
+     m, k = x.shape
+     if k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
+         raise ValueError(f"matmul: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
+@@ -432,6 +434,201 @@ def _matmul_b16(x: torch.Tensor, q: B16, *, out: torch.Tensor | None, f32: bool,
+     return out
+ 
+ 
++# -- patches/0470: 8-bit non-expert weights (GLM53_TF_NONEXPERT=q8 / GLM53_TF_NONEXPERT_MAP) ---------------------
++# int8, symmetric, one bf16 scale per (output column, group of 128 inputs along K): w ~ s[n, g] * q[n, k], q in
++# -127..127. 8.125 bits a weight (sfxnz's INT8 g128). On GLM-5.3-Flash's own weights (zai-org/GLM-5.3-Flash, 12
++# matrices of every non-expert class, docs/QUALITY-PLAN.md section 1) the relative weight error is 0.65-0.73%
++# (eh_proj 1.9%), against 8.6-9.4% for q4mse; per output channel it is 0.65-1.25% (eh_proj 14.7%: its [embedding |
++# hidden] halves have different scales); a zero-point buys 5-10% less error for 1.5% more bytes and an extra
++# group-sum term. The scale is the smallest bf16 >= amax / 127 (nothing clips); an all-zero group gets scale 1.
++#
++# Arithmetic (every kernel, decode and prefill): for group g (G = 128 inputs; 64 when K is not a multiple of 128)
++#     P[m, n, g] = x[m, g-block] . q[n, g-block]      tensor cores, bf16 x integer-valued bf16 (exact) -> fp32, one
++#                                                     mma chain from zero in 64-input halves (``tl.dot(.., .., P)``)
++#     y[m, n]    = sum over g, in order, of  P[m, n, g] * s[n, g]      (one FMA a group)
++# with the K groups split into ``q8_split_k`` slices fixed by the shape (qmm's slices, so the callers' split-K
++# partial buffers fit) and added in slice order: a row's bits never depend on the row tile or on the other rows, and
++# drafted == serial / batched == alone hold as for Q4. No group sums (xs) are read. The weights are read as int32
++# words (``_q8_unpack``) so Triton streams them with cp.async.
++Q8_GS = 128
++
++
++@dataclass
++class Q8:
++    """An 8-bit matrix [n, k]: weight int8 [n, k] row-major, scales bf16 [k / gs, n] (group-major), gs 128 (64 when
++    k is not a multiple of 128)."""
++
++    weight: torch.Tensor
++    scales: torch.Tensor
++    n: int
++    k: int
++    gs: int = Q8_GS
++
++    def nbytes(self) -> int:
++        return sum(t.numel() * t.element_size() for t in (self.weight, self.scales))
++
++
++def q8_group(k: int) -> int:
++    if k % Q8_GS == 0:
++        return Q8_GS
++    if k % 64 == 0:
++        return 64
++    raise ValueError(f"8-bit weights need K a multiple of 64, not {k}")
++
++
++def q8_scales(amax: torch.Tensor) -> torch.Tensor:
++    """fp32 group amax -> bf16 scales: the smallest bf16 >= amax / 127 (no value clips), 1 for an all-zero group."""
++
++    s32 = amax / 127.0
++    s = s32.to(torch.bfloat16)
++    low = s.float() < s32
++    s = torch.where(low, (s.view(torch.int16) + 1).view(torch.bfloat16), s)      # positive: next bf16 up
++    return torch.where(amax > 0, s, torch.ones_like(s))
++
++
++def quantize8(w: torch.Tensor, chunk: int = 8192) -> Q8:
++    """bf16 (N, K) -> ``Q8``: q = round_half_even(w / s) in -127..127 per group of ``q8_group(K)`` inputs (patches/0470,
++    GLM53_TF_NONEXPERT=q8). Elementwise torch ops only: the same bits on the CPU and the GPU."""
++
++    n, k = w.shape
++    gs = q8_group(k)
++    q = torch.empty((n, k), dtype=torch.int8, device=w.device)
++    scales = torch.empty((n, k // gs), dtype=torch.bfloat16, device=w.device)
++    for r in range(0, n, chunk):
++        g = w[r:r + chunk].to(torch.bfloat16).float().view(-1, k // gs, gs)
++        s = q8_scales(g.abs().amax(-1))
++        q[r:r + chunk] = torch.round(g / s.float()[..., None]).clamp(-127, 127).to(torch.int8).view(-1, k)
++        scales[r:r + chunk] = s
++    return Q8(q.contiguous(), scales.t().contiguous(), n, k, gs)
++
++
++def dequantize_q8(q: Q8) -> torch.Tensor:
++    """Reference: (N, K) fp32 values s * q (exact in fp32: an 8-bit integer times a bf16)."""
++
++    s = q.scales.t().float().repeat_interleave(q.gs, dim=-1)
++    return q.weight.float() * s
++
++
++def dequantize_any(q) -> torch.Tensor:
++    """Any stored non-expert matrix (``Q4`` / ``Q8`` / ``B16``) as (N, K) fp32 values."""
++
++    if isinstance(q, Q8):
++        return dequantize_q8(q)
++    if isinstance(q, B16):
++        return q.weight.float()
++    return dequantize_q4(q)
++
++
++def q8_split_k(n: int, k: int) -> int:
++    """K slices of an 8-bit matmul: ``split_k``'s count for the shape (so a caller's partial buffer sized for 4-bit
++    weights fits), halved while it does not divide the groups. Fixed by the shape, never by the row count."""
++
++    sk = split_k(n, k)
++    groups = k // q8_group(k)
++    while sk > 1 and groups % sk:
++        sk //= 2
++    return sk
++
++
++@triton.jit
++def _q8_unpack(words, BN: tl.constexpr, G: tl.constexpr):
++    """[BN, G/4] int32 words (4 int8 values each, little-endian: byte j is input 4 i + j) -> [BN, G] bf16 (exact:
++    |q| <= 127). The weights are read as int32 words, not bytes: Triton then streams them with cp.async like the
++    4-bit words (int8 tensors got one ld.global.b8 a byte and no pipelining)."""
++
++    sh = 24 - tl.arange(0, 4) * 8
++    q = (words[:, :, None] << sh[None, None, :]) >> 24                                  # sign-extended bytes
++    return tl.reshape(q, (BN, G)).to(tl.bfloat16)
++
++
++@triton.jit
++def _q8mm(X, W, S, OUT, PART, M, x_stride,
++          N: tl.constexpr, K: tl.constexpr, SK: tl.constexpr, BM: tl.constexpr,
++          BLOCK_N: tl.constexpr, G: tl.constexpr, GPI: tl.constexpr, F32: tl.constexpr):
++    """Program (row tile, column tile, K slice): the slice's groups in order, acc += (x . q) * s per group."""
++
++    KG: tl.constexpr = K // G
++    PER: tl.constexpr = KG // SK
++    pid_n = tl.program_id(1)
++    pid_s = tl.program_id(2)
++    rm = tl.program_id(0) * BM + tl.arange(0, BM)
++    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    rk = tl.arange(0, 64)
++    m_ok = rm < M
++    n_ok = rn < N
++    wrow = W + rn[:, None].to(tl.int64) * (K // 4) + tl.arange(0, 16)[None, :]
++    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++    for i in range(PER // GPI):
++        for j in tl.static_range(GPI):
++            g = pid_s * PER + i * GPI + j
++            p = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
++            for h in tl.static_range(G // 64):          # the group's dot in 64-input halves: one k16 mma chain
++                k0 = g * G + h * 64
++                words = tl.load(wrow + k0 // 4, mask=n_ok[:, None], other=0)
++                x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
++                p = tl.dot(x, tl.trans(_q8_unpack(words, BLOCK_N, 64)), p)
++            s = tl.load(S + g * N + rn, mask=n_ok, other=0.0).to(tl.float32)
++            acc = acc + p * s[None, :]
++    out_mask = m_ok[:, None] & n_ok[None, :]
++    if SK == 1:
++        if F32:
++            tl.store(OUT + rm[:, None] * N + rn[None, :], acc, mask=out_mask)
++        else:
++            tl.store(OUT + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16), mask=out_mask)
++    else:
++        tl.store(PART + (pid_s * M + rm[:, None]) * N + rn[None, :], acc, mask=out_mask)
++
++
++# (groups per unrolled step, warps, stages, columns a program) by row bucket for ``_q8mm``: no choice changes bits (a
++# row's sums never see the column tile). Chosen offline so every per-rank shape compiles for sm_121 without spills
++# (tests/test_q8_compile.py; ~168 registers at 16 rows, as the 4-bit kernel's), 8 KB of weights a step, 3 stages in
++# flight at <= 16 rows. Not yet timed on GB10 (docs/QUALITY-PLAN.md); GLM53_TF_Q8_DECODE_CFG=gpi,warps,stages[,bn]
++# overrides the <= 16-row entry (same bits).
++Q8_CONFIG = {16: (1, 4, 3, 64), 32: (1, 8, 2, 64), 64: (1, 8, 2, 32), 128: (1, 8, 2, 32)}
++
++
++def _q8_cfg(bm: int) -> tuple[int, int, int, int]:
++    import os
++
++    v = os.environ.get("GLM53_TF_Q8_DECODE_CFG", "").strip() if bm == 16 else ""
++    if v:
++        t = tuple(int(p) for p in v.split(","))
++        if len(t) == 3:
++            t = t + (BN,)
++        if len(t) != 4 or t[0] not in (1, 2, 4, 8) or t[1] not in (1, 2, 4, 8, 16) or not 1 <= t[2] <= 6 \
++                or t[3] not in (16, 32, 64, 128):
++            raise ValueError(f"GLM53_TF_Q8_DECODE_CFG={v!r}: expected gpi,warps,stages[,columns]")
++        return t
++    return Q8_CONFIG[bm]
++
++
++def _matmul_q8(x: torch.Tensor, q: Q8, *, out: torch.Tensor | None, f32: bool,
++               part: torch.Tensor | None) -> torch.Tensor:
++    m, k = x.shape
++    if k != q.k or x.stride(1) != 1 or x.dtype != torch.bfloat16:
++        raise ValueError(f"matmul: x {tuple(x.shape)} {x.dtype} does not match K={q.k}")
++    bm = bucket(m)
++    c_gpi, warps, stages, bn = _q8_cfg(bm)
++    sk = q8_split_k(q.n, q.k)
++    per = (k // q.gs) // sk
++    if out is None:
++        out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
++    elif out.shape != (m, q.n) or not out.is_contiguous():
++        raise ValueError(f"matmul: out {tuple(out.shape)} must be a contiguous ({m}, {q.n})")
++    if sk > 1:
++        need = sk * m * q.n
++        if part is None or part.numel() < need:
++            part = torch.empty((need,), dtype=torch.float32, device=x.device)
++    grid = (triton.cdiv(m, bm), triton.cdiv(q.n, bn), sk)
++    _q8mm[grid](x, q.weight.view(torch.int32), q.scales, out, part if sk > 1 else out, m, x.stride(0), N=q.n, K=k,
++                SK=sk, BM=bm, BLOCK_N=bn, G=q.gs, GPI=gpi_for(per, c_gpi), F32=f32, num_warps=warps,
++                num_stages=stages)
++    if sk > 1:
++        total = m * q.n
++        _reduce[(triton.cdiv(total, 1024),)](part, out, total, SK=sk, BLOCK=1024, F32=f32, num_warps=4)
++    return out
++
++
+ # -- experts ---------------------------------------------------------------------------------------------
+ @dataclass
+ class Experts:
+diff --git i/src/tensorfold/families/glm5_next/cuda/weights.py w/src/tensorfold/families/glm5_next/cuda/weights.py
+index 242be86..52583f2 100644
+--- i/src/tensorfold/families/glm5_next/cuda/weights.py
++++ w/src/tensorfold/families/glm5_next/cuda/weights.py
+@@ -27,7 +27,8 @@ from typing import Any
+ import torch
+ 
+ from .exl3_mm import Exl3Experts, words as exl3_words
+-from .qmm import B16, Experts, Q4, as_i32, make_b16, make_experts, make_q4, quantize4, stack_b16, stack_q4
++from .qmm import (B16, Experts, Q4, Q8, as_i32, make_b16, make_experts, make_q4, quantize4, quantize8, stack_b16,
++                  stack_q4)
+ 
+ import os
+ 
+@@ -37,17 +38,134 @@ import os
+ # as stored. "q4mse" searches each group's clip range for the smallest squared error (same format, same speed).
+ # "bf16" (default) is upstream's behaviour. Drafted replies stay byte-identical to serial ones either way:
+ # drafting and verification read the same weights.
+-NONEXPERT = os.environ.get("GLM53_TF_NONEXPERT", "bf16").strip().lower()
+-if NONEXPERT not in ("bf16", "q4", "q4mse"):
+-    raise ValueError(f"GLM53_TF_NONEXPERT must be bf16, q4 or q4mse, not {NONEXPERT!r}")
++# patches/0470: "q8" stores them in 8 bits (``qmm.Q8``: int8, symmetric, a bf16 scale per 128 inputs; 8.125 bits a
++# weight), and GLM53_TF_NONEXPERT_MAP picks the format per module class, e.g.
++#     GLM53_TF_NONEXPERT=q4mse GLM53_TF_NONEXPERT_MAP=o_proj=q8,down=q8,lm_head=bf16
++# (the output side of every block at 8 bits, the head in BF16, the rest q4mse). Keys: a class (CLASSES), a group of
++# classes (GROUPS), ``default``, each optionally prefixed ``mtp.`` to apply to the MTP layer only (its DSA, indexer,
++# shared expert and eh_proj). The most specific key wins: mtp.<class>, <class>, mtp.<group>, <group>, mtp.default,
++# default, then GLM53_TF_NONEXPERT; two groups at one level that disagree on a class are an error. The prepared
++# folders (patches/0140) are keyed by the resolved table (``precision_key``).
++MODES = ("bf16", "q4", "q4mse", "q8")
++CLASSES = ("kda_proj", "kda_fb", "kda_gb", "kda_out", "dsa_proj", "dsa_qb", "dsa_kvb", "dsa_out", "idx_proj",
++           "idx_qb", "dense_gu", "dense_down", "shared_gu", "shared_down", "mtp_eh", "lm_head")
++# the classes the MTP layer (DSA + MoE, plain residual) has
++MTP_CLASSES = ("dsa_proj", "dsa_qb", "dsa_kvb", "dsa_out", "idx_proj", "idx_qb", "shared_gu", "shared_down", "mtp_eh")
++GROUPS: dict[str, tuple[str, ...]] = {
++    "o_proj": ("kda_out", "dsa_out"),
++    "down": ("dense_down", "shared_down"),
++    "out": ("kda_out", "dsa_out", "dense_down", "shared_down", "lm_head"),      # every block's output side + head
++    "kda": ("kda_proj", "kda_fb", "kda_gb", "kda_out"),
++    "dsa": ("dsa_proj", "dsa_qb", "dsa_kvb", "dsa_out"),
++    "indexer": ("idx_proj", "idx_qb"),
++    "attn": ("kda_proj", "kda_fb", "kda_gb", "kda_out", "dsa_proj", "dsa_qb", "dsa_kvb", "dsa_out", "idx_proj",
++             "idx_qb"),
++    "dense": ("dense_gu", "dense_down"),
++    "shared": ("shared_gu", "shared_down"),
++    "mlp": ("dense_gu", "dense_down", "shared_gu", "shared_down"),
++    "kv_b": ("dsa_kvb",),
++    "head": ("lm_head",),
++}
+ 
+ 
+-def nonexpert(w: torch.Tensor) -> Q4 | B16:
+-    """A non-expert BF16 weight of an EXL3 checkpoint, stored as GLM53_TF_NONEXPERT asks."""
++def _mode(v: str, what: str) -> str:
++    v = v.strip().lower()
++    if v not in MODES:
++        raise ValueError(f"{what} must be one of {', '.join(MODES)}, not {v!r}")
++    return v
+ 
+-    if NONEXPERT == "bf16":
++
++def parse_map(text: str) -> dict[str, str]:
++    """GLM53_TF_NONEXPERT_MAP -> {key: mode} (keys as written, validated; ``,`` or ``;`` between entries)."""
++
++    out: dict[str, str] = {}
++    for part in text.replace(";", ",").split(","):
++        part = part.strip()
++        if not part:
++            continue
++        key, eq, val = part.partition("=")
++        key = key.strip().lower()
++        if not eq:
++            raise ValueError(f"GLM53_TF_NONEXPERT_MAP: {part!r} is not key=mode")
++        base = key[4:] if key.startswith("mtp.") else key
++        if base != "default" and base not in CLASSES and base not in GROUPS:
++            raise ValueError(f"GLM53_TF_NONEXPERT_MAP: unknown key {key!r} (classes: {', '.join(CLASSES)}; groups: "
++                             f"{', '.join(GROUPS)}; default; each optionally mtp.-prefixed)")
++        if key.startswith("mtp.") and base in CLASSES and base not in MTP_CLASSES:
++            raise ValueError(f"GLM53_TF_NONEXPERT_MAP: the MTP layer has no {base!r}")
++        if key in out:
++            raise ValueError(f"GLM53_TF_NONEXPERT_MAP: {key!r} given twice")
++        out[key] = _mode(val, f"GLM53_TF_NONEXPERT_MAP {key}")
++    # two groups at one level must agree on every class they share that is not named alone at that level
++    for pre in ("", "mtp."):
++        for c in CLASSES:
++            if pre + c in out:
++                continue
++            got = {out[pre + g] for g, members in GROUPS.items() if c in members and pre + g in out}
++            if len(got) > 1:
++                raise ValueError(f"GLM53_TF_NONEXPERT_MAP: groups disagree on {pre}{c} ({sorted(got)}); name it alone")
++    return out
++
++
++NONEXPERT = _mode(os.environ.get("GLM53_TF_NONEXPERT", "bf16"), "GLM53_TF_NONEXPERT")
++NONEXPERT_MAP: dict[str, str] = parse_map(os.environ.get("GLM53_TF_NONEXPERT_MAP", ""))
++
++
++def precision(cls: str = "", mtp: bool = False) -> str:
++    """The stored format of a module class (``CLASSES``; "" = GLM53_TF_NONEXPERT), in the MTP layer with ``mtp``."""
++
++    if cls and cls not in CLASSES:
++        raise KeyError(f"unknown non-expert class {cls!r}")
++    m = NONEXPERT_MAP
++    if not m or not cls:
++        return NONEXPERT
++    order = []
++    if mtp:
++        order.append("mtp." + cls)
++    order.append(cls)
++    groups = [g for g, members in GROUPS.items() if cls in members]
++    if mtp:
++        order += ["mtp." + g for g in groups]
++    order += groups
++    if mtp:
++        order.append("mtp.default")
++    order.append("default")
++    for key in order:
++        if key in m:
++            return m[key]
++    return NONEXPERT
++
++
++def precision_table() -> dict[str, str]:
++    """Every (scope, class) the model has -> its format: ``<class>`` for the 45 layers and the head, ``mtp.<class>``
++    for the MTP layer."""
++
++    t = {c: precision(c) for c in CLASSES if c != "mtp_eh"}
++    t.update({"mtp." + c: precision(c, mtp=True) for c in MTP_CLASSES})
++    return t
++
++
++def precision_key() -> str:
++    """What decides the stored non-expert bits: GLM53_TF_NONEXPERT when every class resolves to it (so a MAP that
++    changes nothing keys the same prepared folders), else the whole resolved table."""
++
++    t = precision_table()
++    modes = set(t.values())
++    if len(modes) == 1:
++        return modes.pop()
++    return "map:" + ",".join(f"{k}={v}" for k, v in sorted(t.items()))
++
++
++def nonexpert(w: torch.Tensor, cls: str = "", mtp: bool = False) -> Q4 | Q8 | B16:
++    """A non-expert BF16 weight of an EXL3 checkpoint, stored as GLM53_TF_NONEXPERT (and, patches/0470,
++    GLM53_TF_NONEXPERT_MAP for its class ``cls``) asks."""
++
++    mode = precision(cls, mtp)
++    if mode == "bf16":
+         return make_b16(w)
+-    return quantize4(w.to(torch.bfloat16), mse=NONEXPERT == "q4mse")
++    if mode == "q8":
++        return quantize8(w.to(torch.bfloat16))
++    return quantize4(w.to(torch.bfloat16), mse=mode == "q4mse")
+ 
+ PREFIX = "model.language_model."
+ 
+@@ -255,7 +373,7 @@ class Weights:
+             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
+                 seen.add(t.data_ptr())
+                 total += t.numel() * t.element_size()
+-            elif isinstance(t, (Q4, B16, Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
++            elif isinstance(t, (Q4, Q8, B16, Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
+                 for v in vars(t).values():
+                     add(v)
+             elif isinstance(t, (list, tuple)):
+@@ -314,12 +432,14 @@ def load_checkpoint(model_dir: str | Path, *, rank: int, device: str = "cuda") -
+     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
+ 
+-    def q4(name: str) -> Q4 | B16:
+-        return nonexpert(t(name + ".weight")) if exl3 else make_q4(*trip(name))
++    scope = {"mtp": False}               # patches/0470: building the MTP layer (GLM53_TF_NONEXPERT_MAP's mtp. keys)
+ 
+-    def stack(names: list[str]) -> Q4 | B16:
++    def q4(name: str, cls: str) -> Q4 | Q8 | B16:
++        return nonexpert(t(name + ".weight"), cls, scope["mtp"]) if exl3 else make_q4(*trip(name))
++
++    def stack(names: list[str], cls: str) -> Q4 | Q8 | B16:
+         if exl3:
+-            return nonexpert(torch.cat([t(n + ".weight").to(torch.bfloat16) for n in names]))
++            return nonexpert(torch.cat([t(n + ".weight").to(torch.bfloat16) for n in names]), cls, scope["mtp"])
+         return stack_q4([trip(n) for n in names])
+ 
+     def hc(i: int, site: str) -> HCW:
+@@ -328,33 +448,36 @@ def load_checkpoint(model_dir: str | Path, *, rank: int, device: str = "cuda") -
+ 
+     def kda(i: int) -> KDAW:
+         p = f"layers.{i}.self_attn."
+-        proj = stack([p + "q_proj", p + "k_proj", p + "v_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"])
++        proj = stack([p + "q_proj", p + "k_proj", p + "v_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"],
++                     "kda_proj")
+         conv = torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]).reshape(3 * LL * 128, cfg.conv).contiguous()
+-        return KDAW(proj, q4(p + "f_b_proj"), q4(p + "g_b_proj"), conv, t(p + "A_log", torch.float32).contiguous(),
+-                    t(p + "dt_bias", torch.float32).contiguous(), t(p + "o_norm.weight"), q4(p + "o_proj"), LL)
++        return KDAW(proj, q4(p + "f_b_proj", "kda_fb"), q4(p + "g_b_proj", "kda_gb"), conv,
++                    t(p + "A_log", torch.float32).contiguous(), t(p + "dt_bias", torch.float32).contiguous(),
++                    t(p + "o_norm.weight"), q4(p + "o_proj", "kda_out"), LL)
+ 
+     def dsa(i: int) -> DSAW:
+         p = f"layers.{i}.self_attn."
+-        proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"])
++        proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"], "dsa_proj")
+         rows = torch.arange(HL * 512, device=dev).view(HL, 512)
+         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
+         if exl3:
+             w = t(p + "kv_b_proj.weight")
+-            kv_k, kv_v = nonexpert(w[krows]), nonexpert(w[vrows])
++            kv_k, kv_v = nonexpert(w[krows], "dsa_kvb", scope["mtp"]), nonexpert(w[vrows], "dsa_kvb", scope["mtp"])
+         else:
+             w, s, b = trip(p + "kv_b_proj")
+             kv_k = make_q4(w[krows], s[krows], b[krows])
+             kv_v = make_q4(w[vrows], s[vrows], b[vrows])
+-        ix = IndexW(stack([p + "indexer.wk", p + "indexer.weights_proj"]), q4(p + "indexer.wq_b"),
++        ix = IndexW(stack([p + "indexer.wk", p + "indexer.weights_proj"], "idx_proj"),
++                    q4(p + "indexer.wq_b", "idx_qb"),
+                     t(p + "indexer.k_norm.weight"), t(p + "indexer.k_norm.bias"),
+                     t(p + "indexer.index_kpool_compress_gate", torch.bfloat16).contiguous(),
+                     t(p + "indexer.index_kpool_compress_ape", torch.bfloat16).contiguous())
+-        return DSAW(proj, t(p + "q_a_layernorm.weight"), t(p + "kv_a_layernorm.weight"), q4(p + "q_b_proj"),
+-                    kv_k, kv_v, q4(p + "o_proj"), HL, ix)
++        return DSAW(proj, t(p + "q_a_layernorm.weight"), t(p + "kv_a_layernorm.weight"), q4(p + "q_b_proj", "dsa_qb"),
++                    kv_k, kv_v, q4(p + "o_proj", "dsa_out"), HL, ix)
+ 
+-    def mlp(p: str) -> MLPW:
+-        gu = stack([p + "gate_proj", p + "up_proj"])
+-        return MLPW(gu, q4(p + "down_proj"), gu.n // 2)
++    def mlp(p: str, kind: str) -> MLPW:
++        gu = stack([p + "gate_proj", p + "up_proj"], kind + "_gu")
++        return MLPW(gu, q4(p + "down_proj", kind + "_down"), gu.n // 2)
+ 
+     def moe_exl3(p: str) -> Exl3Experts:
+         parts = {}
+@@ -375,7 +498,7 @@ def load_checkpoint(model_dir: str | Path, *, rank: int, device: str = "cuda") -
+         router = t(p + "gate.weight", torch.bfloat16).contiguous()
+         bias = t(p + "gate.e_score_correction_bias", torch.float32).contiguous()
+         if exl3:
+-            return MoEW(router, bias, moe_exl3(p), mlp(p + "shared_experts."))
++            return MoEW(router, bias, moe_exl3(p), mlp(p + "shared_experts.", "shared"))
+         parts = {}
+         for proj in ("gate_proj", "up_proj", "down_proj"):
+             ws, ss, bs = [], [], []
+@@ -401,7 +524,7 @@ def load_checkpoint(model_dir: str | Path, *, rank: int, device: str = "cuda") -
+         else:
+             lw.dsa = dsa(i)
+         if mk == "dense":
+-            lw.mlp = mlp(f"layers.{i}.mlp.")
++            lw.mlp = mlp(f"layers.{i}.mlp.", "dense")
+         else:
+             lw.moe = moe(i)
+         torch.cuda.empty_cache()
+@@ -418,9 +541,10 @@ def load_checkpoint(model_dir: str | Path, *, rank: int, device: str = "cuda") -
+     draft_head = None
+     if exl3:
+         hw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
+-        head = nonexpert(hw)
+-        # MTP and DFlash2 steps read 0.18 GB a rank instead of 0.63; a 4-bit head already is that copy
+-        draft_head = quantize4(hw.to(torch.bfloat16)) if isinstance(head, B16) else None
++        head = nonexpert(hw, "lm_head")
++        # MTP and DFlash2 steps read 0.18 GB a rank instead of 0.63; a 4-bit head already is that copy (patches/0470:
++        # an 8-bit head, 0.32 GB, gets the same 4-bit draft copy as a BF16 one)
++        draft_head = quantize4(hw.to(torch.bfloat16)) if not isinstance(head, Q4) else None
+         del hw
+     else:
+         hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
+@@ -429,8 +553,10 @@ def load_checkpoint(model_dir: str | Path, *, rank: int, device: str = "cuda") -
+     mtpw = None
+     if cfg.mtp_layers:
+         i = cfg.layers
+-        mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
++        scope["mtp"] = True
++        mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj", "mtp_eh"),
+                     t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
++        scope["mtp"] = False
+     w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
+     w.meta.update(layers=which)
+     torch.cuda.empty_cache()

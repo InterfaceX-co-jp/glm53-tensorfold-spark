@@ -1,6 +1,6 @@
 # Decode plan: how a +40% decode target decomposes on 2x DGX Spark (2026-09-29)
 
-> Research and arithmetic only. No GPU was used and the Sparks were not touched. Inputs:
+> First version: research and arithmetic only (no GPU; the Sparks not touched). Inputs:
 >
 > - This repo's docs: ROOFLINE §2 (decode rounds and floors), PROFILE §5, RESULTS W7-W10, RESEARCH-NIGHT,
 >   ADAPTIVE-DRAFT, DEEP-VERIFY, DECODE-OVERLAP, DECODE-ANALYSIS, COMM-ANALYSIS, EXPERIMENTS, PATCHES and
@@ -11,86 +11,108 @@
 > "Exact" means drafted == serial, batched == alone and resumed == fresh all still hold, with the same EXL3 4-bit
 > weights. Every gain below is **derived from the measured round decomposition**, not measured itself. Section 5
 > lists the measurements that would turn the estimates into numbers.
+>
+> **W11 update (2026-09-29, `docs/RESULTS.md` W11, `results/W11/`):** step 1 of section 5 (nsys of today's production,
+> a bandwidth / launch probe, ncu, the 4-stream graph policy, acceptance on real content) is done. Sections 0, 1, 3.1
+> and 4 now start from the **measured** round; every estimate that moved is marked **[W11]** with its old value.
+>
+> **W12 update (2026-09-29, `docs/RESULTS.md` W12, `results/W12/`):** the first engineering patches were measured on the
+> model (image b5, three same-window controls equal to production b4). Paid: **E3 L2 prefetch (0460 at 8 MiB a site)
+> +2.4% 1 stream / +1.2% 4 streams** and **F0's gentle form (`CAPTURE_AFTER=8`) +2.0% at 4 streams**; together, in
+> production since W12: **+2.5% 1 stream, +2.8% 4 streams**, every exactness gate equal. Did not pay: **E1 / E2 as built
+> (0440)**: E1's streaming ring reaches only ~160 GB/s (old kernel 201-218), E2 loses the large shapes, -3.9% end to
+> end; **E6 / F3-KDA (0450)** exact but -2.3% 1 stream, +0.5-1.2% 4 streams; **E8's RoCE knobs** inside bench noise;
+> **F0 as `BATCH_GRAPHS=0`** +1.9% but lone requests in slots 1-3 -3%. Rows below carry **[W12]** marks.
 
 ## 0. Bottom line
 
 - **+40% is reachable on paper, but only by stacking two independent families, each at its middle estimate:**
-  - Engineering takes ms off each round: about +23% single-stream and +28% at 4 streams.
-  - Better drafters commit more tokens a round: about +13% single-stream and +14% at 4 streams on their own.
-  - Neither family reaches +40% alone. Engineering alone would need the round at ~39 ms against a 37.8 ms floor.
-    A drafter alone would need prose rounds to commit ~3.5 tokens instead of 2.4, a jump no published recipe gives
-    on a model that is already MTP- and DFlash2-drafted.
-- **Middle-case stack:**
+  - Engineering takes ms off each round: about +25% single-stream and +26% at 4 streams **[W11: was +23% / +28%]**.
+  - Better drafters commit more tokens a round: about +12% single-stream and +14% at 4 streams on their own.
+  - Neither family reaches +40% alone. Engineering alone would need the round at ~38 ms against a 37.2 ms floor
+    (W11: 235 GB/s measured ceiling). A drafter alone would need prose rounds to commit ~3.4 tokens instead of 2.4, a
+    jump no published recipe gives on a model that is already MTP- and DFlash2-drafted.
+- **Middle-case stack** (today = W11's measured, uncaptured rounds):
 
-| workload | today (est.) | engineering only | drafters only | both | honest range, both (low / high) |
+| workload | today (W11, measured) | engineering only | drafters only | both | honest range, both (low / high) |
 | --- | ---: | ---: | ---: | ---: | --- |
-| 1 stream, prose (2.4 tokens a round) | 54.4 ms a round, **44 tok/s** | 44.4 ms, 54 tok/s (+23%) | 50 tok/s (+13%) | **61 tok/s (+38%)** | +19% / +64% |
-| 1 stream, code / structured (5.7 tokens a round) | ~70 ms, ~82 tok/s | +15-22% | +8-15% (block-16 drafter) | +25-40% | |
-| 4 streams, aggregate | 119 ms, 9.1 tokens a round, **76.5 tok/s** | 93 ms (+28%) | +14% | **110 tok/s (+44%)** | +19% / +76% |
+| 1 stream, prose (2.42 tokens a round) | 53.3 ms a round, **45.4 tok/s** [est. 54.4, 44] | 42.8 ms, 56.5 tok/s (+25%) | 50.8 tok/s (+12%) | **62.6 tok/s (+38%)** | +18% / +64% |
+| 1 stream, code / structured (4.16 tokens a round on the LRU module; 5.7 on the canary) | 63.6 ms, 65 tok/s [est. ~70 ms, ~82] | +15-22% | +8-15% (block-16 drafter) | +25-40% | |
+| 4 streams, aggregate | 121.3 ms, 9.1 tokens a round, **75.0 tok/s** (77.9-78.4 on multiturn's prompts) [est. 119, 76.5] | 96 ms (+26%) | +14% | **107 tok/s (+42%)** | +20% / +60% |
 
-  The high ends are bounds: they put the round at 97-100% of the bandwidth floor, which nothing on GB10 reaches.
-  The realistic reading: **+25-40% single-stream prose and +30-45% at 4 streams.** +40% single-stream needs every
-  engineering item at its middle estimate *and* a self-distilled drafter.
+  The high ends are bounds: they put the round at the bandwidth floor, which nothing on GB10 reaches. The realistic
+  reading: **+25-40% single-stream prose and +25-42% at 4 streams.** +40% single-stream needs every engineering item at
+  its middle estimate *and* a self-distilled drafter. **[W11]** The 4-stream case got harder: in situ its expert reads
+  already run at 208-220 GB/s (the W7 figure was 193), so F1 has less room; F0 (graphs off) is now a measured +2.2-2.6%.
 - **The three largest single items, in order:**
   1. **Drafters trained on the abliterated target's own outputs.** Two parts:
      - T1: MTP self-distillation, FastMTP recipe, days.
      - T2: a block-drafter re-fit, one to two weeks.
 
      Worth +7-19% single-stream alone and the multiplier on everything else. Our stock MTP acceptance
-     (0.74 / 0.45 / 0.22) is the same as vLLM's on GLM-5.3-Flash (0.70 / 0.45 / 0.26), which is exactly the
+     (0.74 / 0.45 / 0.22; **[W11] measured on our prose, 4 drafts untruncated: 0.72 / 0.43 / 0.22 / 0.10**) is the same as vLLM's on GLM-5.3-Flash (0.70 / 0.45 / 0.26), which is exactly the
      weak-deep-position profile FastMTP and Red Hat lift. DFlash2 reads target taps that the abliteration shifted
      (a sibling abliteration measured cosine 0.926 at L42).
-  2. **Routed-expert and dense decode kernels from 190-193 to ~215 GB/s** (E1 + E2): -4.6 ms of a 54 ms round,
-     -11 ms of a 119 ms 4-stream round. The same GB10 reaches 224-233 GB/s on a plain GEMV and 231 GB/s end to end
-     on a dense NVFP4 model in SGLang, so ~215 on EXL3 grouped reads is plausible, not proven.
+  2. **Routed-expert and dense decode kernels** (E1 + E2): experts 205-214 GB/s and dense q4 **175 GB/s** in situ
+     against a measured **235 / 230.5 GB/s** plain-read ceiling for the same bytes **[W11]**: -5.7 ms of a 53 ms round
+     (was -4.6), -9 ms of a 121 ms 4-stream round (was -11). ncu: both kernels are latency-bound streamers at 25-33%
+     occupancy, so the lever is loads in flight, not arithmetic.
   3. **The per-slot fixed cost at 4 streams (F3):** 6.6 ms a slot, measured in W9. Fused multi-slot
-     KDA / attention / indexer / commit launches are worth -9 ms a 4-stream round.
+     KDA / attention / indexer / commit launches are worth -9 ms a 4-stream round (**[W11] -6 ms mid**: the 4-stream
+     small-kernel families total 15.4 ms against a ~4.9 ms floor).
 - **First steps for the next session**, each small and each deciding a larger item (§5):
-  - one nsys + ncu capture of today's production (b4 + FIN knobs);
+  - ~~one nsys + ncu capture of today's production (b4 + FIN knobs)~~ **done (W11)**;
   - the draft-head vocabulary trim (E7), a 2-3 day exact patch;
-  - the MTP self-distillation data and reference path (T1), days 1-2;
-  - a roof-probe microbench for the expert and q4 GEMV kernels (E1 / E2 go / no-go);
-  - `GLM53_TF_BATCH_GRAPHS=0` or a higher `CAPTURE_AFTER` at 4 streams (config only).
+  - the MTP self-distillation data and reference path (T1), days 1-2 (W11's acceptance table is its baseline);
+  - ~~a roof-probe microbench for the expert and q4 GEMV kernels~~ **done (W11): go for both, E2 first**;
+  - ~~`GLM53_TF_BATCH_GRAPHS=0` or a higher `CAPTURE_AFTER` at 4 streams~~ **measured (W11): +2.6% / +2.2%, exact**;
+    **[W12] adopted as `CAPTURE_AFTER=8` (+2.0%, lone requests unchanged); `BATCH_GRAPHS=0` makes a lone request in
+    slots 1-3 run eager and lose ~3%.**
 
-## 1. Today's decode round, reconstructed after W10
+## 1. Today's decode round, measured (W11)
 
-W7's trace (ROOFLINE §2.2) predates RoCE (W9), 0370 overlap and 0390 (W10). The table below applies each change's
-measured or bounded delta to W7's kernel families, then the capture correction (x 0.98). **It is a reconstruction;
-§5 step 1 replaces it with a measurement.**
+W7's trace (ROOFLINE §2.2) predates RoCE (W9), 0370 overlap and 0390 (W10). Until W11 this section applied each
+change's delta to W7's kernel families (the "est." column). **W11 measured it** (`docs/RESULTS.md` W11 §2; nsys on both
+ranks, rank 0 shown, the ranks agree within 0.02 ms; captured rounds, +2% over uncaptured):
 
-| 1 stream, prose (2.4 tokens, mean window 3.7 rows) | W7 ms | change since | now (est.) ms | floor ms (230 GB/s) |
-| --- | ---: | --- | ---: | ---: |
-| routed experts (`grouped_kernel` + epilogues; 5.09 GB, 193 GB/s) | 26.43 | - | 25.9 | 22.1 |
-| dense q4 GEMMs (`_qmm`; ~3.1 GB, 190 GB/s) | 16.29 | - | 16.0 | 13.5 |
-| exchanges (100 a round) | 4.77 | RoCE: W9 rounds 3-5 ms shorter | ~1.7 | 0.2-0.5 |
-| GPU idle inside the round | 4.65 | 0370: -0.6..-1.1 ms | ~3.8 | 0 |
-| DSA attention + indexer | 2.60 | 0390: expand 114 -> 68 us a call | ~2.1 | 0.2 |
-| hc + router / combine | 2.76 | - | 2.7 | 0.74 |
-| KDA chain / conv / replay | 1.60 | - | 1.6 | 0.65 |
-| other + gap between rounds | 0.68 | 0370 `plan`: gap 0.9 -> ~0.3 | 0.7 | 0.1 |
-| **round** | **59.5** (capture) | | **54.4 = 44 tok/s** | **37.8** |
+| 1 stream, prose (2.42 tokens, mean window 3.5 rows) | W7 ms | est. (W10) ms | **W11 measured ms** | floor ms (W11 ceilings) |
+| --- | ---: | ---: | ---: | ---: |
+| routed experts (`grouped_kernel` + epilogues; 5.47 GB at **205 GB/s**, U = 20 a verify layer) | 26.43 | 25.9 | **27.8** | 23.3 (235 GB/s) |
+| dense q4 GEMVs (`_qmm` + `_reduce` + `_swiglu`; 2.75 GB at **175 GB/s**) | 16.29 | 16.0 | **16.1** | 11.9 (230.5 GB/s) |
+| exchanges exposed (100 RoCE all-gathers, 14.5 us median, 23 us mean; 2 NCCL control) | 4.77 | ~1.7 | **2.3** | 0.3 |
+| GPU idle inside the round (1.1 of it inside the verify forward) | 4.65 | ~3.8 | **1.8** | 0 |
+| DSA attention + indexer | 2.60 | ~2.1 | **2.1** | 0.2 |
+| hc + router / combine | 2.76 | 2.7 | **2.6** | 0.74 |
+| KDA chain / conv / replay | 1.60 | 1.6 | **1.6** | 0.65 |
+| other + gap between rounds | 0.68 | 0.7 | **0.3 + 0.00** | 0.1 |
+| **round** | **59.5** (capture) | **54.4** | **54.6 captured, 53.3 uncaptured = 45.4 tok/s** | **37.2** (68% of the round) |
 
-Cross-checks:
+What the reconstruction got wrong **[W11]**: the idle and the gap between rounds (0370 made rounds back to back and
+left 1.8 ms idle, not 3.8), the exchanges (2.3 ms, not 1.7: the mean RoCE exchange is 23 us because of peer-wait skew),
+and the dense GEMVs' speed (175 GB/s, not 190; the right total came from W7's time, not its bandwidth). By phase: the
+verify forward launches 48.0 ms of kernels, drafting 4.3, sampling 0.1. A verify row costs **~6.4 ms** (windows of 2 / 3
+/ 4 / 5 / 8 rows: 44.5 / 51.2 / 57.8 / 64.6 / 82.7 ms). Code (LRU module, 4.16 tokens, 5.1 rows): 63.6 ms uncaptured,
+experts 36.8, dense 16.5.
 
-- W10's 1-stream medians are 52-53 tok/s over a prompt mix: prose reps 43-52, code / sequence reps 71-97.
-- The task's "prose rounds ~2.4 tokens, ~55 ms" matches.
+**What +40% means in ms.** At constant tokens a round, +40% needs the round at 53.3 / 1.4 = **38.1 ms, i.e. at 98% of
+the 37.2 ms floor.** That is not available: our best rounds run at 68-73% of their floor today, and the best published
+decode kernels anywhere run at ~78-85% of DRAM peak (Hazy's megakernel 78% on H100; SGLang 85% on GB10, dense). So +40%
+on prose has to be split between ms a round and tokens a round.
 
-**What +40% means in ms.** At constant tokens a round, +40% needs the round at 54.4 / 1.4 = **38.9 ms, i.e. at 97%
-of the 37.8 ms floor.** That is not available: our best rounds (canary) run at 72-82% of their floor, and the best
-published decode kernels anywhere run at ~78-85% of DRAM peak (Hazy's megakernel 78% on H100; SGLang 85% on GB10,
-dense). So +40% on prose has to be split between ms a round and tokens a round.
-
-4 streams (ROOFLINE §2.3; W7 125.5 ms under capture, minus ~3 ms RoCE and ~1 ms overlap): **~119 ms, ~9.1 tokens a
-round, 76.5 tok/s** (W10 FIN median 78.1). The floor is 79.5 ms: routed experts 13.81 GB = 60 ms, dense 14.6 ms,
-the rest ~5 ms.
+4 streams (W11: 162 rounds with 4 in flight): **121.3 ms uncaptured (122.0 captured), 9.1 tokens a round, 75.0 tok/s**
+[est. ~119 ms, 76.5]. Experts 75.5 ms (16.1 GB at 220 GB/s by the kbench fit, U = 60 a verify layer; 15.2 GB at 208 by
+W7's R = 1 method), dense 21.7 (3.5 GB at 169 GB/s; the head runs 4.9 times a round), exchanges 4.2 exposed (115, 20.5 us
+median, 36 us mean), KDA 6.0, attention 4.8, hc + router 3.4, other 1.2, idle 5.1. 8 of 162 rounds replayed a graph (a
+fresh server). The floor is **89.0 ms** (73% of the round; W7's 79.5 used U = 51): experts 68.5, dense 15.2, the rest
+~5.
 
 ## 2. What others reach (calibration)
 
 | claim | number | relevance here |
 | --- | --- | --- |
 | GLM-5.3-Flash on 2 Sparks, other kits | MiaAI EXL3 + DFlash2: ~37 tok/s prose, 62.9 structured. vLLM NVFP4 + MTP-3 over RoCE: 20-23 tok/s, MTP per-position acceptance **0.70 / 0.45 / 0.26** | We lead single-stream by 1.2-2x. Our MTP (0.74 / 0.45 / 0.22) is the stock head's ceiling everywhere: nobody has a better one for this model yet |
-| Attainable GB10 bandwidth | GEMV microbench **224-233 GB/s** (82-85% of 273) in the fast state, 66-80 in the hidden slow state. Qwen3.8-27B NVFP4 end to end in SGLang: 18.77 GB a token at 12.32 tok/s = **231 GB/s** | Our big decode kernels run at 190-207. A whole-model 231 GB/s on GB10 shows ~215-225 is not a fantasy for large GEMVs |
-| MoE decode kernels | MonoMoE (weight-major persistent MoE, FlashInfer): vLLM's Triton fused_moe reaches only 10.6 / 19.4 / 30.8 / 45.1% of H200 peak at batch 1 / 2 / 4 / 8; MonoMoE 21-58%; kernel 1.02-1.54x | Our EXL3 grouped kernel is already at 83-84% of attainable. The weight-major idea helps at 4 streams (U ≈ 51 experts a layer, few rows each); expect +5-15% on the kernel, not 1.5x |
+| Attainable GB10 bandwidth | GEMV microbench **224-233 GB/s** (82-85% of 273) in the fast state, 66-80 in the hidden slow state. Qwen3.8-27B NVFP4 end to end in SGLang: 18.77 GB a token at 12.32 tok/s = **231 GB/s** | Our big decode kernels run at 190-207. A whole-model 231 GB/s on GB10 shows ~215-225 is not a fantasy for large GEMVs. **[W11] Measured here: a plain streaming read of one round's expert volumes 235-237 GB/s (gathered = contiguous), the verify's dense set 230.5, copy 216-220; one launch needs ~8 MB for 219 and ~16 MB for 229** |
+| MoE decode kernels | MonoMoE (weight-major persistent MoE, FlashInfer): vLLM's Triton fused_moe reaches only 10.6 / 19.4 / 30.8 / 45.1% of H200 peak at batch 1 / 2 / 4 / 8; MonoMoE 21-58%; kernel 1.02-1.54x | Our EXL3 grouped kernel is already at 83-84% of attainable (**[W11] 87-91% of the measured 235: 205-214 GB/s in situ at 1 stream, 208-220 at 4 streams**). The weight-major idea helps at 4 streams (U ≈ 51 experts a layer, few rows each); expect +5-15% on the kernel, not 1.5x |
 | Megakernels | Hazy "No Bubbles" (Llama-1B): 78% of H100 bandwidth vs ~50% for vLLM / SGLang; 1.3 us per graph kernel launch still paid. Hazy TP8 70B: +22% throughput. MPK (Mirage, OSDI'26): up to 1.7x lower latency, no MoE / linear-attention support | We already run 92% GPU-busy at ~84% bandwidth on the big kernels. A megakernel would buy the 7-9 ms of small-kernel, idle and exchange time (E3-E6, E8), not 1.7x. PARADIGMS #12: +10-18%, 25+ days |
 | 2-Spark small-message latency | RDMA write floor ~2 us; NCCL all-reduce 16-32 KB 40-43 us | Our RoCE all-gather is 11.7 / 16.9 / 20.3 us at 16 / 64 / 128 KiB. ~10-15 us a hop above the wire floor is proxy / flag overhead: the E8 pool |
 | EP vs TP at batch 1 | EP loses: two all-to-alls a MoE layer, poor load balance at batch 1; Qwen3.8 TP4-EP decodes slower than TP2 | Confirms PARADIGMS #15: TP=2 stays |
@@ -108,36 +130,39 @@ Columns:
 
 | # | lever | mechanism | evidence | 1s ms (low / mid / high) | 4s ms | exactness | effort | risk |
 | --- | --- | --- | --- | --- | --- | --- | ---: | --- |
-| E1 / F1 | **Routed-expert decode kernel 193 -> 205 / 215 / 225 GB/s** | One persistent launch per MoE layer: gate/up -> act -> down chained per expert with device flags, so the down pass has no launch ramp or tail. Rot_in / plan / epilogues fused in; PDL on the launch edges; tiles striped evenly over the 48 SMs by distinct-expert count U(R). At 4 streams, weight-major order (MonoMoE-style): each trellis tile is decoded once for all its member rows, rows on the MMA N dimension | R = 1 calls run at 200 GB/s (gate/up 167.5 us, down 83.8 us a layer). 84 launches a round at ~80-170 us each, so ramp and tail are 3-6% of each. GB10 GEMV 224-233; SGLang dense 231 end to end; MonoMoE | 1.5 / **2.7** / 3.8 (5.09 GB) | 4.9 / **8.1** / 10.9 (13.81 GB) | Same bits if each output keeps its k-ordered chain (the 0170 / 0260 bitwise test pattern; the 16+-member `grouped_loop` path already proves it for large windows) | 7-12 | Medium: EXL3 trellis decode ALU at small R; 0330 showed warp-specialized designs can lose on GB10 (register file per sub-partition) |
-| E2 / F2 | **Dense q4 GEMV family (`_qmm`) 190 -> 215** | Pre-shuffled q4 weights (128-bit loads, no shuffles), a persistent grid sized to 48 SMs, and the small projections of one layer (DSA q_a / kv_a / indexer: grids of 12-128 today) grouped into one launch. At 4 streams, dense is 23 ms against a 14.6 floor (146 GB/s): the batched MTP passes and per-slot calls are the gap | Head `_qmm` 207 GB/s, KDA qkv 193; small-grid calls leave SMs idle | 1.2 / **1.9** / 2.5 | 1.5 / **3.0** / 6.0 | Same bits (keep `matmul_fast`'s per-output k order; no split-K) | 5-7 | Low |
-| E4 | **Small-kernel fusion + Programmatic Dependent Launch** | Attention + hc + router / combine + KDA + other are 6.9 ms against a ~1.7 ms floor, and a round is 1,846 kernels. Fuse `hc_post` -> `hc_pre` -> RMSNorm -> router into one kernel a layer boundary (decode's `hc_fused`). Add PDL (`griddepcontrol`, captured in graphs) so each kernel's prologue overlaps the previous tail | Hazy: the per-kernel bubble is the gap between 50% and 78% of peak. SGLang ships PDL in its DeepSeek fused kernels. PARADIGMS #7 | 0.8 / **1.5** / 2.3 | (in F3) | Fusion: same bits if each element's op order is kept (bitwise tests as 0390 / 0400). PDL: scheduling only | 7-10 | Low-medium (sm_121 PDL support to confirm) |
-| E5 | **Graph coverage for lone decode** (no eager or capture rounds in steady state) | In W7, 8 of 106 single-stream rounds (eager / capture) held 55% of the round's idle, 32-35 ms each. W10 FIN still has 2-17% eager + capture rounds per 1-stream rep (`conc-FIN.json`: 6 / 212, 58 / 350, 24 / 144). 16-row windows and power-of-2 context buckets add keys. Pre-capture rows 1..16 x both parities for the current and the next bucket while the slot is idle, instead of on the first sighting | `results/W10/conc-*.json` `round_kinds`; DECODE-OVERLAP §2 | 0.5 / **1.0** / 2.0 | ~0 (W5: 4-slot rounds are GPU-bound, eager costs nothing) | Same code path, graph or not (0200) | 2-3 | Low (graph memory; `LONGCTX_MAX_GRAPHS` 256) |
-| E6 / F4 | **Device-side sampling and draft chains** | Drafting syncs are 1.5 ms median a round (1s) and 3.0-3.2 ms (4s): MTP d + 2 hard syncs, DFlash2 `candidates` readbacks. A GPU port of `choose_rows` (greedy argmax; keyed splitmix64 / float64 Gumbel for sampled rows), the MTP chain as one graph, DFlash2 chain selection on the device. At 4 streams, add batched DFlash2 blocks (ADAPTIVE-DRAFT §7: +2%) | DECODE-OVERLAP §2 (idle split); DECODE-ANALYSIS §3a; SGLang Spec V2 overlap scheduling | 0.6 / **1.0** / 1.5 | 1.5 / **3.0** / 5.0 | The device sampler must reproduce the host's keyed draw bit for bit (tested over millions of draws), or become the reference for serial too | 7-10 | Medium (sampler equivalence) |
-| E7 | **Draft-head vocabulary trim** (drafts only) | An MTP step reads ~270 MB a rank, ~165 MB of it the 154,880-row head. A DFlash2 block runs the head for 7 positions (~0.8 ms). Draft over the top 32k tokens by frequency in our model's replies (FR-Spec); verification keeps the full head | FastMTP's 32k-vocab compression costs 0.03-0.07 τ. FR-Spec: -75% LM-head compute, ~1.12x over EAGLE-2 (not re-verified this session). The tonyd2wild Qwen3.8 Spark kit ships a reduced-vocab draft. DECODE-ANALYSIS §3c | 0.5 / **0.8** / 1.2 | 0.6 / **1.2** / 2.0 (batched MTP reads the head once a step) | Exact: drafts only; a token outside the subset only ends a chain | 2-3 (+ offline frequency pass) | Low. Coverage must be ≥ 97-98% of reply tokens |
-| E3 / F7 | **L2 prefetch during latency windows** (0040 revived) | During each exchange and each small-kernel stretch (~9 ms a round with DRAM mostly idle), stream the next weights (shared-expert gate/up, KDA projection head tiles, router) into L2. 0040 exists, was never measured, and sets **no prefetch sites in `compute_multi`**. With `GLM53_TF_BATCH=4`, production's rounds go through the Batcher, so 0040 must be ported first | COMM-ANALYSIS §3: upper bound 90 x 18 us = 1.6 ms (NCCL-era alpha); RoCE shortens the exchange windows, but the hc / router / attention windows remain | 0.3 / **0.7** / 1.5 | 0.3 / **0.8** / 1.5 | Exact (loads into a sink) | 3-4 | Low (L2 thrash; measure) |
-| E8 / F5 | **RoCE residual latency** | 11.7-20.3 us an exchange against a ~2 us RDMA floor. Tighten 0230's proxy loop and flag path (the GPU writes the flag in the producing kernel's epilogue; the proxy spins on one cache line on its own X925), and cut the peer-wait skew (~half of W7's exchange time) | W9 bench (RoCE 11.7 / 16.9 / 20.3 us vs NCCL 45 / 76 / 66); Sangiorgi's 2 us `ib_write_lat` | 0.2 / **0.4** / 0.8 | 0.3 / **0.8** / 1.5 | Exact (a copy) | 3-5 | Medium (0230's reliability history: soak again) |
-| F3 | **Per-slot fixed cost at 4 streams** | W9 measured ~6.6 ms a slot a round on top of rows: 26 ms of a ~115 ms 4-stream round. That is per-slot KDA chains, attention / indexer launches over 45 layers with small grids, and commit replay. One launch per layer across slots: `chain_kernel` grid (heads, slots) over a slot table; attention / indexer with a per-row sequence id; a batched KDA replay | RESULTS W9 §5 (fit 7 + 6 confirmed: 33 / 45.5 / 69.3 ms); ADAPTIVE-DRAFT simulator: halving it = +6% (finite bench), more in steady serving; 0200 design notes | - | 5 / **9** / 13 | Same bits per row (row-local kernels; the 0200 / 0290 row-independence tests) | 10-14 | Medium (`kda.cu` work) |
-| F0 | **4-stream graph policy** (config only) | W5: at 4 slots, capture rounds cost a full extra forward (8-12% of rounds in W10), and eager rounds cost nothing. `GLM53_TF_BATCH_GRAPHS=0` measured +3.5% (inside the spread, not A/B'd for exactness); a higher `CAPTURE_AFTER` is the gentler form | RESULTS W5; `conc-FIN.json`: 70-158 captures per 4-stream rep | - | 0 / ~2 / 4 | Same code path | 0.5 | Low |
+| E1 / F1 | **Routed-expert decode kernel 205 -> 215 / 225 / 235 GB/s** [W11: in situ 205-214 at 1 stream, 208-220 at 4; ceiling 235 measured] **[W12: 0440's persistent cp.async ring measured 160-163 GB/s at every window, 0.74-0.80x the old kernel; probes without decode / mma equally slow: loads in flight are the limit. Not loaded]** | One persistent launch per MoE layer: gate/up -> act -> down chained per expert with device flags, so the down pass has no launch ramp or tail. Rot_in / plan / epilogues fused in; PDL on the launch edges; tiles striped evenly over the 48 SMs by distinct-expert count U(R). At 4 streams, weight-major order (MonoMoE-style): each trellis tile is decoded once for all its member rows, rows on the MMA N dimension | R = 1 calls run at 200 GB/s (gate/up 167.5 us, down 83.8 us a layer). 84 launches a round at ~80-170 us each, so ramp and tail are 3-6% of each. GB10 GEMV 224-233; SGLang dense 231 end to end; MonoMoE. **[W11]** probe 233-238 GB/s for the same gathered bytes; ncu: `grouped_kernel` 108 registers, 3 CTAs an SM (25% occupancy), SM throughput 18-25%: latency-bound, more loads in flight is the lever | 1.3 / **2.7** / 4.3 (5.47 GB; grouped 26.8 ms + 0.9 ms rot_in / epilogues) | 2.0 / **4.8** / 10 [W11: was 4.9 / 8.1 / 10.9; 16.1 GB already at 208-220] | Same bits if each output keeps its k-ordered chain (the 0170 / 0260 bitwise test pattern; the 16+-member `grouped_loop` path already proves it for large windows) | 7-12 | Medium: EXL3 trellis decode ALU at small R; 0330 showed warp-specialized designs can lose on GB10 (register file per sub-partition) |
+| E2 / F2 | **Dense q4 GEMV family (`_qmm`) 175 -> 215** [W11: 175 in situ, not 190; ceiling 230.5 for the same set] **[W12: 0440 E2 same bits, 1.1-2.1x on small L2-resident shapes, 0.82-0.91x on the five largest; end to end -3.9% 1 stream, -3.1% 4 streams]** | Pre-shuffled q4 weights (128-bit loads, no shuffles), a persistent grid sized to 48 SMs, and the small projections of one layer (DSA q_a / kv_a / indexer: grids of 12-128 today) grouped into one launch. At 4 streams, dense is 23 ms against a 14.6 floor (146 GB/s): the batched MTP passes and per-slot calls are the gap | Head `_qmm` 207 GB/s, KDA qkv 193; small-grid calls leave SMs idle. **[W11]** in situ: head 214, KDA proj 197, dense MLP 190-193, DSA o 189, shared gate/up 166, KDA fb/gb 67 GB/s, plus 224 `_reduce` launches a round (0.3 ms); a plain read of the same bytes 215-238. ncu: 127 registers, 33% occupancy | 2.0 / **3.0** / 3.9 [W11: was 1.2 / 1.9 / 2.5] | 2.5 / **4.0** / 6.5 [W11: was 1.5 / 3.0 / 6.0] | Same bits (keep `matmul_fast`'s per-output k order; no split-K) | 5-7 | Low |
+| E4 | **Small-kernel fusion + Programmatic Dependent Launch** | Attention + hc + router / combine + KDA + other are 6.9 ms against a ~1.7 ms floor, and a round is 1,846 kernels ([W11] 6.6 ms, 1,853 kernels). Fuse `hc_post` -> `hc_pre` -> RMSNorm -> router into one kernel a layer boundary (decode's `hc_fused`). Add PDL (`griddepcontrol`, captured in graphs) so each kernel's prologue overlaps the previous tail | Hazy: the per-kernel bubble is the gap between 50% and 78% of peak. SGLang ships PDL in its DeepSeek fused kernels. PARADIGMS #7 | 0.8 / **1.5** / 2.3 | (in F3) | Fusion: same bits if each element's op order is kept (bitwise tests as 0390 / 0400). PDL: scheduling only | 7-10 | Low-medium. **[W11] PDL confirmed on sm_121**: a graph boundary 0.73 -> 0.42 us, dependents start their prologue early (399 / 399); ~0.6 ms of the mid |
+| E5 | **Graph coverage for lone decode** (no eager or capture rounds in steady state) | In W7, 8 of 106 single-stream rounds (eager / capture) held 55% of the round's idle, 32-35 ms each. W10 FIN still has 2-17% eager + capture rounds per 1-stream rep (`conc-FIN.json`: 6 / 212, 58 / 350, 24 / 144). 16-row windows and power-of-2 context buckets add keys. Pre-capture rows 1..16 x both parities for the current and the next bucket while the slot is idle, instead of on the first sighting | `results/W10/conc-*.json` `round_kinds`; DECODE-OVERLAP §2. **[W11]** after 0370 the lone slot's eager rounds (7-8-row DFlash2 windows) idle 1.25-1.36 ms vs 1.8 for graph rounds: no penalty left. Only a lone request in slots 1-3 still pays captures (22% eager, 8% capture rounds, ~2% slower than slot 0) | 0 / **0.2** / 0.5 [W11: was 0.5 / 1.0 / 2.0] | ~0 (W5: 4-slot rounds are GPU-bound, eager costs nothing) | Same code path, graph or not (0200) | 2-3 | Low (graph memory; `LONGCTX_MAX_GRAPHS` 256) |
+| E6 / F4 | **Device-side sampling and draft chains** **[W12: 0450 exact (10^8 draws == numpy; engine exact in every mode); sample 0%, resident rounds -2.3% 1 stream / +0.5-1.2% 4 streams]** | Drafting syncs are 1.5 ms median a round (1s) and 3.0-3.2 ms (4s): MTP d + 2 hard syncs, DFlash2 `candidates` readbacks. A GPU port of `choose_rows` (greedy argmax; keyed splitmix64 / float64 Gumbel for sampled rows), the MTP chain as one graph, DFlash2 chain selection on the device. At 4 streams, add batched DFlash2 blocks (ADAPTIVE-DRAFT §7: +2%) | DECODE-OVERLAP §2 (idle split); DECODE-ANALYSIS §3a; SGLang Spec V2 overlap scheduling | 0.3 / **0.6** / 1.0 [W11: was 0.6 / 1.0 / 1.5; 1.8 ms idle left] | 1.5 / **3.0** / 5.0 (5.1 ms idle, 16.7 ms host drafting for 11.4 ms of drafting kernels) | The device sampler must reproduce the host's keyed draw bit for bit (tested over millions of draws), or become the reference for serial too | 7-10 | Medium (sampler equivalence) |
+| E7 | **Draft-head vocabulary trim** (drafts only) | An MTP step reads ~270 MB a rank, ~165 MB of it the 154,880-row head. A DFlash2 block runs the head for 7 positions (~0.8 ms). Draft over the top 32k tokens by frequency in our model's replies (FR-Spec); verification keeps the full head | **[W11]** the 178 MB head `_qmm` (834 us) runs 2.6 times a 1-stream round and 4.9 times a 4-stream round: 1.6 / 3.9 of them drafting (1.35 / 3.2 ms). FastMTP's 32k-vocab compression costs 0.03-0.07 τ. FR-Spec: -75% LM-head compute, ~1.12x over EAGLE-2 (not re-verified this session). The tonyd2wild Qwen3.8 Spark kit ships a reduced-vocab draft. DECODE-ANALYSIS §3c | 0.7 / **1.0** / 1.3 [W11: was 0.5 / 0.8 / 1.2] | 1.5 / **2.5** / 3.0 [W11: was 0.6 / 1.2 / 2.0] | Exact: drafts only; a token outside the subset only ends a chain | 2-3 (+ offline frequency pass) | Low. Coverage must be ≥ 97-98% of reply tokens |
+| E3 / F7 | **L2 prefetch during latency windows** (0040 revived) **[W12: 0460 measured: 8 MiB a site +2.4% 1 stream (~-1.3 ms), +1.2% 4 streams; 4 MiB +0.8%; adopted]** | During each exchange and each small-kernel stretch (~9 ms a round with DRAM mostly idle), stream the next weights (shared-expert gate/up, KDA projection head tiles, router) into L2. 0040 exists, was never measured, and sets **no prefetch sites in `compute_multi`**. With `GLM53_TF_BATCH=4`, production's rounds go through the Batcher, so 0040 must be ported first | COMM-ANALYSIS §3: upper bound 90 x 18 us = 1.6 ms (NCCL-era alpha); RoCE shortens the exchange windows, but the hc / router / attention windows remain | 0.3 / **0.7** / 1.5 | 0.3 / **0.8** / 1.5 | Exact (loads into a sink) | 3-4 | Low (L2 thrash; measure) |
+| E8 / F5 | **RoCE residual latency** **[W12: 0460's knobs (lean, stripe, inline, lazy CQ) within the bench's 0.5-1.4 us noise; no engine load]** | 11.7-20.3 us an exchange against a ~2 us RDMA floor. Tighten 0230's proxy loop and flag path (the GPU writes the flag in the producing kernel's epilogue; the proxy spins on one cache line on its own X925), and cut the peer-wait skew (~half of W7's exchange time) | W9 bench (RoCE 11.7 / 16.9 / 20.3 us vs NCCL 45 / 76 / 66); Sangiorgi's 2 us `ib_write_lat`. **[W11]** in situ 100 exchanges a round, 14.5 us median but 23 us mean (35.9 at 4 streams): 2.3 / 4.2 ms exposed; the mean-median gap is peer-wait skew | 0.4 / **0.8** / 1.5 [W11: was 0.2 / 0.4 / 0.8] | 0.8 / **1.5** / 2.5 [W11: was 0.3 / 0.8 / 1.5] | Exact (a copy) | 3-5 | Medium (0230's reliability history: soak again) |
+| F3 | **Per-slot fixed cost at 4 streams** | W9 measured ~6.6 ms a slot a round on top of rows: 26 ms of a ~115 ms 4-stream round. That is per-slot KDA chains, attention / indexer launches over 45 layers with small grids, and commit replay. One launch per layer across slots: `chain_kernel` grid (heads, slots) over a slot table; attention / indexer with a per-row sequence id; a batched KDA replay | RESULTS W9 §5 (fit 7 + 6 confirmed: 33 / 45.5 / 69.3 ms); ADAPTIVE-DRAFT simulator: halving it = +6% (finite bench), more in steady serving; 0200 design notes | - | 3 / **6** / 9 [W11: was 5 / 9 / 13; the 4-stream small-kernel families total 15.4 ms against a ~4.9 ms floor] | Same bits per row (row-local kernels; the 0200 / 0290 row-independence tests) | 10-14 | Medium (`kda.cu` work) |
+| F0 | **4-stream graph policy** (config only) **[W12: `CAPTURE_AFTER=8` +2.0% adopted; `BATCH_GRAPHS=0` +1.9% but lone slots 1-3 -3%]** | W5: at 4 slots, capture rounds cost a full extra forward (8-12% of rounds in W10), and eager rounds cost nothing. `GLM53_TF_BATCH_GRAPHS=0` measured +3.5% (inside the spread, not A/B'd for exactness); a higher `CAPTURE_AFTER` is the gentler form. **[W11]** A/B with a same-window control: G0 +2.6%, CAPTURE_AFTER=8 +2.2% (every G0 rep above both controls), batchexact 4/4; prod rounds are 60-80% eager and 7-12% capture | RESULTS W5; `conc-FIN.json`: 70-158 captures per 4-stream rep | - | 2.2 / **2.7** / 3.2 **[W11: measured +2.2-2.6%]** | Same code path | 0.5 | Low |
 
 **Ranges.** Engineering stacked (the ms add; they are distinct kernels and syncs):
 
-- **1 stream:** low -5.6 ms (+12%), **mid -10.0 ms (+23%)**, high -15.6 ms (+40%, a bound: 97% of floor).
-- **4 streams:** low -14 ms (+13%), **mid -26 ms (+28%)**, high -40 ms (+50%, at the floor).
+- **1 stream [W11]:** low -5.8 ms (+12%), **mid -10.5 ms (+25%)**, high -16.1 ms (+43%, a bound: the 37.2 ms floor).
+  Was -5.6 / -10.0 / -15.6 ms from a 54.4 ms reconstruction.
+- **4 streams [W11]:** low -13 ms (+12%), **mid -25 ms (+26%)**, high -32 ms (+36%, the 89.0 ms floor). Was -14 / -26 /
+  -40 ms from 119 ms: the in-situ expert reads leave less room than W7's 193 GB/s suggested.
 
 ### 3.2 Drafters: more tokens a round (all exact: drafts only propose)
 
 | # | lever | mechanism | evidence | gain here | effort | risk |
 | --- | --- | --- | --- | --- | ---: | --- |
-| T1 | **MTP self-distillation** (FastMTP recipe on the abliterated target) | Fine-tune the MTP layer's attention, `eh_proj`, norms and shared expert (routed experts frozen, dequantized to bf16 for the backward pass, ~14.5 GB) on the target's own continuations. Use recursive 3-step training-time test (its own drafts as inputs) and a KL loss to the target's distribution at positions t+2..t+4 | FastMTP: 389k self-distilled samples, **< 1 day on one H20 server**; acceptance 70 -> 81 / 11 -> 56 / 2 -> 36% at positions 1-3; 2.03x vs NTP. Red Hat on Qwen3-Next-80B-A3B: 0.897 / 0.719 / 0.476 -> 0.912 / 0.776 / 0.616 with **~5k samples in 443 s on 2x H200**. MTP-D: +7.5% acceptance. GLM-5 trained shared-parameter multi-step MTP (τ 2.76 at 4 steps) | a = 0.74 / 0.45 / 0.22 -> ~0.80 / 0.58 / 0.38: MTP-round E[T] 2.41 -> ~2.76 for ~+2.5 ms (a chained step + a row): **+9-10% on MTP rounds**. That is sampled cells (MTP only) +8-12% and greedy prose (about half MTP rounds) +4-6% | 5-8 (reference MTP forward in PyTorch: DSA at ≤ 2,048 context is dense MLA, so exact; data hook; trainer) | Low-medium (the first attempt may undershoot on prose; FastMTP's biggest lift is at positions 2-3, which is where ours is weak) |
-| T2 | **Block drafter re-fit to the abliterated target** (on-policy distillation) | Fine-tune a DFlash-style block drafter on teacher-forced taps (layers 5 / 14 / 24 / 33 / 42) and target logits of the target's own replies, with KL and a confidence / stop head (DSpark-style). Start from `canada-quant/GLM-5.3-Flash-DFlash2-G` (Apache-2.0) or RedHat DSpark (MIT). incoai's DFlash2 is CC BY-NC-ND: private use only, no derivative may be shared | EAGLE-3: training on target-regenerated data plus training-time test gives +30-50% τ over EAGLE-2. DFlash: τ 4.35-7.84 with 800k target-generated samples. DFlash τ scales steeply with data (1.06 -> 2.47 -> 6.12 at 694 -> 20k -> 1.3M samples, **unverified secondary**). Ours: taps drift under abliteration (EXPERIMENTS S4: cosine 0.926 at L42). Prose rounds keep 2.0-2.7 against DFlash2's published MT-Bench τ 4.19 (base GLM-5.3) | Prose DFlash2 rounds +0.4-0.7 tokens: **+10-20% prose alone**. Code +5-10% | 7-12 | Medium: training compute on GB10 (below); acceptance on prose is the least certain number here |
+| T1 | **MTP self-distillation** (FastMTP recipe on the abliterated target) | Fine-tune the MTP layer's attention, `eh_proj`, norms and shared expert (routed experts frozen, dequantized to bf16 for the backward pass, ~14.5 GB) on the target's own continuations. Use recursive 3-step training-time test (its own drafts as inputs) and a KL loss to the target's distribution at positions t+2..t+4 | FastMTP: 389k self-distilled samples, **< 1 day on one H20 server**; acceptance 70 -> 81 / 11 -> 56 / 2 -> 36% at positions 1-3; 2.03x vs NTP. Red Hat on Qwen3-Next-80B-A3B: 0.897 / 0.719 / 0.476 -> 0.912 / 0.776 / 0.616 with **~5k samples in 443 s on 2x H200**. MTP-D: +7.5% acceptance. GLM-5 trained shared-parameter multi-step MTP (τ 2.76 at 4 steps) | a = 0.74 / 0.45 / 0.22 -> ~0.80 / 0.58 / 0.38 (**[W11] measured baseline, MTP x4 untruncated, cumulative: prose 0.72 / 0.43 / 0.22 / 0.10, code 0.90 / 0.71 / 0.53 / 0.32, agent-like 0.94 / 0.84 / 0.71 / 0.51; conditional prose 0.72 / 0.60 / 0.51 / 0.44**): MTP-round E[T] 2.41 -> ~2.76 for ~+2.5 ms (a chained step + a row): **+9-10% on MTP rounds**. That is sampled cells (MTP only) +8-12% and greedy prose (about half MTP rounds) +4-6% | 5-8 (reference MTP forward in PyTorch: DSA at ≤ 2,048 context is dense MLA, so exact; data hook; trainer) | Low-medium (the first attempt may undershoot on prose; FastMTP's biggest lift is at positions 2-3, which is where ours is weak) |
+| T2 | **Block drafter re-fit to the abliterated target** (on-policy distillation) | Fine-tune a DFlash-style block drafter on teacher-forced taps (layers 5 / 14 / 24 / 33 / 42) and target logits of the target's own replies, with KL and a confidence / stop head (DSpark-style). Start from `canada-quant/GLM-5.3-Flash-DFlash2-G` (Apache-2.0) or RedHat DSpark (MIT). incoai's DFlash2 is CC BY-NC-ND: private use only, no derivative may be shared | EAGLE-3: training on target-regenerated data plus training-time test gives +30-50% τ over EAGLE-2. DFlash: τ 4.35-7.84 with 800k target-generated samples. DFlash τ scales steeply with data (1.06 -> 2.47 -> 6.12 at 694 -> 20k -> 1.3M samples, **unverified secondary**). Ours: taps drift under abliteration (EXPERIMENTS S4: cosine 0.926 at L42). Prose rounds keep 2.0-2.7 against DFlash2's published MT-Bench τ 4.19 (base GLM-5.3) | Prose DFlash2 rounds +0.4-0.7 tokens: **+10-20% prose alone**. Code +5-10%. **[W11] baseline, DFlash2 x7 untruncated, cumulative: prose 0.68 / 0.43 / 0.26 / 0.16 / 0.10 (2.69 tokens a block round), code 0.87 / 0.71 / 0.56 / 0.44 (4.39), agent-like 0.90 / 0.81 / 0.74 / 0.68 (5.76): on prose it is no better than MTP at any position** | 7-12 | Medium: training compute on GB10 (below); acceptance on prose is the least certain number here |
 | T3 | **Calibrated stop / confidence** | 0071 prices each row from the drafter's own probability times a per-position correction. A learned stop head (SpecDec++-style) closes part of the oracle gap: +18.8% prose at 8 rows, +15-21% at 4 streams, all of it unreachable by policy alone (ADAPTIVE-DRAFT) | SpecDec++: +7-11% over fixed K; DSpark's confidence-scheduled verification | +3-6% on top of T2, trained with it | +2-3 on T2 | Low |
 | T4 | **Block-16 drafter for code / structured** (DBloom curriculum B8 -> B16) | 0380's 16-row windows are in production, but DFlash2 proposes at most 7. 33-40% of code-like and 81-83% of repetitive DFlash2 rounds keep all 8 | DBloom: +0.8 τ median (up to +1.37) from a short post-training curriculum; naive widening at inference fails. DEEP-VERIFY: block 16 at tail 1.0 = +26% repetitive, +2.7% code | Code / structured **+8-15%**, prose ~0 | +3-5 on T2 | Medium |
 | T5 | Expert-union-aware draft pricing (EcoSpec-lite, chain-only) | Price a draft row by its predicted *new* experts; at 4 streams, choose which slot goes deeper by expected overlap | EcoSpec: DeepSeek-V3.1 + MTP only 1.10 -> 1.15x (union near saturation); Qwen3-235B 1.22 -> 1.36x with trees. ADAPTIVE-DRAFT §4.2: ≤ 1% for the pricing part | ≤ +2-4% (4 streams), ~0 (1 stream) | 3-4 | Low value; last |
 
 **Middle-case drafter effect** in the round model:
 
-- **1 stream:** prose E[T] 2.4 -> 2.9 for +0.6 row (~3.2 ms): +13% alone.
-- **4 streams:** +2 tokens a round for +1.6 rows (~8.6 ms): +14% alone.
+- **1 stream:** prose E[T] 2.4 -> 2.9 for +0.6 row: **[W11]** a row costs ~6.4 ms today (~5.9 after E1), so +3.5-3.8
+  ms (was ~3.2): +12% alone (was +13%).
+- **4 streams:** +2 tokens a round for +1.6 rows (~8.5 ms at ~5.3 ms a row): +14% alone.
 
 **Training cost on this hardware.**
 
@@ -196,68 +221,71 @@ Columns:
 
 ## 4. The combined plan
 
-### 4.1 Single stream (prose; 44 -> ~61 tok/s at mid)
+### 4.1 Single stream (prose; 45.4 -> ~62.6 tok/s at mid) [W11: measured start, was 44 -> ~61]
 
-| # | contribution | ms a round (mid) | cumulative round | tok/s (2.4 tokens) | cumulative gain |
+| # | contribution | ms a round (mid) | cumulative round | tok/s (2.42 tokens) | cumulative gain |
 | --- | --- | ---: | ---: | ---: | ---: |
-| | today (reconstructed) | | 54.4 | 44.1 | |
-| E7 | draft-head vocab trim | -0.8 | 53.6 | 44.8 | +1.5% |
-| E5 | graph coverage | -1.0 | 52.6 | 45.6 | +3.4% |
-| E3 | L2 prefetch in the Batcher path | -0.7 | 51.9 | 46.2 | +4.8% |
-| E2 | dense q4 GEMV -> 215 GB/s | -1.9 | 50.0 | 48.0 | +8.8% |
-| E1 | routed experts -> 215 GB/s | -2.7 | 47.3 | 50.7 | +15% |
-| E4 | fusion + PDL | -1.5 | 45.8 | 52.4 | +19% |
-| E6 | device sampler + draft chains | -1.0 | 44.8 | 53.6 | +21% |
-| E8 | RoCE residual | -0.4 | **44.4** | **54.0** | **+23%** |
-| T1 + T2 (+T3) | drafters: E[T] 2.4 -> 2.9, +0.6 row at 215 GB/s (+3.2 ms) | +3.2 | 47.7 (2.9 tokens) | **60.8** | **+38%** |
+| | today (W11, measured uncaptured) | | 53.3 | 45.4 | |
+| E7 | draft-head vocab trim [W11: 0.8 -> 1.0] | -1.0 | 52.3 | 46.3 | +1.9% |
+| E5 | graph coverage [W11: 1.0 -> 0.2] | -0.2 | 52.1 | 46.4 | +2.3% |
+| E3 | L2 prefetch in the Batcher path **[W12: measured +2.4%, ~-1.3 ms; in production]** | -0.7 | 51.4 | 47.1 | +3.7% |
+| E2 | dense q4 GEMV 175 -> 215 GB/s [W11: 1.9 -> 3.0] **[W12: 0440 E2 measured +2.1 ms (slower)]** | -3.0 | 48.4 | 50.0 | +10.1% |
+| E1 | routed experts 205 -> 225 GB/s **[W12: 0440 E1 0.75x in the bench]** | -2.7 | 45.7 | 53.0 | +16.6% |
+| E4 | fusion + PDL (PDL ~0.6 of it, confirmed on sm_121) | -1.5 | 44.2 | 54.8 | +20.6% |
+| E6 | device sampler + draft chains [W11: 1.0 -> 0.6] **[W12: 0450 sample 0%, resident +1.2 ms (slower)]** | -0.6 | 43.6 | 55.5 | +22.2% |
+| E8 | RoCE residual [W11: 0.4 -> 0.8] | -0.8 | **42.8** | **56.5** | **+24.5%** |
+| T1 + T2 (+T3) | drafters: E[T] 2.42 -> 2.9, +0.6 row at ~5.9 ms (+3.5 ms) | +3.5 | 46.3 (2.9 tokens) | **62.6** | **+38%** |
 
-Sensitivity (1 stream, prose):
+Sensitivity (1 stream, prose) [W11: from 53.3 ms / 2.42 tokens; row cost 6.4 ms today, 5.5-6.2 after engineering]:
 
 | engineering \ drafters | none | low (2.65 tokens, +0.3 row) | mid (2.9, +0.6) | high (3.1, +0.8) |
 | --- | ---: | ---: | ---: | ---: |
-| none | 0 | +7% | +13% | +19% |
-| low (-5.6 ms) | +12% | +19% | +26% | +32% |
-| **mid (-10.0 ms)** | +23% | +31% | **+38%** | +44% |
-| high (-15.6 ms, a bound) | +40% | +49% | +57% | +64% |
+| none | 0 | +6% | +12% | +17% |
+| low (-5.8 ms) | +12% | +18% | +25% | +30% |
+| **mid (-10.5 ms)** | +25% | +31% | **+38%** | +44% |
+| high (-16.1 ms, a bound: the floor) | +43% | +50% | +58% | +64% |
 
-**Code / structured** (~70 ms, 5.7 tokens a round): the same engineering saves ~9-16 ms (+15-30%; the rounds are
-longer, so the fixed savings weigh less), plus T4's +8-15%.
+**Code / structured** (W11: 63.6 ms, 4.16 tokens a round on the LRU module; the canary's 5.7-token rounds ~75 ms): the
+same engineering saves ~10-16 ms (+15-30%; the rounds are longer, so the fixed savings weigh less), plus T4's +8-15%.
 
-### 4.2 Four streams (aggregate; 76.5 -> ~110 tok/s at mid)
+### 4.2 Four streams (aggregate; 75.0 -> ~107 tok/s at mid) [W11: measured start, was 76.5 -> ~110]
 
 | # | contribution | ms a round (mid) | cumulative | gain |
 | --- | --- | ---: | ---: | ---: |
-| | today (reconstructed) | | 119.0 | |
-| F0 | graph policy (config) | -2 (not added to the stack below: inside the spread until A/B'd) | | (+0-3.5%) |
-| F1 | routed experts -> 215 GB/s (weight-major at U ≈ 51) | -8.1 | 110.9 | +7% |
-| F3 | per-slot fixed cost halved-plus | -9.0 | 101.9 | +17% |
-| F2 | dense q4 in batched rounds | -3.0 | 98.9 | +20% |
-| F4 | device sampler + batched DFlash2 blocks | -3.0 | 95.9 | +24% |
-| F6 / F7 / F5 | vocab trim, prefetch, RoCE | -2.8 | **93.1** | **+28%** |
-| T1 + T2 | +2 tokens a round (9.1 -> 11.1), +1.6 rows (+7.7 ms) | +7.7 | 100.8 (11.1 tokens) | **+44%** |
+| | today (W11, measured uncaptured, 9.1 tokens) | | 121.3 | |
+| F0 | graph policy (config) [W11: measured +2.2-2.6%, now in the stack] **[W12: `CAPTURE_AFTER=8` +2.0%, in production]** | -2.7 | 118.6 | +2.3% |
+| F1 | routed experts 214 -> 225 GB/s + epilogues [W11: 8.1 -> 4.8: already 208-220 in situ] | -4.8 | 113.8 | +6.6% |
+| F3 | per-slot fixed cost [W11: 9 -> 6] | -6.0 | 107.8 | +12.5% |
+| F2 | dense q4 in batched rounds 169 -> 215 GB/s [W11: 3.0 -> 4.0] | -4.0 | 103.8 | +16.9% |
+| F4 | device sampler + batched DFlash2 blocks | -3.0 | 100.8 | +20.3% |
+| F6 / F7 / F5 | vocab trim (head 4.9 times a round) [W11: 1.2 -> 2.5], prefetch 0.8, RoCE [W11: 0.8 -> 1.5] | -4.8 | **96.0** | **+26%** |
+| T1 + T2 | +2 tokens a round (9.1 -> 11.1), +1.6 rows (~8.5 ms) | +8.5 | 104.5 (11.1 tokens) | **+42%** |
 
-4 streams: engineering low / mid / high = +13 / +28 / +50%. With middle drafters: +29 / **+44** / +68%.
+4 streams [W11]: engineering low / mid / high = +12 / +26 / +36% (high = the 89.0 ms floor). With middle drafters:
++27 / **+42** / +53%. Was +13 / +28 / +50% and +29 / +44 / +68%.
 
 ### 4.3 Sequence (by gain per effort and risk; each step has its own A/B gate)
 
 | order | item | days | GPU window | expected (mid) | gate to adopt |
 | ---: | --- | ---: | --- | --- | --- |
-| 1 | **Measure**: nsys + ncu on production b4 + FIN (§5.1) | 0.5 | 30-40 min | replaces §1's reconstruction | - |
-| 2 | F0 config A/B (`BATCH_GRAPHS=0` / `CAPTURE_AFTER=6`) | 0 | 20 min | 4s +0-3.5% | batchexact 4/4, ≥ +2% at 4 streams |
+| 1 | ~~**Measure**: nsys + ncu on production b4 + FIN (§5.1)~~ **done, W11** | 0.5 | 53 min | §1 measured | - |
+| 2 | F0 config A/B (`BATCH_GRAPHS=0` / `CAPTURE_AFTER=8`): **W11 measured +2.6% / +2.2%, batchexact 4/4**; **W12: `CAPTURE_AFTER=8` adopted (+2.0%, lone slots unchanged); `BATCH_GRAPHS=0` lone slots 1-3 -3%** | 0 | 20 min | 4s +2.2-2.6% | batchexact 4/4, ≥ +2% at 4 streams, 1 stream in slots 1-3 not lower |
 | 3 | E7 vocab trim | 2-3 | 30 min | 1s +1.5%, 4s +1% | exact 10/10, sampled cells not lower |
-| 4 | E5 graph pre-capture + E3 prefetch port | 5-7 | 40 min | 1s +3.3% | 1s ≥ +2%, memory ≥ 8 GiB in the stress |
+| 4 | E5 graph pre-capture + E3 prefetch port **[W12: E3 (0460) +2.4% 1s, adopted]** | 5-7 | 40 min | 1s +3.3% | 1s ≥ +2%, memory ≥ 8 GiB in the stress |
 | 5 | **T1 MTP self-distillation** (data window 3-6 h, training offline) | 5-8 | data 3-6 h + A/B 40 min | sampled +8-12%, prose +4-6% | teacher-forced a2 / a3 up ≥ 0.08 first; then exact, cells |
-| 6 | E1 + E2 decode kernels (roof probe first, §5.4) | 12-19 | 2 x 40 min | 1s +9%, 4s +10% | bitwise tests; 1s ≥ +5% |
-| 7 | F3 multi-slot launches + E6 device sampler | 17-24 | 2 x 60 min | 4s +12%, 1s +2% | batchexact; sampler equivalence over 10^7 draws |
+| 6 | E1 + E2 decode kernels (roof probe done, W11: go; **E2 first**: 175 vs 230.5 GB/s is the larger gap) **[W12: 0440 as built fails: E1 0.75x, E2 -3.9% end to end; a redesign needs more bytes in flight per warp]** | 12-19 | 2 x 40 min | 1s +12%, 4s +8% | bitwise tests; 1s ≥ +5% |
+| 7 | F3 multi-slot launches + E6 device sampler **[W12: 0450 exact (10^8 draws), resident rounds +0.5-1.2% 4s, -2.3% 1s: off]** | 17-24 | 2 x 60 min | 4s +12%, 1s +2% | batchexact; sampler equivalence over 10^7 draws |
 | 8 | **T2 block-drafter re-fit** (+T3 stop head, +T4 block 16) | 10-15 + compute | data window + A/B | prose +10-20%, code +8-15% | teacher-forced τ on held-out replies ≥ +0.4 before any serving A/B |
-| 9 | E4 fusion + PDL, E8 RoCE path | 10-15 | 2 x 40 min | 1s +3.5% | bitwise; RoCE soak ≥ 2 h |
+| 9 | E4 fusion + PDL, E8 RoCE path **[W12: 0460's RoCE knobs within bench noise]** | 10-15 | 2 x 40 min | 1s +3.5% | bitwise; RoCE soak ≥ 2 h |
 
 Items 1-5 fit roughly one week and should show **+8-12% single-stream** (more on sampled requests). The drafter
 number from item 5 decides how hard items 6-9 must push.
 
 ## 5. First steps for the next session (buildable and testable)
 
-1. **One capture of today's production** (W7 harness, `GLM53_TF_PROFILE` probes, one nsys per server lifetime):
+1. **One capture of today's production** (W7 harness, `GLM53_TF_PROFILE` probes, one nsys per server lifetime).
+   **Done (W11, RESULTS W11 §1-3):** two capture loads (the first fit one slot under nsys), §1 above; ncu ran on the
+   kernels alone (GB10 exposes no `dram__` counters to ncu or nsys GPU metrics, so bytes stay inferred):
    - a 256-token prose reply and a 4-stream 384-token set;
    - `dec.py` / `dec_bytes.py` / `experts_union.py` on the new trace;
    - ncu on `grouped_kernel` and the four largest `_qmm` shapes at R = 1 / 4 / 8 / 16: dram__throughput, launch
@@ -281,11 +309,17 @@ number from item 5 decides how hard items 6-9 must push.
    - (c) A teacher-forced acceptance script that must reproduce today's a = 0.74 / 0.45 / 0.22 on dumped data
      before any training.
    - Everything but the dump is offline.
-4. **Roof probe for E1 / E2.** A microbench that streams exactly the bytes of a decode round's expert set (U = 8,
+4. **Roof probe for E1 / E2.** **Done (W11 §3-4): the probe reads the expert volumes at 235-237 GB/s and the dense set
+   at 230.5; the real kernels run at 205-214 / 175 GB/s (ncu: 25-33% occupancy, latency-bound). E1 / E2 keep their
+   middle columns; E2 grew.** A microbench that streams exactly the bytes of a decode round's expert set (U = 8,
    17, 24, 51 experts x 6.29 MB) and of each `_qmm` shape with a plain 128-bit-load kernel, next to the real kernels.
    The gap between the probe's GB/s and the kernel's is E1 / E2's real headroom. If the probe tops out at ~205,
    E1 / E2 shrink to the low column.
-5. **F0 config A/B** in the same window as step 1 (no build).
+5. **F0 config A/B** in the same window as step 1 (no build). **Done (W11 §5): `BATCH_GRAPHS=0` +2.6%,
+   `CAPTURE_AFTER=8` +2.2% at 4 streams, batchexact 4/4; the adoption A/B needs lone requests in slots 1-3 too.**
+6. **[W11] Acceptance baseline for T1 / T2** (RESULTS W11 §6): MTP x4 prose 0.72 / 0.43 / 0.22 / 0.10 cumulative, DFlash2
+   x7 prose 0.68 / 0.43 / 0.26 / 0.16; code and agent-like content far higher. T1's teacher-forced check (step 3c)
+   should reproduce the prose row.
 
 ## Sources
 
@@ -361,3 +395,4 @@ number from item 5 decides how hard items 6-9 must push.
 - RESEARCH-NIGHT.md §1, §4
 - OPS-GPUWATCH.md
 - `results/W10/conc-*.json`
+- RESULTS.md W11, `results/W11/` (measured round, probe, kbench, ncu, graph A/B, acceptance)

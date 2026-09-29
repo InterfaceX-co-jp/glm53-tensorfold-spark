@@ -1,0 +1,551 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+index dd0317b..59eb214 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batch.py
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -46,6 +46,8 @@ window rows, per-slot context mode: dense or patches/0050's pool bucket), up to
+ KDA states of a graphed round are kept in buffer 0 (``_parity0``: a copy of the state when a commit left it in
+ buffer 1, 71 MB a slot) so parities do not multiply the keys. A key's first round runs eagerly through the
+ capturable code (its result) and is captured after (as 0050 does). Windows crossing 2,051 tokens run eager.
++patches/0510 (``GLM53_TF_BATCH_GRAPHS=lone``): only rounds with one active slot use these graphs; rounds of 2+ slots
++run eagerly (``0``'s path). Same kernels either way, so the same bits.
+ 
+ Tensor parallelism. Rank 0 alone decides each round's cancels, admissions (slot, resume length, request header)
+ and pieces and shares them before the round; rank 1 runs the same rounds in ``follow``.
+@@ -1007,7 +1009,9 @@ class Batcher:
+         if both[0] != both[1]:
+             raise RuntimeError(f"the two ranks were started with different GLM53_TF_SOLO_PIECE: rank 0 {both[0]}, "
+                                f"rank 1 {both[1]}")
+-        self.use_graphs = e.graphs is not None and os.environ.get("GLM53_TF_BATCH_GRAPHS", "1").strip() != "0"
++        # patches/0510: GLM53_TF_BATCH_GRAPHS=1 (every round) | 0 (none) | lone (rounds with one active slot)
++        self.graph_policy = batchplan.graph_policy(os.environ.get("GLM53_TF_BATCH_GRAPHS"))
++        self.use_graphs = e.graphs is not None and self.graph_policy != batchplan.GRAPHS_OFF
+         # patches/0200 (each off by default): graph keys captured on their N-th sighting, windows padded to fewer
+         # graph keys, short prompts prefilled without waiting for the fair share
+         self.sightings = batchplan.Sightings(_env_int("GLM53_TF_BATCH_CAPTURE_AFTER", 1))
+@@ -1025,7 +1029,8 @@ class Batcher:
+         self.adapt_every, self.adapt_window = adapt_mod.env_every(), adapt_mod.env_window()
+         self.adapt_serial = adapt_mod.env_serial()
+         self.last_rows: list[int] = []                 # the rows each slot had in the last ``_forward`` (padded)
+-        both = g._gather_ints([n, int(self.use_graphs), self.graph_rows, self.max_graphs, self.piece,
++        both = g._gather_ints([n, int(self.use_graphs) * self.graph_policy,     # patches/0510: the policy
++                               self.graph_rows, self.max_graphs, self.piece,
+                                self.sightings.after, self.pad, self.short, int(self.parity_key),
+                                int(self.batch_mtp), int(round(self.row_ms * 1000)), self.buckets, int(self.tie),
+                                int(self.adapt), self.adapt_every, self.adapt_window, int(self.adapt_serial)])
+@@ -1141,6 +1146,9 @@ class Batcher:
+             print(f"[tensorfold] batching {n} requests: {n - 1} extra sequence(s), {extra:.2f} GB on this rank "
+                   f"({e.st.capacity} cache slots each; prefill pieces of {self.piece} tokens, at most "
+                   f"{self.fair.share:g} of the time while others decode)", flush=True)
++            if self.graph_policy == batchplan.GRAPHS_LONE:  # patches/0510
++                print("[tensorfold] batch graphs (patches/0510): lone rounds only (GLM53_TF_BATCH_GRAPHS=lone; rounds "
++                      "of 2+ slots run eagerly)", flush=True)
+             if self.solo:                               # patches/0335
+                 most = int(getattr(e, "prefill_max", e.rows))
+                 print(f"[tensorfold] GLM53_TF_SOLO_PIECE={self.solo}: a fast prompt alone in the batch prefills in "
+@@ -2035,6 +2043,11 @@ class Batcher:
+             out.append(win)
+         return out
+ 
++    def graphs_on(self, n_active: int) -> bool:
++        """patches/0510: may a round (or a batched drafter pass) over ``n_active`` slots use the batcher's graphs?"""
++
++        return self.use_graphs and batchplan.graphs_for(self.graph_policy, n_active)
++
+     def _forward(self, active: list[int], windows: list[list[int]]) -> torch.Tensor:
+         """One forward over the active slots' windows -> their logits rows. ``last_rows``: the rows each slot had in
+         it (its window's length, or more with GLM53_TF_BATCH_PAD: its rows start at the running sum of these)."""
+@@ -2051,9 +2064,10 @@ class Batcher:
+         sts = [self.states[s] for s in active]
+         real = [len(x) for x in windows]
+         modes = [self._mode(st, len(x)) for st, x in zip(sts, windows)]
+-        if self.pad and self.use_graphs and all(m is not None for m in modes):
++        graphs = self.graphs_on(len(active))    # patches/0510
++        if self.pad and graphs and all(m is not None for m in modes):
+             windows, modes = self._pad(sts, windows, modes)
+-        if self.buckets and self.use_graphs and len(active) > 1 and all(m is not None for m in modes):
++        if self.buckets and graphs and len(active) > 1 and all(m is not None for m in modes):
+             windows = self._bucket(sts, windows, modes)          # patches/0280
+         self.last_rows = [len(x) for x in windows]
+         T = stage_multi(w, sts, b, windows)
+@@ -2063,7 +2077,7 @@ class Batcher:
+             self.src_host[:T].numpy()[:] = batchplan.route_sources(real, Rs)
+             self.src_dev[:T].copy_(self.src_host[:T], non_blocking=True)
+             src = self.src_dev
+-        if self.use_graphs and all(m is not None for m in modes) and max(Rs) <= self.graph_rows:
++        if graphs and all(m is not None for m in modes) and max(Rs) <= self.graph_rows:
+             if self.parity_key:                 # patches/0200: the parities in the key, no state copies
+                 key = (tuple(active), tuple(Rs), tuple(modes), tuple(st.cur[0] if st.cur else 0 for st in sts))
+             else:
+diff --git i/src/tensorfold/families/glm5_next/cuda/batchplan.py w/src/tensorfold/families/glm5_next/cuda/batchplan.py
+index 16e1aa8..d80cab8 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batchplan.py
++++ w/src/tensorfold/families/glm5_next/cuda/batchplan.py
+@@ -287,6 +287,36 @@ class Sightings:
+         return n >= self.after
+ 
+ 
++# -- patches/0510: which batched rounds use CUDA graphs -----------------------------------------------------------
++GRAPHS_OFF, GRAPHS_ALL, GRAPHS_LONE = 0, 1, 2
++
++
++def graph_policy(spec: str | None) -> int:
++    """GLM53_TF_BATCH_GRAPHS -> GRAPHS_OFF (``0``), GRAPHS_ALL (``1``, unset: as before) or GRAPHS_LONE (``lone``:
++    only rounds with exactly one active slot replay / capture the batcher's graphs; rounds of 2+ slots run eagerly,
++    as with ``0``). Same kernels either way (a graph replays the eager code), so the policy changes timing only."""
++
++    s = str(spec if spec is not None else "").strip().lower()
++    if s in ("", "1", "on", "yes", "true", "all"):
++        return GRAPHS_ALL
++    if s in ("0", "off", "no", "false", "none"):
++        return GRAPHS_OFF
++    if s in ("lone", "single", "one"):
++        return GRAPHS_LONE
++    raise ValueError(f"GLM53_TF_BATCH_GRAPHS={spec!r}: expected 1 (every round), 0 (none) or lone (rounds with one "
++                     "active slot only)")
++
++
++def graphs_for(policy: int, n_active: int) -> bool:
++    """patches/0510: may a batched round (or a batched drafter pass) over ``n_active`` slots use a CUDA graph?"""
++
++    if policy == GRAPHS_ALL:
++        return True
++    if policy == GRAPHS_LONE:
++        return n_active == 1
++    return False
++
++
+ # -- queue and placement -------------------------------------------------------------------------------------------
+ def admission_order(background: Sequence[bool]) -> list[int]:
+     """Queue indices in admission order: every foreground request in arrival order, then background ones."""
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index b6cd80b..6e03756 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -22,6 +22,7 @@ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+ from . import comm as comm_mod, draftvocab, fastpf, fp8pf, lean as lean_mod, pfglue, pfgrid, profile
+ from . import decode_overlap as dover                                       # patches/0370
++from . import vsplit                                                        # patches/0510
+ from . import gpuround, gpusample                                            # patches/0450
+ from . import dump as dump_mod                                               # patches/0430
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+@@ -222,7 +223,8 @@ class Engine:
+         npb = self._long_bucket(self.st.pos, R)
+         if npb is not None:                  # patches/0050: every row past 2050, a graph per pool bucket
+             w, st, b = self.w, self.st, self.buf
+-            self.graphs.long_step(("main", R, st.parity, npb), lambda: compute(w, st, b, R, npb=npb))
++            self.graphs.long_step(("main", R, st.parity, npb), lambda: compute(w, st, b, R, npb=npb),
++                                  lambda n: vsplit.compute_pieces(w, st, b, R, n, npb=npb))   # patches/0510
+             return self.buf.logits[:R]
+         return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/graphs.py w/src/tensorfold/families/glm5_next/cuda/graphs.py
+index fc9fae2..e289e41 100644
+--- i/src/tensorfold/families/glm5_next/cuda/graphs.py
++++ w/src/tensorfold/families/glm5_next/cuda/graphs.py
+@@ -8,6 +8,10 @@ bucket) for the model and per (rows, pool bucket) for the MTP head, captured the
+ that step runs eagerly through the same capturable code (``compute(..., npb=)``), which is the warm-up and the
+ step's result (its writes are the replay's: uncommitted cache slots, the other KDA state buffer, static
+ buffers), then the graph is captured for the next steps. Both ranks meet the same keys in the same order.
++
++patches/0510 (``vsplit.py``, off by default): GLM53_TF_VERIFY_SPLIT=N captures the main graphs (and 0050's long-context
++main graphs) as N graphs over layer ranges, replayed in order (same kernels, same order: same bits);
++GLM53_TF_GRAPH_PROBE=N times their launches (a stamp kernel as node 0).
+ """
+ 
+ from __future__ import annotations
+@@ -17,7 +21,7 @@ import sys
+ 
+ import torch
+ 
+-from . import profile
++from . import profile, vsplit
+ from .forward import compute
+ from .mtp import mtp_compute
+ 
+@@ -34,6 +38,12 @@ class Graphs:
+         self.long: dict[tuple, torch.cuda.CUDAGraph] = {}
+         self.long_max = int(os.environ.get("GLM53_TF_LONGCTX_MAX_GRAPHS", "256"))
+         w, st = e.w, e.st
++        # patches/0510: the main graphs in pieces and / or with the launch probe (both off: the graphs as before)
++        self.split = vsplit.split_env()
++        every = vsplit.probe_env()
++        self.probe = vsplit.Probe(every, w.device, getattr(w, "rank", 0)) if every else None
++        if (self.split > 1 or self.probe is not None) and getattr(w, "rank", 0) == 0:
++            print(f"[tensorfold] {vsplit.describe(self.split, every)} (patches/0510)", file=sys.stderr, flush=True)
+         # patches/0290: the warm-up / capture steps below write the window's rows at position 0 (and the head's at its
+         # length 0) without ``stage``: map those pages first (no-op without the KV pool)
+         from . import kvpool
+@@ -48,6 +58,11 @@ class Graphs:
+                     for _ in range(2):
+                         compute(w, st, e.buf, R)
+                     torch.cuda.synchronize()
++                    if self.split > 1 or self.probe is not None:        # patches/0510
++                        self.main[(R, parity)] = vsplit.capture(
++                            vsplit.compute_pieces(w, st, e.buf, R, self.split), self.pool, key=("main", R, parity),
++                            probe=self.probe)
++                        continue
+                     g = torch.cuda.CUDAGraph()
+                     with torch.cuda.graph(g, pool=self.pool):
+                         compute(w, st, e.buf, R)
+@@ -71,10 +86,11 @@ class Graphs:
+                         graphs[n] = g
+         torch.cuda.synchronize()
+ 
+-    def long_step(self, key: tuple, run) -> None:
++    def long_step(self, key: tuple, run, pieces=None) -> None:
+         """patches/0050: replay the long-context graph for ``key``; the first time, run the step eagerly (``run``,
+         the same capturable code) and capture it for the next ones. A failed capture turns the long graphs off
+-        (the step's result is already in the buffers; later steps run eagerly, both ranks alike)."""
++        (the step's result is already in the buffers; later steps run eagerly, both ranks alike). patches/0510:
++        ``pieces`` (a main step's ``vsplit.compute_pieces`` maker) captures it in pieces when the split / probe is on."""
+ 
+         g = self.long.get(key)
+         if g is not None:
+@@ -86,8 +102,12 @@ class Graphs:
+         torch.cuda.synchronize()
+         g = torch.cuda.CUDAGraph()
+         try:
+-            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
+-                run()
++            if pieces is not None and (self.split > 1 or self.probe is not None):      # patches/0510
++                g = vsplit.capture(pieces(self.split), self.pool, key=key, probe=self.probe,
++                                   error_mode="thread_local")
++            else:
++                with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
++                    run()
+         except Exception as exc:  # noqa: BLE001 - any capture failure: keep serving eagerly
+             self.long_rows = frozenset()
+             print(f"[tensorfold] long-context CUDA graph capture failed ({type(exc).__name__}: {exc}); "
+diff --git i/src/tensorfold/families/glm5_next/cuda/resident.py w/src/tensorfold/families/glm5_next/cuda/resident.py
+index 2f6f959..2b9aab8 100644
+--- i/src/tensorfold/families/glm5_next/cuda/resident.py
++++ w/src/tensorfold/families/glm5_next/cuda/resident.py
+@@ -30,6 +30,8 @@ before a round is launched, so a round is never cut half-way.
+ 
+ from __future__ import annotations
+ 
++import os
++import sys
+ import time
+ from dataclasses import dataclass, field
+ from typing import Any, Sequence
+@@ -42,6 +44,9 @@ from tensorfold.engine.exact_sampling import MARGIN
+ 
+ from . import gpuround as gr, gpusample
+ 
++# patches/0510: a stderr line every N drains (resident rounds, entries, drains by reason, the batcher's round kinds)
++_REPORT = int(os.environ.get("GLM53_TF_RESIDENT_REPORT", "") or 0)
++
+ RING = 4                                # pinned staging / record slots (at most 2 rounds in flight)
+ 
+ 
+@@ -246,6 +251,11 @@ class Resident:
+             self._exit(active)
+         reason = reason or "?"
+         self.drains[reason] = self.drains.get(reason, 0) + 1
++        if _REPORT and sum(self.drains.values()) % _REPORT == 0:   # patches/0510 (GLM53_TF_RESIDENT_REPORT=N)
++            print(f"[tensorfold] resident rounds (patches/0510 report): rounds {self.rounds} entries {self.entries} "
++                  f"drains {dict(sorted(self.drains.items()))}; "
++                  f"batch rounds {dict(sorted((k, v) for k, v in bat.counts.items() if isinstance(v, int)))}",
++                  file=sys.stderr, flush=True)
+         for s in active:
+             q = bat.seqs[s]
+             if q is not None and q.stepper is not None and q.stepper.done(bat.eos):
+@@ -805,14 +815,15 @@ class RealOps:
+                 b.route_src = None
+                 b.kda_slots = None
+ 
+-        g = bat.multi.get(key)
++        graphs = bat.graphs_on(len(active))     # patches/0510 (GLM53_TF_BATCH_GRAPHS=lone)
++        g = bat.multi.get(key) if graphs else None
+         if g is not None:
+             bat.counts["graph"] += 1
+             g.replay()
+             return b.logits[:T]
+         run()
+         bat.counts["eager"] += 1
+-        if bat.use_graphs and len(bat.multi) < bat.max_graphs and bat.sightings.capture(key):
++        if graphs and len(bat.multi) < bat.max_graphs and bat.sightings.capture(key):
+             torch.cuda.synchronize()
+             graph = torch.cuda.CUDAGraph()
+             try:
+@@ -1028,14 +1039,15 @@ class RealOps:
+ 
+         bat = self.bat
+         key = ("mtp", tuple(items), tuple(ns), tuple(modes), bool(full))
+-        g = bat.multi.get(key)
++        graphs = bat.graphs_on(len(items))      # patches/0510 (GLM53_TF_BATCH_GRAPHS=lone)
++        g = bat.multi.get(key) if graphs else None
+         if g is not None:
+             from . import draftvocab
+ 
+             g.replay()
+             return self.e.mbuf.logits[:len(sts), :draftvocab.head_for(self.w, "mtp", full).n]
+         out = self._head_pass(sts, ns, offs, T, sel, full, modes)
+-        if bat.use_graphs and len(bat.multi) < bat.max_graphs and bat.sightings.capture(key):
++        if graphs and len(bat.multi) < bat.max_graphs and bat.sightings.capture(key):
+             torch.cuda.synchronize()
+             graph = torch.cuda.CUDAGraph()
+             try:
+diff --git i/src/tensorfold/families/glm5_next/cuda/vsplit.py w/src/tensorfold/families/glm5_next/cuda/vsplit.py
+new file mode 100644
+index 0000000..a90830c
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/vsplit.py
+@@ -0,0 +1,255 @@
++"""patches/0510: the lone verify forward's CUDA graph in pieces, and a launch probe (both off by default).
++
++THEORY-2 §1.2: at one stream, ~1.1 ms a round of GPU idle sits inside ``cudaGraphLaunch`` of the ~1,650-node verify
++graph (the host is in the call, the graph's first kernel starts only when it returns; measured under nsys node
++tracing, which inflates it). Two knobs:
++
++- ``GLM53_TF_VERIFY_SPLIT=N`` (0 / 1 = off; 2-8): the engine's main graphs (``Graphs.main``: the lone verify / serial
++  step, and patches/0050's long-context main graphs) are captured as N graphs over consecutive layer ranges, replayed
++  back to back. The first piece (~1/N of the nodes) launches in ~1/N of the time and runs while the host launches
++  the rest. The pieces run exactly ``forward._compute``'s kernels in its order (``compute_pieces``; each piece ends
++  with the prefetch side stream's join, a wait only), so the bits are the unsplit graph's.
++- ``GLM53_TF_GRAPH_PROBE=N`` (0 = off): every main-graph replay is timed without per-node tracing: the host time of
++  each piece's ``replay()`` and the first node's start. A stamp kernel (``%globaltimer``) is captured as node 0 of the
++  first piece; an eager stamp right before the replay marks when the (idle) stream could have started. First-node
++  delay = node 0 stamp - eager stamp - the host time between the eager stamp's launch returning and ``replay()``.
++  Every N probed replays rank 0 (and 1) prints one line per graph key: replay host us and first-node delay us
++  (p50 / p90). One sync every N replays; the stamps write only the probe's own buffer (same bits).
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import time
++
++import torch
++
++SPLIT_MAX = 8
++
++
++def split_env(env=None) -> int:
++    """GLM53_TF_VERIFY_SPLIT -> pieces (1 = off)."""
++
++    env = os.environ if env is None else env
++    raw = str(env.get("GLM53_TF_VERIFY_SPLIT", "") or "0").strip().lower()
++    if raw in ("0", "1", "off", "no", "false", ""):
++        return 1
++    try:
++        n = int(raw)
++    except ValueError:
++        n = -1
++    if not 2 <= n <= SPLIT_MAX:
++        raise ValueError(f"GLM53_TF_VERIFY_SPLIT={raw!r}: expected 0 (off) or 2..{SPLIT_MAX} pieces")
++    return n
++
++
++def probe_env(env=None) -> int:
++    """GLM53_TF_GRAPH_PROBE -> replays between reports (0 = off)."""
++
++    env = os.environ if env is None else env
++    raw = str(env.get("GLM53_TF_GRAPH_PROBE", "") or "0").strip()
++    try:
++        n = int(raw)
++    except ValueError:
++        n = -1
++    if n < 0:
++        raise ValueError(f"GLM53_TF_GRAPH_PROBE={raw!r}: expected 0 (off) or the replays between reports")
++    return n
++
++
++def split_bounds(n_layers: int, n: int, first: int | None = None) -> list[tuple[int, int]]:
++    """Layer ranges [lo, hi) of ``n`` pieces over ``n_layers`` layers, in order, covering every layer once. ``first``
++    (default: an even share) is the first piece's layer count: a short first piece starts the GPU soonest; the rest
++    share the remaining layers evenly (earlier pieces take the remainder)."""
++
++    if n_layers < 1 or n < 1:
++        raise ValueError(f"split_bounds({n_layers}, {n})")
++    n = min(n, n_layers)
++    if n == 1:
++        return [(0, n_layers)]
++    if first is None:
++        first = n_layers // n
++    first = max(1, min(int(first), n_layers - (n - 1)))
++    left, m = n_layers - first, n - 1
++    out, lo = [(0, first)], first
++    for i in range(m):
++        size = left // m + (1 if i < left % m else 0)
++        out.append((lo, lo + size))
++        lo += size
++    return out
++
++
++def compute_pieces(w, st, b, R: int, n: int, *, npb: int | None = None) -> list:
++    """``forward.compute(w, st, b, R, npb=npb)`` (logits on, no head_rows, capturable) as ``n`` callables over
++    consecutive layer ranges: the first also embeds, the last also takes the final stream mean, norm and head. Each
++    piece ends with ``forward._join`` (the prefetch side stream joined: a capture cannot end with an open fork; a
++    wait only). Called in order they launch exactly ``_compute``'s kernels in its order."""
++
++    from . import forward, glue, profile, qmm
++
++    c = w.cfg
++    layers = list(w.layers)
++    bounds = split_bounds(len(layers), n, first=_first_env(len(layers), n))
++
++    def piece(lo: int, hi: int, is_first: bool, is_last: bool):
++        def run():
++            if is_first:
++                glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
++                if profile.ON:
++                    profile.lap("embed")
++            for layer in layers[lo:hi]:
++                forward.layer_forward(layer, w, st, b, R, None, None, npb)
++                for slot in b.tap_at.get(layer.index, ()):
++                    glue.stream_mean(b.x[:R], b.taps[slot][:R])
++            if is_last:
++                glue.stream_mean(b.x[:R], b.hidden[:R])
++                if profile.ON:
++                    profile.lap("hc")
++                glue.rmsnorm(b.hidden[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
++                qmm.matmul(b.fnormed[:R], w.head, b.fxs[:R], out=b.logits[:R], part=b.sk)
++                if profile.ON:
++                    profile.lap("head")
++            forward._join(w)
++        return run
++
++    return [piece(lo, hi, i == 0, i == len(bounds) - 1) for i, (lo, hi) in enumerate(bounds)]
++
++
++def _first_env(n_layers: int, n: int) -> int | None:
++    """GLM53_TF_VERIFY_SPLIT_FIRST=L: the first piece's layer count (default: an even share)."""
++
++    raw = os.environ.get("GLM53_TF_VERIFY_SPLIT_FIRST", "").strip()
++    return int(raw) if raw else None
++
++
++# -- the probe -----------------------------------------------------------------------------------------------------
++_stamp_kernel = None
++
++
++def _stamp_fn():
++    global _stamp_kernel
++    if _stamp_kernel is None:
++        import triton
++        import triton.language as tl
++
++        @triton.jit
++        def _stamp(OUT, IDX):
++            # the asm of triton.language.extra.cuda.globaltimer()
++            t = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False,
++                                          pack=1)
++            tl.store(OUT + IDX, t)
++
++        _stamp_kernel = _stamp
++    return _stamp_kernel
++
++
++def delays_us(pre_ns, node0_ns, gap_ns) -> list[float]:
++    """First-node delays (us): node 0's stamp - the eager stamp - the host time between the eager stamp's launch
++    returning and the first ``replay()`` call (the stream was idle, so what is left is the launch's exposure)."""
++
++    return [((n0 - p) - g) / 1e3 for p, n0, g in zip(pre_ns, node0_ns, gap_ns)]
++
++
++def pct(xs, q: float) -> float:
++    s = sorted(xs)
++    if not s:
++        return float("nan")
++    k = min(len(s) - 1, max(0, int(round(q * (len(s) - 1)))))
++    return s[k]
++
++
++class Probe:
++    """Ring of (eager stamp, node-0 stamp) pairs on the device + host times; ``report`` every ``every`` replays."""
++
++    RING = 4096
++
++    def __init__(self, every: int, device, rank: int = 0) -> None:
++        self.every = max(1, int(every))
++        self.rank = rank
++        self.node0 = torch.zeros((1,), dtype=torch.int64, device=device)       # node 0's stamp (a static address)
++        self.ring = torch.zeros((self.RING, 2), dtype=torch.int64, device=device)
++        self.rows: dict = {}                    # key -> [ (i, gap_ns, [piece host ns]) ]
++        self.n = 0
++
++    def stamp_node(self) -> None:
++        """At capture, as the first piece's node 0."""
++
++        _stamp_fn()[(1,)](self.node0, 0, num_warps=1)
++
++    def replay(self, key, graphs) -> None:
++        i = self.n % self.RING
++        self.n += 1
++        _stamp_fn()[(1,)](self.ring[i], 0, num_warps=1)
++        t0 = time.perf_counter_ns()             # the eager stamp's launch has returned
++        host, gap = [], 0
++        for j, g in enumerate(graphs):
++            a = time.perf_counter_ns()
++            if j == 0:
++                gap = a - t0
++            g.replay()
++            host.append(time.perf_counter_ns() - a)
++        self.ring[i, 1].copy_(self.node0[0])    # node 0's stamp of this replay, before the next overwrites it
++        self.rows.setdefault(key, []).append((i, gap, host))
++        if self.n % self.every == 0 or self.n % self.RING == 0:
++            self.report()
++
++    def report(self) -> None:
++        if not self.rows:
++            return
++        torch.cuda.synchronize()
++        ring = self.ring.cpu().tolist()
++        for key, items in sorted(self.rows.items(), key=lambda kv: str(kv[0])):
++            d = delays_us([ring[i][0] for i, _, _ in items], [ring[i][1] for i, _, _ in items],
++                          [gap for _, gap, _ in items])
++            tot = [sum(h) / 1e3 for _, _, h in items]
++            first = [h[0] / 1e3 for _, _, h in items]
++            print(f"[tensorfold] graph probe (patches/0510) r{self.rank} {key} pieces={len(items[0][2])} "
++                  f"n={len(items)}: replay host us p50 {pct(tot, .5):.0f} p90 {pct(tot, .9):.0f} (first piece p50 "
++                  f"{pct(first, .5):.0f}); first node +us p50 {pct(d, .5):.0f} p10 {pct(d, .1):.0f} "
++                  f"p90 {pct(d, .9):.0f}", file=sys.stderr, flush=True)
++        self.rows = {}
++
++
++class Split:
++    """A main graph as pieces (or one graph with the probe's stamp): ``replay`` runs them in order."""
++
++    def __init__(self, graphs, key=None, probe: Probe | None = None) -> None:
++        self.graphs = list(graphs)
++        self.key = key
++        self.probe = probe
++
++    def replay(self) -> None:
++        if self.probe is not None:
++            self.probe.replay(self.key, self.graphs)
++            return
++        for g in self.graphs:
++            g.replay()
++
++
++def capture(fns, pool, *, key=None, probe: Probe | None = None, error_mode: str | None = None) -> Split:
++    """Each callable in ``fns`` captured as its own graph (the probe's stamp first in the first one)."""
++
++    graphs = []
++    for i, f in enumerate(fns):
++        if i:
++            torch.cuda.synchronize()            # every capture starts after a device sync (roce._order's rule)
++        g = torch.cuda.CUDAGraph()
++        kw = {"pool": pool}
++        if error_mode:
++            kw["capture_error_mode"] = error_mode
++        with torch.cuda.graph(g, **kw):
++            if i == 0 and probe is not None:
++                probe.stamp_node()
++            f()
++        graphs.append(g)
++    return Split(graphs, key, probe)
++
++
++def describe(n: int, probe_every: int) -> str:
++    parts = []
++    if n > 1:
++        parts.append(f"lone verify graphs in {n} pieces (GLM53_TF_VERIFY_SPLIT)")
++    if probe_every:
++        parts.append(f"graph launch probe every {probe_every} replays (GLM53_TF_GRAPH_PROBE)")
++    return "; ".join(parts)

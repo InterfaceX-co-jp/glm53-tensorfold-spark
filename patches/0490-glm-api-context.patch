@@ -1,0 +1,378 @@
+diff --git i/src/tensorfold/cuda/server.py w/src/tensorfold/cuda/server.py
+index 88e04a9..c1c729b 100644
+--- i/src/tensorfold/cuda/server.py
++++ w/src/tensorfold/cuda/server.py
+@@ -252,6 +252,68 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]]) -> tuple[str, list[
+     return "".join(residue).strip(), calls or None
+ 
+ 
++# -- patches/0490: OpenAI-shaped request errors, the context limit, token-ID prompts ----------------------------------
++
++class Problem(str):
++    """patches/0490: a request error message that carries an OpenAI error ``code`` and ``param`` (``check`` may
++    return one instead of a plain string; the handler puts both in the error body)."""
++
++    code: str | None = None
++    param: str | None = None
++
++    def __new__(cls, message: str, code: str | None = None, param: str | None = None) -> "Problem":
++        self = super().__new__(cls, message)
++        self.code, self.param = code, param
++        return self
++
++
++def error_body(message: str, kind: str = "invalid_request_error") -> dict[str, Any]:
++    """patches/0490: ``{"error": {...}}`` as OpenAI sends it: message, type, and a ``Problem``'s code / param."""
++
++    err: dict[str, Any] = {"message": str(message), "type": kind}
++    code, param = getattr(message, "code", None), getattr(message, "param", None)
++    if code is not None:
++        err["code"] = code
++    if param is not None:
++        err["param"] = param
++    return {"error": err}
++
++
++def context_problem(prompt: int, asked: int | None, limit: int, *, chat: bool = True) -> Problem | None:
++    """patches/0490: None when ``prompt`` tokens plus ``asked`` reply tokens (1 without max_tokens) fit ``limit``;
++    otherwise a ``context_length_exceeded`` error in the wording OpenAI and vLLM use (clients such as opencode and
++    Hermes Agent read the limit and the split from it and compact the conversation), plus how to raise the limit."""
++
++    need = prompt + (int(asked) if asked else 1)
++    if need <= limit:
++        return None
++    where = "messages" if chat else "prompt"
++    if asked:
++        what = (f"However, you requested {need} tokens ({prompt} in the {where}, {int(asked)} in the completion). "
++                f"Please reduce the length of the {where} or completion.")
++    else:
++        what = f"However, your {where} resulted in {prompt} tokens. Please reduce the length of the {where}."
++    return Problem(f"This model's maximum context length is {limit} tokens. {what} (This TensorFold server was "
++                   f"started with --context {limit} (CONTEXT); restart both ranks with CONTEXT={need} or more to "
++                   "serve it.)", code="context_length_exceeded", param=where)
++
++
++def token_ids_problem(prompt: Any, vocab: int | None) -> str | None:
++    """patches/0490: why a ``/v1/completions`` token-ID ``prompt`` (one flat list of ints, as vLLM takes it) is not
++    usable, or None."""
++
++    if not prompt:
++        return "prompt must not be empty"
++    if all(isinstance(p, list) for p in prompt) or all(isinstance(p, str) for p in prompt):
++        return "one prompt a request: send a string or one list of token ids"
++    if not all(isinstance(t, int) and not isinstance(t, bool) for t in prompt):
++        return "a token-ID prompt must be a list of integers"
++    bad = next((t for t in prompt if t < 0 or (vocab is not None and t >= vocab)), None)
++    if bad is not None:
++        return f"token id {bad} is outside the vocabulary (0 to {vocab - 1 if vocab else '?'})"
++    return None
++
++
+ # -- chat template -------------------------------------------------------------------------
+ 
+ class ChatTemplate:
+@@ -318,6 +380,7 @@ class App:
+         self.sampling = {"temperature": 1.0, "top_k": 20, "top_p": 0.95, **(sampling or {})}
+         self.max_tokens = int(max_tokens)
+         self.lock = threading.Lock()
++        self.created = int(time.time())             # patches/0490: /v1/models' ``created``
+ 
+     def check(self, body: dict[str, Any]) -> str | None:
+         """Why the request cannot run, or None. Checked before a stream's headers are sent."""
+@@ -332,6 +395,10 @@ class App:
+             parse_stop(body.get("stop"))
+         except ValueError as exc:
+             return str(exc)
++        if isinstance(body.get("prompt"), list):    # patches/0490: a token-ID prompt (/v1/completions)
++            problem = token_ids_problem(body["prompt"], self.vocab_size())
++            if problem:
++                return Problem(problem, param="prompt")
+         n = body.get("n")
+         if n is not None and n != 1:
+             return f"n must be 1 on this server (got {n!r}): it returns one choice a request"
+@@ -350,6 +417,40 @@ class App:
+ 
+         return self.tok.encode(text, add_special_tokens=False).ids
+ 
++    def given_ids(self, ids: list[int]) -> list[int]:
++        """patches/0490: a request's own token ids (``/v1/completions`` with a token-ID ``prompt``)."""
++
++        return [int(t) for t in ids]
++
++    def vocab_size(self) -> int | None:
++        """patches/0490: the tokenizer's vocabulary with added tokens (None when the tokenizer cannot say)."""
++
++        size = getattr(self.tok, "get_vocab_size", None)
++        return int(size(with_added_tokens=True)) if size is not None else None
++
++    def context_limit(self) -> int | None:
++        """patches/0490: the most prompt + reply tokens a request may use (the engine's ``limit``: ``--context``),
++        or None when the engine does not say."""
++
++        limit = getattr(self.engine, "limit", None)
++        return int(limit) if isinstance(limit, int) and limit > 0 else None
++
++    def tokenize(self, body: dict[str, Any]) -> list[int]:
++        """patches/0490: ``POST /tokenize`` (vLLM's shape): a string ``prompt`` encoded as the tokenizer does it
++        (``add_special_tokens``, default true as in vLLM), or ``messages`` rendered with the chat template as a chat
++        request renders them. Raises ValueError for anything else."""
++
++        if isinstance(body.get("messages"), list):
++            kwargs = dict(body.get("chat_template_kwargs") or {})
++            thinking = bool(kwargs.pop("enable_thinking", self.default_thinking))
++            text = self.template.render(body["messages"], tools=body.get("tools") or [], enable_thinking=thinking,
++                                        extra=kwargs)
++            return list(self.tok.encode(text, add_special_tokens=False).ids)
++        prompt = body.get("prompt")
++        if not isinstance(prompt, str):
++            raise ValueError("tokenize needs a string prompt or a list of messages")
++        return list(self.tok.encode(prompt, add_special_tokens=bool(body.get("add_special_tokens", True))).ids)
++
+     def sampling_for(self, body: dict[str, Any], prompt: list[int]):
+         """Keyed sampling (the seed, else one drawn from the prompt), or None for greedy decoding."""
+ 
+@@ -371,7 +472,10 @@ class App:
+             text = self.template.render(body["messages"], tools=tools, enable_thinking=thinking, extra=kwargs)
+         else:
+             text = body["prompt"]
+-        prompt = self.prompt_ids(text)             # patches/0210
++        if not chat and isinstance(text, list):    # patches/0490: token ids, used as they are
++            prompt = self.given_ids(text)
++        else:
++            prompt = self.prompt_ids(text)         # patches/0210
+         max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens)
+         sampling = self.sampling_for(body, prompt)
+         out: list[int] = []
+@@ -472,7 +576,11 @@ def make_handler(app: App):
+ 
+         def do_GET(self):
+             if self.path.rstrip("/") in ("/v1/models", "/models"):
+-                self._json(200, {"object": "list", "data": [{"id": app.served, "object": "model", "owned_by": "tensorfold"}]})
++                entry: dict[str, Any] = {"id": app.served, "object": "model", "owned_by": "tensorfold"}
++                limit = app.context_limit()                 # patches/0490: as vLLM (max_model_len) and others say it
++                if limit is not None:
++                    entry.update(created=getattr(app, "created", 0), root=app.served, max_model_len=limit, context_length=limit)
++                self._json(200, {"object": "list", "data": [entry]})
+             elif self.path.rstrip("/") in ("/health", "/v1/health"):
+                 self._json(*app.health.status())            # patches/0150
+             elif self.path.rstrip("/") == "/metrics":       # patches/0150: Prometheus text
+@@ -486,16 +594,27 @@ def make_handler(app: App):
+                 self._json(404, {"error": "not found"})
+ 
+         def do_POST(self):
+-            chat = self.path.rstrip("/").endswith("/chat/completions")
+-            if not chat and not self.path.rstrip("/").endswith("/completions"):
++            path = self.path.rstrip("/")
++            chat = path.endswith("/chat/completions")
++            tokenize = path in ("/tokenize", "/v1/tokenize")        # patches/0490
++            if not chat and not tokenize and not path.endswith("/completions"):
+                 return self._json(404, {"error": "not found"})
+             try:
+                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+             except json.JSONDecodeError:
+-                return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
++                return self._json(400, error_body("the request body is not JSON"))
++            if not isinstance(body, dict):
++                return self._json(400, error_body("the request body must be a JSON object"))
++            if tokenize:                        # patches/0490: host only (no engine, no lock, nothing to rank 1)
++                try:
++                    ids = app.tokenize(body)
++                except ValueError as exc:
++                    return self._json(400, error_body(str(exc)))
++                return self._json(200, {"count": len(ids), "max_model_len": app.context_limit(), "tokens": ids,
++                                        "token_strs": None})
+             problem = app.check(body)
+             if problem:
+-                return self._json(400, {"error": {"message": problem, "type": "invalid_request_error"}})
++                return self._json(400, error_body(problem))     # patches/0490: with a Problem's code / param
+             refused = app.health.reject()           # patches/0150: GLM53_TF_HEALTH=strict after a fatal error
+             if refused:
+                 return self._json(503, {"error": {"message": refused, "type": "server_error"}})
+@@ -532,7 +651,10 @@ def make_handler(app: App):
+                     result = app.run(body, chat, emit)
+                 except Exception as exc:        # patches/0150: an error event, not a dropped connection
+                     try:
+-                        err = {"error": {"message": f"{type(exc).__name__}: {exc}"[:500], "type": "server_error"}}
++                        # patches/0490: a request the engine refused (ValueError) is the client's error, as in the
++                        # non-streamed response
++                        err = error_body(str(exc)[:500]) if isinstance(exc, ValueError) else \
++                            {"error": {"message": f"{type(exc).__name__}: {exc}"[:500], "type": "server_error"}}
+                         self.wfile.write(f"data: {json.dumps(err)}\n\ndata: [DONE]\n\n".encode())
+                         self.wfile.flush()
+                     except (BrokenPipeError, ConnectionResetError):
+diff --git i/src/tensorfold/families/glm5_next/cuda/app.py w/src/tensorfold/families/glm5_next/cuda/app.py
+index 2eede0d..5ea181b 100644
+--- i/src/tensorfold/families/glm5_next/cuda/app.py
++++ w/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -27,6 +27,12 @@ prefix a recent prompt shares is encoded (``prompt_tokens.py``). Only rank 0 tok
+ 
+ patches/0300: GLM53_TF_REQUEST_LOG=<file> appends one JSON line per request (sizes, cache source, timings, finish,
+ hashes of token ids; never text) on this, the serving rank (``reqlog.py``).
++
++patches/0490: a request past the context gets HTTP 400 with OpenAI's ``context_length_exceeded`` code and wording
++("This model's maximum context length is N tokens. However, you requested ..."), which agent clients recognise and
++answer by compacting; ``/v1/models`` reports the limit as ``max_model_len`` / ``context_length``; the load prints one
++``[tensorfold] context:`` line (the limit, the KV cache, the slots, the pool). ``/v1/completions`` also takes one list
++of token ids as ``prompt`` (``/tokenize`` makes them), as vLLM does.
+ """
+ 
+ from __future__ import annotations
+@@ -34,7 +40,7 @@ from __future__ import annotations
+ import os
+ from typing import Any, Callable
+ 
+-from tensorfold.cuda.server import App
++from tensorfold.cuda.server import App, context_problem
+ 
+ from .prompt_tokens import Memo, PromptTokens
+ from . import reqlog as reqlog_mod
+@@ -96,6 +102,27 @@ class ThinkingOffTemplate:
+         return text
+ 
+ 
++def context_summary(engine) -> str:
++    """patches/0490: one line with what decides how long a request can be: the context limit (CONTEXT, the limit
++    ``/v1/models`` reports as ``max_model_len``), the KV cache format, the batch slots and the shared KV pool."""
++
++    limit = getattr(engine, "limit", None)
++    latent = os.environ.get("GLM53_TF_LATENT_KV", "0").strip() == "1"
++    kv = (f"latent {os.environ.get('GLM53_TF_KV_DTYPE', 'bf16').strip() or 'bf16'}" if latent
++          else "per-head K/V (GLM53_TF_LATENT_KV=0, ~390 KB a token a rank)")
++    batch = getattr(engine, "batch", None)
++    slots = int(getattr(batch, "n", 1) or 1) if batch is not None else 1
++    pool = getattr(batch, "kvp", None) if batch is not None else None
++    line = (f"context: {limit} tokens a request (max_model_len; set by CONTEXT / --context); KV cache: {kv}; "
++            f"{slots} request slot(s)")
++    if pool is not None:
++        line += f"; KV pool: {pool.npages * pool.page} tokens shared by the slots"
++    if isinstance(limit, int) and limit <= 65536:
++        line += (f". Requests past {limit} tokens (prompt + max_tokens) get HTTP 400 context_length_exceeded; for "
++                 "long context start with a long-context config (config/prod.env.example: CONTEXT=1048576)")
++    return line
++
++
+ class GlmApp(App):
+     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
+         super().__init__(engine, model_dir, served, **kwargs)
+@@ -111,6 +138,7 @@ class GlmApp(App):
+         if self.reqlog is not None:
+             print(f"[tensorfold] request log (patches/0300): one JSON line a request to {self.reqlog.path}",
+                   flush=True)
++        print(f"[tensorfold] {context_summary(engine)}", flush=True)          # patches/0490
+         if getattr(engine, "batch", None) is not None:
+             # GLM53_TF_BATCH (patches/0030): the engine queues concurrent requests itself, so ``App.run`` must not
+             # serialize them
+@@ -129,21 +157,23 @@ class GlmApp(App):
+             return problem
+         kwargs = dict(body.get("chat_template_kwargs") or {})
+         thinking = bool(kwargs.pop("enable_thinking", self.default_thinking))
+-        if "messages" in body:
++        chat = "messages" in body
++        if chat:
+             text = self.template.render(body["messages"], tools=body.get("tools") or [], enable_thinking=thinking,
+                                         extra=kwargs)
++        elif isinstance(body.get("prompt"), list):              # patches/0490: token ids (checked by App.check)
++            text = None
+         else:
+             text = body.get("prompt") or ""
+-        ids = self.prompt_tokens.encode(text)                       # patches/0210: ``run`` reuses these
+-        self.prompt_memo.put(text, ids)
+-        prompt = len(ids)
++        if text is None:
++            prompt = len(body["prompt"])
++        else:
++            ids = self.prompt_tokens.encode(text)                   # patches/0210: ``run`` reuses these
++            self.prompt_memo.put(text, ids)
++            prompt = len(ids)
+         asked = body.get("max_tokens") or body.get("max_completion_tokens")
+-        need = prompt + (int(asked) if asked else 1)
+-        if need <= limit:
+-            return None
+-        detail = f"{prompt} prompt tokens plus max_tokens {int(asked)}" if asked else f"a {prompt}-token prompt"
+-        return (f"this request needs a {need}-token context ({detail}), and this server was started for {limit}: "
+-                f"restart both ranks with --context {need} or more")
++        # patches/0490: OpenAI's context_length_exceeded (code, wording) instead of a message only people could read
++        return context_problem(prompt, int(asked) if asked else None, limit, chat=chat)
+ 
+     def prompt_ids(self, text: str) -> list[int]:
+         """patches/0210: the ids ``check`` encoded for this text on this request thread, else from the cache."""
+@@ -154,6 +184,21 @@ class GlmApp(App):
+             self._rl.ticket = self.reqlog.begin(ids)
+         return ids
+ 
++    def given_ids(self, ids: list[int]) -> list[int]:
++        """patches/0490: a token-ID prompt, logged as ``prompt_ids`` logs a rendered one (0300)."""
++
++        ids = super().given_ids(ids)
++        if self.reqlog is not None:
++            self._rl.ticket = self.reqlog.begin(ids)
++        return ids
++
++    def tokenize(self, body: dict[str, Any]) -> list[int]:
++        """patches/0490: ``App.tokenize`` with the request's reasoning effort applied first (0150), so ``messages``
++        render as a chat request with the same body renders them."""
++
++        apply_effort(body, field=self.effort_field, default=self.default_effort, default_thinking=self.default_thinking)
++        return super().tokenize(body)
++
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+         from . import cpupin
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index e5c7c8f..9f48a46 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -132,7 +132,7 @@ class Engine:
+         # patches/0290 (GLM53_TF_KV_POOL_TOKENS, default off): every State's capacity-sized caches on one page pool
+         from . import kvpool
+ 
+-        w.meta["kv_pool"] = kvpool.build(w, capacity)
++        w.meta["kv_pool"] = kvpool.build(w, capacity, limit=capacity - max_rows)     # patches/0490: limit
+         self.st = State(w, capacity, rows)
+         self.lean = lean_mod.LeanBuffers(w, lean_rows, rows, len(taps)) if lean_rows > rows else None
+         self.rows_from = None            # the lean set when the last main-model forward was a lean chunk
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index cd6e5fb..4e48725 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -375,6 +375,7 @@ class GlmEngine:
+             raise RuntimeError("the two ranks were started with different KV pool settings (GLM53_TF_KV_POOL_TOKENS, "
+                                f"GLM53_TF_KV_POOL_PAGE, GLM53_TF_KV_POOL_SLACK): {kp_both[0]}, {kp_both[1]}")
+         if kp[0] and rank == 0:
++            kp = (kvpool.pool_tokens(kp[0], kp[1], capacity, self.limit),) + tuple(kp[1:])   # patches/0490: its size
+             per_slot = kvpool.pages_for(capacity, kp[1])
+             print(f"[tensorfold] KV pool (patches/0290): {kp[0]} tokens in pages of {kp[1]} shared by every slot; a "
+                   f"slot grows to {capacity} tokens ({per_slot} pages)"
+diff --git i/src/tensorfold/families/glm5_next/cuda/kvpool.py w/src/tensorfold/families/glm5_next/cuda/kvpool.py
+index c2f5a8e..4108c6d 100644
+--- i/src/tensorfold/families/glm5_next/cuda/kvpool.py
++++ w/src/tensorfold/families/glm5_next/cuda/kvpool.py
+@@ -478,12 +478,26 @@ class KvPool(PoolBook):
+         return True
+ 
+ 
+-def build(w, capacity: int) -> KvPool | None:
+-    """The engine's pool (``decode.Engine``, before any State), or None when GLM53_TF_KV_POOL_TOKENS is unset / 0."""
++def pool_tokens(tokens: int, page: int, capacity: int, limit: int | None = None) -> int:
++    """patches/0490: the pool's size in tokens. A pool set to hold a whole request (``tokens`` >= the context limit)
++    grows to the slot capacity rounded up to a page (limit + the verify window's rows: the most ``need_tokens`` asks
++    for), so every request the context check lets through is admissible on an otherwise free pool; before, one within
++    64 tokens of CONTEXT was refused as "more than the whole pool". One page more at most; which page holds a row never
++    changes a bit. A smaller pool (``tokens`` < limit) stays as set."""
++
++    if tokens and limit is not None and tokens >= limit:
++        return max(int(tokens), pages_for(capacity, page) * page)
++    return int(tokens)
++
++
++def build(w, capacity: int, limit: int | None = None) -> KvPool | None:
++    """The engine's pool (``decode.Engine``, before any State), or None when GLM53_TF_KV_POOL_TOKENS is unset / 0.
++    ``limit``: the engine's context limit (patches/0490, ``pool_tokens``)."""
+ 
+     tokens, page, slack = settings()
+     if not tokens:
+         return None
++    tokens = pool_tokens(tokens, page, capacity, limit)          # patches/0490
+     if not w.meta.get("latent_kv"):
+         raise ValueError(f"{POOL_ENV} pages the latent KV cache: it needs GLM53_TF_LATENT_KV=1")
+     return KvPool(w, tokens, page, slack)

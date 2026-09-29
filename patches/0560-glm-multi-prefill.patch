@@ -1,0 +1,906 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+index fc6b752..d0871fa 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batch.py
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -105,6 +105,14 @@ a request with cost-derived depths pick its round's drafter (MTP, DFlash2, or no
+ (``adapt.SlotChoice``) instead of ``decode.DrafterChoice``'s tokens per lone-model ms; ``BatchDepth`` still picks the
+ depth. Alone, a slot's own choice decides as before. Drafts only: replies unchanged.
+ 
++Multi-slot prefill (patches/0560, ``mpf.py``, GLM53_TF_MULTI_PREFILL=1, off by default): the round's pieces of fast
++lean prefills with the same knobs go through ONE forward (``mpf.run``: each member's rows contiguous, its own
++sub-blocks, KDA / DSA / carries / commit / snapshots / head per member, the routed experts once over every row), up to
++GLM53_TF_MULTI_PREFILL_ROWS rows; each member's piece then ends in ``_piece`` as alone (``mpf.take``: the group's first
++token instead of ``decode.prefill``). Same bits a member as alone (0085's row-independent fast kernels). Rank 0 also
++takes more pieces a round when the fair share allows one (``mpf.more_pieces``) and, idle, waits a few ms for more
++arrivals (``mpf.coalesce``).
++
+ Kept in step with ``forward.py``: ``compute_multi``'s layer loop, ``_kda`` and ``_dsa`` mirror ``forward.compute``,
+ ``kda_block`` and ``dsa_block`` (and ``latent``'s pieces); a change there must be made here too (the tests compare
+ batched rows with lone ones bit for bit).
+@@ -139,6 +147,7 @@ from . import batchplan, comm as comm_mod, decode_v2 as dv2, glue, kda as kda_mo
+ from .attention import attention, kv_write
+ from . import l2pf                                                           # patches/0460
+ from . import vision as vision_mod                                           # patches/0500
++from . import mpf                                                            # patches/0560
+ from .forward import State, _join, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+ 
+ BACKLOG = 32                     # committed rows a drafter may lag behind before they are taken early
+@@ -985,6 +994,8 @@ class Batcher:
+     src_host = src_dev = None
+     kvp = None                                    # patches/0290: the KV page pool (None: every slot owns its caches)
+     pool_check = False
++    mpf_rows = 0                                  # patches/0560: GLM53_TF_MULTI_PREFILL's group rows (0: off)
++    mpf_wait = 0.0                                # patches/0560: rank 0's idle wait for more arrivals (seconds)
+     _spills: Sequence[int] = ()                   # patches/0290: this round's spilled slots (rank 0's plan)
+     overlap = dover.Overlap()                     # patches/0370 defaults (off)
+     _ahead: list[int] | None = None               # patches/0370: the next round's plan, received in this round
+@@ -1065,6 +1076,18 @@ class Batcher:
+             raise RuntimeError(f"the two ranks were started with different GLM53_TF_DECODE_OVERLAP 'plan' parts: rank 0 "
+                                f"{both[0]}, rank 1 {both[1]}")
+         dover.apply_gil(self.overlap)
++        # patches/0560 (GLM53_TF_MULTI_PREFILL): a round's pieces in one forward; both ranks form the same groups
++        lean_rows = int(getattr(getattr(e, "lean", None), "rows", 0) or 0)
++        mine = mpf.settings(lean_rows)
++        both = g._gather_ints(mine)
++        if both[0] != both[1]:
++            raise RuntimeError(f"the two ranks were started with different GLM53_TF_MULTI_PREFILL / "
++                               f"GLM53_TF_MULTI_PREFILL_ROWS: rank 0 {both[0]}, rank 1 {both[1]}")
++        self.mpf_rows = mine[1] if mine[0] and lean_rows else 0
++        self.mpf_wait = mpf.wait_ms() / 1e3 if self.mpf_rows else 0.0
++        if self.mpf_rows and g.rank == 0:
++            print(f"[tensorfold] multi prefill (patches/0560): a round's pieces in one forward, up to {self.mpf_rows} "
++                  f"rows ({int(self.mpf_wait * 1e3)} ms wait for more arrivals when idle)", flush=True)
+         # rank 0 only: scheduling (its decisions travel in the round plans)
+         self.fair = batchplan.Fairness(float(os.environ.get("GLM53_TF_BATCH_PREFILL_SHARE", "") or 0.5))
+         # memory kept free: at load, for the slots (prefill transients, lazily captured graphs); at admission, while
+@@ -1579,6 +1602,8 @@ class Batcher:
+                 if self.stopping:
+                     return None
+                 self.cv.wait()
++            if self.mpf_wait > 0:                       # patches/0560: idle, a few ms for more arrivals
++                mpf.coalesce(self)
+             for job in [j for j in self.queue if j.cancel]:          # gone before it started
+                 self.queue.remove(job)
+                 job.stats.update(cancelled=True)
+@@ -1650,7 +1675,10 @@ class Batcher:
+                 decoding = True
+         for slot, cached, job in admits:
+             prefilling.append((slot, len(job.prompt) - cached, self.round + 1))
+-        pieces = batchplan.pick_pieces(prefilling, self.fair.allow(decoding), self.short) if prefilling else []
++        allow = self.fair.allow(decoding) if prefilling else False
++        pieces = batchplan.pick_pieces(prefilling, allow, self.short) if prefilling else []
++        if self.mpf_rows and prefilling:                # patches/0560: more pieces for one forward
++            pieces = mpf.more_pieces(pieces, prefilling, allow, self.piece, self.mpf_rows)
+         plan = batchplan.encode_plan(cancels, [(slot, cached, self._header(job)) for slot, cached, job in admits],
+                                      pieces)
+         self.g._share(plan)
+@@ -1822,9 +1850,12 @@ class Batcher:
+         for slot, cached, job in admits:
+             self._admit(slot, cached, job)
+         waiting = [q for q in self.seqs if q is not None and q.stepper is not None] if pieces else []
+-        for s in pieces:
++        for grp in mpf.groups(self, pieces) if self.mpf_rows else [[s] for s in pieces]:     # patches/0560
+             t0 = time.perf_counter()
+-            self._piece(s)
++            if len(grp) > 1:
++                mpf.run(self, grp)              # one forward for the group; each piece then ends in ``_piece``
++            for s in grp:
++                self._piece(s)
+             self.last_piece_s += time.perf_counter() - t0
+         for q in waiting:                       # patches/0200: decode time lost to other requests' pieces
+             q.kinds["piece_ms"] += self.last_piece_s * 1e3
+@@ -1921,8 +1952,8 @@ class Batcher:
+                 e.checkpoints = seq.marks           # patches/0180: the store's marks inside this piece
+                 try:
+                     with vision_mod.active(job.vision):     # patches/0500: the prompt's image rows (None: none)
+-                        first = prefill(e, job.prompt[:end], job.sampling, mtp=use_mtp, drafter=drafter,
+-                                        resume=seq.resume)
++                        first = (mpf.take(self, slot) or prefill)(e, job.prompt[:end], job.sampling, mtp=use_mtp,
++                                                                  drafter=drafter, resume=seq.resume)   # 0560
+                 finally:
+                     e.checkpoints = ()
+                 saves = list(getattr(e, "mark_snaps", ()) or ()) if job.draft else []
+diff --git i/src/tensorfold/families/glm5_next/cuda/mpf.py w/src/tensorfold/families/glm5_next/cuda/mpf.py
+new file mode 100644
+index 0000000..677cd2c
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/mpf.py
+@@ -0,0 +1,786 @@
++"""Multi-slot prefill for GLM-5.3-Flash's batch scheduler (patches/0560, GLM53_TF_MULTI_PREFILL, default 0).
++
++Why
++---
++A short prompt's prefill is weight-read bound: a 130-row fast chunk reads nearly every routed expert (130 rows x 8
++picks over 288 experts touch ~97% of them, ~74 GB a rank of the ~76 GB, docs/ROOFLINE.md: U(R) x 0.264 GB), so
++four such prompts prefilled one after another (patches/0200's ``GLM53_TF_BATCH_SHORT``, RigMark C4) read the experts
++four times: W13 measured 0.41 s a piece and first tokens at 0.47 / 0.9 / 1.3 / 1.7 s (0540: each first token as its
++piece ends). With this knob the pieces of one round go through ONE forward: their rows stacked (each prompt's rows
++contiguous), every per-sequence part per slot, the routed experts once over all the rows.
++
++What a group forward is (``compute``)
++-------------------------------------
++The lean fast chunk (patches/0082) whose sub-blocks are the members' own: member i's rows sit at [off_i, off_i + R_i)
++of the lean set and are cut into sub-blocks of ``GLM53_TF_LEAN_BLOCK`` rows FROM ITS OWN START (``blocks``), so a
++sub-block never holds rows of two prompts and a member's sub-blocks are exactly the ones its lone chunk of R_i rows
++would run. Per sub-block (member i, local row la, absolute position pos_i + la) the attention half runs as in the lone
++chunk: hc_pre, the KDA block from the member's committed state (la = 0) or the carry of its previous sub-block (the
++member's own conv tail, ``tails``), the DSA block on the member's latent / index caches (patches/0290: its page
++tables) at its positions; the FFN half's hc_pre, shared expert, combine and hc_post per sub-block; the router, top-k,
++grouping and the routed experts ONCE over all T = sum R_i rows. The three production loops are covered: 0082's
++(``_plain``), 0084's pipeline (``_MultiChunk``: the same piece order, pre(k) then post(k - 1)) and 0320's row split
++(``_MultiSplit``, when the lone rule would split a chunk of T rows: T > the sub-block); the head runs on each member's
++last row (one row: qmm, as alone), into its own logits row.
++
++Exactness (each member's bits are its lone prefill's)
++------------------------------------------------------
++- every call that reads per-sequence state or positions (KDA chain, DSA write / attention / indexer, carries, commit,
++  snapshots, MTP absorb, DFlash2 taps, the head, the sample) is the member's lone call: same rows, same shapes, same
++  state, same positions (its sub-blocks are its lone sub-blocks);
++- every other call runs on a row subset that is not the lone one: hyper-connections, norms, embed, stream means
++  (per-row glue), the matmuls (``fast_qmm.matmul_fast``: tiles fixed by the weight's shape, one accumulator over K,
++  every row count on the fast kernels except the head's single row, patches/0085), the router and top-k (per row), the
++  grouping (only decides which warp holds a pair), the routed experts (``exl3_fast.cu``: a pair's mma chain is one
++  warp's ascending walk over K) and the bf16 exchanges (copies). These are exactly the kernels patches/0085's claim
++  already rests on: a fast prefill's state does not depend on its chunking because no fast kernel's result for a row
++  depends on the other rows of the call or their count. A group is one more chunking of the same rows;
++- kernel CHOICES that depend on the call's total rows: ``fast_qmm``'s < 64-row qmm fallback is gone in fast chunks
++  (0085; the head keeps it and is per member); the routed experts' mode picks by rows under
++  GLM53_TF_FAST_EXPERTS=auto (fast2 vs fat, 0270) and =once (GLM53_TF_ONCE_MIN_ROWS, 0260), each documented as the
++  same bits, but a group never relies on that: with those modes groups are not formed (``kernels_ok``). Production
++  runs ``fat`` (one kernel family for every row count). pfpp's split / pfoverlap's drain depend on the sub-block
++  count, and are the same bits (0320, 0084);
++- the order of the per-member host steps (reset / restore, marks, snapshots, absorb, taps, commit, sample, saves) is
++  the lone prefill's for each member; members never share state (their own ``State``, drafter view, snapshots). The
++  KDA projection / replay rows (``State.proj`` / ``scratch``) are slot 0's for every member (``Batcher._borrow``):
++  they hold one sub-block's rows between its projection and its chain, sub-blocks run one after another.
++
++Which pieces go together (``groups``, both ranks, from state both hold)
++-----------------------------------------------------------------------
++A round's pieces (``batchplan.pick_pieces``: short prompts fewest-left first, then the fair share's piece) are packed
++in that order into groups of the same request knobs (``knobs.HEADER`` values: the chunk kernels are knob-dependent),
++at most ``rows_max`` piece rows a group (GLM53_TF_MULTI_PREFILL_ROWS, default the lean set's rows,
++GLM53_TF_PREFILL_ROWS_MAX). A piece joins only when its request runs a fast lean prefill without image rows
++(patches/0500's virtual ids go through ``vision.active``, one table at a time), GLM53_TF_PROFILE and the 0430 dump
++are off. ``_piece`` recomputes each member's bound when its turn comes: the members after it still hold their slots,
++so only the LAST member could find itself alone (the others done at their first token) and get 0335's solo bound; it
++leaves the group when that would move its bound and no other request holds a slot. Others run alone as before. With
++GLM53_TF_MULTI_PREFILL on, a round whose fair share allows a piece may take more pieces (``more_pieces``: fewest
++tokens left first, while their rows fit ``rows_max``): prompts past ``GLM53_TF_BATCH_SHORT`` (agent bursts) share
++forwards too. GLM53_TF_MULTI_PREFILL_WAIT_MS (rank 0; default 10): when the batch is idle and fewer requests wait
++than slots are free, the plan waits up to that long after the oldest arrival for more (RigMark C4's four streams
++arrive within a few ms; without it the first is prefilled alone and the other three together).
++
++Both ranks must agree on the knob and ``rows_max`` (checked at load: they decide the forwards and collectives).
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import sys
++from types import SimpleNamespace
++from typing import Sequence
++
++ENV = "GLM53_TF_MULTI_PREFILL"
++ROWS_ENV = "GLM53_TF_MULTI_PREFILL_ROWS"
++WAIT_ENV = "GLM53_TF_MULTI_PREFILL_WAIT_MS"
++
++
++def parse(raw: str | None = None) -> bool:
++    raw = os.environ.get(ENV, "0") if raw is None else raw
++    v = str(raw).strip().lower()
++    if v in ("", "0", "off", "false", "no"):
++        return False
++    if v in ("1", "on", "true", "yes"):
++        return True
++    raise ValueError(f"{ENV}={raw!r}: expected 0 or 1")
++
++
++def rows_env() -> int:
++    """GLM53_TF_MULTI_PREFILL_ROWS: piece rows a group may hold (0 / unset: the lean set's rows)."""
++
++    raw = os.environ.get(ROWS_ENV, "").strip()
++    v = int(raw) if raw else 0
++    if v < 0 or (v and v < 64):
++        raise ValueError(f"{ROWS_ENV}={raw}: expected 0 (the lean rows) or at least 64")
++    return v
++
++
++def wait_ms() -> float:
++    raw = os.environ.get(WAIT_ENV, "").strip()
++    v = float(raw) if raw else 10.0
++    if v < 0:
++        raise ValueError(f"{WAIT_ENV}={raw}: expected 0 or more milliseconds")
++    return v
++
++
++ON = parse()
++
++
++def settings(lean_rows: int) -> list[int]:
++    """What both ranks must agree on: the knob and the group row budget."""
++
++    return [int(ON), limit(lean_rows) if ON else 0]
++
++
++def limit(lean_rows: int) -> int:
++    v = rows_env()
++    return min(v, lean_rows) if v else int(lean_rows)
++
++
++def kernels_ok() -> bool:
++    """No kernel of a fast chunk picks by the call's total rows: 0270's auto and 0260's once with a row threshold do
++    (same bits by their patches, but a group does not rely on it)."""
++
++    import sys
++
++    ex = sys.modules.get(__package__ + ".exl3_mm") if __package__ else None
++    if ex is None:
++        return True
++    return not getattr(ex, "AUTO", False) and not (getattr(ex, "ONCE", False) and getattr(ex, "ONCE_MIN_ROWS", 0))
++
++
++# -- rank 0: which pieces --------------------------------------------------------------------------------------------
++def more_pieces(pieces: list[int], prefilling: Sequence[tuple[int, int, int]], allow: bool, piece: int,
++                rows_max: int) -> list[int]:
++    """This round's pieces with more of the waiting prompts' pieces when the fair share allows one: fewest tokens left
++    first, while the pieces' rows (at most ``piece`` each: an estimate, ``groups`` checks the real bounds) fit
++    ``rows_max``. ``prefilling``: (slot, tokens left, admission order), as ``batchplan.pick_pieces``."""
++
++    if not allow or rows_max <= 0:
++        return list(pieces)
++    left = {s: n for s, n, _ in prefilling}
++    out = list(pieces)
++    used = sum(min(left.get(s, piece), piece) for s in out)
++    for s, n, _ in sorted((p for p in prefilling if p[0] not in out), key=lambda p: (p[1], p[2], p[0])):
++        r = min(n, piece)
++        if used + r > rows_max:
++            break
++        out.append(s)
++        used += r
++    return out
++
++
++def coalesce(bat) -> None:
++    """Rank 0, ``Batcher._plan`` holding ``bat.cv``: when no slot holds a request and fewer requests wait than there
++    are slots, wait until ``bat.mpf_wait`` seconds after the oldest arrival (or until the slots are covered) so
++    requests that arrive together are admitted, and prefilled, together."""
++
++    import time
++
++    if not bat.queue or any(s is not None for s in bat.seqs):
++        return
++    now = time.perf_counter()
++    first = min((j.submitted or now) for j in bat.queue)
++    deadline = first + bat.mpf_wait
++    while len(bat.queue) < bat.n and not bat.stopping:
++        left = deadline - time.perf_counter()
++        if left <= 0:
++            break
++        bat.cv.wait(left)
++
++
++def pack(cands: Sequence[tuple[int, object, int] | tuple[int, None, int]], rows_max: int) -> list[list[int]]:
++    """Groups from (slot, key or None, rows) in round order: a member joins the open group of its key while the rows
++    fit, else opens a new one; None (ineligible) runs alone. Groups ordered by their first member."""
++
++    groups: list[list[int]] = []
++    rows: list[int] = []
++    open_: dict = {}
++    for slot, key, r in cands:
++        if key is None or r > rows_max:
++            groups.append([slot])
++            rows.append(r)
++            continue
++        i = open_.get(key)
++        if i is not None and rows[i] + r <= rows_max:
++            groups[i].append(slot)
++            rows[i] += r
++            continue
++        open_[key] = len(groups)
++        groups.append([slot])
++        rows.append(r)
++    return groups
++
++
++def piece_bounds(bat, slot: int) -> tuple[int, bool]:
++    """(the piece's end, whether 0335's solo rule could move it), under the request's knobs (``Batcher._piece``'s
++    arithmetic with the slots as they are now)."""
++
++    from . import batchplan, fastpf
++
++    e = bat.g.e
++    seq = bat.seqs[slot]
++    n = len(seq.job.prompt)
++    grid = batchplan.piece_grid(fastpf.grid(e.prefill_rows), int(getattr(e, "snap_grid", 0) or 0)) \
++        if e.fast_prefill else 0
++    others = [i for i, q in enumerate(bat.seqs) if q is not None and i != slot]
++    solo = batchplan.solo_piece(bat.solo, bat.piece, grid, others)
++    end = batchplan.piece_end(seq.done, n, solo, grid)
++    moves = bool(bat.solo and grid and batchplan.piece_end(seq.done, n, bat.piece, grid)
++                 != batchplan.piece_end(seq.done, n, bat.solo, grid))
++    return end, moves
++
++
++def engine_ok(e) -> bool:
++    """The engine prefills this request's knobs through a fast lean chunk (the only path grouped)."""
++
++    return bool(getattr(e, "fast_prefill", False)) and getattr(e, "lean", None) is not None
++
++
++def groups(bat, pieces: Sequence[int]) -> list[list[int]]:
++    """The round's pieces as groups (both ranks, the same result: from the slots' requests and ``rows_max``)."""
++
++    from . import dump as dump_mod, knobs, profile
++    from .vision_prep import has_vids
++
++    g = bat.g
++    rows_max = getattr(bat, "mpf_rows", 0) or 0
++    if len(pieces) < 2 or rows_max <= 0 or profile.ON or dump_mod.DUMP is not None or not kernels_ok():
++        return [[s] for s in pieces]
++    cands = []
++    for s in pieces:
++        seq = bat.seqs[s]
++        job = seq.job
++        key, rows = None, 0
++        if not has_vids(job.prompt) and seq.stepper is None:
++            with g._knobs(job.values):
++                if engine_ok(g.e):
++                    end, _ = piece_bounds(bat, s)
++                    rows = end - seq.done
++                    if 0 < rows:
++                        key = tuple(int(job.values[k]) for k in knobs.HEADER)
++        cands.append((s, key, rows))
++    return pack(cands, rows_max)
++
++
++# -- the group's prefill (both ranks) -------------------------------------------------------------------------------
++class _Member:
++    """One slot's prefill in a group: ``decode._prefill`` cut at its forwards (``setup``, then per chunk ``before`` /
++    the group forward / ``after``, then ``finish`` inside ``Batcher._piece``)."""
++
++    def __init__(self, bat, slot: int, end: int) -> None:
++        from . import pfgrid
++
++        seq = bat.seqs[slot]
++        job = seq.job
++        _, mtp, dflash = bat.g._drafters(job.code)
++        self.slot, self.seq, self.job = slot, seq, job
++        self.state = bat.states[slot]
++        self.group = 1
++        self.mtp = mtp
++        self.drafter = bat.drafters[slot] if dflash else None
++        self.prompt = list(job.prompt[:end])
++        n = len(job.prompt)
++        # ``Batcher._piece``: e.snap_before = n (draft requests, the rule on); ``_prefill`` applies it when len == n
++        self.before = bool(job.draft and pfgrid.before_end() and end == n)
++        self.marks = tuple(seq.marks)
++        self.resume = seq.resume
++        self.error: BaseException | None = None
++        self.k = 0
++        self.last = None
++        self.last_hidden = None
++        self.view = None
++
++    # decode._prefill up to its chunk loop
++    def setup(self, e) -> None:
++        from . import b12xpf, fp8pf, pfglue, pfgrid
++        from .decode import absorb, restore
++
++        prompt = self.prompt
++        w, st = e.w, e.st
++        drafter = self.drafter
++        self.use_mtp = use_mtp = self.mtp and w.mtp is not None
++        fast = True
++        lean = getattr(e, "lean", None)
++        fp8pf.ON = fast and bool(getattr(e, "fp8_prefill", False))
++        grid = getattr(e, "snap_grid", None) or pfgrid.snapshot_grid()
++        self.tag = pfgrid.tag(fast, fp8pf.ON, grid, pfglue.latent_tc(getattr(e, "w", None)),
++                              b12xpf.tag_bits(getattr(e, "w", None)))
++        cap = lean.rows if lean is not None else e.rows
++        self.mtp_lo = pfglue.mtp_start(len(prompt)) if use_mtp else 0
++        self.fast_snap = None
++        self.mark_snaps: list = []
++        begin = 0
++        resume = self.resume
++        if resume is None:
++            e.reset()
++            if drafter is not None:
++                drafter.reset()
++        else:
++            begin = len(resume.ids)
++            if begin >= len(prompt) or list(prompt[:begin]) != resume.ids:
++                raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt")
++            if (use_mtp and resume.mtp_len < 0) or (drafter is not None and resume.drafter_end != begin):
++                raise ValueError("this snapshot's draft caches do not fit the request")
++            if not pfgrid.resumable(resume.grid, self.tag, begin):
++                raise ValueError(f"a snapshot of grid {resume.grid} at {begin} cannot resume a prefill of grid "
++                                 f"{self.tag}")
++            restore(e, resume, drafter)
++            if use_mtp:
++                k = resume.pending.shape[0]
++                pfglue.absorb(e, resume.pending, list(prompt[begin - k + 1:begin + 1]), begin - k, self.mtp_lo, absorb)
++        n = len(prompt)
++        self.begin, self.n = begin, n
++        self.step = pfgrid.chunk_rows(e.prefill_rows, n - begin, cap, fast)
++        self.plan = pl = pfgrid.plan(begin, n, self.step, fast=fast, marks=self.marks or (), grid=grid,
++                                     tail=getattr(e, "snap_tail", None), before=self.before)
++        if pl.snap == begin and resume is not None:
++            self.fast_snap = resume
++        # patches/0550 when present: the prefill selection's scratch sized before the first forward, as ``_prefill``
++        sparse = sys.modules.get(__package__ + ".sparse")
++        reserve = getattr(sparse, "reserve_for_prefill", None)
++        if reserve is not None and getattr(st, "index", None) is not None \
++                and n - 1 >= getattr(w.cfg, "dense_limit", n) and getattr(sparse, "SELECT", "") == "blocked":
++            reserve(begin, n, e.buf.rows if lean is not None else self.step, st.index[0][2], w.device)
++        room(w, st, n - begin, begin)            # every chunk's room (and 0290's pages) before any group forward
++
++    def span(self) -> tuple[int, int]:
++        return self.plan.spans[self.k]
++
++    def done(self) -> bool:
++        return self.k >= len(self.plan.spans)
++
++    def before_chunk(self, e) -> list[int]:
++        """Marks and the snapshot at the chunk's start; -> the chunk's tokens."""
++
++        from .decode import take_snapshot
++
++        start, stop = self.span()
++        pl, use_mtp = self.plan, self.use_mtp
++        pend = self.last_hidden if use_mtp else None
++        if start in pl.marks:
++            self.mark_snaps.append(take_snapshot(e, self.prompt[:start], pend, mtp=use_mtp, drafter=self.drafter,
++                                                 grid=self.tag, mtp_len=start - 1))
++        if start == pl.snap and start > self.begin:
++            self.fast_snap = take_snapshot(e, self.prompt[:start], pend, mtp=use_mtp, drafter=self.drafter,
++                                           grid=self.tag, mtp_len=start - 1)
++        return self.prompt[start:stop]
++
++    def after_chunk(self, e, logits, view) -> None:
++        """The chunk's rows are in (``view``: its final-normed rows and taps); ``decode._prefill``'s steps after the
++        forward, then the commit (``commit_member``)."""
++
++        from . import pfglue
++        from .decode import absorb, take_snapshot
++
++        start, stop = self.span()
++        R = stop - start
++        self.view = view
++        if hasattr(e, "rows_from"):
++            e.rows_from = view
++        self.last = logits.clone()
++        self.last_hidden = e.main_hidden(slice(R - 1, R)).clone()
++        if self.use_mtp:
++            nxt = list(self.prompt[start + 1:start + R + 1])
++            if nxt:
++                pfglue.absorb(e, e.main_hidden(slice(0, len(nxt))), nxt, start, self.mtp_lo, absorb)
++        if self.drafter is not None:
++            self.drafter.add_taps(e.tap_rows(R))
++        commit_member(e, self)
++        self.k += 1
++        if self.done() and self.plan.snap == self.n:       # the prompt (piece) ends on the grid
++            self.fast_snap = take_snapshot(e, self.prompt, self.last_hidden if self.use_mtp else None,
++                                           mtp=self.use_mtp, drafter=self.drafter, grid=self.tag)
++
++    def finish(self, e, prompt, sampling, *, mtp=True, drafter=None, resume=None) -> int:
++        """``decode.prefill``'s place in ``Batcher._piece``: the engine fields a prefill leaves, the first token."""
++
++        if self.error is not None:
++            raise self.error
++        if len(prompt) != len(self.prompt):
++            raise RuntimeError(f"multi prefill: slot {self.slot}'s piece ends at {len(prompt)}, the group ran it to "
++                               f"{len(self.prompt)}")
++        if not self.done():
++            raise RuntimeError(f"multi prefill: slot {self.slot}'s prefill did not finish")
++        e.fast_snap = self.fast_snap
++        e.mark_snaps = list(self.mark_snaps)
++        e.last_hidden = self.last_hidden
++        e.fast_rows = self.step
++        e.snap_before = 0
++        if hasattr(e, "rows_from"):
++            e.rows_from = self.view
++        self.seq.job.stats["multi_prefill"] = self.group
++        return e.sample(self.last, [len(self.prompt)], sampling)[0]
++
++
++def room(w, st, R: int, pos: int) -> None:
++    """``forward.check_room`` (the tests' fake models replace it)."""
++
++    from .forward import check_room
++
++    check_room(w, st, R, pos)
++
++
++def _failed(exc: BaseException):
++    def raise_(*a, **k):
++        raise exc
++
++    return raise_
++
++
++def run(bat, slots: Sequence[int]) -> None:
++    """The group's prefill up to each member's first token: every member's setup, then its chunks in lockstep (one
++    group forward per chunk index), each member's steps in slot order. Each member's piece then finishes in
++    ``Batcher._piece`` (``take``). A request's own error (ValueError, before any forward) makes its piece fail there,
++    as alone."""
++
++    g = bat.g
++    e = g.e
++    _done(bat).clear()                  # nothing left from an earlier round (every member's ``_piece`` takes its own)
++    job0 = bat.seqs[slots[0]].job
++    ends = {}
++    members: list[_Member] = []
++    with g._knobs(job0.values):
++        bounds = {s: piece_bounds(bat, s) for s in slots}
++    # ``_piece`` recomputes a member's bound when its turn comes: the members after it still hold their slots (no solo
++    # piece), but the LAST one may find every other slot freed (members done at their first token) and, with
++    # GLM53_TF_SOLO_PIECE, a bound the group did not run: it prefills alone then, unless another request holds a slot
++    slots = list(slots)
++    if bounds[slots[-1]][1] and not any(q is not None and i not in slots for i, q in enumerate(bat.seqs)):
++        slots.pop()
++    if len(slots) < 2:
++        return
++    with g._knobs(job0.values), _borrow_all(bat, slots):
++        for s in slots:
++            ends[s] = bounds[s][0]
++        for s in slots:
++            m = _Member(bat, s, ends[s])
++            m.group = len(slots)
++            with bat._on(s):
++                try:
++                    m.setup(e)
++                except ValueError as exc:
++                    _done(bat)[s] = _failed(exc)
++                    continue
++            members.append(m)
++        while True:
++            live = [m for m in members if not m.done()]
++            if not live:
++                break
++            chunks = []
++            for m in live:
++                with bat._on(m.slot):
++                    chunks.append(m.before_chunk(e))
++            logits, views = forward_group(e, live, chunks)
++            for i, m in enumerate(live):
++                with bat._on(m.slot):
++                    m.after_chunk(e, logits[i:i + 1], views[i])
++        bat.counts["multi_groups"] += 1
++        bat.counts["multi_members"] += len(members)
++    for m in members:
++        _done(bat)[m.slot] = m.finish
++
++
++def _done(bat) -> dict:
++    return bat.__dict__.setdefault("_mpf_done", {})
++
++
++def take(bat, slot: int):
++    """``Batcher._piece``: the group's result for ``slot`` (a ``decode.prefill`` stand-in), else None."""
++
++    done = bat.__dict__.get("_mpf_done")
++    return done.pop(slot, None) if done else None
++
++
++@contextlib.contextmanager
++def _borrow_all(bat, slots):
++    with contextlib.ExitStack() as stack:
++        for s in slots:
++            stack.enter_context(bat._borrow(s))
++        yield
++
++
++# -- the forward (hooks: the tests' fake models replace these) --------------------------------------------------------
++def forward_group(e, live: Sequence[_Member], chunks: Sequence[list[int]]):
++    """One forward over the members' chunks: -> (last-row logits [k, V/world], per member its rows' view)."""
++
++    w, b, lb = e.w, e.buf, e.lean
++    segs = []
++    off = 0
++    tokens: list[int] = []
++    tails = _tails(lb, len(live))
++    for i, (m, ch) in enumerate(zip(live, chunks)):
++        st = m.state
++        segs.append(Seg(st, off, len(ch), st.pos, tails[i], lb))
++        tokens += ch
++        off += len(ch)
++    stage(w, lb, segs, tokens)
++    logits = compute(w, b, lb, segs)
++    views = [SimpleNamespace(fnormed=lb.fnormed[s.off:s.off + s.R],
++                             tapcat=lb.tapcat[s.off:s.off + s.R] if lb.tapcat is not None else None) for s in segs]
++    for m, s in zip(live, segs):
++        m.seg = s
++    return logits, views
++
++
++def commit_member(e, m: _Member) -> None:
++    from . import lean
++
++    s = m.seg
++    lean.commit(e.w, s.st, SimpleNamespace(tail=s.tail), s.R)
++
++
++def stage(w, lb, segs, tokens: list[int]) -> None:
++    """The group's token ids into the lean set (one copy), each member's room checked at its position."""
++
++    from .forward import check_room
++
++    T = len(tokens)
++    if T > lb.rows:
++        raise RuntimeError(f"multi prefill: {T} rows, the lean buffers hold {lb.rows}")
++    for s in segs:
++        check_room(w, s.st, s.R, s.pos)
++    if lb.staged is not None:
++        lb.staged.synchronize()
++    lb.ids_host[:T].numpy()[:] = tokens
++    lb.ids[:T].copy_(lb.ids_host[:T], non_blocking=True)
++    if lb.staged is not None:
++        lb.staged.record()
++
++
++def _tails(lb, k: int):
++    """k KDA conv carries (``LeanBuffers.tail``'s shape each), kept on the lean set (not a tensor attribute: the set's
++    byte count stays the lean set's)."""
++
++    import torch
++
++    have = getattr(lb, "mpf_tails", None)           # a tuple: ``LeanBuffers.nbytes`` counts tensor attributes only
++    if have is None or have[0].shape[0] < k:
++        have = (torch.zeros((max(k, 4),) + tuple(lb.tail.shape), dtype=lb.tail.dtype, device=lb.tail.device),)
++        lb.mpf_tails = have
++    return [have[0][i] for i in range(k)]
++
++
++class Seg:
++    """A member's rows in a group forward: its State, first row in the lean set, rows, position, conv carry."""
++
++    __slots__ = ("st", "off", "R", "pos", "tail", "carry")
++
++    def __init__(self, st, off: int, R: int, pos: int, tail, lb) -> None:
++        self.st, self.off, self.R, self.pos, self.tail = st, off, R, pos, tail
++        # what ``lean._kda_block`` / ``_carry`` read of the lean set: the conv tail (the member's) and the state copy
++        self.carry = SimpleNamespace(tail=tail, rec_tmp=lb.rec_tmp)
++
++
++def blocks(segs: Sequence[Seg], block: int) -> list[tuple[int, int, int]]:
++    """(first row, rows, member) of every sub-block: each member's rows cut at ``block`` from its own start."""
++
++    out = []
++    for i, s in enumerate(segs):
++        for la in range(0, s.R, block):
++            out.append((s.off + la, min(block, s.R - la), i))
++    return out
++
++
++class _SegLB:
++    """The lean set as the chunk loops see it, with the group's sub-blocks (attribute reads and writes go to the set)."""
++
++    def __init__(self, lb, bl) -> None:
++        object.__setattr__(self, "_lb", lb)
++        object.__setattr__(self, "_bl", [(a, r) for a, r, _ in bl])
++
++    def __getattr__(self, name):
++        return getattr(object.__getattribute__(self, "_lb"), name)
++
++    def __setattr__(self, name, value) -> None:
++        setattr(object.__getattribute__(self, "_lb"), name, value)
++
++    def sub_blocks(self, R: int):
++        return list(object.__getattribute__(self, "_bl"))
++
++
++def _fxs_rows(lb, w):
++    from . import pfpp
++
++    return pfpp._fxs_rows(lb, w)
++
++
++def split_applies(w, lb, T: int) -> bool:
++    """0320's row split for a group of T rows: when the lone rule splits a chunk of T rows (more than one sub-block)."""
++
++    from . import pfpp
++
++    return (pfpp.ON and w.comm is not None and w.world == 2 and getattr(w.comm, "world", 2) == 2
++            and -(-T // lb.block) >= pfpp.MIN_BLOCKS)
++
++
++def compute(w, b, lb, segs: Sequence[Seg], *, head: bool = True):
++    """The group forward on staged rows (``stage``): -> the members' last-row logits [k, V/world] (a view of
++    ``b.logits``); every member's final-normed rows in ``lb.fnormed`` and taps in ``lb.tapcat`` at its rows. States
++    are committed by ``lean.commit`` per member (its ``Seg.tail``)."""
++
++    from . import lean, pfoverlap
++
++    T = sum(s.R for s in segs)
++    if T > lb.rows:
++        raise ValueError(f"multi prefill: {T} rows, the lean buffers hold {lb.rows}")
++    if lb.block > b.rows:
++        raise ValueError(f"lean sub-blocks of {lb.block} rows, the main buffers hold {b.rows}")
++    if len(segs) > b.logits.shape[0]:
++        raise ValueError(f"multi prefill: {len(segs)} members, {b.logits.shape[0]} logits rows")
++    bl = blocks(segs, lb.block)
++    with lean.chunk_rows(w, T):
++        if pfoverlap.on():
++            fxs = _pipelined(w, b, lb, segs, bl, T)
++        else:
++            fxs = _plain(w, b, lb, segs, bl, T)
++        from . import fastpf, qmm
++
++        with fastpf.chunk(b, w.head):
++            if head:
++                for i, s in enumerate(segs):
++                    r = s.off + s.R
++                    qmm.matmul(lb.fnormed[r - 1:r], w.head, fxs[r - 1:r], out=b.logits[i:i + 1], part=b.sk)
++            lean._join(w)
++    return b.logits[:len(segs)]
++
++
++def _attn_half(layer, w, s: Seg, b, lb, a: int, r: int) -> None:
++    """``lean._attn_half`` for the member's sub-block [a, a + r) (its local row a - off, its position)."""
++
++    from . import glue, lean
++    from .attention import CHUNK
++
++    c = w.cfg
++    la = a - s.off
++    pos = s.pos + la
++    x = lb.x[a:a + r]
++    h = layer.attn_hc
++    glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:r], b.xs[:r], b.post[:r], b.comb[:r],
++                b.hcpart[:r], c.eps, c.hc_eps, c.hc_iters)
++    b.site = (layer.index, "a")
++    st = s.st
++    if layer.kind == "kda":
++        g = lean._kda_block(layer, w, st, b, s.carry, la, r, pos)
++    else:
++        di = st.dsa_index[layer.index]
++        lb.pos_dev.fill_(pos)
++        g = lean.dsa_block(layer, w, st.kc[di], st.vc[di], lb.pos_dev, b, r, -(-(pos + r) // CHUNK),
++                           st.index[di] if st.index is not None else None, pos, None)
++    glue.hc_post(x, x, g, b.post[:r], b.comb[:r])
++
++
++def _plain(w, b, lb, segs, bl, T: int):
++    """0082's loop (``lean._compute``) over the group's sub-blocks. -> the final norm's group sums of every row."""
++
++    from . import fastpf, glue, lean
++
++    c = w.cfg
++    seg = _SegLB(lb, bl)
++    fxs = _fxs_rows(lb, w)
++    with fastpf.chunk(b, w.head):
++        glue.embed(lb.ids[:T], w.embed, c.hidden, c.streams, lb.x[:T])
++        for layer in w.layers:
++            for a, r, i in bl:
++                _attn_half(layer, w, segs[i], b, lb, a, r)
++            if layer.mlp is not None:
++                for a, r, _ in bl:
++                    lean._ffn_dense(layer, w, b, lb, a, r)
++            else:
++                lean._ffn_moe(layer, w, b, seg, T)
++            for slot in b.tap_at.get(layer.index, ()):
++                for a, r, _ in bl:
++                    glue.stream_mean(lb.x[a:a + r], b.taps[slot][:r])
++                    lb.tapcat[a:a + r, slot * lb.D:(slot + 1) * lb.D].copy_(b.taps[slot][:r])
++        for a, r, _ in bl:
++            glue.stream_mean(lb.x[a:a + r], b.hidden[:r])
++            glue.rmsnorm(b.hidden[:r], w.norm, c.eps, lb.fnormed[a:a + r], fxs[a:a + r])
++    return fxs
++
++
++def _seg_classes():
++    from . import glue, pfoverlap, pfpp
++
++    class _SegMixin:
++        """The member-aware attention piece: the sub-block's member, local row and position."""
++
++        def seg_setup(self, segs, bl) -> None:
++            self.segs = segs
++            self.owner = {a: i for a, _, i in bl}
++
++        def attn_pre(self, layer, a: int, r: int):
++            need = getattr(self, "need", None)
++            if need is not None:                 # 0320: the sub-block's shared rows first
++                need(a)
++            from . import lean
++            from .attention import CHUNK
++
++            s = self.segs[self.owner[a]]
++            w, b, lb = self.w, self.b, self.lb
++            la = a - s.off
++            pos = s.pos + la
++            st = s.st
++            b.site = (layer.index, "a")
++            if layer.kind == "kda":
++                return lean._kda_block(layer, w, st, b, s.carry, la, r, pos, lb.normed[a:a + r], lb.xs[a:a + r])
++            b.normed[:r].copy_(lb.normed[a:a + r])
++            b.xs[:r].copy_(lb.xs[a:a + r])
++            di = st.dsa_index[layer.index]
++            lb.pos_dev.fill_(pos)
++            return lean.dsa_block(layer, w, st.kc[di], st.vc[di], lb.pos_dev, b, r, -(-(pos + r) // CHUNK),
++                                  st.index[di] if st.index is not None else None, pos, None)
++
++    class _MultiChunk(_SegMixin, pfoverlap._Chunk):
++        """0084's pipelined chunk over the group's sub-blocks; the final norm's group sums kept for every row (each
++        member's head reads its last row's)."""
++
++        def ffn_post(self, layer, nxt, a: int, r: int, g) -> None:
++            if nxt is not None:
++                return super().ffn_post(layer, nxt, a, r, g)
++            w, b, lb, c = self.w, self.b, self.lb, self.c
++            taps = b.tap_at.get(layer.index, ())
++            for s0, n in self.slabs(a, r):
++                x = lb.x[s0:s0 + n]
++                self.hc_post(g, a, s0, n)
++                for slot in taps:
++                    glue.stream_mean(x, b.taps[slot][:n])
++                    lb.tapcat[s0:s0 + n, slot * lb.D:(slot + 1) * lb.D].copy_(b.taps[slot][:n])
++                glue.stream_mean(x, b.hidden[:n])
++                glue.rmsnorm(b.hidden[:n], w.norm, c.eps, lb.fnormed[s0:s0 + n], self.fxs[s0:s0 + n])
++
++    class _MultiSplit(_SegMixin, pfpp._SplitChunk):
++        """0320's row-split chunk over the group's sub-blocks (its final sums are per row already)."""
++
++    return _MultiChunk, _MultiSplit
++
++
++_CLASSES = None
++
++
++def classes():
++    global _CLASSES
++    if _CLASSES is None:
++        _CLASSES = _seg_classes()
++    return _CLASSES
++
++
++def _pipelined(w, b, lb, segs, bl, T: int):
++    from . import fastpf, pfoverlap, pfpp
++
++    Multi, Split = classes()
++    seg = _SegLB(lb, bl)
++    mode = pfoverlap.MODE
++    split = split_applies(w, lb, T)
++    if split:
++        pipe = pfpp._pipe(w, lb)
++        cls = Split
++    else:
++        pipe = pfoverlap._pipe(w, b, lb)
++        cls = Multi
++    pipe.begin(mode.gather)
++    run = cls(w, segs[0].st, b, seg, T, pipe, pfoverlap.slab_rows(w, lb.block) if mode.slab else 0)
++    run.seg_setup(segs, bl)
++    if not split:
++        run.fxs = _fxs_rows(lb, w)
++    with fastpf.chunk(b, w.head):
++        b.defer = pipe
++        ok = False
++        try:
++            run.run()
++            ok = True
++        finally:
++            b.defer = None
++            if not ok:
++                if split:
++                    run.rows_pending.clear()
++                pipe.abort()
++        if not pipe.idle() or (split and run.rows_pending):
++            raise RuntimeError("multi prefill: exchanges left pending at the end of a group forward")
++    compute.last = run                    # tests: the piece order
++    return run.fxs
++
++
++compute.last = None
+diff --git i/src/tensorfold/families/glm5_next/cuda/reqlog.py w/src/tensorfold/families/glm5_next/cuda/reqlog.py
+index 1be5b54..8bc75b1 100644
+--- i/src/tensorfold/families/glm5_next/cuda/reqlog.py
++++ w/src/tensorfold/families/glm5_next/cuda/reqlog.py
+@@ -291,6 +291,7 @@ class RequestLog:
+             "tokens_per_round": _num(stats.get("tokens_per_round")), "rounds": stats.get("rounds"),
+             "pieces": stats.get("pieces"), "slot": stats.get("slot"), "kv_pages": stats.get("kv_pages"),
+             "kv_free": stats.get("kv_free"), "marks": stats.get("marks"),
++            "multi": stats.get("multi_prefill"),          # patches/0560: members of its group forward (None: alone)
+             "thinking": thinking, "effort": kw.get("reasoning_effort") if thinking else None,
+             "effort_asked": body.get("reasoning_effort"),
+             "max_tokens": int(asked) if asked else None, "max_tokens_eff": max_tokens_eff,

@@ -1,0 +1,96 @@
+[
+ {
+  "name": "greedy",
+  "first": {
+   "ttft": 8.889,
+   "wall": 9.38,
+   "sha": "e9120f41b5df8f87",
+   "text": "The committee reviews quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse. These items are the focus of its regular oversight duties.",
+   "prompt_tokens": 14036,
+   "cached_tokens": 0,
+   "log": {
+    "n": 49,
+    "prompt": 14036,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 4,
+    "prefill_s": 8.7903,
+    "prefill_tps": 1596.8,
+    "queue_s": 0.006,
+    "first_s": 8.859,
+    "slot": 1,
+    "finish": "stop"
+   }
+  },
+  "second": {
+   "ttft": 0.228,
+   "wall": 0.683,
+   "sha": "e9120f41b5df8f87",
+   "text": "The committee reviews quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse. These items are the focus of its regular oversight duties.",
+   "prompt_tokens": 14036,
+   "cached_tokens": 14016,
+   "log": {
+    "n": 50,
+    "prompt": 14036,
+    "cached": 14016,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.1767,
+    "prefill_tps": 113.2,
+    "queue_s": 0.005,
+    "first_s": 0.227,
+    "slot": 1,
+    "finish": "stop"
+   }
+  },
+  "identical": true,
+  "cached_within_64": true
+ },
+ {
+  "name": "sampled",
+  "first": {
+   "ttft": 0.232,
+   "wall": 1.054,
+   "sha": "5a3cb5100a5b4adc",
+   "text": "The committee reviews quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse. These items are mentioned repeatedly throughout the text as the key areas of th",
+   "prompt_tokens": 14036,
+   "cached_tokens": 14016,
+   "log": {
+    "n": 51,
+    "prompt": 14036,
+    "cached": 14016,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.1745,
+    "prefill_tps": 114.6,
+    "queue_s": 0.006,
+    "first_s": 0.231,
+    "slot": 1,
+    "finish": "stop"
+   }
+  },
+  "second": {
+   "ttft": 0.24,
+   "wall": 0.98,
+   "sha": "5a3cb5100a5b4adc",
+   "text": "The committee reviews quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse. These items are mentioned repeatedly throughout the text as the key areas of th",
+   "prompt_tokens": 14036,
+   "cached_tokens": 14016,
+   "log": {
+    "n": 52,
+    "prompt": 14036,
+    "cached": 14016,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.179,
+    "prefill_tps": 111.7,
+    "queue_s": 0.005,
+    "first_s": 0.237,
+    "slot": 1,
+    "finish": "stop"
+   }
+  },
+  "identical": true,
+  "cached_within_64": true
+ }
+]

@@ -100,7 +100,7 @@ def small_chunks(monkeypatch):
     monkeypatch.setattr(fastboot, "CHUNK", 64 << 10)
 
 
-@pytest.mark.parametrize("nonexpert", ["bf16", "q4", "q4mse"])
+@pytest.mark.parametrize("nonexpert", ["bf16", "q4", "q4mse", "q8"])          # q8: patches/0470
 @pytest.mark.parametrize("rank", [0, 1])
 def test_weights_roundtrip(synthetic, tmp_path, monkeypatch, small_chunks, rank, nonexpert):
     ckpt, _ = synthetic

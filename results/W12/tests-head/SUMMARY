@@ -1,0 +1,30 @@
+12:49:20 start head
+12:50:37 off-emu rc=0 77s :: 61 passed in 73.80s (0:01:13)
+12:50:57 off-compile rc=0 20s :: 6 passed in 16.78s
+12:51:07 off-api rc=0 10s :: 20 passed, 1 skipped in 7.71s
+12:52:55 e-bits rc=1 108s :: 1 failed, 15 passed, 9 deselected in 105.38s (0:01:45)
+12:54:02 e-bench rc=1 67s :: ninja: build stopped: subcommand failed.
+12:55:05 e-engines rc=0 63s :: 9 passed, 16 deselected in 60.46s (0:01:00)
+12:55:15 e-decode-on rc=0 10s :: 7 passed in 7.37s
+12:55:26 e-bpar-on rc=0 11s :: 26 passed in 8.56s
+12:55:41 e-deep-on rc=1 15s :: 1 failed, 4 passed, 17 skipped in 11.62s
+12:55:41 head tests done
+13:05:01 start head
+13:05:19 e-bits rc=0 18s :: 16 passed, 9 deselected in 15.15s
+13:05:36 e-bench rc=0 17s :: 
+13:05:36 head tests done
+13:10:26 start head
+13:35:31 g-sampler rc=0 1505s :: 
+13:35:50 p-unit rc=1 19s :: 10 failed, 5 passed, 10 errors in 16.71s
+13:35:57 p-roce rc=1 7s :: 6 failed, 19 errors in 3.57s
+13:36:04 p-comm rc=0 7s :: 15 passed in 4.68s
+13:36:12 p-bpar rc=1 8s :: 18 passed, 8 errors in 5.27s
+13:36:17 p-pdl rc=0 5s :: 1 passed, 24 deselected in 2.79s
+13:36:17 head tests done
+13:42:17 start head
+13:43:51 p-unit rc=0 94s :: 25 passed in 91.68s (0:01:31)
+13:44:01 p-roce rc=0 10s :: 25 passed in 7.08s
+13:44:09 p-comm rc=0 8s :: 15 passed in 4.69s
+13:44:20 p-bpar rc=0 11s :: 26 passed in 8.16s
+13:44:53 p-pdl rc=0 33s :: 1 passed, 24 deselected in 30.29s
+13:44:53 head tests done

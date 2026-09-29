@@ -1,0 +1,85 @@
+826 GLM-served steps, 385061 reply tokens (prose 181559, code 136395, tool 67107) in 15 sessions; prior: 3321608 tokens of other text in 60 sessions; CJK stand-in 1890041 tokens
+
+coverage, session split: built on 676 GLM steps (10623 distinct ids) + prior (34960 distinct ids), measured on 150 steps
+   M/rank      N list             prose    code    tool     cjk     all  cost rows
+     8192  16384 per-rank        89.58%  91.22%  92.00%  46.43%  90.38%    8192
+     8192  16384 per-rank GLM    89.13%  90.87%  90.83%  37.06%  89.85%    8192
+     8192  16384 global 2M       94.82%  95.01%  95.03%  43.09%  94.90%   15168
+     8192  16384 per-rank +ctx   96.09%  98.80%  97.34%       -  97.00%
+    12288  24576 per-rank        93.56%  93.62%  94.57%  50.97%  93.73%   12288
+    12288  24576 per-rank GLM    91.38%  92.38%  92.22%  47.24%  91.77%   12288
+    12288  24576 global 2M       97.11%  96.76%  96.96%  52.75%  97.00%   22336
+    12288  24576 per-rank +ctx   97.52%  99.08%  98.13%       -  98.02%
+    16384  32768 per-rank        95.49%  95.52%  96.21%  56.50%  95.61%   16384
+    16384  32768 per-rank GLM    92.82%  93.66%  93.73%  49.99%  93.18%   16384
+    16384  32768 global 2M       98.25%  97.81%  98.23%  57.90%  98.13%   29504
+    16384  32768 per-rank +ctx   98.25%  99.27%  98.59%       -  98.57%
+    24576  49152 per-rank        98.22%  97.83%  98.28%  64.27%  98.13%   24576
+    24576  49152 per-rank GLM    95.05%  95.44%  95.57%  61.93%  95.23%   24576
+    24576  49152 global 2M       98.42%  97.89%  98.57%  60.03%  98.30%   31104
+    24576  49152 per-rank +ctx   99.28%  99.56%  99.24%       -  99.35%
+    32768  65536 per-rank        98.62%  98.15%  98.85%  67.76%  98.53%   32768
+    32768  65536 per-rank GLM    96.32%  96.48%  96.60%  67.80%  96.41%   32768
+    32768  65536 global 2M       98.42%  97.89%  98.57%  60.03%  98.30%   31104
+    32768  65536 per-rank +ctx   99.57%  99.67%  99.46%       -  99.58%
+
+coverage, time split: built on 619 GLM steps (11159 distinct ids) + prior (32632 distinct ids), measured on 207 steps
+   M/rank      N list             prose    code    tool     cjk     all  cost rows
+     8192  16384 per-rank        90.62%  88.98%  94.71%  43.57%  90.84%    8192
+     8192  16384 per-rank GLM    90.30%  87.30%  94.12%  37.03%  90.12%    8192
+     8192  16384 global 2M       95.54%  96.10%  98.22%  42.67%  96.13%   15104
+     8192  16384 per-rank +ctx   96.43%  99.16%  99.15%       -  97.60%
+    12288  24576 per-rank        94.67%  95.35%  97.86%  49.74%  95.37%   12288
+    12288  24576 per-rank GLM    92.34%  89.37%  96.49%  45.00%  92.22%   12288
+    12288  24576 global 2M       97.75%  98.27%  99.08%  52.33%  98.11%   22208
+    12288  24576 per-rank +ctx   97.61%  99.29%  99.42%       -  98.35%
+    16384  32768 per-rank        96.27%  97.20%  98.55%  55.09%  96.89%   16384
+    16384  32768 per-rank GLM    93.74%  91.07%  97.01%  47.55%  93.55%   16384
+    16384  32768 global 2M       98.69%  98.88%  99.30%  56.13%  98.84%   29568
+    16384  32768 per-rank +ctx   98.32%  99.55%  99.54%       -  98.84%
+    24576  49152 per-rank        98.48%  98.78%  99.21%  62.88%  98.68%   24576
+    24576  49152 per-rank GLM    95.92%  93.82%  98.04%  59.43%  95.70%   24576
+    24576  49152 global 2M       98.85%  98.97%  99.30%  57.94%  98.95%   29568
+    24576  49152 per-rank +ctx   99.29%  99.80%  99.74%       -  99.50%
+    32768  65536 per-rank        99.06%  99.27%  99.48%  66.76%  99.18%   32768
+    32768  65536 per-rank GLM    97.22%  95.26%  98.60%  65.73%  96.92%   32768
+    32768  65536 global 2M       98.85%  98.97%  99.30%  57.94%  98.95%   29568
+    32768  65536 per-rank +ctx   99.55%  99.88%  99.87%       -  99.69%
+
+coverage, in-sample split: built on 826 GLM steps (12443 distinct ids) + prior (36187 distinct ids), measured on 826 steps
+   M/rank      N list             prose    code    tool     cjk     all  cost rows
+     8192  16384 per-rank        98.66%  99.48%  99.33%  47.09%  99.06%    8192
+     8192  16384 per-rank GLM    98.67%  99.45%  99.34%  38.77%  99.06%    8192
+     8192  16384 global 2M      100.00% 100.00% 100.00%  44.77% 100.00%   15040
+     8192  16384 per-rank +ctx   98.84%  99.62%  99.47%       -  99.22%
+    12288  24576 per-rank       100.00% 100.00% 100.00%  53.02% 100.00%   12288
+    12288  24576 per-rank GLM   100.00% 100.00% 100.00%  49.12% 100.00%   12288
+    12288  24576 global 2M      100.00% 100.00% 100.00%  52.99% 100.00%   22336
+    12288  24576 per-rank +ctx  100.00% 100.00% 100.00%       - 100.00%
+    16384  32768 per-rank       100.00% 100.00% 100.00%  57.42% 100.00%   16384
+    16384  32768 per-rank GLM   100.00% 100.00% 100.00%  52.17% 100.00%   16384
+    16384  32768 global 2M      100.00% 100.00% 100.00%  58.39% 100.00%   29248
+    16384  32768 per-rank +ctx  100.00% 100.00% 100.00%       - 100.00%
+    24576  49152 per-rank       100.00% 100.00% 100.00%  64.30% 100.00%   24576
+    24576  49152 per-rank GLM   100.00% 100.00% 100.00%  62.01% 100.00%   24576
+    24576  49152 global 2M      100.00% 100.00% 100.00%  60.48% 100.00%   32256
+    24576  49152 per-rank +ctx  100.00% 100.00% 100.00%       - 100.00%
+    32768  65536 per-rank       100.00% 100.00% 100.00%  67.70% 100.00%   32768
+    32768  65536 per-rank GLM   100.00% 100.00% 100.00%  68.93% 100.00%   32768
+    32768  65536 global 2M      100.00% 100.00% 100.00%  60.48% 100.00%   32256
+    32768  65536 per-rank +ctx  100.00% 100.00% 100.00%       - 100.00%
+
+head a rank: full 77440 rows 178.4 MB = 0.892 ms at 200 GB/s
+drafter rounds, session split held out: tokens a round full -> trimmed, net tokens/ms vs full (fallback: > 3% of the last 256 tokens unlisted -> full head)
+  mtp    M  8192 (saves 0.798 ms an eval)  prose 2.42->2.18 net -6.0% fb -0.1% (95% full)  code 2.40->2.19 net -5.0% fb +0.1% (84% full)  tool 2.38->2.20 net -3.9% fb +0.6% (86% full)  cjk 2.41->1.43 net -38.0% fb -0.0% (100% full)
+  mtp    M 12288 (saves 0.751 ms an eval)  prose 2.42->2.27 net -2.5% fb -0.0% (83% full)  code 2.40->2.26 net -2.2% fb +0.3% (77% full)  tool 2.38->2.25 net -1.8% fb +0.7% (72% full)  cjk 2.41->1.49 net -35.8% fb -0.0% (100% full)
+  mtp    M 16384 (saves 0.703 ms an eval)  prose 2.42->2.31 net -0.9% fb +0.1% (63% full)  code 2.40->2.30 net -0.7% fb +0.5% (62% full)  tool 2.38->2.30 net -0.1% fb +1.2% (51% full)  cjk 2.41->1.57 net -32.6% fb -0.0% (100% full)
+  mtp    M 24576 (saves 0.609 ms an eval)  prose 2.42->2.37 net +1.3% fb +1.4% (20% full)  code 2.40->2.35 net +0.9% fb +1.2% (21% full)  tool 2.38->2.35 net +1.7% fb +1.7% (20% full)  cjk 2.41->1.68 net -28.1% fb -0.0% (100% full)
+  mtp    M 32768 (saves 0.515 ms an eval)  prose 2.42->2.38 net +1.3% fb +1.3% (13% full)  code 2.40->2.36 net +0.5% fb +0.9% (17% full)  tool 2.38->2.37 net +2.0% fb +2.1% (13% full)  cjk 2.41->1.73 net -26.2% fb -0.0% (99% full)
+  dflash M  8192 (saves 0.798 ms an eval)  prose 2.61->2.30 net -10.6% fb -0.2% (95% full)  code 5.06->3.94 net -21.4% fb -1.3% (83% full)  tool 4.95->3.92 net -19.9% fb -0.5% (86% full)  cjk 2.61->1.44 net -43.8% fb -0.0% (100% full)
+  dflash M 12288 (saves 0.751 ms an eval)  prose 2.61->2.41 net -6.4% fb -0.4% (83% full)  code 5.06->4.20 net -16.1% fb -2.4% (76% full)  tool 4.95->4.22 net -13.9% fb -1.2% (71% full)  cjk 2.61->1.51 net -41.5% fb -0.0% (100% full)
+  dflash M 16384 (saves 0.703 ms an eval)  prose 2.61->2.47 net -4.2% fb -0.8% (63% full)  code 5.06->4.47 net -10.9% fb -2.9% (62% full)  tool 4.95->4.43 net -9.7% fb -2.4% (50% full)  cjk 2.61->1.59 net -38.4% fb -0.0% (100% full)
+  dflash M 24576 (saves 0.609 ms an eval)  prose 2.61->2.55 net -1.1% fb -0.5% (20% full)  code 5.06->4.75 net -5.4% fb -3.7% (21% full)  tool 4.95->4.69 net -4.6% fb -2.0% (19% full)  cjk 2.61->1.71 net -33.6% fb -0.0% (100% full)
+  dflash M 32768 (saves 0.515 ms an eval)  prose 2.61->2.56 net -0.9% fb -0.4% (13% full)  code 5.06->4.80 net -4.4% fb -3.1% (17% full)  tool 4.95->4.78 net -2.9% fb -1.0% (13% full)  cjk 2.61->1.77 net -31.4% fb -0.1% (99% full)
+
+wrote ~/.cache/vocab0420/tf/src/tensorfold/families/glm5_next/cuda/draft_vocab.txt: 37074 ids (12443 seen in GLM replies)

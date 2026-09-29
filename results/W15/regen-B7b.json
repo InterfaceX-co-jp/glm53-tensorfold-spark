@@ -1,0 +1,96 @@
+[
+ {
+  "name": "greedy",
+  "first": {
+   "ttft": 8.781,
+   "wall": 9.527,
+   "sha": "0c9ba4d09018010b",
+   "text": "The committee reviews quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse. These items are mentioned repeatedly throughout the text as the core focus of t",
+   "prompt_tokens": 14035,
+   "cached_tokens": 0,
+   "log": {
+    "n": 30,
+    "prompt": 14035,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 4,
+    "prefill_s": 8.7283,
+    "prefill_tps": 1608.0,
+    "queue_s": 0.01,
+    "first_s": 8.741,
+    "slot": 1,
+    "finish": "stop"
+   }
+  },
+  "second": {
+   "ttft": 0.183,
+   "wall": 0.895,
+   "sha": "0c9ba4d09018010b",
+   "text": "The committee reviews quarterly logistics, inventory forecasts, and the maintenance schedule for the northern warehouse. These items are mentioned repeatedly throughout the text as the core focus of t",
+   "prompt_tokens": 14035,
+   "cached_tokens": 14016,
+   "log": {
+    "n": 31,
+    "prompt": 14035,
+    "cached": 14016,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.1728,
+    "prefill_tps": 110.0,
+    "queue_s": 0.005,
+    "first_s": 0.181,
+    "slot": 1,
+    "finish": "stop"
+   }
+  },
+  "identical": true,
+  "cached_within_64": true
+ },
+ {
+  "name": "sampled",
+  "first": {
+   "ttft": 0.182,
+   "wall": 0.695,
+   "sha": "f595e0dd5ae59d2b",
+   "text": "The committee reviews quarterly logistics, inventory forecasts, and the maintenance schedule. Its focus is specifically on the northern warehouse.",
+   "prompt_tokens": 14035,
+   "cached_tokens": 14016,
+   "log": {
+    "n": 32,
+    "prompt": 14035,
+    "cached": 14016,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.1719,
+    "prefill_tps": 110.5,
+    "queue_s": 0.006,
+    "first_s": 0.18,
+    "slot": 1,
+    "finish": "stop"
+   }
+  },
+  "second": {
+   "ttft": 0.197,
+   "wall": 0.72,
+   "sha": "f595e0dd5ae59d2b",
+   "text": "The committee reviews quarterly logistics, inventory forecasts, and the maintenance schedule. Its focus is specifically on the northern warehouse.",
+   "prompt_tokens": 14035,
+   "cached_tokens": 14016,
+   "log": {
+    "n": 33,
+    "prompt": 14035,
+    "cached": 14016,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.171,
+    "prefill_tps": 111.1,
+    "queue_s": 0.021,
+    "first_s": 0.195,
+    "slot": 1,
+    "finish": "stop"
+   }
+  },
+  "identical": true,
+  "cached_within_64": true
+ }
+]

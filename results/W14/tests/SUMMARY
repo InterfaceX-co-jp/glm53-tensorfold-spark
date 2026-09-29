@@ -1,0 +1,11 @@
+17:32:51 start
+17:33:34 gpu-vision rc=134 43s :: frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0xdc (0xfe8656e163dc in /usr/local/lib/python3.12/dist-packages/torc
+17:33:50 host-vision rc=0 16s :: 58 passed, 26 skipped in 13.85s
+17:33:54 host-vision-interp rc=5 4s :: 
+17:33:54 done
+17:45:49 start
+17:46:07 hf-tower rc=0 :: desk1920x1080 torch.float32 (2691, 4096) (1, 78, 138)
+17:47:02 gpu-vision2 rc=1 55s :: 1 failed, 7 passed in 51.54s
+17:47:11 gpu-vision-latent rc=1 9s :: 1 deselected, 7 errors in 6.27s
+17:47:27 tower-ours rc=0 16s :: 
+17:47:27 done

@@ -1,0 +1,786 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+index ae1cbf7..fe847f7 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batch.py
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -983,6 +983,9 @@ class Batcher:
+     m_all = f_all = None                          # patches/0450: every slot's drafter backlog in one tensor each
+     _resident_go: list[int] | None = None         # patches/0450: the slots to run resident after this round
+     emit_first = True                             # patches/0540: GLM53_TF_EMIT_FIRST (a piece's first token at once)
++    admit_policy = "free"                         # patches/0550 (``__init__``: GLM53_TF_ADMIT_MEM)
++    admit_log = None                              # patches/0550: memsafe.AdmitLog (rank 0)
++    trimmer = None                                # patches/0550: memsafe.Trimmer (GLM53_TF_ALLOC_TRIM_GB)
+ 
+     def __init__(self, g, n: int) -> None:
+         from .engine import GRAPH_ROWS, MAX_ROWS
+@@ -1056,6 +1059,14 @@ class Batcher:
+         # other requests run (a request waits for one to end when less is free)
+         self.reserve = float(os.environ.get("GLM53_TF_BATCH_RESERVE_GB", "") or 4.0) * 2**30
+         self.admit_min = float(os.environ.get("GLM53_TF_BATCH_ADMIT_GB", "") or 1.0) * 2**30
++        # patches/0550: admission counts reclaimable page cache (GLM53_TF_ADMIT_MEM, ``memsafe``) and says when it
++        # waits for memory (rank 0); the caching allocator's unused cache is trimmed before a prefill piece
++        # (GLM53_TF_ALLOC_TRIM_GB, both ranks, each for itself)
++        from . import memsafe
++
++        self.admit_policy = memsafe.admit_policy()
++        self.admit_log = memsafe.AdmitLog()
++        self.trimmer = memsafe.Trimmer()
+         self.last_verify = False
+         # patches/0180: the session store behind the slots (``attach_store``, after the batcher); its budget is set
+         # aside now, so the slots never take the memory the store may fill later
+@@ -1152,6 +1163,13 @@ class Batcher:
+                       f"pieces of {self.solo} tokens (chunks of at most {most} rows"
+                       + ("" if most >= self.solo else "; raise GLM53_TF_PREFILL_ROWS_MAX for chunks as big as the "
+                          "piece") + ")", flush=True)
++            print(f"[tensorfold] memory safety (patches/0550): selection scratch {sparse.SCRATCH} (key blocks up to "
++                  f"{sparse.SELECT_MB} MiB), admission {self.admit_policy} (GLM53_TF_ADMIT_MEM"
++                  + (f"; page cache counted above max(Mapped, {memsafe.cache_keep_bytes() / 2**30:g} GiB) less dirty, "
++                     f"at least {min(memsafe.free_floor_bytes(), int(self.admit_min)) / 2**30:g} GiB free now"
++                     if self.admit_policy == "available" else "") + "), allocator trim "
++                  + (f"over {self.trimmer.limit / 2**30:g} GiB unused" if self.trimmer.limit > 0 else "off"),
++                  flush=True)
+             if self.overlap.on:                        # patches/0370
+                 print(f"[tensorfold] decode overlap (patches/0370): {self.overlap.describe()}"
+                       + (f", switch interval {self.overlap.switch_us} us" if self.overlap.gil else ""), flush=True)
+@@ -1296,6 +1314,39 @@ class Batcher:
+             else:
+                 self.g._share(self.store.save_all(snaps))
+ 
++    def _mem_ok(self, job: Job, admits: list) -> bool:
++        """patches/0550 (rank 0): whether ``job`` may start beside running (or this round's) requests: the usable
++        memory (``memsafe.view``: free + the allocator's cache, + the page cache credit with GLM53_TF_ADMIT_MEM=
++        available) less the store's unused budget covers GLM53_TF_BATCH_ADMIT_GB and the selection scratch the
++        prompt still needs (the largest of this round's), and something is free right now. Logs a wait."""
++
++        from . import memsafe
++
++        need = self.admit_min + max([self._scratch_need(j) for j in [job] + [a[2] for a in admits]])
++        v = memsafe.view(self._free(), 0, self.admit_policy)
++        headroom = self._headroom()
++        if memsafe.admit_ok(v, headroom, need, min(memsafe.free_floor_bytes(), int(self.admit_min))):
++            return True
++        self.counts["mem_deferred"] += 1
++        if self.admit_log is not None:
++            self.admit_log.waiting(v, headroom, need, len(self.queue))
++        return False
++
++    def _scratch_need(self, job: Job) -> int:
++        """patches/0550: bytes the prefill selection's scratch still grows by for ``job``'s prompt (0: none)."""
++
++        try:
++            e, st = self.g.e, self.states[0]
++            if st.index is None or sparse.SCRATCH == "off" or sparse.SELECT != "blocked" \
++                    or len(job.prompt) <= self.g.w.cfg.dense_limit or not torch.cuda.is_available():
++                return 0
++            from . import memsafe
++
++            return memsafe.scratch_growth(len(job.prompt), sparse.scratch_bytes(self.g.w.device), e.buf.rows,
++                                          st.index[0][2].shape[0] - 2, sparse.SELECT_MB, sparse.SCRATCH)
++        except Exception:  # noqa: BLE001 - host fakes without these parts: nothing to reserve
++            return 0
++
+     # -- slots ----------------------------------------------------------------------------------------------------
+     @staticmethod
+     def _free() -> int:
+@@ -1590,8 +1641,9 @@ class Batcher:
+                     self.counts["prefix_wait"] += 1
+                     job.stats["prefix_wait"] = job.stats.get("prefix_wait", 0) + 1
+                     continue
+-                if (others or admits) and batchplan.admit_free(self._free(), self._headroom()) < self.admit_min:
++                if (others or admits) and not self._mem_ok(job, admits):
+                     self.counts["deferred"] += 1               # short of memory: it waits for a request to end
++                    job.stats["mem_waits"] = job.stats.get("mem_waits", 0) + 1     # patches/0550
+                     break
+                 slot, cached = self._place(job, free, spills)
+                 if self.kvp is not None:                       # patches/0290: its pages, reserved now
+@@ -1619,6 +1671,8 @@ class Batcher:
+                 free.remove(slot)
+                 self.queue.remove(job)
+                 admits.append((slot, cached, job))
++                if self.admit_log is not None:                 # patches/0550: ends a wait for memory (if any)
++                    self.admit_log.admitted()
+             self.queue.extend(requeue)
+         # the prefill piece: one prompt's next piece, when the others have had their share of the time
+         admitted = {slot for slot, _, _ in admits}
+@@ -1885,6 +1939,10 @@ class Batcher:
+         drafter = self.drafters[slot] if use_dflash else None
+         n = len(job.prompt)
+         self.counts["pieces"] += 1
++        from . import memsafe
++
++        if memsafe.trim_torch(self.trimmer):            # patches/0550: the allocator's unused cache back to the device
++            self.counts["trims"] += 1
+         try:
+             with self._on(slot) as e, self._borrow(slot), g._knobs(job.values):
+                 # patches/0180: pieces end on the chunk grid and on the snapshot grid (the snapshot the next resumes)
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index 342a990..9c79f4e 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -511,6 +511,13 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     # patches/0085: the chunk size (a speed choice: the bits do not depend on it), the chunks and the snapshot point
+     step = pfgrid.chunk_rows(e.prefill_rows, n - begin, cap, fast)
+     e.fast_rows = step if fast else 0
++    # patches/0550: the selection scratch sized for this prefill's largest key block before its first chunk (DSA calls
++    # of the lean sub-block's rows, else the chunk's), so no key block is allocated inside the chunks
++    if getattr(st, "index", None) is not None and n - 1 >= getattr(w.cfg, "dense_limit", n):
++        from . import sparse
++
++        if sparse.SELECT == "blocked":
++            sparse.reserve_for_prefill(begin, n, b.rows if lean is not None else step, st.index[0][2], w.device)
+     # patches/0540 (``pfgrid.before_end``): the caller's whole-prompt prefill keeps its snapshot strictly before n
+     # (``e.fast_snap``, exact prefills too), so the same prompt sent again resumes all but its last grid step
+     before = bool(getattr(e, "snap_before", 0)) and int(e.snap_before) == len(prompt)
+diff --git i/src/tensorfold/families/glm5_next/cuda/memsafe.py w/src/tensorfold/families/glm5_next/cuda/memsafe.py
+new file mode 100644
+index 0000000..df4d5e2
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/memsafe.py
+@@ -0,0 +1,469 @@
++"""Memory safety for GLM-5.3-Flash on GB10 (patches/0550): the prefill selection's context-sized scratch, the caching
++allocator's growth, and admission / store decisions that count reclaimable page cache.
++
++Why (W15, docs/MEMORY-SAFETY.md)
++--------------------------------
++1. The needle dip. During a lone ~300k prefill MemAvailable fell by 3-4.5 GiB (to 6.4 GiB after the stress + MMLU)
++   and came back at once when the prefill ended. The cause is patches/0065's blocked selection
++   (``sparse.select_pools_blocked``): every DSA call (11 layers, one a 512-row sub-block of a fast chunk) allocates
++   its int32 key block ``[n, npc]`` with npc = the block's complete pools, about 512 B x position: 67 MB at 131k,
++   161 MB at 314k, 256 MiB (``GLM53_TF_SELECT_MB``) from 524k on. The size grows a little every sub-block, so every
++   ~4,096 tokens the next one no longer fits the freed block of the previous one (torch's caching allocator keeps
++   segments whole and returns nothing to the system on its own): it takes a new segment of the new size and keeps
++   the old one cached. The reserved memory grows by the sum of all sizes, quadratically in the context (bound:
++   ``keys_growth``: ~5.8 GiB from 0 to 314k, ~16 GiB to 1M), and is handed back only by ``torch.cuda.empty_cache()``,
++   which ``torch.cuda.graph`` calls before every capture: the first MTP draft after the prompt meets a new pool
++   bucket (patches/0050's long graphs), captures, and MemFree jumps up. W15's trace fits it: the slope steepens with
++   the position (0.6 -> 1.9-2.5 GiB/min), the drop is ~75% of the no-reuse bound, and the release is the capture.
++2. Page cache. On GB10 ``cudaMemGetInfo`` free is the kernel's MemFree: reclaimable page cache counts as used, so
++   while a 36 GB file was copied (MemFree 2.1 GiB, 16.8 GiB of cache) admission (free - store headroom >=
++   ``GLM53_TF_BATCH_ADMIT_GB``) let C4 requests in one at a time.
++
++What this module holds (no torch at import; host-tested)
++--------------------------------------------------------
++- ``/proc/meminfo`` and the admission measure: ``usable`` = CUDA free + the allocator's cached bytes + the page cache
++  credit, the credit = MemAvailable - MemFree - Dirty - Writeback - max(Mapped, ``GLM53_TF_ADMIT_CACHE_KEEP_GB``)
++  (dirty pages need writeback before they can go, mapped pages are other programs' and our libraries' working set).
++  ``GLM53_TF_ADMIT_MEM=available`` (default) or ``free`` (the old measure). A request is also held while the
++  immediately free memory (CUDA free + allocator cache) is under ``GLM53_TF_ADMIT_FREE_FLOOR_GB`` (1).
++- ``AdmitLog``: one line when admission starts waiting for memory (and every 30 s while it does), one when it ends.
++- ``Trimmer`` (``GLM53_TF_ALLOC_TRIM_GB``, default 2; 0 off): before a prefill piece, when the allocator holds more
++  than that many GiB it does not use, ``torch.cuda.empty_cache()``, at most once every ``GLM53_TF_ALLOC_TRIM_S`` (10)
++  seconds; if a trim frees little (graph pools), the trigger moves up (hysteresis), so it cannot run every piece.
++- The selection's size model: ``select_blocks`` (what one DSA call allocates, as ``sparse`` computes it),
++  ``keys_growth`` (the caching allocator's reserved growth over a prefill without the scratch, an upper bound: no
++  reuse by other allocations), ``scratch_bytes`` / ``scratch_grow_to`` (what ``sparse``'s scratch holds after a
++  prefill to a position: its largest block rounded up to 16 MiB, at most GLM53_TF_SELECT_MB), ``scratch_growth``
++  (admission's reservation for a prompt).
++- ``drop_file_cache``: fdatasync + POSIX_FADV_DONTNEED for our own buffered writes (the session tier's fallback).
++
++Same bits: the scratch (``sparse``) gives each call the same shapes, strides, alignment and values; a trim or a
++different admission changes addresses and scheduling only (``torch.cuda.graph`` already empties the cache at every
++capture; batched == alone). See docs/MEMORY-SAFETY.md for the proofs and the GPU plan.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import time
++from dataclasses import dataclass, field
++
++KiB = 1 << 10
++MiB = 1 << 20
++GiB = 1 << 30
++
++POOL = 4                 # sparse.POOL
++TOPK_POOLS = 512         # sparse.TOPK_POOLS
++BRB = 16                 # sparse.BRB
++MIN_BUCKET = 1024        # sparse.MIN_BUCKET
++SEGMENT_ROUND = 2 * MiB  # torch's caching allocator: large segments rounded up to 2 MiB (kRoundLarge)
++LARGE_MIN = 10 * MiB     # below this a large request takes a 20 MiB segment (kMinLargeAlloc / kLargeBuffer)
++LARGE_BUFFER = 20 * MiB
++SMALL_MAX = 1 * MiB      # kSmallSize: requests up to this share 2 MiB small segments
++
++
++def _env_float(name: str, default: float, least: float = 0.0) -> float:
++    raw = os.environ.get(name, "").strip()
++    try:
++        v = float(raw) if raw else float(default)
++    except ValueError:
++        raise ValueError(f"{name}={raw!r}: expected a number") from None
++    if v < least:
++        raise ValueError(f"{name}={v:g}: expected >= {least:g}")
++    return v
++
++
++# -- settings ---------------------------------------------------------------------------------------------------------
++ADMIT_POLICIES = ("available", "free")
++
++
++def admit_policy() -> str:
++    """GLM53_TF_ADMIT_MEM: ``available`` (default: reclaimable page cache counts, with the margins below) or ``free``
++    (CUDA free + allocator cache only: the rule before 0550)."""
++
++    v = os.environ.get("GLM53_TF_ADMIT_MEM", "").strip().lower() or "available"
++    if v not in ADMIT_POLICIES:
++        raise ValueError(f"GLM53_TF_ADMIT_MEM={v!r}: expected available or free")
++    return v
++
++
++def cache_keep_bytes() -> int:
++    """GLM53_TF_ADMIT_CACHE_KEEP_GB (default 2): page cache never counted as available (at least Mapped is kept)."""
++
++    return int(_env_float("GLM53_TF_ADMIT_CACHE_KEEP_GB", 2.0) * GiB)
++
++
++def free_floor_bytes() -> int:
++    """GLM53_TF_ADMIT_FREE_FLOOR_GB (default 1): least immediately free memory (CUDA free + allocator cache) for an
++    admission beside running requests, whatever the page cache (the first chunk's buffers are allocated at once)."""
++
++    return int(_env_float("GLM53_TF_ADMIT_FREE_FLOOR_GB", 1.0) * GiB)
++
++
++def trim_bytes() -> int:
++    """GLM53_TF_ALLOC_TRIM_GB (default 2; 0 off): the allocator's unused cache that triggers ``empty_cache`` after a
++    prefill piece."""
++
++    return int(_env_float("GLM53_TF_ALLOC_TRIM_GB", 2.0) * GiB)
++
++
++def drop_own_cache() -> bool:
++    """GLM53_TF_DROP_OWN_CACHE (default 1): our own buffered file writes leave no page cache behind."""
++
++    return os.environ.get("GLM53_TF_DROP_OWN_CACHE", "1").strip().lower() not in ("0", "off", "no", "false")
++
++
++# -- /proc/meminfo ------------------------------------------------------------------------------------------------------
++MEMINFO_KEYS = ("MemTotal", "MemFree", "MemAvailable", "Cached", "Dirty", "Writeback", "Mapped", "Shmem",
++                "AnonPages")
++
++
++def parse_meminfo(text: str) -> dict[str, int]:
++    """``/proc/meminfo`` text -> bytes for the keys this module reads (kB lines; others ignored)."""
++
++    out: dict[str, int] = {}
++    for line in text.splitlines():
++        k, sep, v = line.partition(":")
++        if not sep or k not in MEMINFO_KEYS:
++            continue
++        parts = v.split()
++        if not parts:
++            continue
++        n = int(parts[0])
++        out[k] = n * KiB if len(parts) > 1 and parts[1] == "kB" else n
++    return out
++
++
++def read_meminfo(path: str = "/proc/meminfo") -> dict[str, int]:
++    try:
++        with open(path) as f:
++            return parse_meminfo(f.read())
++    except OSError:
++        return {}
++
++
++def page_cache_credit(mi: dict[str, int], keep: int | None = None) -> int:
++    """Page cache the kernel can hand to a device allocation now: MemAvailable - MemFree (clean file pages and
++    reclaimable slab the kernel counts as available) less what cannot go at once (Dirty, Writeback) and less the
++    working set we never count (max(Mapped, ``keep``)). 0 without meminfo."""
++
++    if "MemAvailable" not in mi or "MemFree" not in mi:
++        return 0
++    keep = cache_keep_bytes() if keep is None else int(keep)
++    extra = mi["MemAvailable"] - mi["MemFree"]
++    extra -= mi.get("Dirty", 0) + mi.get("Writeback", 0)
++    extra -= max(mi.get("Mapped", 0), keep)
++    return max(0, int(extra))
++
++
++@dataclass
++class MemView:
++    """One reading: CUDA free (``cudaMemGetInfo``), the allocator's cached-but-unused bytes, the page cache credit."""
++
++    cuda_free: int
++    cached: int
++    credit: int
++    policy: str = "available"
++    meminfo: dict = field(default_factory=dict)
++
++    @property
++    def now(self) -> int:
++        """Allocatable without reclaiming anything."""
++
++        return int(self.cuda_free) + int(self.cached)
++
++    @property
++    def usable(self) -> int:
++        return self.now + (int(self.credit) if self.policy == "available" else 0)
++
++    def describe(self) -> str:
++        s = f"free {self.cuda_free / GiB:.2f} + allocator cache {self.cached / GiB:.2f}"
++        if self.policy == "available":
++            s += f" + page cache credit {self.credit / GiB:.2f}"
++            mi = self.meminfo
++            if mi:
++                s += (f" (MemAvailable {mi.get('MemAvailable', 0) / GiB:.2f}, MemFree {mi.get('MemFree', 0) / GiB:.2f}, "
++                      f"Dirty+Writeback {(mi.get('Dirty', 0) + mi.get('Writeback', 0)) / GiB:.2f}, Mapped "
++                      f"{mi.get('Mapped', 0) / GiB:.2f})")
++        return s + f" = {self.usable / GiB:.2f} GiB"
++
++
++def view(cuda_free: int, cached: int, policy: str | None = None, mi: dict | None = None,
++         keep: int | None = None) -> MemView:
++    policy = admit_policy() if policy is None else policy
++    if policy == "available":
++        mi = read_meminfo() if mi is None else mi
++        credit = page_cache_credit(mi, keep)
++    else:
++        mi, credit = mi or {}, 0
++    return MemView(int(cuda_free), max(0, int(cached)), credit, policy, mi)
++
++
++def admit_ok(v: MemView, headroom: int, need: int, floor: int | None = None) -> bool:
++    """Admission beside running requests: what may be used, less the session store's unused budget, covers ``need``
++    (``GLM53_TF_BATCH_ADMIT_GB`` + the prompt's predicted scratch growth), and something is free right now."""
++
++    floor = free_floor_bytes() if floor is None else int(floor)
++    if v.policy == "free":
++        floor = 0                                # the old rule exactly
++    return v.usable - max(0, int(headroom)) >= int(need) and v.now >= floor
++
++
++class AdmitLog:
++    """Rank 0: a line when admission starts waiting for memory (then every ``every`` s while it waits), one when a
++    request is admitted again; counts the waits."""
++
++    def __init__(self, every: float = 30.0, out=None) -> None:
++        self.every = every
++        self.out = out
++        self.since: float | None = None
++        self.last = 0.0
++        self.waits = 0
++        self.episodes = 0
++
++    def _print(self, msg: str) -> None:
++        print(msg, file=self.out or sys.stdout, flush=True)
++
++    def waiting(self, v: MemView, headroom: int, need: int, queued: int, now: float | None = None) -> None:
++        now = time.monotonic() if now is None else now
++        self.waits += 1
++        if self.since is None or now - self.last >= self.every:
++            if self.since is None:
++                self.since = now
++                self.episodes += 1
++            self.last = now
++            self._print(f"[tensorfold] admission waits for memory ({queued} queued): usable {v.describe()}, less the "
++                        f"session store's unused {max(0, headroom) / GiB:.2f} GiB, is under {need / GiB:.2f} GiB "
++                        f"(GLM53_TF_BATCH_ADMIT_GB + scratch), or free now {v.now / GiB:.2f} GiB is under the floor"
++                        + (f"; waiting {now - self.since:.0f} s" if now > self.since else ""))
++
++    def admitted(self, now: float | None = None) -> None:
++        if self.since is None:
++            return
++        now = time.monotonic() if now is None else now
++        self._print(f"[tensorfold] admission resumed after {now - self.since:.1f} s waiting for memory")
++        self.since = None
++
++
++# -- the allocator's unused cache ------------------------------------------------------------------------------------
++class Trimmer:
++    """``empty_cache`` when the allocator holds more than ``limit`` bytes it does not use, at most once every
++    ``interval`` seconds (``GLM53_TF_ALLOC_TRIM_S``, default 10: re-allocating a piece's buffers after a trim costs
++    milliseconds, so a trim cannot cost more than a fraction of a percent). A trim that frees under ``min_gain``
++    (memory of live graph pools cannot be freed) raises the trigger to what stayed + ``limit``; a later trim that frees
++    enough brings it back down. Local to a rank (no collective)."""
++
++    def __init__(self, limit: int | None = None, min_gain: int = 256 * MiB, interval: float | None = None) -> None:
++        self.limit = trim_bytes() if limit is None else int(limit)
++        self.min_gain = int(min_gain)
++        self.interval = _env_float("GLM53_TF_ALLOC_TRIM_S", 10.0) if interval is None else float(interval)
++        self.trigger = self.limit
++        self.trims = 0
++        self.freed = 0
++        self.last = float("-inf")
++
++    def maybe(self, reserved: int, allocated: int, empty_cache, after=None, now: float | None = None) -> int:
++        """-> bytes freed (0 when nothing was done). ``after()`` -> (reserved, allocated) after the trim."""
++
++        if self.limit <= 0:
++            return 0
++        unused = int(reserved) - int(allocated)
++        if unused <= self.trigger:
++            return 0
++        now = time.monotonic() if now is None else now
++        if now - self.last < self.interval:
++            return 0
++        self.last = now
++        empty_cache()
++        r2, a2 = after() if after is not None else (allocated, allocated)
++        gain = max(0, int(reserved) - int(r2))
++        left = max(0, int(r2) - int(a2))
++        self.trims += 1
++        self.freed += gain
++        self.trigger = self.limit if gain >= self.min_gain else max(self.limit, left + self.limit)
++        return gain
++
++
++def trim_torch(trimmer: "Trimmer | None") -> int:
++    """``Trimmer.maybe`` on the current CUDA device (0 without CUDA or while a graph is being captured)."""
++
++    if trimmer is None or trimmer.limit <= 0:
++        return 0
++    import torch
++
++    if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
++        return 0
++    return trimmer.maybe(torch.cuda.memory_reserved(), torch.cuda.memory_allocated(), torch.cuda.empty_cache,
++                         lambda: (torch.cuda.memory_reserved(), torch.cuda.memory_allocated()))
++
++
++# -- the selection's sizes (patches/0065 blocked selection, patches/0050 pool buckets) ------------------------------
++def pool_bucket(end: int, cap_pools: int) -> int:
++    """``sparse.pool_bucket``."""
++
++    need = end // POOL
++    if need > cap_pools:
++        raise ValueError(f"pool_bucket: {need} pools past the cache's {cap_pools}")
++    b = MIN_BUCKET
++    while b < need:
++        b *= 2
++    return min(b, cap_pools)
++
++
++def block_rows(R: int, np_max: int, select_mb: int = 256) -> int:
++    """``sparse.block_rows``."""
++
++    rows = (select_mb << 20) // (4 * max(np_max, 1))
++    return max(BRB, min(R, rows) // BRB * BRB)
++
++
++def select_blocks(pos: int, R: int, cap_pools: int, select_mb: int = 256, bound: bool = True) -> list[int]:
++    """Bytes of each int32 key block one blocked selection of rows pos .. pos + R - 1 allocates, in order
++    (``sparse.select_pools_blocked`` with ``np_max`` as ``latent._attend`` passes it: the pool bucket with
++    patches/0050's bound, else the cache's pools)."""
++
++    np_max = pool_bucket(pos + R, cap_pools) if bound else cap_pools
++    step = block_rows(R, np_max, select_mb)
++    out = []
++    for r0 in range(0, R, step):
++        n = min(step, R - r0)
++        need_np = (pos + r0 + n) // POOL
++        npc = min(np_max, max(TOPK_POOLS, -(-need_np // 64) * 64))
++        out.append(n * npc * 4)
++    return out
++
++
++def _round512(n: int) -> int:
++    return max(512, -(-int(n) // 512) * 512)
++
++
++def segment_size(n: int) -> int:
++    """The segment torch's caching allocator makes for a request of ``n`` bytes it cannot place in its cache."""
++
++    n = _round512(n)
++    if n <= SMALL_MAX:
++        return 2 * MiB
++    if n < LARGE_MIN:
++        return LARGE_BUFFER
++    return -(-n // SEGMENT_ROUND) * SEGMENT_ROUND
++
++
++def keys_growth(p0: int, p1: int, R: int = 512, cap_pools: int = 262_148, select_mb: int = 256,
++                dense_limit: int = 2051, cached: tuple[int, ...] = ()) -> tuple[int, int]:
++    """The caching allocator's reserved growth from the key blocks of a prefill of positions p0 .. p1 - 1 in calls of
++    ``R`` rows (a fast chunk's sub-blocks; every DSA layer allocates the same sizes, so one layer stands for all), and
++    the largest block. Upper bound: a request reuses a cached free segment of at least its size (the smallest one;
++    freed blocks merge back into their segment) and otherwise takes a new segment, which stays cached; other
++    allocations never take these segments. ``cached``: free segment sizes already in the cache when it starts.
++    Rows before ``dense_limit`` select nothing. -> (bytes of new segments, largest block)."""
++
++    free = sorted(int(c) for c in cached)
++    grown = peak = 0
++    for s in _blocks(p0, p1, R, cap_pools, select_mb, dense_limit):
++        peak = max(peak, s)
++        if not free or free[-1] < _round512(s):       # no cached segment holds it: a new one, kept afterwards
++            seg = segment_size(s)
++            grown += seg
++            free.append(seg)
++            free.sort()
++    return grown, peak
++
++
++def _blocks(p0: int, p1: int, R: int, cap_pools: int, select_mb: int, dense_limit: int = 2051):
++    """Every key block (bytes) of a prefill of positions p0 .. p1 - 1 in calls of ``R`` rows, in order."""
++
++    p = p0
++    while p < p1:
++        r = min(R, p1 - p)
++        if p + r - 1 >= dense_limit:
++            yield from select_blocks(p, r, cap_pools, select_mb)
++        p += r
++
++
++def select_peak_scan(p1: int, R: int = 512, cap_pools: int = 262_148, select_mb: int = 256, p0: int = 0) -> int:
++    """``select_peak`` by visiting every call (tests)."""
++
++    return max(_blocks(p0, p1, R, cap_pools, select_mb), default=0)
++
++
++def select_peak(p1: int, R: int = 512, cap_pools: int = 262_148, select_mb: int = 256, p0: int = 0,
++                dense_limit: int = 2051) -> int:
++    """The largest key block a prefill of positions p0 .. p1 - 1 in calls of ``R`` rows allocates (<= ``select_mb``
++    MiB). Within one pool bucket a call's row blocks keep their rows and their pools only grow with the position, so
++    the largest block is in the last call of a bucket: only those (at most ~10) and the prefill's last call are sized
++    (admission runs this every round a long prompt waits)."""
++
++    if p1 <= p0:
++        return 0
++    starts = {p0 + (p1 - p0 - 1) // R * R}                      # the last call (maybe partial) ...
++    if p1 - p0 >= R:
++        starts.add(p0 + ((p1 - p0) // R - 1) * R)               # ... and the last full one
++    b = MIN_BUCKET
++    while True:
++        e = p0 + (4 * b + 3 - p0) // R * R                       # the last full call ending at or before 4b + 3
++        if p0 < e <= p1:
++            starts.add(e - R)
++        if b >= cap_pools or 4 * b > p1:
++            break
++        b *= 2
++    peak = 0
++    for p in starts:
++        r = min(R, p1 - p)
++        if p + r - 1 >= dense_limit:
++            peak = max(peak, *select_blocks(p, r, cap_pools, select_mb))
++    return peak
++
++
++SCRATCH_MIN = 16 * MiB      # the scratch's least size (a 16-row verify window's block at a 1M cache fits)
++SCRATCH_STEP = 16 * MiB     # it grows to the need rounded up to this (at most 16 growths to 256 MiB)
++
++
++def scratch_grow_to(need: int, have: int, most: int) -> int:
++    """``sparse``'s grow policy: the scratch's new size (bytes) for blocks of up to ``need`` bytes when it holds
++    ``have``: ``need`` rounded up to ``SCRATCH_STEP``, at least ``SCRATCH_MIN``, at most ``most`` rounded up (never
++    below ``need``); unchanged when it already holds ``need``. The old buffer is released when it grows (and the
++    allocator's cache emptied), so growing in steps leaves nothing behind."""
++
++    if need <= have:
++        return have
++    new = max(-(-need // SCRATCH_STEP) * SCRATCH_STEP, SCRATCH_MIN)
++    top = max(-(-most // SEGMENT_ROUND) * SEGMENT_ROUND, -(-need // SEGMENT_ROUND) * SEGMENT_ROUND)
++    return max(have, min(new, top))
++
++
++def scratch_bytes(p1: int, R: int = 512, cap_pools: int = 262_148, select_mb: int = 256, have: int = 0,
++                  mode: str = "grow", p0: int = 0) -> int:
++    """What the scratch holds after a prefill of positions p0 .. p1 - 1 that reserved for itself first (``have``
++    before it): ``grow`` holds its largest block rounded up (``scratch_grow_to``), ``max`` ``select_mb`` from the
++    first use, ``off`` nothing."""
++
++    if mode == "off":
++        return 0
++    need = select_peak(p1, R, cap_pools, select_mb, p0)
++    if need <= have:
++        return have
++    most = select_mb << 20
++    return scratch_grow_to(max(need, most) if mode == "max" else need, have, most)
++
++
++def scratch_growth(p1: int, have: int, R: int = 512, cap_pools: int = 262_148, select_mb: int = 256,
++                   mode: str = "grow") -> int:
++    """Admission's reservation for the scratch: how much it still grows for a prompt of ``p1`` tokens."""
++
++    return max(0, scratch_bytes(p1, R, cap_pools, select_mb, have, mode) - have)
++
++
++# -- our own files ------------------------------------------------------------------------------------------------------
++def drop_file_cache(fd: int, off: int = 0, length: int = 0, sync: bool = True) -> bool:
++    """Our buffered writes out of the page cache (written back first: DONTNEED leaves dirty pages). -> done."""
++
++    if not drop_own_cache() or not hasattr(os, "posix_fadvise"):
++        return False
++    try:
++        if sync:
++            os.fdatasync(fd)
++        os.posix_fadvise(fd, off, length, os.POSIX_FADV_DONTNEED)
++        return True
++    except OSError:
++        return False
+diff --git i/src/tensorfold/families/glm5_next/cuda/sessdisk.py w/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+index b3b0c86..13e1afa 100644
+--- i/src/tensorfold/families/glm5_next/cuda/sessdisk.py
++++ w/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+@@ -468,6 +468,15 @@ def _pread_all(fd: int, mv, off: int, direct: bool, path) -> None:
+         os.posix_fadvise(fd, off, want, os.POSIX_FADV_DONTNEED)
+ 
+ 
++def _drop_cache(fd: int) -> None:
++    """patches/0550 (GLM53_TF_DROP_OWN_CACHE, default 1): a buffered file's pages written back and dropped: page cache
++    is MemFree on GB10, which the load-time slot rule and CUDA free count as used."""
++
++    from . import memsafe
++
++    memsafe.drop_file_cache(fd)
++
++
+ def _pwrite_all(fd: int, mv, off: int) -> None:
+     done = 0
+     while done < len(mv):
+@@ -493,6 +502,7 @@ def _write_file(path: Path, mv, direct: bool) -> None:
+         if fd < 0:
+             fd = os.open(tmp, flags, 0o644)
+             _pwrite_all(fd, mv, 0)
++            _drop_cache(fd)                                 # patches/0550: no page cache left behind
+         os.close(fd)
+         fd = -1
+         os.replace(tmp, path)
+@@ -984,6 +994,8 @@ class DiskTier:
+                         raise LoadError("header size changed")
+                     with open(tmp, "r+b") as f:        # buffered: the header's pages are not the data's
+                         f.write(head + bytes(h - len(head)))
++                        f.flush()
++                        _drop_cache(f.fileno())         # patches/0550: nor the header's (nor a buffered body's)
+                     if size == 0:
+                         os.truncate(tmp, h)
+                     os.close(fd)
+diff --git i/src/tensorfold/families/glm5_next/cuda/sessions.py w/src/tensorfold/families/glm5_next/cuda/sessions.py
+index a098f5d..1739bae 100644
+--- i/src/tensorfold/families/glm5_next/cuda/sessions.py
++++ w/src/tensorfold/families/glm5_next/cuda/sessions.py
+@@ -980,9 +980,12 @@ class SessionStore:
+ 
+         if not self.comps or not self.comps[0].live.is_cuda:
+             return True
++        from . import memsafe
++
+         free, _ = torch.cuda.mem_get_info()
+         cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+-        return free + cached - n >= self.reserve
++        # patches/0550 (GLM53_TF_ADMIT_MEM=available): reclaimable page cache counts too, with admission's margins
++        return memsafe.view(free, cached).usable - n >= self.reserve
+ 
+     # -- both ranks -------------------------------------------------------------------------------------------------
+     def begin(self, hit, cut: int) -> None:
+diff --git i/src/tensorfold/families/glm5_next/cuda/sparse.py w/src/tensorfold/families/glm5_next/cuda/sparse.py
+index c1e0952..ac98f4f 100644
+--- i/src/tensorfold/families/glm5_next/cuda/sparse.py
++++ w/src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -461,10 +461,109 @@ def block_rows(R: int, np_max: int) -> int:
+     return max(BRB, min(R, rows) // BRB * BRB)
+ 
+ 
++# -- patches/0550: the key blocks in one scratch buffer (GLM53_TF_SELECT_SCRATCH) -----------------------------------
++#
++# A key block is [n, npc] int32 with npc the block's complete pools: ~512 B a position of the prompt at 512-row
++# sub-blocks, up to GLM53_TF_SELECT_MB. Allocated per call (0065), its size grows a little every sub-block, so every
++# ~4,096 tokens the caching allocator can no longer place it in the previous block's freed segment, takes a new one
++# and keeps the old one cached: the reserved memory grows quadratically with the prompt (~4-6 GiB at 300k, ~16 GiB
++# bound at 1M: ``memsafe.keys_growth``) until something empties the cache (every CUDA graph capture does). Here the
++# blocks are views of one buffer per (device, stream): ``reserve_scratch`` grows it BEFORE a prefill (the prompt's
++# largest block, ``memsafe.select_peak``, rounded up to 16 MiB) and empties the cache when it replaces a smaller one,
++# so nothing is left behind; a block is ``scratch[:n * npc].view(n, npc)``: the same shape, strides and 512-byte-
++# aligned base as ``torch.empty`` gives, and every element is written by ``_scores_rows`` before ``torch.topk`` /
++# ``_gather_sel`` read it (the grid covers rows row0 .. row0 + n - 1 and pools < npc), so the values, the top-k
++# threshold and the selection are the same bits. While a stream captures a CUDA graph, or when the scratch is too
++# small (a caller that did not reserve), the block is allocated as before (``grow`` also grows it then, without
++# emptying the cache: the trim before the next piece does). Modes: ``grow`` (default), ``max`` (GLM53_TF_SELECT_MB at the
++# first reservation), ``off`` (0065's allocation per block).
++SCRATCH = os.environ.get("GLM53_TF_SELECT_SCRATCH", "grow").strip().lower() or "grow"
++if SCRATCH not in ("grow", "max", "off"):
++    raise ValueError(f"GLM53_TF_SELECT_SCRATCH must be grow, max or off, not {SCRATCH!r}")
++_SCRATCH: dict = {}
++SCRATCH_STATS = {"grown": 0, "fallback": 0}
++
++
++def _scratch_key(device) -> tuple:
++    dev = torch.device(device)
++    if dev.type == "cuda":
++        return (str(dev), torch.cuda.current_stream(dev).cuda_stream)
++    return (str(dev), 0)
++
++
++def _capturing(device) -> bool:
++    return torch.device(device).type == "cuda" and torch.cuda.is_current_stream_capturing()
++
++
++def scratch_bytes(device=None) -> int:
++    """Bytes the selection scratch of ``device``'s current stream holds (all of them when ``device`` is None)."""
++
++    if device is None:
++        return sum(t.numel() * 4 for t in _SCRATCH.values())
++    t = _SCRATCH.get(_scratch_key(device))
++    return 0 if t is None else t.numel() * 4
++
++
++def reserve_scratch(nbytes: int, device, *, empty: bool = True) -> int:
++    """Grow the current stream's selection scratch to hold key blocks of ``nbytes`` (``memsafe.scratch_grow_to``;
++    ``max``: GLM53_TF_SELECT_MB at once). Host side, before a forward: when it replaces a smaller buffer the cache is
++    emptied (``empty``), so the old buffer goes back to the device. -> bytes it holds (0: off / capturing)."""
++
++    from . import memsafe
++
++    if SCRATCH == "off" or nbytes <= 0 or _capturing(device):
++        return 0
++    key = _scratch_key(device)
++    cur = _SCRATCH.get(key)
++    have = 0 if cur is None else cur.numel() * 4
++    most = SELECT_MB << 20
++    new = memsafe.scratch_grow_to(max(nbytes, most) if SCRATCH == "max" else nbytes, have, most)
++    if new <= have:
++        return have
++    if cur is not None:
++        del _SCRATCH[key]
++        del cur
++        if empty and torch.device(device).type == "cuda":
++            torch.cuda.synchronize(device)
++            torch.cuda.empty_cache()
++    _SCRATCH[key] = torch.empty((new // 4,), dtype=torch.int32, device=device)
++    SCRATCH_STATS["grown"] += 1
++    return new
++
++
++def reserve_for_prefill(p0: int, p1: int, R: int, pk, device) -> int:
++    """``reserve_scratch`` for the key blocks of a prefill of positions p0 .. p1 - 1 in calls of up to ``R`` rows
++    against the pool-key cache ``pk`` (patches/0050's bound as ``latent._attend`` applies it)."""
++
++    from . import memsafe
++
++    if SCRATCH == "off" or p1 <= p0:
++        return 0
++    cap_pools = pk.shape[0] - 2
++    need = memsafe.select_peak(p1, R, cap_pools, SELECT_MB, p0)
++    return reserve_scratch(need, device) if need else 0
++
++
++def _keys_block(n: int, npc: int, dev) -> torch.Tensor:
++    """patches/0550: an [n, npc] int32 key block, a view of the scratch when it can be one."""
++
++    if SCRATCH != "off" and not _capturing(dev):
++        key = _scratch_key(dev)
++        cur = _SCRATCH.get(key)
++        if cur is None or cur.numel() < n * npc:
++            SCRATCH_STATS["fallback"] += 1
++            reserve_scratch(n * npc * 4, dev, empty=False)
++            cur = _SCRATCH.get(key)
++        if cur is not None and cur.numel() >= n * npc:
++            return cur[:n * npc].view(n, npc)
++    return torch.empty((n, npc), dtype=torch.int32, device=dev)
++
++
+ def select_pools_blocked(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
+                          pos_dev: torch.Tensor, rows: int | None = None) -> torch.Tensor:
+     """Every row's 512 pools, ascending ([R, 512] int32): the first 512 of the stable descending sort of
+-    ``select_tokens``' scores over ``np_max`` pools (np_max >= every row's complete pools), in row blocks."""
++    ``select_tokens``' scores over ``np_max`` pools (np_max >= every row's complete pools), in row blocks.
++    patches/0550: the key blocks are views of the selection scratch (``_keys_block``: same bits)."""
+ 
+     dev = qi.device
+     pools = torch.empty((R, TOPK_POOLS), dtype=torch.int32, device=dev)
+@@ -475,7 +574,7 @@ def select_pools_blocked(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor,
+         npc = min(np_max, max(TOPK_POOLS, triton.cdiv(need_np, 64) * 64))
+         if npc < TOPK_POOLS:
+             raise ValueError(f"select_pools_blocked: {np_max} pools to score, fewer than {TOPK_POOLS}")
+-        keys = torch.empty((n, npc), dtype=torch.int32, device=dev)
++        keys = _keys_block(n, npc, dev)
+         _launch_rows(qi, wts, pk, keys, pos_dev, R, npc, r0, n)
+         top = torch.topk(keys, TOPK_POOLS, dim=1, largest=True, sorted=False).values
+         t = top.min(dim=1).values.contiguous()

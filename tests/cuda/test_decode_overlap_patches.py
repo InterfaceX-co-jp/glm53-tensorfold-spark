@@ -314,14 +314,17 @@ def test_cancels_ride_and_replay(monkeypatch, part):
 
 
 @needs_torch
-def test_emit_after_the_next_forward_launch(monkeypatch):
+@pytest.mark.parametrize("first_now", [False, True], ids=["first-held", "first-now"])
+def test_emit_after_the_next_forward_launch(monkeypatch, first_now):
     """``emit``: tokens a round accepted are handed out when the next round's forward has been launched (or when the
-    request ends), in order, before the end marker, none lost."""
+    request ends), in order, before the end marker, none lost. patches/0540 (GLM53_TF_EMIT_FIRST, default on): a
+    prompt's first token goes out when its piece ends instead (``first-now``), so no token waits for a launch here."""
 
     import numpy as np
     import test_batch_sessions_patches as tb
 
     bat = _overlap_batcher(monkeypatch, "emit")
+    bat.emit_first = first_now
     rng = np.random.default_rng(9)
     prompts = [[int(t) for t in rng.integers(0, 1000, size=s)] for s in (130, 190)]
     jobs = [tb._job(p, 25, False, 64) for p in prompts]
@@ -359,7 +362,10 @@ def test_emit_after_the_next_forward_launch(monkeypatch):
         assert toks[-1] is None and None not in toks[:-1]
         assert toks[:-1] == tb._reference(p, 25, 64, False)[0]
     assert bat._held is None and len(launches) > 20
-    assert max(launches) >= 1                                     # tokens were waiting when forwards launched
+    if first_now:
+        assert max(launches) == 0                                 # patches/0540: first tokens never wait for a launch
+    else:
+        assert max(launches) >= 1                                 # tokens were waiting when forwards launched
 
 
 @needs_torch

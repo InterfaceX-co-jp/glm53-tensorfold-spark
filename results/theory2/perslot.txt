@@ -1,0 +1,49 @@
+rounds: 1 stream 651, 4 streams 178. Per round: count and ms at 1 / 4 streams; delta ms; per extra slot = delta / 3
+kernel                                     phase           n 1s    n 4s   ms 1s   ms 4s    d ms  /slot
+grouped_kernel                             vfwd            84.0    84.0   23.63   68.24  +44.61 +14.87
+chain_kernel                               vfwd            34.0   129.7    1.11    4.28   +3.17  +1.06
+_qmm                                       other            0.0    17.6    0.00    2.53   +2.53  +0.84
+_qmm                                       propose         27.2    57.6    2.73    4.37   +1.63  +0.54
+_lchunks                                   vfwd            11.0    42.0    0.55    2.12   +1.57  +0.52
+grouped_kernel                             other            0.0     4.1    0.00    1.52   +1.52  +0.51
+gather_kernel                              vfwd            90.0    90.0    2.01    3.34   +1.33  +0.44
+_qmm                                       vfwd           271.0   271.0   12.74   13.71   +0.97  +0.32
+replay_layers_kernel                       other            0.6     1.9    0.37    1.23   +0.85  +0.28
+grouped_loop_kernel                        other            0.0     0.3    0.00    0.50   +0.50  +0.17
+rot_in_kernel                              vfwd            42.0    42.0    0.23    0.60   +0.38  +0.13
+gateup_epilogue_kernel                     vfwd            42.0    42.0    0.38    0.71   +0.33  +0.11
+gather_kernel                              propose          8.7    17.1    0.24    0.50   +0.25  +0.08
+gather_kernel                              other            0.0     6.3    0.00    0.24   +0.24  +0.08
+_lchunks                                   other            0.0     4.4    0.00    0.23   +0.23  +0.08
+down_epilogue_kernel                       vfwd            42.0    42.0    0.23    0.45   +0.22  +0.07
+_hc_post                                   vfwd            90.0    90.0    0.16    0.35   +0.19  +0.06
+_group                                     vfwd            42.0    42.0    0.13    0.31   +0.18  +0.06
+_reduce                                    vfwd           199.0   199.0    0.25    0.42   +0.18  +0.06
+_expand2                                   other            0.0     2.2    0.00    0.16   +0.16  +0.05
+_router_part                               vfwd            53.0    53.0    0.67    0.82   +0.15  +0.05
+_hc_partial                                vfwd            90.0    90.0    0.79    0.91   +0.13  +0.04
+_lwrite8                                   vfwd            11.0    42.0    0.02    0.11   +0.08  +0.03
+_index_write                               vfwd            11.0    42.0    0.02    0.10   +0.08  +0.03
+_lmerge                                    vfwd            11.0    42.0    0.02    0.09   +0.07  +0.02
+ncclDevKernel_AllGather_RING_LL            other            0.0     0.3    0.00    0.07   +0.07  +0.02
+_pool_keys                                 vfwd            11.0    42.0    0.04    0.10   +0.07  +0.02
+_absorb2                                   other            0.0     2.2    0.00    0.06   +0.06  +0.02
+_conv_shift                                other            1.0     3.8    0.02    0.08   +0.06  +0.02
+index_elementwise_kernel                   propose          9.5    31.1    0.02    0.08   +0.06  +0.02
+computeDigitCumSum                         other            0.0    17.8    0.00    0.05   +0.05  +0.02
+_router_part                               other            0.0     4.4    0.00    0.05   +0.05  +0.02
+_dattn_kernel                              propose          2.4     7.8    0.02    0.06   +0.04  +0.01
+computeBlockwiseWithinKCounts              other            0.0    17.8    0.00    0.04   +0.04  +0.01
+_rmsnorm                                   other            0.0    17.6    0.00    0.04   +0.04  +0.01
+computeBlockDigitCounts                    other            0.0    17.8    0.00    0.04   +0.04  +0.01
+_group_sums                                vfwd           113.0   113.0    0.11    0.15   +0.04  +0.01
+_swiglu                                    vfwd            45.0    45.0    0.05    0.09   +0.04  +0.01
+_reduce                                    propose         23.1    48.3    0.03    0.07   +0.03  +0.01
+vectorized_elementwise_kernel              propose         16.3    44.2    0.02    0.05   +0.03  +0.01
+_dconv_kernel                              propose          9.5    31.1    0.01    0.05   +0.03  +0.01
+computeDigitCumSum                         sample_multi     4.0    15.3    0.01    0.04   +0.03  +0.01
+computeBlockDigitCounts                    sample_multi     4.0    15.3    0.01    0.04   +0.03  +0.01
+_reduce                                    other            0.0    15.4    0.00    0.03   +0.03  +0.01
+elementwise_kernel                         vfwd            42.0    42.0    0.06    0.08   +0.03  +0.01
+delta by phase (ms a round): {'propose': 1.31, 'other': 6.78, 'sample_multi': 0.18, 'vfwd': 53.92}
+kernels a round: 1s 1845  4s 2576

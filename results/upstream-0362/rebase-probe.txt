@@ -1,0 +1,1170 @@
+# rebase probe 2026-09-29T11:48:04+07:00
+# upstream clone ~/.cache/tf-upstream ; base 2f8e514 ; target 71377a5 ; patches ~/glm53-tensorfold-spark/patches
+
+## Stage 1: series on 2f8e514 (Dockerfile method: git apply || patch -p1 --forward)
+0001-glm-exl3-nonexpert-q4.patch         git-apply  plain-diff   prefix=i/ hunks=9
+0002-glm-tool-call-parser.patch          git-apply  plain-diff   prefix=i/ hunks=3
+0003-glm-prefill-rows.patch              git-apply  plain-diff   prefix=i/ hunks=3
+0004-glm-sparse-long-prefill.patch       git-apply  plain-diff   prefix=i/ hunks=5
+0005-glm-prefill-profile.patch           git-apply  plain-diff   prefix=i/ hunks=16
+0006-glm-exl3-expert-loop.patch          git-apply  plain-diff   prefix=i/ hunks=11
+0010-glm-auto-deep-dflash-drafts.patch   git-apply  plain-diff   prefix=a/ hunks=4
+0020-glm-suffix-drafter.patch            git-apply  plain-diff   prefix=i/ hunks=14
+0030-glm-batch2.patch                    git-apply  plain-diff   prefix=i/ hunks=7
+0040-glm-comm-prefetch.patch             git-apply  plain-diff   prefix=i/ hunks=12
+0050-glm-longctx-decode.patch            git-apply  plain-diff   prefix=i/ hunks=26
+0060-glm-latent-kv.patch                 git-apply  plain-diff   prefix=c/ hunks=11
+0065-glm-1m-memory-indexer.patch         git-apply  plain-diff   prefix=c/ hunks=23
+0070-glm-realistic-calibration.patch     git-apply  plain-diff   prefix=i/ hunks=10
+0071-glm-cost-derived-depth.patch        git-apply  plain-diff   prefix=i/ hunks=28
+0080-glm-fast-prefill.patch              git-apply  plain-diff   prefix=a/ hunks=30
+0081-glm-fast-prefill-kernels.patch      git-apply  plain-diff   prefix=a/ hunks=2
+0082-glm-lean-prefill.patch              git-apply  plain-diff   prefix=a/ hunks=11
+0083-glm-fp8-prefill.patch               git-apply  plain-diff   prefix=a/ hunks=24
+0084-glm-prefill-overlap.patch           git-apply  plain-diff   prefix=a/ hunks=14
+0085-glm-c-independent-prefill.patch     git-apply  plain-diff   prefix=a/ hunks=26
+0090-glm-request-knobs.patch             git-apply  plain-diff   prefix=a/ hunks=16
+0091-glm-fast-prefill-knob.patch         git-apply  plain-diff   prefix=a/ hunks=7
+0092-glm-fp8-prefill-knob.patch          git-apply  plain-diff   prefix=a/ hunks=9
+0093-glm-prefill-overlap-knob.patch      git-apply  plain-diff   prefix=a/ hunks=4
+0110-glm-session-cache.patch             git-apply  plain-diff   prefix=a/ hunks=15
+0120-glm-batch-v2.patch                  git-apply  plain-diff   prefix=c/ hunks=23
+0130-glm-decode-step.patch               git-apply  plain-diff   prefix=c/ hunks=16
+0140-glm-fast-boot.patch                 git-apply  plain-diff   prefix=c/ hunks=15
+0150-glm-mia-wins.patch                  git-apply  plain-diff   prefix=c/ hunks=10
+0160-glm-openai-compat.patch             git-apply  plain-diff   prefix=i/ hunks=7
+0170-glm-mia-prefill.patch               git-apply  plain-diff   prefix=i/ hunks=16
+0180-glm-batch-sessions.patch            git-apply  plain-diff   prefix=i/ hunks=28
+0190-glm-prefill-glue.patch              git-apply  plain-diff   prefix=i/ hunks=28
+0200-glm-batch-parallel.patch            git-apply  plain-diff   prefix=c/ hunks=26
+0210-glm-prompt-tokens.patch             git-apply  plain-diff   prefix=c/ hunks=8
+0220-glm-fp8-latent-kv.patch             git-apply  plain-diff   prefix=a/ hunks=20
+0230-glm-roce-gather.patch               git-apply  plain-diff   prefix=a/ hunks=23
+0240-glm-b12x-prefill.patch              git-apply  plain-diff   prefix=c/ hunks=28
+0250-glm-session-nvme.patch              git-apply  plain-diff   prefix=c/ hunks=22
+0260-glm-expert-decode-once.patch        git-apply  plain-diff   prefix=i/ hunks=7
+0270-glm-fast-experts-auto.patch         git-apply  plain-diff   prefix=i/ hunks=7
+0280-glm-batch-buckets.patch             git-apply  plain-diff   prefix=i/ hunks=11
+0290-glm-kv-pool.patch                   git-apply  plain-diff   prefix=c/ hunks=73
+0300-glm-request-log.patch               git-apply  plain-diff   prefix=a/ hunks=9
+0310-glm-prefix-share.patch              git-apply  plain-diff   prefix=a/ hunks=15
+0320-glm-prefill-row-split.patch         git-apply  plain-diff   prefix=c/ hunks=5
+0330-glm-expert-tc.patch                 git-apply  plain-diff   prefix=a/ hunks=6
+0335-glm-solo-piece.patch                git-apply  plain-diff   prefix=a/ hunks=10
+0340-glm-batch-adapt.patch               git-apply  plain-diff   prefix=c/ hunks=10
+0350-glm-roce-loopback-fix.patch         git-apply  plain-diff   prefix=a/ hunks=27
+0360-glm-b12x-attn-fp8.patch             git-apply  plain-diff   prefix=a/ hunks=7
+0370-glm-decode-overlap-cpu-pin.patch    git-apply  plain-diff   prefix=a/ hunks=29
+0380-glm-deep-verify.patch               git-apply  plain-diff   prefix=c/ hunks=15
+0390-glm-mla-expand-v2.patch             git-apply  plain-diff   prefix=a/ hunks=4
+0400-glm-kda-v2.patch                    git-apply  plain-diff   prefix=a/ hunks=5
+0410-glm-sparse-v2.patch                 git-apply  plain-diff   prefix=c/ hunks=4
+0420-glm-draft-vocab.patch               git-apply  plain-diff   prefix=c/ hunks=33
+0430-glm-draft-dump.patch                git-apply  plain-diff   prefix=c/ hunks=8
+0440-glm-decode-stream.patch             git-apply  plain-diff   prefix=c/ hunks=11
+0460-glm-prefetch-comm.patch             git-apply  plain-diff   prefix=a/ hunks=55
+0470-glm-nonexpert-q8.patch              git-apply  plain-diff   prefix=i/ hunks=33
+0490-glm-api-context.patch               git-apply  plain-diff   prefix=i/ hunks=17
+
+Stage-1 failures: none
+
+## Stage 2: each patch on 71377a5 with git apply --3way (committed on success, reset on conflict)
+=== 0001-glm-exl3-nonexpert-q4.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/qmm.py (1 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/weights.py (2 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/qmm.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/weights.py' with conflicts.
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/qmm.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/weights.py.rej : 3 hunk(s)
+    summary: 3way-conflict-regions=3 rejected-hunks=6/9 in 3 file(s)
+=== 0002-glm-tool-call-parser.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/cuda/server.py (1 conflict regions)
+    Applied patch to 'src/tensorfold/cuda/server.py' with conflicts.
+    rejected: src/tensorfold/cuda/server.py.rej : 3 hunk(s)
+    summary: 3way-conflict-regions=1 rejected-hunks=3/3 in 1 file(s)
+=== 0003-glm-prefill-rows.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (1 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/qmm.py.rej : 1 hunk(s)
+    summary: 3way-conflict-regions=1 rejected-hunks=2/3 in 2 file(s)
+=== 0004-glm-sparse-long-prefill.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/sparse.py (2 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/sparse.py' with conflicts.
+    rejected: src/tensorfold/families/glm5_next/cuda/sparse.py.rej : 3 hunk(s)
+    summary: 3way-conflict-regions=2 rejected-hunks=3/5 in 1 file(s)
+=== 0005-glm-prefill-profile.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/decode.py (4 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/forward.py (10 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/mtp.py (2 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/mtp.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 9 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/mtp.py.rej : 3 hunk(s)
+    summary: 3way-conflict-regions=16 rejected-hunks=15/16 in 3 file(s)
+=== 0006-glm-exl3-expert-loop.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/exl3.cu (2 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/exl3_mm.py (2 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/exl3.cu' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/exl3_mm.py' with conflicts.
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3.cpp.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3.cu.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3_mm.py.rej : 4 hunk(s)
+    summary: 3way-conflict-regions=4 rejected-hunks=8/11 in 3 file(s)
+=== 0010-glm-auto-deep-dflash-drafts.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (2 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 3 hunk(s)
+    summary: 3way-conflict-regions=2 rejected-hunks=3/4 in 1 file(s)
+=== 0020-glm-suffix-drafter.patch : CONFLICT (3way rc=1)
+    3way-conflict: docs/recipes/glm-5.3-flash.md (1 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/decode.py (1 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (2 conflict regions)
+    Applied patch to 'docs/recipes/glm-5.3-flash.md' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Falling back to direct application...
+    rejected: docs/recipes/glm-5.3-flash.md.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 2 hunk(s)
+    rejected: tests/cuda/test_glm_engine.py.rej : 1 hunk(s)
+    summary: 3way-conflict-regions=4 rejected-hunks=6/14 in 4 file(s)
+=== 0030-glm-batch2.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/attention.py (1 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (1 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/attention.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/app.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/attention.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 2 hunk(s)
+    summary: 3way-conflict-regions=2 rejected-hunks=4/7 in 3 file(s)
+=== 0040-glm-comm-prefetch.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/mtp.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/comm.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 6 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/mtp.py.rej : 3 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/comm.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=10/12 in 3 file(s)
+=== 0050-glm-longctx-decode.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/decode.py (2 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (1 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/forward.py (7 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/graphs.py (4 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/mtp.py (2 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/sparse.py (5 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/graphs.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/mtp.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/sparse.py' with conflicts.
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 4 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 7 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/graphs.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/mtp.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/sparse.py.rej : 6 hunk(s)
+    summary: 3way-conflict-regions=21 rejected-hunks=22/26 in 6 file(s)
+=== 0060-glm-latent-kv.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 5 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/latent.py: already exists in working directory
+    summary: 3way-conflict-regions=0 rejected-hunks=7/11 in 2 file(s)
+=== 0065-glm-1m-memory-indexer.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/dflash2.py (2 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/forward.py (1 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/latent.py (1 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/sparse.py (2 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/dflash2.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/sparse.py' with conflicts.
+    rejected: src/tensorfold/families/glm5_next/cuda/dflash2.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/sparse.py.rej : 3 hunk(s)
+    summary: 3way-conflict-regions=6 rejected-hunks=9/23 in 4 file(s)
+=== 0070-glm-realistic-calibration.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/decode.py (1 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (3 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 6 hunk(s)
+    summary: 3way-conflict-regions=4 rejected-hunks=7/10 in 2 file(s)
+=== 0071-glm-cost-derived-depth.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/dflash2.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/lookup.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 5 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/dflash2.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 10 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/lookup.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=16/28 in 3 file(s)
+=== 0080-glm-fast-prefill.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/decode.py (6 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (4 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/exl3_mm.py (3 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/forward.py (7 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/exl3_mm.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 7 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 5 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3_mm.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 7 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/qmm.py.rej : 1 hunk(s)
+    summary: 3way-conflict-regions=20 rejected-hunks=22/30 in 5 file(s)
+=== 0081-glm-fast-prefill-kernels.patch : clean
+=== 0082-glm-lean-prefill.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/decode.py (5 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (2 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 8 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 2 hunk(s)
+    summary: 3way-conflict-regions=7 rejected-hunks=10/11 in 2 file(s)
+=== 0083-glm-fp8-prefill.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/decode.py (6 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (3 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/latent.py (4 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 6 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 11 hunk(s)
+    summary: 3way-conflict-regions=13 rejected-hunks=20/24 in 3 file(s)
+=== 0084-glm-prefill-overlap.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/glue.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/lean.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/glue.py.rej : 3 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/lean.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=7/14 in 3 file(s)
+=== 0085-glm-c-independent-prefill.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    error: patch failed: src/tensorfold/families/glm5_next/cuda/fast_qmm.py:268
+    error: repository lacks the necessary blob to perform 3-way merge.
+    error: src/tensorfold/families/glm5_next/cuda/fastpf.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/fast_qmm.py: patch does not apply
+    error: src/tensorfold/families/glm5_next/cuda/fp8pf.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/lean.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/pfoverlap.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 8 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 4 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/fast_qmm.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/fastpf.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/fp8pf.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/lean.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/pfoverlap.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=15/26 in 4 file(s)
+=== 0090-glm-request-knobs.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/app.py (2 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/decode.py (1 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/engine.py (9 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/forward.py (1 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/app.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/cuda/server.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/app.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 8 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 1 hunk(s)
+    summary: 3way-conflict-regions=13 rejected-hunks=13/16 in 5 file(s)
+=== 0091-glm-fast-prefill-knob.patch : CONFLICT (3way rc=1)
+    error: patch failed: src/tensorfold/families/glm5_next/cuda/engine.py:305
+    error: repository lacks the necessary blob to perform 3-way merge.
+    error: src/tensorfold/families/glm5_next/cuda/engine.py: patch does not apply
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 3 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=3/7 in 1 file(s)
+=== 0092-glm-fp8-prefill-knob.patch : CONFLICT (3way rc=1)
+    error: patch failed: src/tensorfold/families/glm5_next/cuda/engine.py:318
+    error: repository lacks the necessary blob to perform 3-way merge.
+    error: src/tensorfold/families/glm5_next/cuda/engine.py: patch does not apply
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 4 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=4/9 in 1 file(s)
+=== 0093-glm-prefill-overlap-knob.patch : CONFLICT (3way rc=1)
+    error: patch failed: src/tensorfold/families/glm5_next/cuda/engine.py:334
+    error: repository lacks the necessary blob to perform 3-way merge.
+    error: src/tensorfold/families/glm5_next/cuda/engine.py: patch does not apply
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 2 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=2/4 in 1 file(s)
+=== 0110-glm-session-cache.patch : CONFLICT (3way rc=1)
+    error: patch failed: src/tensorfold/families/glm5_next/cuda/decode.py:299
+    error: patch failed: src/tensorfold/families/glm5_next/cuda/engine.py:15
+    error: repository lacks the necessary blob to perform 3-way merge.
+    error: src/tensorfold/families/glm5_next/cuda/decode.py: patch does not apply
+    error: src/tensorfold/families/glm5_next/cuda/engine.py: patch does not apply
+    Falling back to direct application...
+    rejected: src/tensorfold/cuda/server.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 4 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 7 hunk(s)
+    summary: 3way-conflict-regions=0 rejected-hunks=13/15 in 3 file(s)
+=== 0120-glm-batch-v2.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/app.py' with conflicts.
+    error: patch failed: src/tensorfold/families/glm5_next/cuda/engine.py:298
+    error: repository lacks the necessary blob to perform 3-way merge.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/engine.py: patch does not apply
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/app.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 2 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=4/23 in 2 file(s)
+=== 0130-glm-decode-step.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/exl3_mm.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/qmm.py' with conflicts.
+    error: patch failed: src/tensorfold/families/glm5_next/cuda/forward.py:27
+    error: repository lacks the necessary blob to perform 3-way merge.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/forward.py: patch does not apply
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3_mm.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 6 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/qmm.py.rej : 2 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=10/16 in 3 file(s)
+=== 0140-glm-fast-boot.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/dflash2.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/weights.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/calib.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/dflash2.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 8 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/weights.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/calib.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=10/15 in 3 file(s)
+=== 0150-glm-mia-wins.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/cuda/server.py (3 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/app.py (4 conflict regions)
+    Applied patch to 'src/tensorfold/cuda/server.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/app.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/cuda/server.py.rej : 4 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/app.py.rej : 4 hunk(s)
+    summary: 3way-conflict-regions=7 rejected-hunks=8/10 in 2 file(s)
+=== 0160-glm-openai-compat.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/cuda/server.py (6 conflict regions)
+    Applied patch to 'src/tensorfold/cuda/server.py' with conflicts.
+    rejected: src/tensorfold/cuda/server.py.rej : 6 hunk(s)
+    summary: 3way-conflict-regions=6 rejected-hunks=6/7 in 1 file(s)
+=== 0170-glm-mia-prefill.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/exl3_mm.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/fast_qmm.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/exl3_fast.cu: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/fastpf.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/lean.py: does not exist in index
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3_mm.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/fast_qmm.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/exl3_fast.cu: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/fastpf.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/lean.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=7/16 in 4 file(s)
+=== 0180-glm-batch-sessions.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batchplan.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessions.py: does not exist in index
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 2 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batchplan.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessions.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=2/28 in 1 file(s)
+=== 0190-glm-prefill-glue.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/glue.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/lean.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/pfgrid.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/pfoverlap.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 4 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 5 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/glue.py.rej : 4 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 5 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/lean.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/pfgrid.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/pfoverlap.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=18/28 in 4 file(s)
+=== 0200-glm-batch-parallel.patch : CONFLICT (3way rc=1)
+    error: src/tensorfold/families/glm5_next/cuda/batchplan.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batchplan.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=0/26 in 0 file(s)
+=== 0210-glm-prompt-tokens.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/cuda/server.py (2 conflict regions)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/app.py (5 conflict regions)
+    Applied patch to 'src/tensorfold/cuda/server.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/app.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/cuda/server.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/app.py.rej : 5 hunk(s)
+    summary: 3way-conflict-regions=7 rejected-hunks=7/8 in 2 file(s)
+=== 0220-glm-fp8-latent-kv.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    error: patch failed: src/tensorfold/families/glm5_next/cuda/engine.py:238
+    error: repository lacks the necessary blob to perform 3-way merge.
+    error: src/tensorfold/families/glm5_next/cuda/engine.py: patch does not apply
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessions.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 4 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 10 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessions.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=15/20 in 3 file(s)
+=== 0230-glm-roce-gather.patch : CONFLICT (3way rc=1)
+    Applied patch to 'pyproject.toml' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'THIRD_PARTY_NOTICES.md' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/comm.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/pfoverlap.py: does not exist in index
+    Falling back to direct application...
+    rejected: pyproject.toml.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 2 hunk(s)
+    rejected: THIRD_PARTY_NOTICES.md.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/comm.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/pfoverlap.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=6/23 in 5 file(s)
+=== 0240-glm-b12x-prefill.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/glue.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    Applied patch to 'THIRD_PARTY_NOTICES.md' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/fastpf.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/pfgrid.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 7 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/glue.py.rej : 5 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 2 hunk(s)
+    rejected: THIRD_PARTY_NOTICES.md.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/fastpf.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/pfgrid.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=16/28 in 5 file(s)
+=== 0250-glm-session-nvme.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessions.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 6 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessions.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=6/22 in 1 file(s)
+=== 0260-glm-expert-decode-once.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/exl3_mm.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/exl3_fast.cu: does not exist in index
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3_mm.py.rej : 2 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/exl3_fast.cpp: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/exl3_fast.cu: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=2/7 in 1 file(s)
+=== 0270-glm-fast-experts-auto.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/exl3_mm.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3_mm.py.rej : 3 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=5/7 in 2 file(s)
+=== 0280-glm-batch-buckets.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batchplan.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 2 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batchplan.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=2/11 in 1 file(s)
+=== 0290-glm-kv-pool.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/graphs.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/sparse.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/b12x_attn.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/batchplan.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/pfglue.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessions.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/graphs.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 14 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/sparse.py.rej : 13 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/b12x_attn.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batchplan.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/pfglue.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessions.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=33/73 in 6 file(s)
+=== 0300-glm-request-log.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/app.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/app.py.rej : 5 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=6/9 in 2 file(s)
+=== 0310-glm-prefix-share.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessions.py: does not exist in index
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessions.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=1/15 in 1 file(s)
+=== 0320-glm-prefill-row-split.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/comm.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/pfoverlap.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/comm.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/pfoverlap.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=1/5 in 1 file(s)
+=== 0330-glm-expert-tc.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/exl3_mm.py (2 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/exl3_mm.py' with conflicts.
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3_mm.py.rej : 3 hunk(s)
+    summary: 3way-conflict-regions=2 rejected-hunks=3/6 in 1 file(s)
+=== 0335-glm-solo-piece.patch : CONFLICT (3way rc=1)
+    error: src/tensorfold/families/glm5_next/cuda/batchplan.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/lean.py: does not exist in index
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batchplan.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/lean.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=0/10 in 0 file(s)
+=== 0340-glm-batch-adapt.patch : CONFLICT (3way rc=1)
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    Falling back to direct application...
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=0/10 in 0 file(s)
+=== 0350-glm-roce-loopback-fix.patch : CONFLICT (3way rc=1)
+    error: src/tensorfold/families/glm5_next/cuda/roce_common.h: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/roce.cpp: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/roce.cu: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/roce.py: does not exist in index
+    Falling back to direct application...
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/roce_common.h: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/roce.cpp: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/roce.cu: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/roce.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=0/27 in 0 file(s)
+=== 0360-glm-b12x-attn-fp8.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/b12x_attn.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: does not exist in index
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 2 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/b12x_attn.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=2/7 in 1 file(s)
+=== 0370-glm-decode-overlap-cpu-pin.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/app.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/app.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 3 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=7/29 in 3 file(s)
+=== 0380-glm-deep-verify.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/calib.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/depth.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/knobs.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/lookup.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 4 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/calib.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/depth.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/knobs.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/lookup.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=5/15 in 2 file(s)
+=== 0390-glm-mla-expand-v2.patch : CONFLICT (3way rc=1)
+    3way-conflict: src/tensorfold/families/glm5_next/cuda/latent.py (3 conflict regions)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 4 hunk(s)
+    summary: 3way-conflict-regions=3 rejected-hunks=4/4 in 1 file(s)
+=== 0400-glm-kda-v2.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/fastpf.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/fastpf.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=1/5 in 1 file(s)
+=== 0410-glm-sparse-v2.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/b12x_attn.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/b12x_attn.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=1/4 in 1 file(s)
+=== 0420-glm-draft-vocab.patch : CONFLICT (3way rc=1)
+    Applied patch to 'pyproject.toml' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/dflash2.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/graphs.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/mtp.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/overlap.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/pfglue.py: does not exist in index
+    Falling back to direct application...
+    rejected: pyproject.toml.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/dflash2.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/graphs.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/mtp.py.rej : 4 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/overlap.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/pfglue.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=14/33 in 6 file(s)
+=== 0430-glm-draft-dump.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 3 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=5/8 in 2 file(s)
+=== 0440-glm-decode-stream.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/exl3_mm.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/qmm.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/exl3_mm.py.rej : 2 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/qmm.py.rej : 2 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/sessdisk.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=5/11 in 3 file(s)
+=== 0460-glm-prefetch-comm.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/forward.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/batch.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/overlap.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/roce_common.h: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/roce.cpp: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/roce.cu: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/roce.py: does not exist in index
+    Falling back to direct application...
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/forward.py.rej : 5 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 3 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/batch.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/overlap.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/roce_common.h: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/roce.cpp: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/roce.cu: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/roce.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=9/55 in 3 file(s)
+=== 0470-glm-nonexpert-q8.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/fast_qmm.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/latent.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/qmm.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/weights.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/dump.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/fastboot.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/fastpf.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/l2pf.py: does not exist in index
+    error: src/tensorfold/families/glm5_next/cuda/overlap.py: does not exist in index
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/fast_qmm.py.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/latent.py.rej : 6 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/qmm.py.rej : 3 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/weights.py.rej : 6 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/dump.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/fastboot.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/fastpf.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/l2pf.py: No such file or directory
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/overlap.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=19/33 in 5 file(s)
+=== 0490-glm-api-context.patch : CONFLICT (3way rc=1)
+    Applied patch to 'src/tensorfold/cuda/server.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/app.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/decode.py' with conflicts.
+    Applied patch to 'src/tensorfold/families/glm5_next/cuda/engine.py' with conflicts.
+    error: src/tensorfold/families/glm5_next/cuda/kvpool.py: does not exist in index
+    rejected: src/tensorfold/cuda/server.py.rej : 8 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/app.py.rej : 5 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/decode.py.rej : 1 hunk(s)
+    rejected: src/tensorfold/families/glm5_next/cuda/engine.py.rej : 1 hunk(s)
+    missing/exists: error: src/tensorfold/families/glm5_next/cuda/kvpool.py: No such file or directory
+    summary: 3way-conflict-regions=0 rejected-hunks=15/17 in 4 file(s)
+
+## Stage 2 summary (isolated: a failed patch is reset, so later patches cascade-fail on files it creates)
+0001-glm-exl3-nonexpert-q4.patch         CONFLICT markers=3 rej=6/9
+0002-glm-tool-call-parser.patch          CONFLICT markers=1 rej=3/3
+0003-glm-prefill-rows.patch              CONFLICT markers=1 rej=2/3
+0004-glm-sparse-long-prefill.patch       CONFLICT markers=2 rej=3/5
+0005-glm-prefill-profile.patch           CONFLICT markers=16 rej=15/16
+0006-glm-exl3-expert-loop.patch          CONFLICT markers=4 rej=8/11
+0010-glm-auto-deep-dflash-drafts.patch   CONFLICT markers=2 rej=3/4
+0020-glm-suffix-drafter.patch            CONFLICT markers=4 rej=6/14
+0030-glm-batch2.patch                    CONFLICT markers=2 rej=4/7
+0040-glm-comm-prefetch.patch             CONFLICT markers=0 rej=10/12
+0050-glm-longctx-decode.patch            CONFLICT markers=21 rej=22/26
+0060-glm-latent-kv.patch                 CONFLICT markers=0 rej=7/11
+0065-glm-1m-memory-indexer.patch         CONFLICT markers=6 rej=9/23
+0070-glm-realistic-calibration.patch     CONFLICT markers=4 rej=7/10
+0071-glm-cost-derived-depth.patch        CONFLICT markers=0 rej=16/28
+0080-glm-fast-prefill.patch              CONFLICT markers=20 rej=22/30
+0081-glm-fast-prefill-kernels.patch      clean
+0082-glm-lean-prefill.patch              CONFLICT markers=7 rej=10/11
+0083-glm-fp8-prefill.patch               CONFLICT markers=13 rej=20/24
+0084-glm-prefill-overlap.patch           CONFLICT markers=0 rej=7/14
+0085-glm-c-independent-prefill.patch     CONFLICT markers=0 rej=15/26
+0090-glm-request-knobs.patch             CONFLICT markers=13 rej=13/16
+0091-glm-fast-prefill-knob.patch         CONFLICT markers=0 rej=3/7
+0092-glm-fp8-prefill-knob.patch          CONFLICT markers=0 rej=4/9
+0093-glm-prefill-overlap-knob.patch      CONFLICT markers=0 rej=2/4
+0110-glm-session-cache.patch             CONFLICT markers=0 rej=13/15
+0120-glm-batch-v2.patch                  CONFLICT markers=0 rej=4/23
+0130-glm-decode-step.patch               CONFLICT markers=0 rej=10/16
+0140-glm-fast-boot.patch                 CONFLICT markers=0 rej=10/15
+0150-glm-mia-wins.patch                  CONFLICT markers=7 rej=8/10
+0160-glm-openai-compat.patch             CONFLICT markers=6 rej=6/7
+0170-glm-mia-prefill.patch               CONFLICT markers=0 rej=7/16
+0180-glm-batch-sessions.patch            CONFLICT markers=0 rej=2/28
+0190-glm-prefill-glue.patch              CONFLICT markers=0 rej=18/28
+0200-glm-batch-parallel.patch            CONFLICT markers=0 rej=0/26
+0210-glm-prompt-tokens.patch             CONFLICT markers=7 rej=7/8
+0220-glm-fp8-latent-kv.patch             CONFLICT markers=0 rej=15/20
+0230-glm-roce-gather.patch               CONFLICT markers=0 rej=6/23
+0240-glm-b12x-prefill.patch              CONFLICT markers=0 rej=16/28
+0250-glm-session-nvme.patch              CONFLICT markers=0 rej=6/22
+0260-glm-expert-decode-once.patch        CONFLICT markers=0 rej=2/7
+0270-glm-fast-experts-auto.patch         CONFLICT markers=0 rej=5/7
+0280-glm-batch-buckets.patch             CONFLICT markers=0 rej=2/11
+0290-glm-kv-pool.patch                   CONFLICT markers=0 rej=33/73
+0300-glm-request-log.patch               CONFLICT markers=0 rej=6/9
+0310-glm-prefix-share.patch              CONFLICT markers=0 rej=1/15
+0320-glm-prefill-row-split.patch         CONFLICT markers=0 rej=1/5
+0330-glm-expert-tc.patch                 CONFLICT markers=2 rej=3/6
+0335-glm-solo-piece.patch                CONFLICT markers=0 rej=0/10
+0340-glm-batch-adapt.patch               CONFLICT markers=0 rej=0/10
+0350-glm-roce-loopback-fix.patch         CONFLICT markers=0 rej=0/27
+0360-glm-b12x-attn-fp8.patch             CONFLICT markers=0 rej=2/7
+0370-glm-decode-overlap-cpu-pin.patch    CONFLICT markers=0 rej=7/29
+0380-glm-deep-verify.patch               CONFLICT markers=0 rej=5/15
+0390-glm-mla-expand-v2.patch             CONFLICT markers=3 rej=4/4
+0400-glm-kda-v2.patch                    CONFLICT markers=0 rej=1/5
+0410-glm-sparse-v2.patch                 CONFLICT markers=0 rej=1/4
+0420-glm-draft-vocab.patch               CONFLICT markers=0 rej=14/33
+0430-glm-draft-dump.patch                CONFLICT markers=0 rej=5/8
+0440-glm-decode-stream.patch             CONFLICT markers=0 rej=5/11
+0460-glm-prefetch-comm.patch             CONFLICT markers=0 rej=9/55
+0470-glm-nonexpert-q8.patch              CONFLICT markers=0 rej=19/33
+0490-glm-api-context.patch               CONFLICT markers=0 rej=15/17
+
+## Stage 3: keep-going on 71377a5 (git apply --reject; partial result committed; rejects classified)
+=== 0001-glm-exl3-nonexpert-q4.patch : rejUP=6 rejOWN=0 skippedFiles=0 of 9 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/qmm.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/weights.py : 3
+=== 0002-glm-tool-call-parser.patch : rejUP=3 rejOWN=0 skippedFiles=0 of 3 hunks
+    rej UP src/tensorfold/cuda/server.py : 3
+=== 0003-glm-prefill-rows.patch : rejUP=2 rejOWN=0 skippedFiles=0 of 3 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/qmm.py : 1
+=== 0004-glm-sparse-long-prefill.patch : rejUP=3 rejOWN=0 skippedFiles=0 of 5 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/sparse.py : 3
+=== 0005-glm-prefill-profile.patch : rejUP=15 rejOWN=0 skippedFiles=0 of 16 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 3
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 9
+    rej UP src/tensorfold/families/glm5_next/cuda/mtp.py : 3
+=== 0006-glm-exl3-expert-loop.patch : rejUP=8 rejOWN=0 skippedFiles=0 of 11 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3.cpp : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3.cu : 3
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3_mm.py : 4
+=== 0010-glm-auto-deep-dflash-drafts.patch : rejUP=3 rejOWN=0 skippedFiles=0 of 4 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 3
+=== 0020-glm-suffix-drafter.patch : rejUP=6 rejOWN=0 skippedFiles=0 of 14 hunks
+    rej UP docs/recipes/glm-5.3-flash.md : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+    rej UP tests/cuda/test_glm_engine.py : 1
+=== 0030-glm-batch2.patch : rejUP=4 rejOWN=0 skippedFiles=0 of 7 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/app.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/attention.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+=== 0040-glm-comm-prefetch.patch : rejUP=10 rejOWN=0 skippedFiles=1 of 12 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 6
+    rej UP src/tensorfold/families/glm5_next/cuda/mtp.py : 3
+    skipped-file src/tensorfold/families/glm5_next/cuda/comm.py (missing or already exists on target)
+=== 0050-glm-longctx-decode.patch : rejUP=22 rejOWN=0 skippedFiles=0 of 26 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 4
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 7
+    rej UP src/tensorfold/families/glm5_next/cuda/graphs.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/mtp.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/sparse.py : 6
+=== 0060-glm-latent-kv.patch : rejUP=7 rejOWN=0 skippedFiles=1 of 11 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 5
+    skipped-file src/tensorfold/families/glm5_next/cuda/latent.py (missing or already exists on target)
+=== 0065-glm-1m-memory-indexer.patch : rejUP=7 rejOWN=1 skippedFiles=0 of 23 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/dflash2.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 3
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/sparse.py : 2
+=== 0070-glm-realistic-calibration.patch : rejUP=4 rejOWN=0 skippedFiles=0 of 10 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 3
+=== 0071-glm-cost-derived-depth.patch : rejUP=9 rejOWN=0 skippedFiles=0 of 28 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 5
+    rej UP src/tensorfold/families/glm5_next/cuda/dflash2.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 3
+=== 0080-glm-fast-prefill.patch : rejUP=21 rejOWN=0 skippedFiles=0 of 30 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 7
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 4
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3_mm.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 7
+    rej UP src/tensorfold/families/glm5_next/cuda/qmm.py : 1
+=== 0081-glm-fast-prefill-kernels.patch : clean
+=== 0082-glm-lean-prefill.patch : rejUP=9 rejOWN=0 skippedFiles=0 of 11 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 8
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 1
+=== 0083-glm-fp8-prefill.patch : rejUP=6 rejOWN=11 skippedFiles=0 of 24 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 5
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 1
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 11
+=== 0084-glm-prefill-overlap.patch : rejUP=6 rejOWN=0 skippedFiles=0 of 14 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 3
+    rej UP src/tensorfold/families/glm5_next/cuda/glue.py : 3
+=== 0085-glm-c-independent-prefill.patch : rejUP=10 rejOWN=0 skippedFiles=0 of 26 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 7
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 1
+=== 0090-glm-request-knobs.patch : rejUP=9 rejOWN=0 skippedFiles=0 of 16 hunks
+    rej UP src/tensorfold/cuda/server.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/app.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 4
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 1
+=== 0091-glm-fast-prefill-knob.patch : rejUP=2 rejOWN=0 skippedFiles=0 of 7 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+=== 0092-glm-fp8-prefill-knob.patch : rejUP=3 rejOWN=0 skippedFiles=0 of 9 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 3
+=== 0093-glm-prefill-overlap-knob.patch : rejUP=2 rejOWN=0 skippedFiles=0 of 4 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+=== 0110-glm-session-cache.patch : rejUP=10 rejOWN=0 skippedFiles=0 of 15 hunks
+    rej UP src/tensorfold/cuda/server.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 4
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 4
+=== 0120-glm-batch-v2.patch : rejUP=4 rejOWN=0 skippedFiles=0 of 23 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/app.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+=== 0130-glm-decode-step.patch : rejUP=10 rejOWN=0 skippedFiles=0 of 16 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3_mm.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 6
+    rej UP src/tensorfold/families/glm5_next/cuda/qmm.py : 2
+=== 0140-glm-fast-boot.patch : rejUP=10 rejOWN=0 skippedFiles=0 of 15 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/dflash2.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 8
+    rej UP src/tensorfold/families/glm5_next/cuda/weights.py : 1
+=== 0150-glm-mia-wins.patch : rejUP=8 rejOWN=0 skippedFiles=0 of 10 hunks
+    rej UP src/tensorfold/cuda/server.py : 4
+    rej UP src/tensorfold/families/glm5_next/cuda/app.py : 4
+=== 0160-glm-openai-compat.patch : rejUP=6 rejOWN=0 skippedFiles=0 of 7 hunks
+    rej UP src/tensorfold/cuda/server.py : 6
+=== 0170-glm-mia-prefill.patch : rejUP=5 rejOWN=0 skippedFiles=0 of 16 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3_mm.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 1
+=== 0180-glm-batch-sessions.patch : rejUP=2 rejOWN=0 skippedFiles=0 of 28 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+=== 0190-glm-prefill-glue.patch : rejUP=10 rejOWN=5 skippedFiles=0 of 28 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 4
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 4
+    rej UP src/tensorfold/families/glm5_next/cuda/glue.py : 2
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 5
+=== 0200-glm-batch-parallel.patch : clean
+=== 0210-glm-prompt-tokens.patch : rejUP=7 rejOWN=0 skippedFiles=0 of 8 hunks
+    rej UP src/tensorfold/cuda/server.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/app.py : 5
+=== 0220-glm-fp8-latent-kv.patch : rejUP=4 rejOWN=10 skippedFiles=0 of 20 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 4
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 10
+=== 0230-glm-roce-gather.patch : rejUP=6 rejOWN=0 skippedFiles=1 of 23 hunks
+    rej UP pyproject.toml : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 2
+    rej UP THIRD_PARTY_NOTICES.md : 1
+    skipped-file src/tensorfold/families/glm5_next/cuda/comm.py (missing or already exists on target)
+=== 0240-glm-b12x-prefill.patch : rejUP=7 rejOWN=2 skippedFiles=0 of 28 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 5
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 2
+    rej UP THIRD_PARTY_NOTICES.md : 1
+=== 0250-glm-session-nvme.patch : rejUP=4 rejOWN=0 skippedFiles=0 of 22 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 4
+=== 0260-glm-expert-decode-once.patch : rejUP=2 rejOWN=0 skippedFiles=0 of 7 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3_mm.py : 2
+=== 0270-glm-fast-experts-auto.patch : rejUP=5 rejOWN=0 skippedFiles=0 of 7 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3_mm.py : 3
+=== 0280-glm-batch-buckets.patch : rejUP=2 rejOWN=0 skippedFiles=0 of 11 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 2
+=== 0290-glm-kv-pool.patch : rejUP=11 rejOWN=14 skippedFiles=0 of 73 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/graphs.py : 1
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 14
+    rej UP src/tensorfold/families/glm5_next/cuda/sparse.py : 6
+=== 0300-glm-request-log.patch : rejUP=6 rejOWN=0 skippedFiles=0 of 9 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/app.py : 5
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 1
+=== 0310-glm-prefix-share.patch : rejUP=1 rejOWN=0 skippedFiles=0 of 15 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 1
+=== 0320-glm-prefill-row-split.patch : rejUP=0 rejOWN=0 skippedFiles=1 of 5 hunks
+    skipped-file src/tensorfold/families/glm5_next/cuda/comm.py (missing or already exists on target)
+=== 0330-glm-expert-tc.patch : rejUP=3 rejOWN=0 skippedFiles=0 of 6 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3_mm.py : 3
+=== 0335-glm-solo-piece.patch : clean
+=== 0340-glm-batch-adapt.patch : clean
+=== 0350-glm-roce-loopback-fix.patch : clean
+=== 0360-glm-b12x-attn-fp8.patch : clean
+=== 0370-glm-decode-overlap-cpu-pin.patch : rejUP=5 rejOWN=0 skippedFiles=0 of 29 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/app.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 3
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 1
+=== 0380-glm-deep-verify.patch : rejUP=3 rejOWN=1 skippedFiles=0 of 15 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 3
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 1
+=== 0390-glm-mla-expand-v2.patch : rejUP=0 rejOWN=4 skippedFiles=0 of 4 hunks
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 4
+=== 0400-glm-kda-v2.patch : clean
+=== 0410-glm-sparse-v2.patch : clean
+=== 0420-glm-draft-vocab.patch : rejUP=11 rejOWN=0 skippedFiles=0 of 33 hunks
+    rej UP pyproject.toml : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/graphs.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/mtp.py : 4
+=== 0430-glm-draft-dump.patch : rejUP=5 rejOWN=0 skippedFiles=0 of 8 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 3
+=== 0440-glm-decode-stream.patch : rejUP=5 rejOWN=0 skippedFiles=0 of 11 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/exl3_mm.py : 2
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/qmm.py : 2
+=== 0460-glm-prefetch-comm.patch : rejUP=6 rejOWN=3 skippedFiles=0 of 55 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 1
+    rej UP src/tensorfold/families/glm5_next/cuda/forward.py : 5
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 3
+=== 0470-glm-nonexpert-q8.patch : rejUP=9 rejOWN=6 skippedFiles=0 of 33 hunks
+    rej UP src/tensorfold/families/glm5_next/cuda/engine.py : 1
+    rej OWN src/tensorfold/families/glm5_next/cuda/latent.py : 6
+    rej UP src/tensorfold/families/glm5_next/cuda/qmm.py : 3
+    rej UP src/tensorfold/families/glm5_next/cuda/weights.py : 5
+=== 0490-glm-api-context.patch : rejUP=13 rejOWN=0 skippedFiles=0 of 17 hunks
+    rej UP src/tensorfold/cuda/server.py : 7
+    rej UP src/tensorfold/families/glm5_next/cuda/app.py : 5
+    rej UP src/tensorfold/families/glm5_next/cuda/decode.py : 1
+
+## Stage 3 summary
+0001-glm-exl3-nonexpert-q4.patch         rejUP=6 rejOWN=0 skippedFiles=0 of 9 hunks
+0002-glm-tool-call-parser.patch          rejUP=3 rejOWN=0 skippedFiles=0 of 3 hunks
+0003-glm-prefill-rows.patch              rejUP=2 rejOWN=0 skippedFiles=0 of 3 hunks
+0004-glm-sparse-long-prefill.patch       rejUP=3 rejOWN=0 skippedFiles=0 of 5 hunks
+0005-glm-prefill-profile.patch           rejUP=15 rejOWN=0 skippedFiles=0 of 16 hunks
+0006-glm-exl3-expert-loop.patch          rejUP=8 rejOWN=0 skippedFiles=0 of 11 hunks
+0010-glm-auto-deep-dflash-drafts.patch   rejUP=3 rejOWN=0 skippedFiles=0 of 4 hunks
+0020-glm-suffix-drafter.patch            rejUP=6 rejOWN=0 skippedFiles=0 of 14 hunks
+0030-glm-batch2.patch                    rejUP=4 rejOWN=0 skippedFiles=0 of 7 hunks
+0040-glm-comm-prefetch.patch             rejUP=10 rejOWN=0 skippedFiles=1 of 12 hunks
+0050-glm-longctx-decode.patch            rejUP=22 rejOWN=0 skippedFiles=0 of 26 hunks
+0060-glm-latent-kv.patch                 rejUP=7 rejOWN=0 skippedFiles=1 of 11 hunks
+0065-glm-1m-memory-indexer.patch         rejUP=7 rejOWN=1 skippedFiles=0 of 23 hunks
+0070-glm-realistic-calibration.patch     rejUP=4 rejOWN=0 skippedFiles=0 of 10 hunks
+0071-glm-cost-derived-depth.patch        rejUP=9 rejOWN=0 skippedFiles=0 of 28 hunks
+0080-glm-fast-prefill.patch              rejUP=21 rejOWN=0 skippedFiles=0 of 30 hunks
+0081-glm-fast-prefill-kernels.patch      clean
+0082-glm-lean-prefill.patch              rejUP=9 rejOWN=0 skippedFiles=0 of 11 hunks
+0083-glm-fp8-prefill.patch               rejUP=6 rejOWN=11 skippedFiles=0 of 24 hunks
+0084-glm-prefill-overlap.patch           rejUP=6 rejOWN=0 skippedFiles=0 of 14 hunks
+0085-glm-c-independent-prefill.patch     rejUP=10 rejOWN=0 skippedFiles=0 of 26 hunks
+0090-glm-request-knobs.patch             rejUP=9 rejOWN=0 skippedFiles=0 of 16 hunks
+0091-glm-fast-prefill-knob.patch         rejUP=2 rejOWN=0 skippedFiles=0 of 7 hunks
+0092-glm-fp8-prefill-knob.patch          rejUP=3 rejOWN=0 skippedFiles=0 of 9 hunks
+0093-glm-prefill-overlap-knob.patch      rejUP=2 rejOWN=0 skippedFiles=0 of 4 hunks
+0110-glm-session-cache.patch             rejUP=10 rejOWN=0 skippedFiles=0 of 15 hunks
+0120-glm-batch-v2.patch                  rejUP=4 rejOWN=0 skippedFiles=0 of 23 hunks
+0130-glm-decode-step.patch               rejUP=10 rejOWN=0 skippedFiles=0 of 16 hunks
+0140-glm-fast-boot.patch                 rejUP=10 rejOWN=0 skippedFiles=0 of 15 hunks
+0150-glm-mia-wins.patch                  rejUP=8 rejOWN=0 skippedFiles=0 of 10 hunks
+0160-glm-openai-compat.patch             rejUP=6 rejOWN=0 skippedFiles=0 of 7 hunks
+0170-glm-mia-prefill.patch               rejUP=5 rejOWN=0 skippedFiles=0 of 16 hunks
+0180-glm-batch-sessions.patch            rejUP=2 rejOWN=0 skippedFiles=0 of 28 hunks
+0190-glm-prefill-glue.patch              rejUP=10 rejOWN=5 skippedFiles=0 of 28 hunks
+0200-glm-batch-parallel.patch            clean
+0210-glm-prompt-tokens.patch             rejUP=7 rejOWN=0 skippedFiles=0 of 8 hunks
+0220-glm-fp8-latent-kv.patch             rejUP=4 rejOWN=10 skippedFiles=0 of 20 hunks
+0230-glm-roce-gather.patch               rejUP=6 rejOWN=0 skippedFiles=1 of 23 hunks
+0240-glm-b12x-prefill.patch              rejUP=7 rejOWN=2 skippedFiles=0 of 28 hunks
+0250-glm-session-nvme.patch              rejUP=4 rejOWN=0 skippedFiles=0 of 22 hunks
+0260-glm-expert-decode-once.patch        rejUP=2 rejOWN=0 skippedFiles=0 of 7 hunks
+0270-glm-fast-experts-auto.patch         rejUP=5 rejOWN=0 skippedFiles=0 of 7 hunks
+0280-glm-batch-buckets.patch             rejUP=2 rejOWN=0 skippedFiles=0 of 11 hunks
+0290-glm-kv-pool.patch                   rejUP=11 rejOWN=14 skippedFiles=0 of 73 hunks
+0300-glm-request-log.patch               rejUP=6 rejOWN=0 skippedFiles=0 of 9 hunks
+0310-glm-prefix-share.patch              rejUP=1 rejOWN=0 skippedFiles=0 of 15 hunks
+0320-glm-prefill-row-split.patch         rejUP=0 rejOWN=0 skippedFiles=1 of 5 hunks
+0330-glm-expert-tc.patch                 rejUP=3 rejOWN=0 skippedFiles=0 of 6 hunks
+0335-glm-solo-piece.patch                clean
+0340-glm-batch-adapt.patch               clean
+0350-glm-roce-loopback-fix.patch         clean
+0360-glm-b12x-attn-fp8.patch             clean
+0370-glm-decode-overlap-cpu-pin.patch    rejUP=5 rejOWN=0 skippedFiles=0 of 29 hunks
+0380-glm-deep-verify.patch               rejUP=3 rejOWN=1 skippedFiles=0 of 15 hunks
+0390-glm-mla-expand-v2.patch             rejUP=0 rejOWN=4 skippedFiles=0 of 4 hunks
+0400-glm-kda-v2.patch                    clean
+0410-glm-sparse-v2.patch                 clean
+0420-glm-draft-vocab.patch               rejUP=11 rejOWN=0 skippedFiles=0 of 33 hunks
+0430-glm-draft-dump.patch                rejUP=5 rejOWN=0 skippedFiles=0 of 8 hunks
+0440-glm-decode-stream.patch             rejUP=5 rejOWN=0 skippedFiles=0 of 11 hunks
+0460-glm-prefetch-comm.patch             rejUP=6 rejOWN=3 skippedFiles=0 of 55 hunks
+0470-glm-nonexpert-q8.patch              rejUP=9 rejOWN=6 skippedFiles=0 of 33 hunks
+0490-glm-api-context.patch               rejUP=13 rejOWN=0 skippedFiles=0 of 17 hunks
+
+## Stage 4: squashed series (2f8e514..series tip) merged onto 71377a5 with git merge-tree (renames followed)
+conflicted paths: 19
+    docs/recipes/glm-5.3-flash.md                                          1 region(s)
+    pyproject.toml                                                         1 region(s)
+    src/tensorfold/cuda/server.py                                          11 region(s)
+    src/tensorfold/families/glm5_next/cuda/app.py                          3 region(s)
+    src/tensorfold/families/glm5_next/cuda/attention.py                    1 region(s)
+    src/tensorfold/families/glm5_next/cuda/decode.py                       11 region(s)
+    src/tensorfold/families/glm5_next/cuda/dflash2.py                      3 region(s)
+    src/tensorfold/families/glm5_next/cuda/engine.py                       9 region(s)
+    src/tensorfold/families/glm5_next/cuda/exl3.cu                         3 region(s)
+    src/tensorfold/families/glm5_next/cuda/exl3_mm.py                      2 region(s)
+    src/tensorfold/families/glm5_next/cuda/forward.py                      21 region(s)
+    src/tensorfold/families/glm5_next/cuda/glue.py                         5 region(s)
+    src/tensorfold/families/glm5_next/cuda/graphs.py                       4 region(s)
+    src/tensorfold/families/glm5_next/cuda/latent.py                       5 region(s)
+    src/tensorfold/families/glm5_next/cuda/mtp.py                          5 region(s)
+    src/tensorfold/families/glm5_next/cuda/qmm.py                          4 region(s)
+    src/tensorfold/families/glm5_next/cuda/sparse.py                       5 region(s)
+    src/tensorfold/families/glm5_next/cuda/weights.py                      6 region(s)
+    THIRD_PARTY_NOTICES.md                                                 1 region(s)
+messages:
+    CONFLICT (content): Merge conflict in THIRD_PARTY_NOTICES.md
+    CONFLICT (content): Merge conflict in docs/recipes/glm-5.3-flash.md
+    CONFLICT (content): Merge conflict in pyproject.toml
+    CONFLICT (content): Merge conflict in src/tensorfold/cuda/server.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/app.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/attention.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/decode.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/dflash2.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/engine.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/exl3.cu
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/forward.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/glue.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/graphs.py
+    CONFLICT (add/add): Merge conflict in src/tensorfold/families/glm5_next/cuda/latent.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/mtp.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/qmm.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/sparse.py
+    CONFLICT (content): Merge conflict in src/tensorfold/families/glm5_next/cuda/weights.py
+# worktrees removed

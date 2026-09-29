@@ -31,7 +31,7 @@ fi
 export CONFIG
 # A non-empty caller export wins over the same key in the config file:
 #   CONTEXT=32768 GLM53_TF_NONEXPERT=q4mse scripts/serve.sh start
-caller_env=$(env | grep -E '^(HEAD_PREPARED|WORKER_PREPARED|HEAD_SESSIONS|WORKER_SESSIONS|CONTEXT|MTP_DRAFTS|NO_DRAFTS|IMAGE|PORT|HOST|DRAFTER|MODEL_PATH|EXTRA_ARGS|SERVED_NAME|MAX_TOKENS|CPUSET|HEAD_CPUSET|WORKER_CPUSET|CANARY[A-Z_]*|MEM_GATE_[A-Z_]+|START_ATTEMPTS|READY_TIMEOUT|LOG_MAX_[A-Z]+|WATCH_[A-Z_]+|GPUWATCH_[A-Z_]+|WARMUP_LENGTHS|PREFLIGHT|NCCL_PASSTHROUGH|GLM53_TF_[A-Z0-9_]+)=.' || true)
+caller_env=$(env | grep -E '^(HEAD_PREPARED|WORKER_PREPARED|HEAD_SESSIONS|WORKER_SESSIONS|CONTEXT|MTP_DRAFTS|NO_DRAFTS|IMAGE|PORT|HOST|DRAFTER|MODEL_PATH|EXTRA_ARGS|SERVED_NAME|MAX_TOKENS|CPUSET|HEAD_CPUSET|WORKER_CPUSET|CANARY[A-Z_]*|MEM_GATE_[A-Z_]+|START_ATTEMPTS|READY_TIMEOUT|LOG_MAX_[A-Z]+|WATCH_[A-Z_]+|GPUWATCH_[A-Z_]+|WARMUP_LENGTHS|PREFLIGHT|NCCL_PASSTHROUGH|PATCHES|GLM53_TF_[A-Z0-9_]+)=.' || true)
 # shellcheck disable=SC1090
 set -a; source "$CONFIG"; set +a
 while IFS= read -r kv; do [[ -n "$kv" ]] && export "${kv?}"; done <<< "$caller_env"
@@ -515,7 +515,8 @@ watch_tick() {
 
 case "${1:-}" in
 build)
-    docker build -f docker/Dockerfile -t "$IMAGE" .
+    # PATCHES="0001 0002 ...": only these patch number prefixes (docker/Dockerfile); unset = every patch in patches/
+    docker build -f docker/Dockerfile ${PATCHES:+--build-arg PATCHES="$PATCHES"} -t "$IMAGE" .
     log "shipping $IMAGE to $WORKER_SSH"
     docker save "$IMAGE" | wssh docker load
     ;;

@@ -24,3 +24,7 @@ config/*.env
 .idea/
 *.swp
 .DS_Store
+
+# fetched evaluation data (bench/mmlu_full.py fetch, bench/divergence.py corpus): cached locally, not committed
+bench/data/mmlu/
+bench/data/divergence/

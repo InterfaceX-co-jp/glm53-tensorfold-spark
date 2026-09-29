@@ -56,6 +56,20 @@ what upstream serves (plus the GLM tool-call parser, which only adds a format up
 | 0390 `glm-mla-expand-v2` | `GLM53_TF_MLA_EXPAND=v1\|v2` (load-time) | `v1` | the latent MLA absorb / expand (`latent.absorb` / `expand`: every DSA layer and the MTP head, in prefill, decode, verify and MTP steps) through `_absorb2` / `_expand2`: the same fp32 FMA chain per output element (k in order from +0.0, exactly dequantized kv_b, one bf16 rounding), retiled: 16-128 rows a program share one dequantization of the kv_b tile (v1: 16), 16-wide dot steps (v1's 64-deep dot spills 452 B in `_expand`), a head's programs adjacent. **Same bits** as v1 for every row at any row count (offline: Triton source + compiled IR + interpreter model; GPU bitwise test pending). Offline estimate: `_expand` 2,415 -> 250-450 us, `_absorb` 676 -> 200-300 us a 512-row sub-block: +7.5-8.5% prefill. `docs/MLA-EXPAND.md` **W10: GPU bitwise passed, tiles retuned (4 warps), adopted: prefill +7.1% / +6.7%.** |
 | 0400 `glm-kda-v2` | `GLM53_TF_KDA_V2=0\|1\|2` (`split` / `fused`; load-time, checked at load); `_BV`, `_WARPS`, `_MAXNREG`, `_KSPLIT`; `_FUSED_BV`, `_CTAS`, `_LAG`, `_RING`, `_FUSED_MAXNREG` | `0`; `32`, `4`, `168`, `1`; `64`, `0` (one an SM), `1`, `3`, `0` | fast chunks' KDA recurrence (`fastpf.kda_chain`, every KDA layer) through `kda_v2.kda_prefill_v2` instead of `fast_kda.kda_prefill_chunked`, **same bits** (every output row, every state / snapshot, any call size; shares snapshots, left out of the NVMe compat hash). `1` split: `fast_kda`'s prep, then a scan in 32-value-row blocks (128 programs, not 64; a head's blocks adjacent so DRAM serves each chunk's operands once; dots over two 64-key halves: 24 KB shared memory, 3 programs an SM). `2` fused: one persistent kernel takes prep and scan-step items by ticket, waits on release / acquire flags (every wait on an earlier ticket: no deadlock), the workspace a 3-chunk ring kept in L2 (not 46 MB a 512-row call through DRAM). Value columns of the state are independent; each dot is the same mma chain; reductions only in the unchanged prep. Offline: compiled IR == `fast_kda`'s op for op (3.7.1 and 3.8), interpreter bitwise at 1-8,192 rows and call splits; estimate -7..-11 (split) / -20..-35 (fused) us a token = +1-1.6% / +3-5% prefill. `docs/KDA-V2.md` **W10: bitwise passed; split +1.0-1.2% end to end, fused slower: off.** |
 | 0410 `glm-sparse-v2` | `GLM53_TF_SPARSE_V2=0\|1` (load-time); `GLM53_TF_SPARSE_V2_CFG=stages,qkl[,qreg]` | `0`; `3,1,1` (FP8), `2,0,0` (bf16) | b12x bit 4's one-pass sparse latent attention (`b12x_attn.sparse_latent_one`, production's fast-prefill sparse attention since W9) through `sparse_v2._lsparse_v2`, a Gluon kernel with **the one-pass kernel's bits** (same 32-token tiles in list order, same mma chains and kWidth 2, both reductions on the reference's own `#mma` [1, 8], same element-wise ops; row-invariant; shares bit 4's snapshots, left out of the NVMe compat hash): the selected FP8 rows gathered with `cp.async` into a 3-slot ring through the 0290 page table (the reference loads each tile synchronously, one CTA an SM), dequantized once into shared memory, the scores on [2, 4] without the reference's duplicated warps (512 mma a tile, not 768), half of q in registers (~286 KB of shared-memory traffic a tile, not ~430). Offline: compiled IR == the reference's arithmetic op for op + equal PTX float counts (3.7.1 and 3.8), CPU emulator of v2's own source (cp.async ring, barriers modelled) == the reference in the interpreter bitwise, reference PTX unchanged. Estimate 1.8-3.1x the kernel, +3.5-6% prefill. `docs/SPARSE-V2.md` **W10: engine.py syntax error fixed; FP8 bitwise passed; kernel 1.2x, end to end +0%: off.** |
+| 0420 `glm-draft-vocab` | `GLM53_TF_DRAFT_VOCAB=0\|N\|path[:N]` (load-time); `GLM53_TF_DRAFT_VOCAB_ARMS=mtp\|dflash\|all`; `GLM53_TF_DRAFT_VOCAB_FALLBACK=RATE[,WINDOW]\|off` | `0` (off); `mtp`; `0.03,256` | DECODE-PLAN E7 (FR-Spec style): the drafters' head over a ranked token list, each rank its first N / 2 ids of its vocabulary half (the shipped ranking `glm5_next/cuda/draft_vocab.txt`: in this public release 118,040 ids built from public, permissively licensed text by `bench/draftvocab_public.py`; the study below used a private list from 826 GLM-5.3-Flash agent steps, `bench/draftvocab.py` writes one from your own sessions), the same 4-bit rows gathered at load (24,576 rows a rank: 56.6 MB, a head read 0.89 -> 0.28 ms); draft columns map to token ids before the exchange, so draws use the target's keyed noise; the target's sampling is untouched (drafted == serial by construction; CPU tests through the real MTP loop, PTX 33 / 33). A request drafts over the whole vocabulary while > RATE of its last WINDOW absorbed tokens are unlisted (CJK: 63% coverage). Held-out coverage 98.1-98.7% at 24,576 a rank; estimate MTP rounds +1.2-1.7%, ~+0.5-0.8% at 1 stream overall, DFlash2 arm net negative. `docs/DRAFT-VOCAB.md` |
+| 0430 `glm-draft-dump` | `GLM53_TF_DRAFT_DUMP=<dir>` (+ `_TOPK`, `_TAPS=bf16\|fp8\|0`, `_WHAT`, `_GIB`, `_TAP_LAYERS`); `GLM53_TF_MTP_WEIGHTS=<dir>` (load-time, both ranks) | off; off | Training records for the drafters (docs/DRAFTER-TRAINING.md): every committed row (prefill chunks in every mode, kind p; kept decode rows of batch slots, kind d) as the token, the final-normed row the MTP head reads, the DFlash2 taps and the target's top-32 log-probabilities over the whole vocabulary (each rank's half, one control all-gather, merged); rank 0 writes sharded files linked by prefix hashes. Reads only: replies byte-identical. 8.4 / 28.9 / 49.3 KB a token (no / fp8 / bf16 taps); estimate prefill +4-6%, decode < 1%. `_TAP_LAYERS` dumps another tap set (DFlash2-G's 9) with the DFlash2 drafter off. `GLM53_TF_MTP_WEIGHTS` (`mtpw.py`, outside `weights.py` so prepared folders stay valid when unset): a distilled MTP head's BF16 tensors replace the checkpoint's, sliced and quantized as the checkpoint's own. Offline only so far (CPU tests); `docs/DRAFTER-TRAINING.md` |
+| 0440 `glm-decode-stream` | `GLM53_TF_DEC_EXPERTS=0\|1` (+ `_CFG=nt_gu,stages_gu,nt_dn,stages_dn`); `GLM53_TF_DEC_QMM=0\|1\|force` (+ `_CFG=gps,stages`, `_SERIAL=auto\|0\|1`); `GLM53_TF_DEC_PDL=0\|1`; `GLM53_TF_DEC_CTAS=N` | `0`; `4,4,4,4`; `0`; `1,4`, `auto`; `0`; `0` (every slot) | DECODE-PLAN E1 / E2 (+ E4's PDL): the decode-window routed experts (member tables of <= 64 columns: decode, verify, MTP, DFlash2, 4-slot windows) through two persistent kernels (`exl3_stream.cu`: warp-private cp.async rings 4-8 k steps deep across items, the gate/up and down epilogues run by the last item of each (expert, Hadamard block): 3 launches a layer, not 5) and the 4-bit dense matmuls of 1-64 rows through one (`q4_stream.cu`: persistent CTA ring, nibbles straight into the bf16 mma fragments, the K slices reduced in the launch, in order). **Same bits** as exl3.cu's grouped kernels + epilogues and as `_qmm` + `_reduce` for every row count (the same per-element instruction sequence; the dense kernel only under Triton 3.7.x, where `_qmm`'s epilogue is fully fused -- Triton 3.8 leaves some of it unfused, bucket-dependently). PDL: L2 prefetch of the first item, nothing else before `griddepcontrol.wait`. Offline: 67 tests (CPU emulator of both kernels vs the references with an order-sensitive mma model and 12 negative controls; sm_121 compile: 0 spills, 2-5 CTAs an SM). Estimate +9.7% 1 stream, +12.8% 4 streams (W11 ceilings). `docs/DECODE-KERNELS.md` **W12: bitwise and PDL race passed; microbench gate failed (E1 0.74-0.80x at every window, capped at ~160 GB/s by loads in flight; E2 1.1-2.1x on small L2-resident shapes, 0.82-0.91x on the five largest); E2 engine load -3.9% 1 stream, exact: off.** |
+| 0450 `glm-gpu-round` | `GLM53_TF_GPU_ROUND=0\|1\|sample,resident,kda` (load-time, both ranks, checked); `GLM53_TF_GPU_ROUND_PEEK=1\|0` | `0`; `1` | DECODE-PLAN E6 + the KDA part of F3. `sample`: the keyed sampler, greedy pick and drafts' probabilities on the GPU (`gpusample.py`) with **the host's bits**: glibc 2.39's aarch64 `__log` / `__exp` ported instruction for instruction (its fmas, its tables), numpy's pairwise sum, float64 everywhere, no contraction; the host reads tokens only; a load check against the node's numpy turns it off on both ranks if anything differs. `resident` (needs 0370's `plan`): steady batched decode as GPU-resident rounds (`resident.py`): stage, sample, `Stepper.accept`'s rule, commits (every slot's replay in one launch), backlogs, MTP chains (`DepthOptimizer.mtp_next` on the device) and DFlash2 chains / `f_depth` on the device; the host processes round k - 1 while round k's forward runs and waits only on small pinned records at the draft decisions (PEEK=1; 0: a whole round ahead, stale bounds, padded rows); anything unsteady drains to the normal path. `kda`: commits folded into the next window's chain, every slot in one launch a layer (`kda.cu` `chain_slots`: same `update` routine and row order). Offline: sampler == host on 1,900+ random row sets (Triton 3.7.1 / 3.8), the port == Ubuntu's aarch64 libm on 15.9M inputs (unicorn), fake-model resident rounds == serial with two ranks in threads, sm_121 PTX checks. Estimate +1-2% 1 stream, +3-6% 4 streams (W11). `docs/GPU-ROUND.md` **W12: KDA fold bitwise 8/8; 1.05 x 10^8 keyed draws + 2.5 x 10^9 libm values == the node's numpy; engine exact in every mode (the synthetic tests fail on a harness that duplicates rank 0's candidates); sample 0%, resident -2.3% 1 stream / +0.5% 4 streams, 1 -2.3% / +1.2%, PEEK=0 -4%: off.** |
+| 0460 `glm-prefetch-comm` | `GLM53_TF_L2PF=0\|1\|bulk\|lines\|touch` (+ `_MB`, `_SITES=a,f,o,e`, `_EXPERT_KB`, `_ROWS`, `_CHUNK_KB`); `GLM53_TF_ROCE_STRIPE_KB`, `_INLINE`, `_LAZY_CQ`, `_LEAN`, `_TRACE` | `0`; `4`, `a,f,o`, `64`, `64`, `32`; `0` each (0350's path) | **E3:** the next kernels' weights into L2 during decode's latency-bound windows, on EVERY forward path: 0040's all-gather sites now also in `batch.compute_multi` (production's multi-slot rounds never prefetched), plus `o` (the attention output projection, fired before the KDA chains / attention core) and `e` (the router's picked experts' first tiles, device-indexed); `cp.async.bulk.prefetch.L2` from a tiny side-stream kernel (no SM held), one-wave 4-bit launches prefetched as the head of every (tile, K slice) chunk; loads only, same bits. **E8:** small shards on one HCA (agreed at load), release / acquire ordering in the gather kernel, inline posts, lazy CQ reaping, a timestamp ring (`bench_roce.py --trace`); same bytes, same order. Estimate +2.4% 1 stream, +1.2% 4 streams (mid). `docs/PREFETCH-COMM.md` **W12: two bugs fixed (roce.py's `load()` lost `sources=` to a comment: every 0460 image fell back to NCCL; l2pf.cu's bulk prefetch unguarded for compute_80); L2PF 8 MiB +2.4% 1 stream, +1.2% 4 streams, exact: adopted (`GLM53_TF_L2PF=1`, `_MB=8`); 4 MiB +0.8%, site e 0%; RoCE knobs within bench noise: off.** |
+| 0470 `glm-nonexpert-q8` | `GLM53_TF_NONEXPERT=q8`; `GLM53_TF_NONEXPERT_MAP=key=mode,...` (load-time, both ranks); `GLM53_TF_Q8_DECODE_CFG`, `GLM53_TF_Q8_TILE` (speed only) | unset (0001's modes); unset | non-expert weights in 8 bits (int8 symmetric, a bf16 scale per 128 inputs: 8.125 bpw, relative error 0.65-0.73% on the model's own weights against q4mse's 8.6-9.4%) with row-invariant decode (`qmm._q8mm`) and prefill (`fast_qmm._fq8`) kernels and 8-bit kv_b in the latent MLA kernels; the format per module class (`o_proj=q8,down=q8,lm_head=bf16,...`, `mtp.` for the MTP layer); prepared folders keyed by the resolved precision. Estimated: output side at q8 -6.5% decode / +0.82 GiB, all q8 -16% / +1.99 GiB (docs/QUALITY-PLAN.md) |
+| 0490 `glm-api-context` | none (on: host-side API only) | on | The context limit where clients see it, and vLLM-shaped extras. `GET /v1/models` adds `max_model_len` / `context_length` (= `--context`, the engine's `limit`), `created`, `root`. A request past the limit gets HTTP 400 with OpenAI's `code: context_length_exceeded`, `param` and wording ("This model's maximum context length is N tokens. However, you requested M tokens (P in the messages, R in the completion)...", plus the `CONTEXT` to restart with), which opencode and Hermes Agent recognise and answer by compacting (the old message matched none of their patterns). An engine refusal (`ValueError`) in a stream is an `invalid_request_error` event. One `[tensorfold] context:` boot line (limit, KV cache, slots, pool). RigMark compatibility (docs/RIGMARK.md gap 1): `POST /tokenize` / `/v1/tokenize` (vLLM's `{count, max_model_len, tokens, token_strs}`; a string `prompt` with `add_special_tokens`, or `messages` rendered as a chat renders them; host only, no engine, nothing to rank 1) and one flat list of token ids as `prompt` on `/v1/completions` (validated: ints in the vocabulary, one prompt a request; used as given, so `usage.prompt_tokens` is exactly its length). Pool fix: a 0290 pool set to hold a whole request (`GLM53_TF_KV_POOL_TOKENS` >= CONTEXT) is sized to the slot capacity rounded up to a page (+1 page, ~2 MB a rank), so a request within 64 tokens of CONTEXT is no longer refused as "more than the whole pool" after passing the context check; no kernel change, replies are byte-identical. **W12: in-image tests pass; /v1/models 1,048,576, over-limit 400 `context_length_exceeded`, the pool edge (32 under CONTEXT) admitted; knobs-off b5 == b4 bit for bit: in production with image b5.** |
+| 0500 `glm-vision` | `GLM53_TF_VISION=0\|1` (rank 0; rank 1 follows the data); `GLM53_TF_VISION_MAX_IMAGES`, `_MAX_TOKENS`, `_LOW_TOKENS`, `_FETCH`, `_FETCH_TIMEOUT`, `_MAX_BYTES`, `_MAX_PIXELS`, `_CACHE_MB`, `_PREP_MB` | `0`; `8`, `0` (processor's 8,000), `0` (detail ignored), `1`, `10` s, 20 MiB, 64 M px, `256`, `256` | Image input: OpenAI `image_url` parts (`data:` and http(s) URLs) on chat completions and `/tokenize`. The LM is NoPE throughout (no M-RoPE: `qk_rope_head_dim` 0, transformers passes plain `arange` positions no layer reads), so an image is only its rows: rank 0 preprocesses exactly as transformers' `Glm5NextImageProcessor` (bit for bit on CPU), runs the BF16 tower (`vision.py`: 24 blocks, 2D axial RoPE, full attention, 2x2 merge + merger; 1.13 GB on rank 0; ~5.4 TFLOP / est. 75-90 ms for a 1024x768 screenshot = 1,036 rows), and ships the rows to rank 1 after the prompt; `glue.embed` substitutes them inside the prefill. Each image row is a **virtual token id** >= 2^24 derived from the preprocessed pixels, so every token-keyed cache (snapshots, session store, prefix share, NVMe tier) tells images apart unchanged, and shares state past an image only for the same pixels. The checkpoint's template renders images as a "cannot see" reminder; parts are rendered as the vision template's `<\|begin_of_image\|><\|image\|><\|end_of_image\|>` (prompt ids == `Glm5NextProcessor` with the vLLM kit's template). Text requests: same bits, same protocol. `docs/VISION.md` **W14: works on the GPU, one bug fixed (MTP head graphs in the prefill absorb); W15: adopted (`GLM53_TF_VISION=1`, 64 / 64 MB caches, image b7).** |
+| 0510 `glm-batch-graphs-lone` | `GLM53_TF_BATCH_GRAPHS=1\|0\|lone`; `GLM53_TF_VERIFY_SPLIT=0\|2..8` (+ `_FIRST=L`); `GLM53_TF_GRAPH_PROBE=N`; `GLM53_TF_RESIDENT_REPORT=N` | `1`; `0`; `0`; `0` | THEORY-2 ideas 1 and 2. `lone`: the batcher's CUDA graphs (0120 / 0200 rounds, 0450's resident rounds and batched MTP head passes) only for rounds with ONE active slot; rounds of 2+ slots run eagerly, exactly `0`'s path (W11 / W12: `0` is +1.9-2.6% at 4 streams but -2.7% for lone requests in slots 1-3); policy checked equal on both ranks. `VERIFY_SPLIT=N`: the engine's main graphs (the lone verify / serial step; 0050's long-context main graphs too) captured as N graphs over layer ranges and replayed back to back (`vsplit.py`), so the GPU starts on the first ~1/N of the ~1,650 nodes while the host launches the rest (W11: 1.1 ms a round inside `cudaGraphLaunch`, nsys-inflated). `GRAPH_PROBE=N`: every main-graph replay timed without per-node tracing (host `replay()` us per piece; first-node delay from a `%globaltimer` stamp captured as node 0 vs an eager stamp), one stderr line per key every N replays. `RESIDENT_REPORT=N`: 0450's resident rounds / entries / drains by reason every N drains. **Same bits** (same kernels in the same order; stamps write only the probe's buffer). CPU tests (`tests/test_batch_graphs_lone.py`, 44) + GPU test `tests/cuda/test_batch_graphs_lone_patches.py`; W13 (results/THEORY2-SESSION) |
+| 0520 `glm-hc-fused` | `GLM53_TF_HC_CUDA=0\|1` (load-time, both ranks); `GLM53_TF_HC_CUDA_ROWS=1..64`; `GLM53_TF_HC_CUDA_RG=1\|2\|4\|8`; `GLM53_TF_HC_CUDA_PDL=0\|1` | `0`; `16`; `4`; `0` | THEORY-2 idea 3: a hyper-connection boundary (`glue.hc_post` + the next `glue.hc_pre` = Triton `_hc_post`, `_hc_partial`, `_hc_finish`) in one CUDA launch (`hc_fused.cu`) with the Triton kernels' bits on every output (x, normed, xs, post, comb, partials), in `layer_forward` / `compute_multi` (both boundaries of a layer; the next layer's first hc_pre skipped), windows of 1-16 rows, not fast chunks; used only after a load-time bitwise self-check passed on both ranks (Triton 3.7.1 arithmetic; under 3.8 it stays off). Microbenchmark: `tests/cuda/bench_hc_fused.py` (gate: <= 50% of the three kernels, cold). docs/HC-FUSED.md |
+| 0530 `glm-http-pin` | `GLM53_TF_CPU_PIN=http[=cpus][;engine=cpus\|fast]`; `GLM53_TF_ROCE_TRACE_DUMP=<prefix>` (+ `_EVERY=N`, needs 0460's `GLM53_TF_ROCE_TRACE`) | off; off (`16 x` the ring) | THEORY-2 idea 6. `http`: 0370's pinning reduced to rank 0's HTTP request threads (`tf-http`: tokenize, stream, detokenize) on the non-fast cores (GB10: the A725s 0-4, 10-14); nothing else moves (`engine=` also keeps every other thread on the given / fast cores); without batching the request thread decodes on the engine's cpus and goes back. `ROCE_TRACE_DUMP`: each rank appends 0460's exchange trace ring (`Runtime.trace_rows`) to `<prefix>-r<rank>.jsonl` every N exchanges, checked once a round (`cpupin.tick`), so transport vs skew is measured in a running server without nsys (`results/THEORY2-SESSION/rocetrace.py`). Host scheduling / reads only: **same bits**. CPU tests `tests/test_http_pin.py` |
+| 0540 `glm-replay-ttft` | `GLM53_TF_SNAPSHOT_BEFORE_END=1\|0` (load-time, both ranks, checked); `GLM53_TF_EMIT_FIRST=1\|0` (rank 0) | `1`; `1` | RigMark W13 fixes (docs/REPLAY-TTFT.md). A whole prompt's snapshot sits at its last grid point **strictly before** its end ((n - 1) // G * G; was n for a prompt ending on the grid, and n for every exact prompt), replacing the one at n: an identical prompt sent again (regenerate, retry, RigMark's immediate replay) resumes all but <= 64 tokens (W13: 0 / 16,384 / 49,152 of 8K / 32K / 64K). Off-grid prompts unchanged; one more chunk on a cold on-grid prompt (~0.2 s). A prompt's first token leaves when its batch piece ends instead of after the round's other pieces and verify launch (0370 `emit` held it): C4 TTFT est. 1.91 -> ~1.2 s. Same bits (a cut / snapshot on the 64-grid; scheduling). Multi-slot prefill analysed, not implemented (now 0560). **W15: adopted (image b7, both knobs default on): an identical 8K / 32K / 64K prompt resent resumes at n - 64, TTFT 0.21-0.26 s, byte-identical output (RESULTS W15 §6); C4 first tokens median 1.46 -> 0.93 s without thinking, unchanged with thinking; cold grid-aligned 8K -1.8%.** |
+| 0550 `glm-memory-safety` | `GLM53_TF_SELECT_SCRATCH=grow\|max\|off`; `GLM53_TF_ALLOC_TRIM_GB=N` (+ `_S`); `GLM53_TF_ADMIT_MEM=available\|free` (+ `GLM53_TF_ADMIT_CACHE_KEEP_GB`, `GLM53_TF_ADMIT_FREE_FLOOR_GB`); `GLM53_TF_DROP_OWN_CACHE=1\|0` | `grow`; `2` (10 s); `available` (2, 1); `1` | W15 memory findings (docs/MEMORY-SAFETY.md). **The needle dip**: 0065's prefill key blocks (~512 B a prompt position, <= `SELECT_MB`) grow every 512-row sub-block, so torch's caching allocator took a new segment every ~4k tokens and kept the old ones: reserved memory grew quadratically (bound 5.8 GiB at 314k, measured 4.5; 16 GiB at 1M) until the next CUDA graph capture emptied the cache (the MTP head's new pool bucket right after the prompt). Now one scratch per device / stream, grown before a prefill to its largest block (<= 256 MiB), plus a trim of the unused cache before a batch piece over 2 GiB (at most every 10 s). **Page cache**: admission and the session store count MemAvailable - MemFree less Dirty / Writeback / max(Mapped, 2 GiB), keep a 1 GiB free-now floor, reserve the prompt's scratch growth and log waits (W15: C4 serialized during a 36 GB copy). Same bits (views with the same shape / strides / alignment, every element written before read; trims and admission change addresses and scheduling only). CPU tests `tests/test_memory_safety.py`; **offline only: GPU plan in MEMORY-SAFETY.md** |
+| 0560 `glm-multi-prefill` | `GLM53_TF_MULTI_PREFILL=0\|1` (load-time, both ranks, checked); `GLM53_TF_MULTI_PREFILL_ROWS=N` (checked); `GLM53_TF_MULTI_PREFILL_WAIT_MS=ms` (rank 0) | `0`; the lean rows; `10` | RigMark C4 / agent bursts (docs/MULTI-PREFILL.md). A round's prefill pieces (fast lean, same knobs, <= ROWS piece rows) go through ONE forward: each member's rows contiguous and cut into its own lone sub-blocks (KDA / DSA / carries / commit / snapshots / marks / MTP absorb / taps / head / sample per member, in the lone order), the router and routed experts once over every row (the ~74 GB expert read paid once), in 0082's, 0084's and 0320's loops; each piece then ends in `Batcher._piece` as alone. Rank 0 takes more pieces a round when the fair share allows one (fewest left first) and, idle, waits <= 10 ms for more arrivals. **Same bits** a member as alone (0085's row-independent fast kernels; groups not formed under FAST_EXPERTS auto / once+min rows). Est. C4 first tokens ~0.6-0.8 s (thinking off / on; b7 0.93 / 1.9 s), bursts of short prompts 1.7-2.8x prefill tok/s. **Offline only: GPU plan in MULTI-PREFILL.md.** |
 
 ## 0001 — EXL3 non-expert weights in 4 bits
 
@@ -2650,6 +2664,835 @@ passed, 3 skipped). Bench (FP8, 10.7k / 85.8k context): 1.16-1.25x the one-pass 
 1.43x), 1.3-1.6% projected. Engine: exact 10/10, batchexact 4/4, sessions == cold, same reply sha, prefill **+0.0%**
 (under the +3% bar); with 0390 and 0400 split together +1.5% over 0390 alone. docs/RESULTS.md "W10".
 
+## 0420 — trimmed draft vocabulary (`GLM53_TF_DRAFT_VOCAB`; `draftvocab.py`, `mtp.py`, `decode.py`, `batch.py`, `dflash2.py`, `graphs.py`, `engine.py`)
+
+**Question.** DECODE-PLAN E7: a draft step's last matmul is the 77,440-row head a rank (178 MB, ~0.9 ms of a
+1.7 ms MTP step). Scoring only the ~32k most frequent tokens (FR-Spec) would save most of it, if the tokens a
+drafter must propose are covered. Full write-up, coverage study, estimate and GPU plan: `docs/DRAFT-VOCAB.md`.
+
+**Change** (default off = upstream code and graphs).
+- `GLM53_TF_DRAFT_VOCAB=N`: each rank's drafters score the first N / 2 ids of its vocabulary half in the shipped
+  ranking (`glm5_next/cuda/draft_vocab.txt`; public release: built from public text, `bench/draftvocab_public.py`,
+  held-out coverage on the private sessions 78.8% / 87.1% / 91.3% at N = 16k / 32k / 48k, docs/DRAFT-VOCAB.md), then the half's lowest unlisted ids, a multiple of 64 rows, the same
+  count on both ranks (a draft step lasts as long as the larger half). A path: that file's ids (`PATH:N`: the first
+  N / 2 a half).
+- The trimmed head is the same 4-bit words, scales and biases, gathered once at load (`take_rows`). With 12,288+ rows
+  its logits are the full head's listed columns bit for bit.
+- `_ARMS`: `mtp` (default), `dflash`, `all`. `_FALLBACK=RATE,WINDOW` (default `0.03,256`): a request drafts over
+  the whole vocabulary while more than RATE of the last WINDOW tokens its MTP head absorbed (prompt, then committed)
+  are unlisted. Whole-vocabulary MTP graphs (and a DFlash2 block) are captured next to the trimmed ones. In
+  batched MTP one pass serves every slot: full if any slot's rule says so.
+- The ranks compare the settings and the list's digest; the calibration key includes them.
+
+**Exactness.** The target's sampling path is untouched (`sample_rows` without `draft`, `sample_multi`); a draft is
+kept exactly when it equals the target's keyed sample. Draft columns map to token ids before the exchange, so draft
+draws use the target's keyed Gumbel noise per (seed, position, token id); the noise is a stateless hash (no RNG
+stream a draft could advance). With top-k / top-p, the draft's top-k over listed ids can take in tail tokens outside
+the target's, an acceptance effect only. No Triton source changed (`tests/kvpool_ptx.py`: 33 / 33 identical).
+
+**Offline results** (`bench/draftvocab.py`, `results/draftvocab/`): 826 GLM-5.3-Flash agent steps, 385k reply
+tokens, held out by session and by time.
+- Coverage at 24,576 rows a rank: prose 98.2-98.5%, code 97.8-98.8%, tool calls 98.3-99.2%; CJK (a stand-in) 63-64%;
+  at 16,384 a rank 95.6-96.9% overall. A per-rank list beats a global top-N list at equal cost.
+- Net (upper-leaning loss): MTP rounds +1.2-1.7% at 24,576 a rank (bound +3.1%); ~+0.5-0.8% for 1-stream decode
+  overall; DFlash2 rounds -0.5% to -3.7% even with the fallback (one head pass a round saves ~0.6 ms); CJK -28% to
+  -38% without the fallback, 0 with it.
+- Tests: `tests/cuda/test_draft_vocab_patches.py` 27 passed on the CPU (drafted == serial through the real MTP loop,
+  greedy / sampled, with / without fallback, rank 0 == rank 1; the target's sampling identical with and without the
+  list), `tests/test_draft_vocab_interpreter.py` 3 passed; 19 existing suites unchanged (226 passed).
+
+**GPU plan** (`docs/DRAFT-VOCAB.md` section 7): the unit tests in the image, then production +
+`GLM53_TF_DRAFT_VOCAB=49152` against a control load: exact 10/10, batchexact 4/4, reply sha, `glmbench --suites
+tf,kit,edit`, concurrent 1 / 4 streams, and acceptance by position per drafter (`bench/acceptpos.py`). Adopt at
+≥ +0.5% 1-stream decode with MTP position-1 acceptance within -0.02.
+
+Revert: unset the knob.
+
+## 0430 — draft-training records and a distilled MTP head (`GLM53_TF_DRAFT_DUMP`, `GLM53_TF_MTP_WEIGHTS`; `dump.py`, `mtpw.py`, `decode.py`, `batch.py`, `engine.py`)
+
+**Question.** DECODE-PLAN T1 / T2: train the MTP head (FastMTP self-distillation) and re-fit a block drafter on the
+abliterated target's own outputs. Both need, per token, what the drafters read (the final-normed hidden row, the
+DFlash2 taps) and what they should predict (the target's next-token distribution), dumped at serving speed. The
+plan, data and time budget, reference, trainers and licences are in `docs/DRAFTER-TRAINING.md`.
+
+**Change** (default off: no hook runs, `mtpw.load` is `weights.load`).
+- `GLM53_TF_DRAFT_DUMP=<dir>` (`dump.py`), load-time on both ranks (checked at start):
+  - **prefill:** each chunk of `decode._prefill` (exact / fast / lean / row-split / pipelined), before its commit.
+    The head runs on all rows, 256 at a time (the same `qmm.matmul` as a verify window).
+  - **decode:** `Batcher._verify` after the accept loop. The kept rows of every slot, whose logits the round
+    already computed.
+  - Each rank takes the top-k and the log-sum-exp of its vocabulary half. One all-gather on the NCCL control path,
+    then a merge (log-probabilities over the whole vocabulary). Rank 0 writes; rank 1 does not.
+  - Files: `<dir>/<host>-<pid>-<t>/`: `meta.json`, `index.jsonl` (a segment a line: kind, start, n, prefix hashes
+    `h0` / `h1`, array offsets) and `shard-NNNNN.bin` (4 GiB). A background writer with ≤ 4 segments queued. It
+    stops at `_GIB`.
+  - Records start at `arm()` (the engine ready): calibration and capture passes are not written.
+  - `_TAP_LAYERS` taps other layers than the served drafter's (the engine's tap buffers take them), with the DFlash2
+    drafter off while they differ.
+- `GLM53_TF_MTP_WEIGHTS=<dir>` (`mtpw.py`, called from `GlmEngine.__init__` in place of `weights.load`):
+  - `train/mtp_distill.py`'s export: full BF16 tensors under the checkpoint's names, MTP layer only. They replace the
+    checkpoint's through a `split.RankReader` overlay (this rank's slice by `split.rule`, stored as
+    `GLM53_TF_NONEXPERT` stores the checkpoint's).
+  - Unknown or unused names are refused.
+  - The prepared tree's key includes the folder's files. `weights.py` is untouched, so production's prepared
+    folders stay valid with the knob unset.
+
+**Exactness.**
+- The dump only reads buffers the next forward overwrites (after the drafters absorbed them, before the commit /
+  the next round), and runs its own head into its own scratch. Replies are unchanged.
+- A distilled MTP head only drafts: drafted == serial holds with any head.
+
+**Offline results.**
+- `tests/test_draft_dump.py`: a fake two-rank engine through `dump.Dumper`:
+  - the merged top-k == top-k of the full log-softmax;
+  - a resumed request's rows link to the first request's prompt segments; every row owned once;
+  - tokens / hidden / taps / lp round-trip (fp8 taps within e4m3), a tap subset.
+- `tests/test_drafter_train.py`: dump → `train/mtp_distill.py` → export → reload → `train/eval_accept.py` →
+  `train/dflash_distill.py` → export → reload, on CPU.
+- 17 CPU tests pass with `tests/test_drafter_ref.py`.
+- Estimate: prefill +4-6% (the extra head, ~25 µs a row a rank), decode < 1% (~0.2-0.4 ms a round). 8,388 B a token
+  without taps, 28,888 with 5 fp8 taps, 45,288 with 9.
+
+**GPU plan** (`docs/DRAFTER-TRAINING.md` §8):
+- `tests/cuda/test_drafter_ref_patches.py` on the synthetic checkpoint:
+  - the reference MTP / DFlash2 == the engine;
+  - the override loads an export;
+  - replies identical with the dump on or off;
+  - greedy decode rows' dumped top-1 == the emitted token.
+- A 300-prompt smoke with overhead A/B (canary, multiturn 1 / 4, dump on vs off).
+- Gate 1 on real dumps: the reference reproduces the engine's stock MTP acceptance within ±0.08.
+
+Revert: unset both knobs.
+
+## 0440 — streaming decode kernels, same bits (`GLM53_TF_DEC_EXPERTS`, `GLM53_TF_DEC_QMM`, `GLM53_TF_DEC_PDL`; `exl3_stream.cu`, `q4_stream.cu`, `decode_stream.py`, `exl3_mm.py`, `qmm.py`, `forward.py`, `sessdisk.py`)
+
+**Question.** DECODE-PLAN E1 / E2: the two bandwidth kernels of a decode round run at ~193 GB/s (routed experts, 44%
+of a 1-stream round) and ~190 GB/s (dense 4-bit, 27%). W11's probe streams the same bytes at 233-237 / 230 GB/s.
+Can they get close to that with today's bits? SFXNZ-AUDIT adds two bars: Marlin's dense GEMV at 210-229 GB/s on our
+shapes, and Marlin MoE at 213 GB/s. It also adds a caution, their PDL gate on sm_12x.
+
+**Change** (default off: the hooks are `None`).
+
+- **`GLM53_TF_DEC_EXPERTS=1`.** `exl3_mm.routed` (not fast) for member tables of <= 64 columns: decode, verify,
+  MTP and DFlash2 windows and 4-slot batched windows; prefill chunks keep `grouped_loop`. Three launches:
+  exl3.cu's `rot_in`, then `exl3_stream.cu` for gate/up and for down.
+  - **Grid:** persistent, SMs x resident CTAs.
+  - **Items:** every (member tile, expert, matrix, K split, column block), striped over the CTAs. Dead pairs are
+    never visited: extra member tiles come from a per-CTA list.
+  - **Rings:** 4 warps a CTA, each running exl3.cu's K range for its warp index. Each warp owns a ring of 4-8
+    shared-memory k steps (trellis words and the live member rows, 16-byte `cp.async.cg`), kept full across item
+    ends.
+  - **Arithmetic:** `decode_tile` / `mma16816` verbatim. The warps are added in order by warp 0, and Z is stored
+    for live rows.
+  - **Epilogues:** a ticket on (member tile, expert, Hadamard block). The last item runs exl3_dec.cu's
+    `gateup_epilogue` / `down_epilogue` (verbatim) for the tile's rows. The counters are left at zero.
+  - `GLM53_TF_DEC_EXPERTS_CFG` places work only.
+- **`GLM53_TF_DEC_QMM=1`.** `qmm.matmul` for Q4 weights and 1-64 rows through `q4_stream.cu`.
+  - A persistent CTA ring 4-8 groups deep of words, scales, biases, input rows and group sums.
+  - The nibbles go straight into the bf16 mma B fragments (`sub.rn.bf16x2` of `0x4300 | q`, exact).
+  - The chain is `_qmm`'s: four chained m16n8k16 a group from +0.0, then `fma(xs, b, fma(p, s, acc))`.
+  - Items are (64-column tile, K slice), the slices added in order by the last to finish. `SERIAL`: whole-tile
+    items, the slices added in registers in order, the default for >= 96 tiles. Either way it is `_reduce`'s sum.
+  - Refused (qmm's kernels run) under a Triton that does not fuse `_qmm`'s epilogue on every shape (3.8.0 does
+    not). `force` skips the check, for measurements only.
+- **`GLM53_TF_DEC_PDL=1`.** Both kernels launched as programmatic dependents.
+  - Each CTA prefetches its first item's weights into L2, then waits.
+  - Before `griddepcontrol.wait` only L2 prefetches (and E1's `ld.global.cg` of the grouping for their addresses,
+    never kept) are issued.
+- **`GLM53_TF_DEC_CTAS=N`** caps the grid.
+- The knobs are skipped in the NVMe compat hash (same bits).
+
+**Exactness.**
+- Every output element gets the instruction sequence of the kernel it replaces: exl3.cu's warp K ranges, mma chain,
+  warp order, split order and epilogue code; `_qmm`'s mma chain and fused epilogue as Triton 3.7.1 compiles it, and
+  `_reduce`'s slice order. NT, stages, item order, CTA count and which CTA reduces only place work.
+- So a row's bits do not depend on the window, the other rows, the configuration or the knob. Drafted == serial,
+  batched == alone and resumed == fresh hold as before, even with the ranks set differently.
+- **Found on the way:** under Triton 3.8.0, `_qmm` itself leaves 24-36 product-adds a thread unfused for 12288 x 4096
+  and 77440 x 4096 (and 4096 x 128 at 64 rows), in bucket-dependent slots. An image moving to 3.8 would change
+  today's bits and could break batched == alone there. `tests/test_decode_kernels_compile.py` checks it.
+
+**Offline results** (no GPU; stack 0001-0430 + 0440; Triton 3.7.1 and 3.8.0; nvcc 13.4):
+- `tests/test_decode_kernels_emulator.py` (61 tests, ~3 min). Lane-level CPU ports of both kernels against
+  matrix-level models of exl3.cu's routed path and `_qmm` + `_reduce`. Setup: an order-sensitive mma model, NaN
+  garbage in shared memory, copies landing at random before their wait, random CTA interleavings.
+  - E1, bit for bit for Xd and Y: 1-16-row windows, 4-slot mixes, skewed 20 / 40-row windows with extra member
+    tiles, every configuration, grids of 1-50; plus real-K Z checks and the real-shape walk.
+  - E2, bit for bit: 1-64 rows, K slices 1-8, N not a multiple of 64, bf16 / fp32, both item modes.
+  - Rows alone == rows in the window.
+  - 12 negative controls caught: a missing wait, swizzle, warp order, a dropped live row, a moved k half, the fma
+    order, the chunk order, the slice order.
+- `tests/test_decode_kernels_compile.py` (6 tests).
+  - sm_121: E1 100-142 registers, 20-45 KB, 2-4 CTAs an SM; E2 68-166 registers, 19-47 KB, 2-5 CTAs an SM; 0 spills.
+  - PDL prologues clean in the PTX; E1's helpers are exl3.cu's text.
+  - `_qmm`'s TTIR / PTX sequence for 11 shapes x 3 buckets.
+- Both extensions compile host + device against torch's headers.
+- Estimate (W11 ceilings; DECODE-KERNELS.md §7):
+  - E1: -2.3 ms (1 stream) / -9.7 ms (4 streams);
+  - E2: -2.1 / -3.0 ms;
+  - PDL: -0.4 / -0.8 ms;
+  - total **+9.7% 1 stream, +12.8% 4 streams** (range +5-16% / +7-19%).
+
+**GPU plan** (DECODE-KERNELS.md §8, ~45 minutes).
+1. `tests/cuda/test_decode_stream_patches.py -k "experts or qmm or pdl"`: bitwise on == off at the real shapes,
+   every configuration, graphs, rows alone. Includes the PDL race test: a late writer releases its dependents, then
+   writes their poisoned inputs 0.3 ms later, beside a busy stream.
+2. `tests/cuda/bench_decode_kernels.py`: old vs new µs / GB/s at 1 / 2 / 4 / 8 / 16 rows and 4-slot mixes, a roof
+   probe beside them, probes 1 / 2. Pick the configurations; gate ≥ 1.05x on U = 8-22 and the five largest dense
+   shapes.
+3. Engine tests, then the existing suites with the knobs on.
+4. Production A/B with exact / batchexact and reply SHAs equal. Adopt at ≥ +3% 1 stream; PDL separately at ≥ +1%.
+
+Revert: unset the knobs.
+
+**W12 (2026-09-29): GPU plan run; not adopted** (docs/RESULTS.md "W12"). Offline suites in the image pass (emulator 61,
+compile 6: Triton 3.7.1 fuses every `_qmm` epilogue). E1 / E2 bitwise at the real shapes and the **PDL race test: 16
+passed** (the race test's `load_inline` helper needed a C++ declaration: test fix). Engine tests 9 passed; the existing
+suites with both knobs on pass (deep verify: W10's known coverage assert only). **`bench_decode_kernels.py` failed the
+gate** (every variant same bits): E1's best configuration (8,3,8,3 + PDL) streams **~160-163 GB/s at every window**
+against the old kernel's 201-218 (0.74-0.80x), and probes 1 (no decode) / 2 (no mma) run at the same speed, so the
+ring's loads in flight, not the ALU, are the limit. E2 wins only the small shapes, which the bench keeps in L2 (3
+copies < 24 MB; 1.1-2.1x), and loses the five largest 10-18% (head 0.82-0.86x, KDA projection 0.85-0.89x, MLP gate/up
+0.89-0.91x, DSA o 0.87-0.91x, MLP down 0.96-1.01x). One engine load of `DEC_QMM=1`: exact everywhere (every reply hash
+equal), **1 stream -3.9%, 4 streams -3.1%**. E1 and PDL were not loaded. Knobs stay off.
+
+## 0450 — a GPU-resident decode round (`GLM53_TF_GPU_ROUND`, `GLM53_TF_GPU_ROUND_PEEK`; `gpusample.py`, `gpuround.py`, `resident.py`, `batch.py`, `decode.py`, `dflash2.py`, `kda.cu`, `kda.cpp`, `kda.py`, `engine.py`)
+
+**Question.** DECODE-PLAN E6 / F3 / F4: take the host off the decode round's critical path and batch the per-slot
+fixed cost.
+
+- A round reads the device from the host several times:
+  - the sampler's candidates (`batch.py:333`);
+  - every MTP draft (`decode.py:54`, `batch.py:379`);
+  - DFlash2's candidates (`dflash2.py:526`).
+- Each read is followed by numpy and Python, then per-slot commit launches.
+- At 4 streams, each slot costs ~6.6 ms a round on top of its rows (W9). W11 splits that into: drafting passes 2.4,
+  KDA 1.5, idle 1.1, attention 0.9, exchanges 0.6 (`docs/GPU-ROUND.md` §1).
+
+**Change** (default off: every path is today's).
+
+- **`sample`** (`gpusample.py`): `_choose_kernel` draws each row from its gathered candidates with the host's float64
+  operations in the host's order:
+  - ranks by (value desc, id asc);
+  - the division by max(T, 1e-6);
+  - the splitmix64 uniform;
+  - `log(-log(u))`, and the top-p cut with numpy's pairwise sum and a sequential cumsum;
+  - the first maximum.
+
+  log / exp:
+
+  - They are glibc 2.39's aarch64 `__log` / `__exp` as Ubuntu builds them (GCC contracted glibc's C into
+    fmadd / fmsub): ported from the disassembly, with glibc's own tables (read from the binary, == e_log_data.c /
+    e_exp_data.c).
+  - Every path is covered, including `log(+-0)` (`u` rounds to 1.0 once in 2^53 draws). Compiled with
+    `enable_fp_fusion=False`.
+  - `_probability` (the drafts' confidence) the same way.
+
+  Where it is used:
+
+  - `batch.sample_multi` / `sample_drafts` and `decode.sample_rows` read tokens (and probabilities, rank 0's rider
+    words) instead of the candidates. Rows past 128 kept / 256 gathered candidates stay on the host.
+  - At load, both ranks compare the kernels with their own numpy (libm on 3 x 32,768 values, 4,096 draws). A
+    difference on either turns the device draw off on both.
+- **`resident`** (`resident.py`, `gpuround.py`; needs `GLM53_TF_DECODE_OVERLAP`'s `plan`).
+  - When rank 0's plan rider rode empty and every slot can, both ranks run GPU-resident rounds after the normal round:
+    - `_stage_kernel` (window ids, tie routes for padded rows, sampler positions);
+    - `compute_multi` (the batcher's graph policy per key);
+    - one exchange + `_choose_kernel`;
+    - `_accept_kernel` (`Stepper.accept`'s rule, `done`, counters, the MTP token backlog, a record);
+    - `kda.replay_slots` (every slot's replay in one launch, keeps on the device);
+    - `_conv_shift_dev`;
+    - `_backlog_kernel`;
+    - the next window's drafts on the device: batched MTP head passes with device-sampled drafts and
+      `DepthOptimizer.mtp_next`; DFlash2 `add_taps_dev`, the block graph, `dflash2._chain_kernel`, `f_depth`;
+    - `_finish_kernel`, then one pinned record.
+  - `PEEK=1` (default):
+    - The host does round k - 1's `Stepper` bookkeeping (records, emits, depth calibration) while round k's forward
+      runs.
+    - It waits only on small pinned copies of the counters, after each MTP chain step and after the drafting. Chains
+      run exactly their steps and windows are never padded.
+  - `PEEK=0`: the host launches a whole round ahead (no reads while launching). Bounds are one round stale: MTP steps
+    past a chain's end run for nothing, and windows are padded, tie-routed and never kept.
+  - Drains (the round in flight processed, host state materialized, `_finish` for finished requests):
+    - a finished request;
+    - rank 0's drain flag (queue, cancel, stopping) riding the sampler exchange;
+    - a lookup match;
+    - an uncertain context mode (2,051, a pool bucket);
+    - the cache's end or a pool shortage.
+  - Every check comes before a round is launched.
+- **`kda`**: `kda.chain_slots` runs every slot's chain in one launch a layer.
+  - Its prologue replays the previous window's kept rows (keeps read on the device: `replay_kernel`'s loop) and writes
+    the committed state.
+  - Then it runs the real rows only, saving into a second 16-row scratch set per slot (~27 MB a rank).
+  - The separate replay pass (71 MB read + written a slot a rejected window) and two copies a slot a layer go.
+  - Drains materialize with `replay_slots`.
+
+**Exactness.**
+- The draw is the host's arithmetic op for op, and the accept rule is `Stepper.accept`'s.
+- Commits keep the update routine and row order.
+- Drafts only propose. So replies, committed states and snapshots are today's: drafted == serial, batched == alone,
+  resumed == fresh.
+- Both ranks run the same kernels on the same gathered data, make the same host decisions from equal device records,
+  and drain after the same round.
+
+**Offline results** (`docs/GPU-ROUND.md` §4).
+- The sampler == host (`choose_rows`, greedy lexsort, `_probability`) on 1,900+ random row sets, in Triton 3.7.1 and
+  3.8's interpreter.
+- The Triton port == Ubuntu 24.04's aarch64 libm executed in unicorn on 5.4M inputs, and the scalar spec on 10.5M.
+- Glue kernels == the host rules (the accept rule, `mtp_next` / `f_depth` / the confidence cuts on random calibrated
+  histories).
+- The real `Batcher` / `Stepper` on a hostile fake model:
+  - replies and committed states == serial, the MTP cache and the DFlash2 context position by position;
+  - peek and lag, MTP batched or not, `kda`;
+  - two ranks in threads with identical logs;
+  - no device read while launching (lag) / only the peek records (peek).
+- sm_121:
+  - the sampler's float64 exactly as written;
+  - `chain_slots` = `chain` + `replay_layers` per PTX opcode (nvcc 13.4), <= 64 registers.
+- Existing CPU suites unchanged with the knob unset.
+- Applies after 0440; 0460 / 0470 / 0490 apply after it.
+- Estimate (W11 round): 1 stream -0.6..-1.2 ms (+1-2%), 4 streams -3.5..-7 ms (+3-6%).
+
+**GPU plan** (`docs/GPU-ROUND.md` §6):
+- the KDA kernels bitwise;
+- the sampler over 10^8 draws against the node's numpy;
+- the synthetic checkpoint with each part == serial;
+- loads A (prod) / `sample` / `resident` / `1` / `1` + `PEEK=0` through exact, batchexact, transcripts, tf / kit /
+  edit hashes, 1 / 4 streams x 5 reps, cancel, arrival, resume;
+- nsys of the idle outside the forward and the KDA family.
+
+Revert: unset `GLM53_TF_GPU_ROUND`.
+
+**W12 (2026-09-29): GPU plan run; not adopted** (docs/RESULTS.md "W12"). **KDA fold bitwise** (`replay_slots` ==
+`replay_layers`, `chain_slots` == replay + `chain`): 8 passed. **Sampler at scale** (`results/W12/sampler.py`,
+`self_check`'s two halves at size): 104,857,600 keyed draws and 2.5 x 10^9 libm values against the node's numpy /
+`choose_rows`, **0 differences**. The synthetic-checkpoint GPU tests (run with `TRITON_INTERPRET=0`: the module
+defaults to the CPU interpreter, which made the first run crawl) fail for every part, and `test_batch_parallel` /
+`test_batch_sessions` with `GPU_ROUND=1` fail their sampled cases: **a harness artifact**. The one-GPU fakes
+(`_TwoCopies`, `_Gather`) give rank 1 a copy of rank 0's candidates, so every id appears twice with the same value;
+the host's lexsort keeps one, the device pick adds the tied winners (instrumented: id 88 -> 176). Real ranks hold
+disjoint vocabulary halves, and the **engine is exact in every mode** on the model (exact, batchexact, W9
+transcripts, 13 glmbench cells' hashes). Still a latent difference between the device pick and the host rule on exact
+duplicates (fix the kernel's tie rule or the fakes). Engine A/B vs three controls: `sample` -0.1% / -0.4% (1 / 4
+streams); `resident` -2.3% / +0.5% (tf code greedy -18%, hashmap -8%); `1` -2.3% / +1.2%; `1` + `PEEK=0` -4.3% /
+-4.3%. Under the bars (4 streams >= +3%, 1 stream not lower): off. No nsys was taken, so the resident rounds' loss
+is not decomposed.
+
+## 0460 — L2 prefetch in every decode path, and the RoCE exchange's residual latency (`GLM53_TF_L2PF`, `GLM53_TF_ROCE_STRIPE_KB` / `_INLINE` / `_LAZY_CQ` / `_LEAN` / `_TRACE`; `l2pf.py`, `l2pf.cu`, `l2pf.cpp`, `forward.py`, `batch.py`, `latent.py`, `decode.py`, `overlap.py`, `roce.py`, `roce.cpp`, `roce.cu`, `roce_common.h`)
+
+**Question.** DECODE-PLAN E3 and E8.
+- E3: 0040's prefetch sets no site in `batch.compute_multi`, the Batcher's multi-slot forward (production runs
+  `GLM53_TF_BATCH=4`). Port it and extend it to the other latency-bound windows.
+- E8: cut the per-exchange latency and the exchange count where the math allows.
+
+**Change** (every knob off by default; off, each hook is one dict lookup).
+
+- **`GLM53_TF_L2PF=1` (`bulk`).** A side-stream kernel issues `cp.async.bulk.prefetch.L2.global` over a static
+  per-site table. Sites (`_SITES`):
+  - `a` at a layer's attention all-gather: fn, post norm, router, bias, shared gate/up (or the dense MLP's gate/up);
+  - `f` at its FFN all-gather: the next layer's fn, input norm, input projection (after the last layer: the head);
+  - `o` after the attention projections: KDA `o`, or latent DSA `kv_v` + `o`, while the chains / attention core run;
+  - `e` (opt-in) after the router: `_EXPERT_KB` of each picked expert's gate and up trellis, indexed on the device
+    from `qmm.Group`;
+  - the MTP head's own `a` / `f` / `o` / `e`.
+- **Budget:** `_MB` a site (4 MiB, capped at half of GB10's 24 MB L2).
+- **4-bit matrices:** scales and biases first. Then, for a one-wave launch (<= 192 programs), the head of every
+  (64-column tile, K slice) chunk; for multi-wave launches, the first bytes.
+- **Tagged paths:** `forward.compute`, `batch.compute_multi` (new: tags and join), `mtp_compute`, `mtp_multi`,
+  `batch._kda` / `_dsa`, latent `dsa_block_latent` / `dsa_multi`.
+- **Joins and limits:** each forward joins the side stream; an eager fork never joins a capture. Windows over `_ROWS`
+  (64) skip every site.
+- **Mechanisms:** `lines` (`prefetch.global.L2`) and `touch` (0040's loads) as alternatives.
+- **The shared expert** runs before the routed experts while a prefetcher is installed (0040's order).
+- **Exclusive with 0040:** `GLM53_TF_COMM=prefetch` is refused together with `GLM53_TF_L2PF`.
+- **RoCE** (extension renamed `tensorfold_glm_roce_v3`):
+  - **`_STRIPE_KB`:** padded shards below it travel on one HCA (seq % HCAs): one post, one flag. The kernel, the
+    proxy and the test loop share `roce_common.h`'s rule. It is agreed at load.
+  - **`_LEAN=1`:** the doorbell is an `atom.acq_rel.sys` arrival (none for one block) plus a `st.release.sys`
+    sequence, instead of two `fence.sc.sys`; the tail has no fences.
+  - **`_INLINE=N`:** stripes up to N bytes (capped by the QP's granted inline size) are posted inline.
+  - **`_LAZY_CQ=1`:** completions are reaped in the idle loop.
+  - **`_TRACE=N`:** a device ring of kernel stamps plus the proxy's stamps. `Runtime.trace_rows`,
+    `roce.trace_summary`, `bench_roce.py --trace`. The stats gain `inline_posts`, `single_hca_ops`, `inline_cap`.
+
+**Exactness.**
+- The prefetch kernels' PTX holds only loads and L2 prefetches. There is no store, atomic or reduction (checked).
+  Every model kernel keeps its arguments and stream order, the shared-expert reorder aside (disjoint buffers).
+- The RoCE changes move the same bytes in the same rank order. Each used HCA keeps payload-then-flag on one RC QP.
+  The lean ordering keeps 0230's happens-before edges.
+- **The count stays 100 / 115 a round.** Fusion and deferral are impossible exactly: hc is nonlinear and attention
+  and FFN are sequential. Micro-batching re-reads the weights (+12 ms to hide ≤ 4.2). No model exchange falls to
+  NCCL at 4 streams (W11).
+- **Zero-copy** (NIC DMA from the tensors): not built. The device memory is not registrable without GPUDirect, and
+  host-pinned tensors would need a send-completion wait and parity-keyed graphs for ≤ 1 us an exchange.
+
+**Offline results** (no GPU; stack 0001-0440 + 0460; nvcc 13.4, Triton 3.7.1, torch 2.14 CPU):
+- `tests/test_prefetch_comm.py`: 22 passed.
+  - The port: compute_multi and mtp_multi reach the lone forward's sites in order, with rows, and join. With the tags
+    removed the test fails (checked).
+  - Also: plans, heads, expert plans, knobs, `agreed()`, `trace_summary`.
+- `tests/test_roce_protocol_model.py`: 166 passed, 76 of them new (one-HCA / inline under random schedules, 3 ranks,
+  two controls that time out).
+- `tests/test_prefetch_comm_compile.py`: 4 passed.
+  - `l2pf.cu`: 22-30 registers, no spills.
+  - `roce.cu`: still 64 registers, 0 spills; lean forms present.
+  - Both `.cpp` files pass the syntax check.
+- The RoCE / batch / overlap / sessions / draft-vocab host tests pass. The series 0001-0440 + 0460 applies in order.
+- Estimate (W11 rounds): E3 `a,f,o` -1.05 ms (0.65-2.1), `e` -0.15 / -0.3, E8 knobs -0.1. **Total +2.4% 1 stream,
+  +1.2% 4 streams (mid).** DECODE-PLAN's E8 shrinks: of 2.3 ms exposed at 1 stream, ~0.9 is peer skew.
+
+**GPU plan** (PREFETCH-COMM.md §6, ~70 minutes).
+1. `tests/cuda/test_prefetch_comm_patches.py` plus the regressions (`test_roce_patches.py`, `test_comm_patches.py`,
+   `test_batch_parallel_patches.py`, `test_decode_stream_patches.py -k pdl`).
+2. `bench_roce.py bench --trace 4096` per RoCE knob.
+3. stress / fault / soak with the chosen knobs.
+4. Engine A/B: L2PF (a,f,o / +e / 8 MiB) then + RoCE knobs.
+   - exact 10/10, batchexact 4/4, transcripts byte-identical;
+   - 1 / 4-stream decode;
+   - one nsys capture.
+
+Adopt L2PF at ≥ +1.5% single stream with 4 streams not lower. Adopt the RoCE knobs only after a clean stress and a 1 h
+soak.
+
+Revert: unset the knobs.
+
+**W12 (2026-09-29): L2PF adopted at 8 MiB a site; the RoCE knobs not** (docs/RESULTS.md "W12").
+**Two bugs fixed in this patch** (found by its GPU unit tests; the patch file now carries the fixes):
+
+- `roce.py` `_ext()`: the new `# patches/0460 ...` comment was written on the `load(name="tensorfold_glm_roce_v3", ...)`
+  line **before** `sources=[...]`, so the call lost its sources and the extension never built. Every image with 0460
+  would have fallen back from RoCE to NCCL at load, knobs off included (`test_roce_patches.py` 6 failed / 19 errors ->
+  25 passed).
+- `l2pf.cu`: `cp.async.bulk.prefetch.L2` needs sm_90+, and the image's `TORCH_CUDA_ARCH_LIST` also builds compute_80,
+  so `GLM53_TF_L2PF=1` could not build (the offline compile test built sm_121 only). Now under `__CUDA_ARCH__ >= 900`,
+  with a line-prefetch loop for older targets (never run on GB10).
+
+GPU tests after the fixes: `test_prefetch_comm_patches.py` 25 passed (L2PF bulk / lines / touch at sites a f o e,
+the Batcher, the RoCE loop runtime with `STRIPE_KB` 0 / 32 x `LEAN` 0 / 1); `test_roce_patches` 25, `test_comm_patches`
+15, `test_batch_parallel_patches` with L2PF 26, `-k pdl` with L2PF 1 passed. Engine A/B vs three controls (every
+reply hash equal): **`L2PF=1` (4 MiB) +0.8% 1 stream / -0.1% 4 streams**; sites a,f,o,e +0.4% / -0.1%; **`L2PF_MB=8`
++2.4% 1 stream (prose +2.9, code +2.5, edit +1.7), +1.2% 4 streams, lone requests +2.8%**: over the +1.5% bar, adopted
+with the combined candidate (+ `BATCH_CAPTURE_AFTER=8`: 1 stream +2.5%, 4 streams +2.8%, all gates). RoCE knobs (bench
+`--trace 4096`, two nodes, bits equal): base-to-base spread 0.5-1.4 us a op; only `LEAN=1` comes near the 0.3 us bar
+(-0.2 to -1.4 us at 16-64 KiB, inside that spread, <= 0.1 ms a round): no stress / soak / engine load, knobs off. The
+trace's `notice` component prints ~1.8 x 10^15 us (a clock-domain mix-up in that stamp).
+
+## 0470 — 8-bit non-expert weights and a per-class precision map (`GLM53_TF_NONEXPERT=q8`, `GLM53_TF_NONEXPERT_MAP`; `qmm.py`, `fast_qmm.py`, `latent.py`, `weights.py`, `fastboot.py`, `l2pf.py`, `overlap.py`, `fastpf.py`, `dump.py`, `engine.py`)
+
+**Problem.** q4mse (0001) stores every non-expert matrix at 4.5 bpw.
+
+- The sfxnz kit's data (SFXNZ-AUDIT §4 item 5) says 4.5-bpw non-expert weights on this model cost ~6x the A/A KL.
+  Top-1 agreement there was 95.6%.
+- Our only quality gate so far is MMLU-200.
+- The goal: higher-precision non-experts, paid for by the decode kernel gains.
+- `bf16` (upstream) is the only other mode. It is ~3.6x q4's bytes and does not fit production memory.
+
+**Change.**
+
+- **`qmm.Q8`: int8, symmetric, one bf16 scale per (column, 128 inputs).**
+  - The scale is the smallest bf16 >= amax / 127, so nothing clips.
+  - Chosen on real `zai-org/GLM-5.3-Flash` tensors over per-channel, g64 and zero-point variants
+    (docs/QUALITY-PLAN.md §1.2).
+  - `quantize8` is elementwise torch: the same bits on the CPU and the GPU.
+- **Kernels.** Every one sums a group as one mma chain (two 64-input halves), then one FMA with the group's scale,
+  groups in order:
+  - `_q8mm`: decode / verify / MTP, with qmm's split-K slices (`q8_split_k`, never more partial rows than Q4's);
+  - `_fq8`: prefill, one accumulator in fast chunks; `exact` keeps qmm's slice order and bits;
+  - the latent absorb / expand tile loaders (`IS_Q4 = 2`, exact `s * q`).
+- **Weight loads.** Weights are read as int32 words and unpacked in registers (`_q8_unpack`). Triton then streams
+  them with `cp.async` like the 4-bit words. Plain int8 tensors compiled to a `ld.global.b8` a byte, unpipelined.
+- **Tiles.** Chosen offline to compile without spills for sm_121 on Triton 3.7.1 and 3.8.0 at every per-rank shape;
+  not yet timed. Env overrides: `GLM53_TF_Q8_DECODE_CFG`, `GLM53_TF_Q8_TILE`.
+- **`weights.py`.**
+  - Builds each non-expert matrix with its class: `kda_proj kda_fb kda_gb kda_out dsa_proj dsa_qb dsa_kvb dsa_out
+    idx_proj idx_qb dense_gu dense_down shared_gu shared_down mtp_eh lm_head`.
+  - `GLM53_TF_NONEXPERT_MAP` picks a mode per class, a group (`o_proj`, `down`, `out`, `attn`, `mlp`, `kv_b`,
+    `head`, ...) or `default`, optionally `mtp.`-prefixed.
+  - The most specific key wins; conflicting groups at one level are an error.
+  - An 8-bit head gets the 4-bit draft copy a BF16 head gets.
+- **Prepared folders.** Keyed by `weights.precision_key()`: the plain mode when every class agrees, else the resolved
+  table. Each precision is its own folder (~82-88 GB a node).
+
+**Exactness.** Within a configuration, every guarantee Q4 has:
+
+- a row's bits never depend on the row tile, the call's rows or the tile tables;
+- drafted == serial, batched == alone, resumed == fresh;
+- exact prefill == decode bits.
+
+An 8-bit or mixed configuration is a different model from q4mse (new reply hashes), checked by
+`bench/divergence.py` (KL / top-1 against `bf16`) and `bench/mmlu_full.py`.
+
+**Result (offline).**
+
+- Tests:
+  - `tests/test_q8_interpreter.py`: 21 passed;
+  - `tests/test_q8_compile.py`: 90 passed on 3.7.1 and 3.8.0;
+  - `tests/test_nonexpert_map.py`, `tests/test_fastboot_prepared.py` (q8 added), `tests/test_divergence.py`: 42
+    passed, CPU.
+- 0440 / 0460 / 0430 CPU suites unchanged.
+- GPU: `tests/cuda/test_q8_patches.py` (bits, and `-k timing -s` for GB/s and tile sweeps).
+- Estimates and the GPU plan: docs/QUALITY-PLAN.md.
+
+## 0490 — the context limit in the API, OpenAI-shaped context errors, `/tokenize` and token-ID prompts (`cuda/server.py`, `glm5_next/cuda/app.py`)
+
+Why: a user of the public kit reported "only ~50K max context". Nothing told a client (or the user) what the server
+served: `/v1/models` had no context field, the over-limit 400 used wording no agent client recognises, and the boot
+log never said the limit. Host-side only, on by default (no knob): the engine, the kernels and every reply's bits are
+unchanged.
+
+- `GET /v1/models`: `max_model_len` and `context_length` (vLLM's and OpenRouter's keys; Hermes Agent and others read
+  them), `created`, `root`, when the engine has a `limit` (GLM: `--context` / `CONTEXT`; 2,051 when unset). Engines
+  without one list the entry as before.
+- `GlmApp.check` answers a request whose prompt plus `max_tokens` (1 without) exceeds the limit with HTTP 400
+  `{"error": {"message", "type": "invalid_request_error", "code": "context_length_exceeded", "param": "messages" |
+  "prompt"}}` and OpenAI's / vLLM's wording: "This model's maximum context length is N tokens. However, you requested
+  M tokens (P in the messages, R in the completion). Please reduce the length of the messages or completion." plus
+  "(This TensorFold server was started with --context N (CONTEXT); restart both ranks with CONTEXT=M or more to serve
+  it.)". opencode (`packages/llm/src/provider-error.ts`) then treats the turn as a context overflow and compacts;
+  Hermes Agent parses the limit and the prompt / completion split. Streams: still refused before any header.
+  (`check` may return `server.Problem`, a `str` with `code` / `param`; `server.error_body` builds the body.)
+- A `ValueError` raised by the engine inside a stream (e.g. 0290's "more than the whole pool") is sent as an
+  `invalid_request_error` event, as the non-streamed response already answered it with a 400.
+- The load prints `[tensorfold] context: N tokens a request (max_model_len; set by CONTEXT / --context); KV cache:
+  latent fp8 | per-head ...; K request slot(s); KV pool: T tokens shared by the slots`, with a pointer to the
+  long-context config when N <= 65,536.
+- RigMark (docs/RIGMARK.md, gap 1; proposed there as "0470"): `POST /tokenize` or `/v1/tokenize` returns
+  `{"count", "max_model_len", "tokens", "token_strs": null}` for a string `prompt` (`add_special_tokens`, default true
+  as in vLLM; GLM's post-processor adds nothing either way) or `messages` (rendered as a chat request renders them,
+  0150's effort applied); anything else is a 400. It runs on the HTTP thread: no engine lock, no GPU, nothing sent
+  to rank 1. `/v1/completions` takes one flat list of token ids as `prompt`: `App.check` requires ints (not bools)
+  in `[0, vocab)`, a list of lists or strings is "one prompt a request"; `GlmApp.check` counts `len(ids)` for the
+  context check; `App.run` passes the ids through `given_ids` (`GlmApp.given_ids` starts 0300's log ticket as
+  `prompt_ids` does). Rank sharing, sessions, the prefix share and 0210 work on ids already.
+  `GLM53_TF_REASONING_FIELDS` keeps its default (RigMark runs set it at start).
+
+- 0290 pool sizing (`kvpool.pool_tokens`, `kvpool.build(..., limit)`, `decode.Engine`, the load line in `engine.py`):
+  admission reserves `min(prompt + max_tokens + 64, capacity)` tokens of pages, capacity being CONTEXT + the verify
+  window's rows (16), while the pool held exactly CONTEXT: a request with prompt + max_tokens within 64 tokens of
+  CONTEXT passed the context check and was then refused as "more than the whole pool" (1,048,576: 4,097 pages needed,
+  4,096 held). A pool set to at least the context limit now grows to the capacity rounded up to a page (4,097 pages
+  at 1M, ~2 MB more a rank); a pool set smaller stays as set. The load line no longer says "one request alone cannot
+  reach it" for production's pool. Which page holds a row never changes a bit.
+
+Launcher (not in the patch): `scripts/serve.sh` stops with a pointer to `config/prod.env.example` when the config
+file is missing, logs `CONFIG: CONTEXT=... tokens a request, KV cache ..., GLM53_TF_BATCH=..., GLM53_TF_KV_POOL_TOKENS=...`
+before a start, warns when `CONTEXT` is unset (2,051) or <= 65,536, refuses `CONTEXT` > 131,072 on the per-head KV
+cache (`GLM53_TF_LATENT_KV` unset: ~390 KB a token a rank does not fit next to the weights; `FORCE_CONTEXT=1`
+overrides), and after the load logs "serving up to N tokens a request (max_model_len)".
+
+Tests (host only): `tests/test_api_context.py` (19: the wording against copies of opencode's and Hermes Agent's
+patterns, `/v1/models` with and without a limit, 400s with the code chat / stream / completions, plain errors keep
+their shape, a stream refusal event, `/tokenize` string / special tokens / messages / 400, token-ID prompts streamed
+and not with exact `prompt_tokens`, bad ids, a 65,536-id prompt within 1,048,576 and past 65,536, the boot line);
+`tests/test_prompt_tokens.py` (the check's answer is now `context_problem`'s, code included);
+`tests/test_serve_ops.py` (+4: missing config, the context line and warnings, the per-head refusal and
+`FORCE_CONTEXT`, the max_model_len line). On the Sparks (new image): RigMark's `preflight.py` should pass, and the
+usual exact / batchexact / reply-sha gates (the check and run paths changed).
+
+**W12 (2026-09-29): in production** with image b5 (docs/RESULTS.md "W12"). `tests/test_api_context.py` +
+`test_prompt_tokens.py` in the image: 20 passed, 1 skipped (no tokenizer dir). On the served model: `/v1/models`
+lists `max_model_len` = `context_length` = 1,048,576; 13 + 1,048,576 tokens -> HTTP 400 `context_length_exceeded`
+with OpenAI's wording; the pool edge, 13 + 1,048,531 = 1,048,544 tokens (reservation 64 past CONTEXT), is admitted
+and answers; the boot line reads `KV pool: 1048832 tokens` (4,097 pages). b5 with every new knob off equals b4 bit for
+bit (reply sha, exact, batchexact, W9 transcripts, 13 glmbench cells, N1's 12 long replies).
+
+## 0500 — image input (`GLM53_TF_VISION`; `vision_prep.py`, `vision.py`, `glue.py`, `engine.py`, `batch.py`, `app.py`, `lookup.py`, `draftvocab.py`)
+
+**Question.** Serve images in OpenAI chat messages for GLM-5.3-Flash, whose checkpoint carries a vision tower that
+the engine ignored, without disturbing text serving or any cache.
+
+**Findings** (`docs/VISION.md` §2):
+
+- The 347 `model.visual.*` tensors are BF16 (1.127 GB, one shard).
+- The LM uses **no positions**, so there is no M-RoPE. transformers' `glm5_next`:
+  - asserts `qk_rope_head_dim == 0`;
+  - calls every layer with `position_embeddings=None` and plain `arange` ids;
+  - has no rope index.
+- An image is `masked_scatter` of the tower's rows at the `<|image|>` positions, so the engine needs only the
+  embedding step changed.
+- This checkpoint's `chat_template.jinja` renders image parts as a "you cannot process images" reminder. The vision
+  template (the vLLM kit's, MikeRoz's) emits `<|begin_of_image|><|image|><|end_of_image|>`.
+- Upstream 0.3.6.2 has no vision: it skips the tensors and answers media with 400. The vLLM kit serves vision on by
+  default (`LIMIT_MM` image 4, its own template).
+
+**Change** (default off: the knob unset serves exactly as before).
+
+- **Host** (`vision_prep.py`):
+  - content parts (`image_url` / `input_image` / `image`);
+  - `data:` and http(s) fetch with size / time / pixel limits;
+  - RGB conversion as vLLM (alpha on white);
+  - the processor, bit for bit (smart resize to the 16-8,000-token budget, bicubic antialiased uint8 resize, zero
+    padding, fused normalize, merge-window-major patches, the frame duplicated over the temporal pair).
+- **Rendering:** each image part becomes a sentinel before the checkpoint's template runs, then the vision
+  template's placeholder. The prompt equals `Glm5NextProcessor`'s ids.
+- **Virtual ids:** each image's `<|image|>` becomes its N = grid / 4 rows as virtual ids.
+  - Ids are >= 2^24 and < 2^31. Each row's id is a hash of (the SHA-256 of the canvas, grid and settings; the row
+    index).
+  - A registry on rank 0 re-salts any clash within the process.
+  - A typed-in `<|image|>` is refused.
+  - `usage.prompt_tokens` and the context check count the rows. `/tokenize` returns them as `<|image|>`.
+- **Engine** (`vision.py`):
+  - the tower in PyTorch BF16 on rank 0 (cuBLAS + flash SDPA, the MLP row-chunked, its own CUDA stream, one
+    request at a time);
+  - a cache of rows by digest;
+  - `exchange`: sorted ids and rows as int32 words through the all-gather, right after the prompt, in both the lone
+    and the batch paths, data-driven so text requests exchange nothing;
+  - `glue.embed` inside `vision.active(table)`, which wraps `_run`'s and `_piece`'s prefill: virtual ids read row 0,
+    then `Table.fixup` writes the tower rows in every stream copy (device-only, never inside a graph capture).
+- **Drafters:**
+  - the MTP head's absorb gets the image rows (as vLLM's drafter does);
+  - DFlash2 reads only vocabulary ids;
+  - `SuffixIndex.propose` cuts lookup drafts at a virtual id (0450's resident rounds use it too);
+  - the draft-vocabulary fallback window skips them.
+
+**Caches:** nothing keyed by token ids changed, and none needs to. Two different images with the same text differ at
+every image row. Covered:
+
+- the lone and batch snapshots, the session store's entries, pages, fork marks and `lcp`, the prefix share;
+- the NVMe tier's index and int32 packing.
+
+These resume up to the image, never past it. The same pixels (any encoding) resume everything, including a
+conversation's next turn. A false share needs a 31-bit collision per image row of the cached prefix.
+
+**Cost:**
+
+- rank 0: +1.13 GB tower, ~0.1 GB transient a screenshot (~0.5 GB at the 8,000-row maximum), and up to 2 x 256 MB of
+  host caches;
+- rank 1: the rows in flight (8 KB a row).
+- Tower FLOPs: 5.37 T for 1024x768, 20.9 T for 1920x1080, 128 T for 3840x2160 (78% attention). That is 49 ms / 190 ms
+  / 1.17 s at 110 TFLOP/s, estimated 75-90 ms / 0.3 s / ~2 s. The image rows' LM prefill (~0.9 s for 1,036 rows)
+  dominates.
+
+**Tests** (CPU, 89 checks: `tests/test_vision_prep.py`, `tests/test_vision.py`, `tests/test_vision_interpreter.py`,
+`tests/test_vision_server.py`):
+
+- processor parity with transformers bit for bit (16 sizes, plus 3,000 `smart_resize` draws and 63 token counts);
+- the tower == transformers' `Glm5NextVisionModel` (fp32 1e-5, bf16 close);
+- loading; the table; the two-rank exchange;
+- `glue.embed` in the interpreter (BF16 / 4-bit tables);
+- the HTTP flow and its 400s;
+- every cache index for two images and the same image;
+- the lookup cut;
+- the whole prompt == `Glm5NextProcessor` on the real tokenizer.
+
+Existing host and interpreter tests pass on the patched tree. `tests/cuda/test_vision_patches.py` (GPU, the next
+Spark round): image rows set to real tokens' embedding rows reply exactly as the tokens across prefill modes,
+drafters and resume; plus the real tower's latency and memory.
+
+The GPU plan (text 10/10 unchanged, real images against the vLLM kit, cache exactness, the 4 x 250k memory, latency)
+is in `docs/VISION.md` §7.
+
+- Applies after 0490 (and 0450).
+- Revert: unset `GLM53_TF_VISION`.
+
+## 0510 — lone-only batched graphs, the verify graph in pieces, a launch probe (`GLM53_TF_BATCH_GRAPHS=lone`, `GLM53_TF_VERIFY_SPLIT`, `GLM53_TF_GRAPH_PROBE`, `GLM53_TF_RESIDENT_REPORT`; `batchplan.py`, `batch.py`, `resident.py`, `vsplit.py`, `graphs.py`, `decode.py`)
+
+Why (docs/THEORY-2.md §4 items 1, 2 and 9): batched graphs off (`GLM53_TF_BATCH_GRAPHS=0`, load G0) measured +2.6%
+(W11) / +1.9% (W12) at 4 streams, because rounds of 2-4 slots meet many (slots, rows, parity) keys and each capture
+costs a forward, but a request alone in slots 1-3 lost ~3% (its rounds are the batcher's, graphed under `1`). And at
+one stream ~1.1 ms a round of GPU idle sat inside `cudaGraphLaunch` of the ~1,650-node verify graph (measured under
+node-level nsys tracing, which inflates launches: the uncaptured size is 0.1-1.1 ms).
+
+- `batchplan.graph_policy` / `graphs_for`: `1` (unset, as before), `0`, `lone` (also `single`, `one`). `Batcher.graphs_on(n)`
+  answers for a round of n active slots; `_forward` (padding, buckets, capture / replay), 0450's `RealOps.forward` and
+  `_pass` (batched MTP head) ask it. Under `lone` a round of 2+ slots takes the eager path of `0` (the same
+  `compute_multi(..., nchs, host_pos)` call); a round of one slot captures / replays as `1`; slot 0 alone still replays
+  the engine's own graphs. The policy is in the ranks' batch-settings exchange (checked equal). Boot line:
+  `batch graphs (patches/0510): lone rounds only`.
+- `vsplit.compute_pieces(w, st, b, R, n, npb=)`: `forward._compute` (logits on, the capturable path) as n callables
+  over `split_bounds` layer ranges (the first also embeds, the last takes the final stream mean, norm and head; each
+  ends with `forward._join`, the prefetch side stream's join: a wait only). `Graphs.__init__` captures the main graphs
+  that way when `GLM53_TF_VERIFY_SPLIT` >= 2 (or the probe is on), `long_step` does the same for 0050's ("main", R,
+  parity, npb) keys; `vsplit.Split.replay` runs the pieces in capture order (a device sync before each piece's capture,
+  as `roce._order` assumes). `GLM53_TF_VERIFY_SPLIT_FIRST=L` sizes the first piece.
+- `GLM53_TF_GRAPH_PROBE=N`: a Triton `%globaltimer` stamp as node 0 of the first piece, an eager stamp before the replay;
+  per replay the host ns of each piece's `replay()` and the host gap before the first; every N replays (one sync)
+  `[tensorfold] graph probe (patches/0510) r0 ('main', R, parity) pieces=P n=..: replay host us p50 .. p90 .. (first
+  piece p50 ..); first node +us p50 .. p10 .. p90 ..` on stderr. First-node delay = node-0 stamp - eager stamp - the
+  host gap: the launch's exposure on an idle stream.
+- `GLM53_TF_RESIDENT_REPORT=N`: `[tensorfold] resident rounds (patches/0510 report): rounds .. entries .. drains
+  {reason: n} ; batch rounds {...}` every N drains (item 9's attribution of 0450's -18% on greedy code).
+
+Same bits: the policy picks between two paths that run the same kernels (G0 passed exact / batchexact / reply hashes
+in W11 / W12); the pieces launch `_compute`'s kernels in its order (CPU test with every kernel wrapper recorded); the
+stamps write only the probe's own buffer. Tests: `tests/test_batch_graphs_lone.py` (44, CPU: parsing, the dispatch of
+`_forward` / `RealOps.forward` / `_pass` on fakes under each policy, `split_bounds`, the pieces' call sequence ==
+`_compute`'s for 1-8 pieces with and without `npb` and taps, capture / replay order on fake graphs, the probe
+arithmetic); `tests/cuda/test_batch_graphs_lone_patches.py` (GPU: Split objects of N pieces, window logits / hidden of
+1-8 rows and replies == the default engine's with split 2 / 3 / 8 and the probe, lone batched replies == serial with
+no multi-slot graph and a lone-slot graph captured). GPU plan and gates: results/THEORY2-SESSION (W13 loads L, CT, VS).
+
+## 0520 — one hyper-connection boundary in one CUDA kernel, same bits (`GLM53_TF_HC_CUDA`, `_ROWS`, `_RG`, `_PDL`; `hc_fused.cu`, `hc_fused.cpp`, `hc_cuda.py`, `forward.py`, `batch.py`, `engine.py`)
+
+Why (docs/THEORY-2.md §1.5, §4 item 3): every layer boundary runs `_hc_post` -> `_hc_partial` -> `_hc_finish`, 15.6 us
+of latency-bound kernels (1-96 CTAs), 90 times a 1-stream round (~1.4 ms). 0190's Triton fusion was bitwise but 7-8x
+slower. docs/HC-FUSED.md has the design, the bit-identity argument and the GPU plan. (`GLM53_TF_HC_FUSED` is 0190's
+per-request prefill knob, hence `HC_CUDA`.)
+
+- `hc_fused.cu`: 32 step CTAs a group of `GLM53_TF_HC_CUDA_RG` rows (one per 128-column step of a quarter of D): fn
+  slice, X' of their columns by `_hc_post`'s expression (staged, and to a scratch XP), and `_hc_partial`'s per-step
+  dot values (8-column chain, 16-lane butterfly) to a scratch TS; a ticket per group. One finisher CTA a row spins on
+  its group's 32 tickets (acquire), then sums the steps in order (PART), the square sums (same chains and trees), writes
+  X from XP (every step CTA has read X), and runs `_hc_finish` with its thread mapping. The last finisher resets the
+  tickets (graphs). Arithmetic: only `.rn` intrinsics (ptxas contracts none) plus rcp / sqrt / ex2 `.approx.ftz` with
+  the scaling ptxas wraps around Triton's `div.full` / `ex2.approx` written out; the fma where ptxas fused Triton's
+  multiply with the next add (div + hc_eps, x / 2^k + eps, the square chains); Triton's mixed bf16 instructions.
+  sm_121: 80 registers, no spills, 18.9 KB shared, 3 CTAs an SM.
+- `hc_cuda.py`: knobs, `fits` (decode shapes, not fast chunks / b12x, <= ROWS rows), `post_pre` (the kernel or False:
+  the caller runs the Triton pair), scratch per Buffers (allocated on the first eager use; never inside a capture),
+  the layer-to-layer mark (`mark_ready` / `take_ready`: consumed by the very next layer_forward; a stale one costs a
+  recomputation only), `self_check` (1 / 3 / 16 random rows, every output bitwise vs glue's kernels).
+- Call sites: `forward.layer_forward` and `batch.compute_multi` (both boundaries of a layer), `engine.py` (ranks must
+  agree on `GLM53_TF_HC_CUDA`; with 1, the self-check at load, before calibration and graph capture; on only if both
+  ranks pass). Off: the same Triton calls in the same order (unit-tested).
+
+Same bits: the specification (`tests/hc_fused_emu.py`) is Triton 3.7.1's executed arithmetic on sm_121: the Triton
+kernels' own PTX, run in a PTX interpreter through a model of ptxas's contractions (checked against the SASS: FFMA /
+FADD / MUFU counts exact for all three kernels), equals it; so do hc_fused.cu's own PTX and a lane-level port (1-16
+rows, rg 1-8, random CTA orders, 7 input kinds incl. signed zeros, the unit sequences' scaling paths, subnormals,
+inf / NaN, and an adversarial input for the collapse's per-slot fusion). 7 specification variants and 6 source
+mutations are caught. Under Triton 3.8 the Triton kernels compile to other arithmetic (the self-check keeps the knob
+off there). Not proven offline: the production image's ptxas (analysed: 13.1; the GPU test prints it), hardware unit
+results and the ticket ordering (GPU test). Tests: `tests/test_hc_fused.py` (68, CPU), `tests/test_hc_fused_compile.py`
+(33: sm_121 compile, IR / PTX / SASS checks, the interpreter runs, full extension compile),
+`tests/cuda/test_hc_fused_patches.py` (GPU: fused == Triton for 1-16 / 24-64 rows, edge inputs, graphs, 2,112 CTAs,
+PDL late writer, self-check), `tests/cuda/bench_hc_fused.py` (cold in-graph bench, GATE line). Offline estimate
+7.5-9.5 us vs 15.6 (0.48-0.61: borderline on the 50% gate), +1.0-1.4% at 1 stream. Not measured yet.
+
+## 0530 — rank 0's HTTP threads off the engine's cores, and the RoCE trace from a running server (`GLM53_TF_CPU_PIN=http`, `GLM53_TF_ROCE_TRACE_DUMP`; `cpupin.py`, `rocedump.py`, `roce.py`)
+
+Why (docs/THEORY-2.md §1.4, §4 item 6): each rank waits 1.3-1.5 ms a round (one stream) and 2.2-3.0 ms (four) inside
+all-gathers for the other; at four streams rank 0, the HTTP node, is late on 62% of exchanges. Hypothesis: rank 0's
+host threads (HTTP, streaming) share cores (and LPDDR5x) with the engine's launch thread and RoCE proxy. 0370's
+`CPU_PIN=auto` dedicates cores to every role (W10: +0.4%, not adopted); this moves only the HTTP threads.
+
+- `GLM53_TF_CPU_PIN=http`: `cpupin.plan` mode `http`; `http_thread()` (rank 0's request threads, named `tf-http`) moves
+  its thread to the http cpus (default: allowed minus fast cores = the A725s on GB10; else the lower half);
+  `classify` goes by thread name; nothing else is pinned unless `engine=<cpus>|fast` (then the main thread, the round
+  loop and every other thread there, by the 30 s sweep). Without batching `serving_request` runs the decoding request
+  thread on the engine's cpus (or all allowed) and puts it back. `http=` and `engine=` must not overlap and must be
+  allowed. 0370's other modes are unchanged.
+- `GLM53_TF_ROCE_TRACE_DUMP=<prefix>` (with `GLM53_TF_ROCE_TRACE=N`, 0460's ring): `rocedump.tick` (from `cpupin.tick`,
+  once a round on both ranks) appends `{"t", "rank", "completed", "rows"}` to `<prefix>-r<rank>.jsonl` whenever
+  `GLM53_TF_ROCE_TRACE_EVERY` exchanges (default 16 x the ring) completed since the last dump; `roce.COMMS` lists the
+  process's `RoceComm`s so it finds the runtime. Three failures turn it off; NCCL or no ring: nothing. The two ranks'
+  rows pair by `seq`: `results/THEORY2-SESSION/rocetrace.py` gives transport (the shorter wait), skew and the waiting
+  beyond transport per rank, and the item 6 gate against a control.
+
+Same bits: affinity and a host read of the trace ring only. Tests: `tests/test_http_pin.py` (plans on a fake GB10
+sysfs, errors, classify by name, real affinity calls on this host's threads, the dump on a fake runtime).
+
+## 0540 — warm replay and multi-arrival TTFT (`GLM53_TF_SNAPSHOT_BEFORE_END`, `GLM53_TF_EMIT_FIRST`; `pfgrid.py`, `decode.py`, `engine.py`, `batch.py`)
+
+Why (RigMark W13, `docs/REPLAY-TTFT.md`): the immediate replays resumed only 0 / 16,384 / 49,152 of 8,192 / 32,768 /
+65,536 tokens (6,304 tok/s at 64K vs vLLM's 11,364), because a prompt ending on the 64-grid kept its only snapshot at
+n and a resume needs a strict prefix; and C4's per-stream TTFT was 1.91 s (vLLM 0.81) because a round's short prompts
+prefill one after another and 0370's `emit` held each first token until the round's verify launch.
+
+- `pfgrid.before_end()` (`GLM53_TF_SNAPSHOT_BEFORE_END`, default 1) and `pfgrid.plan(before=True)`: S = (n - 1) // G *
+  G for every n (= the old S off the grid), with 0085's tail exception; exact plans (grid 0) cut at the last 64-multiple
+  before n and snapshot there (none for a fresh prompt of <= 64 tokens). `decode._prefill` applies it when
+  `e.snap_before == len(prompt)` (set by `GlmEngine._run` for the prompt and by `Batcher._piece` with the whole
+  prompt's length, so only the piece that ends at n uses it; consumed once) and leaves the snapshot in `e.fast_snap`
+  (exact prefills too); `_run` / `_piece` store and remember it instead of the snapshot at n. The load checks the knob
+  on both ranks (it moves a cut, hence a chunk's collectives).
+- `Batcher.emit_first` (`GLM53_TF_EMIT_FIRST`, default 1): `_piece` flushes the held tokens right after emitting a
+  prompt's first token (only this round's earlier first tokens are held there).
+
+Same bits: a cut and a snapshot on the 64-grid are what off-grid prompts, marks and piece bounds already get
+(resumed == fresh, 0085); emitting earlier is host scheduling on rank 0. Memory: the snapshot moves, none is added
+(<= 2 a slot, one a save, the store under budget). Cost: one more chunk (~0.2 s) on a cold prompt that ends on the
+grid. Estimates: replay 8K / 32K / 64K ~23k-33k / 94k-131k / 187k-262k tok/s; cold -4 / -1 / -0.5%; C4 TTFT median
+~1.2 s. Multi-slot prefill (several prompts in one fast chunk) is exact in principle but needs segment-aware lean /
+0084 / 0320 loops and GPU validation: analysed in REPLAY-TTFT.md (est. C4 TTFT ~0.6 s), not implemented. Also in this
+change: `GLM53_TF_REASONING_FIELDS=reasoning` recommended for prod.env (the vLLM kit sends `reasoning` only; not
+edited), and `test_vision_patches.py`'s bf16 bound 2% -> 8% (W14). Offline only (no GPU run yet): GPU plan in
+REPLAY-TTFT.md.
+
+## 0550 — memory safety: the prefill selection's scratch, allocator trims, page cache at admission (`GLM53_TF_SELECT_SCRATCH`, `GLM53_TF_ALLOC_TRIM_GB`, `GLM53_TF_ADMIT_MEM`, `GLM53_TF_DROP_OWN_CACHE`; `memsafe.py`, `sparse.py`, `decode.py`, `batch.py`, `sessions.py`, `sessdisk.py`)
+
+Why (W15 §3, `docs/MEMORY-SAFETY.md`): during a lone ~300k prefill MemAvailable fell by 3-4.5 GiB (6.39 / 6.42 GiB
+after the stress + MMLU, under the 8 GiB floor) and came back when the prefill ended; and while a 36 GB file was
+copied on the head node the batcher admitted C4 requests one at a time because `cudaMemGetInfo` free (= MemFree on GB10)
+counts reclaimable page cache as used.
+
+- Cause of the dip: `sparse.select_pools_blocked` (0065) allocates each DSA call's int32 key block `[n, npc]`,
+  ~512 B a prompt position at 512-row sub-blocks (153 MiB at 314k, 256 MiB = `GLM53_TF_SELECT_MB` from 524k). The
+  size grows every sub-block; torch's caching allocator cannot reuse the previous (smaller) freed segment, takes a new
+  one every ~4,096 tokens and keeps the old: reserved memory grows quadratically (`memsafe.keys_growth`: 5.78 GiB
+  bound at 314k, measured 4.5; 4.04 vs 3.0 in B7b; 16 GiB at 524k-1M) until `torch.cuda.graph`'s `empty_cache` (the
+  MTP head's long-context graph for a new pool bucket, captured with the first draft after the prompt) releases it.
+  Nothing else in a lone prefill scales with the prompt beyond MiB (inventory in MEMORY-SAFETY.md §2).
+- `sparse.reserve_scratch` / `reserve_for_prefill` / `_keys_block` (`GLM53_TF_SELECT_SCRATCH`, default `grow`): the key
+  blocks are views of one int32 buffer per (device, stream), grown on the host before a prefill
+  (`decode._prefill`, for positions begin .. n with the DSA call rows) to the largest block rounded up to 16 MiB (<=
+  256 MiB; old buffer dropped, device synced, cache emptied: nothing left behind; <= 16 growths a process). Inside a
+  capture, or when a caller did not reserve, the old allocation / an in-place growth (`SCRATCH_STATS`). `max`:
+  `SELECT_MB` at the first use; `off`: 0065.
+- `memsafe.Trimmer` (`GLM53_TF_ALLOC_TRIM_GB`, default 2; `GLM53_TF_ALLOC_TRIM_S`, 10): before a batch prefill piece
+  (both ranks, each for itself), `empty_cache` when the allocator holds more than 2 GiB unused, at most every 10 s; a
+  trim that frees < 256 MiB (live graph pools) raises the trigger above what stayed.
+- Admission (`Batcher._mem_ok`, rank 0) and the store (`SessionStore._can_grow`) use `memsafe.view`: CUDA free +
+  allocator cache + the page cache credit MemAvailable - MemFree - Dirty - Writeback - max(Mapped,
+  `GLM53_TF_ADMIT_CACHE_KEEP_GB` = 2) (`GLM53_TF_ADMIT_MEM=available`, default; `free` = the old measure). Beside
+  running requests a request also needs `min(GLM53_TF_ADMIT_FREE_FLOOR_GB, ADMIT_GB)` (1 GiB) immediately free, and
+  `ADMIT_GB` + the scratch its prompt still grows by. `memsafe.AdmitLog` prints `admission waits for memory` (numbers,
+  once an episode and every 30 s) and `admission resumed after N s`; `counts["mem_deferred"]`, `stats["mem_waits"]`.
+  The load-time slot rule is unchanged. Why counting clean page cache is safe on GB10 (device memory is kernel pages;
+  reclaim hands clean cache to the driver's allocation; every "MemFree" observation so far was a check of the
+  reported figure), the margins, and the probe that verifies it: MEMORY-SAFETY.md §4.
+- `sessdisk._drop_cache` (`GLM53_TF_DROP_OWN_CACHE`, default 1): entry headers and buffered-fallback writes are
+  `fdatasync`ed and `POSIX_FADV_DONTNEED`ed (the tier is otherwise O_DIRECT).
+- A boot line (rank 0): `memory safety (patches/0550): selection scratch grow (key blocks up to 256 MiB), admission
+  available (...), allocator trim over 2 GiB unused`.
+
+Same bits: a key block view has the shape, strides and 512-byte-aligned base `torch.empty` gives, and `_scores_rows`
+writes every element of it before `torch.topk` / `_gather_sel` read it; blocks run in stream order; no chunk, piece,
+row block or grid changes. A trim changes addresses only (every graph capture already empties the cache); admission
+changes scheduling only (batched == alone). Expected (per rank): the needle's minimum at 314k from 6.4 to ~10.7 GiB
+(start 10.9 less a 160 MiB scratch), a lone ~1M prompt ~10.6 GiB (before: exhaustion), ~900k beside three busy slots
+>= ~8.1 GiB (likely 9-10; levers `GLM53_TF_SELECT_MB=128`, `ALLOC_TRIM_GB=1`), the stress minimum up; C4 under a copy
+admitted together. Offline only (CPU tests; no GPU run): the GPU plan (unit tests, the page cache probe
+`bench/pagecache_probe.py`, gates with reply sha 8794a3463259cc2f, stress + needle 314k, ~900k with 3 busy slots, C4
+during a 36 GB copy) is MEMORY-SAFETY.md §5.
+
+## 0560 — multi-slot prefill: a round's pieces in one forward (`GLM53_TF_MULTI_PREFILL`, `_ROWS`, `_WAIT_MS`; `mpf.py`, `batch.py`, `reqlog.py`)
+
+Why (RigMark W13 / W15, `docs/MULTI-PREFILL.md`, `docs/REPLAY-TTFT.md` §2): a short prompt's prefill is weight-read
+bound (a 130-row chunk reads ~97% of the routed experts, ~74 GB a rank), and a round prefilled its short prompts one
+after another (0200's `BATCH_SHORT`): C4 paid four expert reads, per-stream TTFT 1.9 s with thinking on (0540's
+`EMIT_FIRST` helps only when the first token is text: 0.93 s median); vLLM 0.8 s.
+
+- `mpf.compute`: the lean chunk (0082) over the members' rows, stacked (member i at `[off_i, off_i + R_i)`) and cut into
+  sub-blocks from each member's own start (`mpf.blocks`: never two members in one, a member's sub-blocks are its lone
+  ones). Per sub-block the attention half as alone with the member's State, position and conv carry (`Seg.tail`), the
+  FFN half's per-sub-block work as alone, the router / top-k / grouping / routed experts once over all rows, the head
+  per member's last row. Loops: `_plain` (0082), `_MultiChunk` (0084's pipeline; `attn_pre` per member, final sums per
+  row), `_MultiSplit` (0320, when a chunk of T rows would split). `lean.commit` per member with its carry.
+- `mpf.run` (both ranks): `decode._prefill` cut at its forwards: each member's setup (reset / restore, pending MTP
+  rows, `pfgrid.plan` with marks and 0540's rule, room and pages; 0550's scratch reservation when present), then the
+  members' chunks in lockstep (one group forward per chunk index), and per member after each: last row, MTP absorb,
+  DFlash2 taps, commit, the end snapshot. `Batcher._piece` then runs per member with `mpf.take`'s result in place of
+  `decode.prefill` (one changed line), so saves, remembered snapshots, stats, the first token's emit, the Stepper are
+  the lone code. A member's own error before the forward (ValueError) fails that request only.
+- `mpf.groups` (both ranks, `_execute`): the round's pieces in order, packed by equal `knobs.HEADER` values within
+  `GLM53_TF_MULTI_PREFILL_ROWS` (default the lean rows); only fast lean prefills without image rows, profile / dump
+  off, not under FAST_EXPERTS auto / once with min rows. The last member leaves its group when 0335's solo rule could
+  move its bound (it may be alone at its turn) and no other request holds a slot.
+- `mpf.more_pieces` (rank 0 plan): with the fair share allowing a piece, more waiting prompts' pieces, fewest tokens
+  left first, within the row budget. `mpf.coalesce` (rank 0, `GLM53_TF_MULTI_PREFILL_WAIT_MS`, default 10): idle and
+  fewer waiting than slots, the plan waits until 10 ms after the oldest arrival.
+- Load: both ranks' `[on, rows]` checked; boot line; request log `multi` (members of the request's group); counts
+  `multi_groups`, `multi_members`.
+
+Same bits: every call that reads per-sequence state or positions is the member's lone call on the same rows; every
+other call is per-row glue, or a fast kernel 0085 already proved row-independent (the chunking-independence of fast
+prefill rests on it); no new kernel. Memory: 2.5 MB of carries a member. Estimates (§6 there): C4 group ~0.55-0.6 s,
+first tokens ~0.6-0.7 s (thinking off) / ~0.7-0.8 s (on), C2 ~0.5 / ~0.6 s; bursts of 4-8 short prompts 2-2.8x,
+4 x 1,000 tokens ~1.7x prefill tok/s; lone requests unchanged (<= 10 ms wait when idle). Limits: attention / shared /
+dense weights are still read once a member sub-block (~15 ms a member; sharing them is the follow-up). Offline only:
+the GPU plan in MULTI-PREFILL.md §9.
+
 ## Tests
 
 | File | What it checks |
@@ -2661,6 +3504,11 @@ passed, 3 skipped). Bench (FP8, 10.7k / 85.8k context): 1.16-1.25x the one-pass 
 | `tests/cuda/test_knob_patches.py` | 0090: host-only validation (unknown / load-only / out-of-range / typed knobs, batch mode), header block round trip, the server's 400 message; on the synthetic EXL3 checkpoint: 14 knob sets == serial (greedy, sampled, drafted and serial, fresh and resumed across chunk sizes), knobs revert after each request (also a failing one) and are echoed, invalid ones fail before rank 1 hears, lookup/depth/auto_fdrafts reach the header and bound the windows, a replaying follower runs rank 0's knobs and windows with other defaults of its own, `longctx_graphs` 0 vs 1 per request past 2,051 tokens |
 | `tests/cuda/test_batch2_patches.py` | 0120 (replaces 0030's `test_batch_patches.py`). Host only: request headers and round plans round trip; piece bounds (exact, fast grid); the prefill time share; piece order, admission order, which background request steps aside; the title heuristic; the round cost model; knobs in batch mode. GPU (synthetic EXL3 checkpoint): per-slot states / DFlash2 contexts / graphs; batched rows == lone rows (logits, MTP rows, taps; 2-4 sequences; graphs first round and replay, eager); 2 and 4 requests == serial for every policy (MTP, DFlash2, auto, o / om / of, thresholds, serial, lookup), sampled and greedy, graphs and eager; uneven lengths and queued requests; per-slot prefix reuse; a 700-token prompt in pieces while another decodes; fast and lean prefill admissions == the lone fast / lean engine (grid snapshots only, resume, exact requests never resume fast snapshots); per-request knobs per sequence == lone with the same knobs; latent and expanded KV past 2,051 tokens (pieces across the limit, a crossing window, bucket-keyed graphs, resume); a client gone mid-reply; a background request stepping aside; concurrent streaming callers; slots trimmed to memory; the MLX checkpoint; a follower replaying rank 0's plans makes the same decisions |
 | `tests/cuda/test_fastk_patches.py` | 0081: fast_qmm vs qmm on the per-rank GLM shapes, M = 256/1024/1500 (close, deterministic, bitwise), BF16, strided rows, timings; fast_kda vs `kda.chain` (32 heads, aligned/unaligned pos, tf32 tolerance), the fp32 variant vs the fp32 reference, determinism, 64-aligned split == one call, `save_replay` feeds `kda.replay`, timing |
+| `tests/test_gpu_sampler_interpreter.py` | 0450 in Triton's CPU interpreter (with `tests/gpuround_interp.py`: a correctly rounded fma, launches serialized): the libm port == numpy bit for bit (uniforms, their Gumbel, near 1, every exp range); the device draw == `choose_rows` / the greedy lexsort / `_probability` (1-2 ranks, top_k 0-120, top_p, temperatures, ties); numpy's pairwise sum; the samplers with the knob == the host path; the load check |
+| `tests/libm_a64.py` | 0450, optional (`GLM53_TF_LIBM_A64`): the libm port == Ubuntu's aarch64 `libm.so.6` executed in unicorn |
+| `tests/test_gpu_round_compile.py` | 0450 on sm_121 without a GPU: the sampler's float64 is exactly as written (no contraction; fma counts), the glue and the DFlash2 chain compile; with nvcc, `kda.cu`'s slot kernels have the reference kernels' float ops per opcode and fit 64 registers |
+| `tests/cuda/test_gpu_round_patches.py` | 0450: knob; the glue kernels == the host rules (accept, stage, `mtp_next`, `f_depth`, the confidence cuts, conv shift, backlogs). GPU: `replay_slots` / `chain_slots` bitwise, the load check on GB10, the synthetic checkpoint with each part == serial, a lone request + resume |
+| `tests/cuda/test_gpu_round_resident.py` | 0450: the real `Batcher` / `Stepper` / `Resident` on a hostile fake model (CPU, interpreter): replies and committed states == serial, the MTP cache and DFlash2 context position by position, peek and lag, `kda`, context-mode drains, two ranks in threads, no device read while launching |
 | `tests/test_fastk_interpreter.py` | 0081 in Triton's CPU interpreter (no GPU): the same checks on small shapes, tf32 operand rounding emulated |
 | `tests/cuda/test_fp8_kv_patches.py` | 0220 (GPU): the FP8 writer == torch's e4m3 conversion (every finite bf16 value <= 448, random rows over 11 decades, zeros / -0.0), rows independent, error <= half an e4m3 step; FP8 dense / sparse latent attention (BM 16 / 32) == the bf16 kernels on the dequantized rows bit for bit; absorb -> attend -> expand vs the fp32 expanded reference (prints bf16 vs fp8 error); window rows == serial rows; the knob's validation. Engine with fp8 KV: layout and bytes a token, drafted == serial (11 policies), resumed == fresh, 64 / 512-row chunks same state, fp8 vs bf16 KV prefill within tolerance (quality hook), snapshots never cross formats, 3,000 tokens past the dense limit (chunks, drafting, 0050 graphs, resume), batched == alone (2 slots; 4 slots with 0200's on-set), sessions resume FP8 rows (keys carry the format), 0180 batch sessions == alone |
 | `tests/test_fp8kv_interpreter.py` | 0220 in Triton's CPU interpreter: writer == torch conversion (exhaustive bf16), rows independent, fp8 attention == bf16 on dequantized rows (dense, sparse, BM 16 / 32); the knob, session key tag, snapshot format check |
@@ -2690,8 +3538,18 @@ passed, 3 skipped). Bench (FP8, 10.7k / 85.8k context): 1.16-1.25x the one-pass 
 | `tests/test_sparse_v2_compile.py`, `tests/test_sparse_v2_emulator.py` (+ `tests/sparse_v2_emu.py`), `tests/cuda/test_sparse_v2_patches.py`, `tests/cuda/bench_sparse_v2.py` | 0410: compiled for sm_121 without a GPU (v2's softmax layout == the reference's `#mma`, kWidth 2, the loop's float op sequence and chains == the one-pass kernel's, equal PTX float counts, cp.async zero-fill gathers, shared memory / no spills, dispatch and knob); v2's own Gluon source on a CPU emulator (cp.async ring, byte-level shared memory, barrier / hazard model) == the one-pass kernel in the interpreter bitwise (FP8 / bf16, paged, every setting, counts 0-2,051, subsets), controls (unfolded / chunked differ, missing wait / barriers caught); GPU: bitwise == one pass on the real shapes for every setting, paged, 1-2,048 rows, extreme logits, the knob; bench: chunked / one pass / every v2 setting, TF/s, same-bits flag, projected tok/s |
 | `tests/cuda/test_deep_verify_patches.py`, `bench/lookupsim.py` | 0380 (the file re-runs itself with `GLM53_TF_MAX_DRAFT_ROWS=16` in a child process: the knob is read at import). Host: knobs, caps at 8 (upstream's) and 16, the two-line calibration table, cost depths past 7 only for confident drafts, 15-token lookup copies. Torch on the CPU (0180's hostile fake model): the real `Stepper` / `Batcher` (`auto` + lookup, `l15:3`, `of15`, `om15`, mixed; alone and shared) and the lone `auto_decode` with windows of 9-16 rows == serial, `depths` stats, a follower deciding the same windows. GPU: dense windows 1-16 == serial rows, long-context windows / MTP steps 1-16 through graphs == eager, lone and batched drafted replies with a 16-row DFlash2 block == serial. At 16 rows five older tests that assert the 7-draft cap fail by design (run them at the default) |
 | `tests/test_mla_expand_interpreter.py`, `tests/test_mla_expand_compile.py`, `tests/cuda/test_mla_expand_patches.py`, `tests/cuda/bench_mla_expand.py` | 0390: in the interpreter with the GPU's dot (per-element fp32 FMA chain, exact fma emulation) and nearest-even bf16, v2 == v1 (Combine-folded source) == a numpy chain for 1-8,192 rows, rows == alone, every tile / BN; compiled for sm_121: v1's dot folded, v2's dots chained, FMA path only, no unfused fp32 op in the PTX, no spills; GPU: v2 == v1 bitwise (q4 / q4mse / bf16, 1-8,192 rows, 3 seeds incl. extreme magnitudes, windows, every tile, in a CUDA graph), control vs the tensor-core kernels; bench: v1 vs v2 us a call, tile sweep |
+| `tests/cuda/test_draft_vocab_patches.py`, `tests/test_draft_vocab_interpreter.py`, `bench/draftvocab.py`, `bench/acceptpos.py` | 0420. Host only: knobs and refusals, the list file, per-rank rows (order, fill, multiple of 64, equal counts), the shipped ranking, the settings the ranks compare, the fallback window. Torch on the CPU, two ranks in two threads over a fake all-gather: `take_rows` / `attach`; the target's sampling identical with and without the list (`sample_rows`, `sample_multi`); trimmed draft draws equal on both ranks, listed, greedy coupling; `sample_drafts` == per row; `MtpChains` full iff any slot falls back; drafted == serial through the real `mtp_decode` / `draft` / `absorb` / `Engine.mtp` / `Engine.sample` (greedy / sampled; list with and without fallback, untrimmed). Compile: `qmm._qmm` at the trimmed shapes for sm_121. Interpreter: the trimmed head through `qmm.matmul` == the full head's listed columns bit for bit. GPU (synthetic checkpoint): trimmed MTP logits == listed columns (graphs incl. `mtp_full`), drafted == serial == untrimmed, lone and 4 batched, arms `mtp` / `all`, fallback off / forced |
+| `tests/test_draft_dump.py`, `tests/test_drafter_ref.py`, `tests/test_drafter_train.py`, `tests/cuda/test_drafter_ref_patches.py`, `train/`, `bench/gendata.py` | 0430 and the drafter pipeline (docs/DRAFTER-TRAINING.md). CPU (`TF_SRC=<patched tree>/src`): the dump's records, merge and prefix linking on a fake two-rank engine; the reference's `quantize4` / clip search == the engine's source, EXL3 dequantization == the engine's float64 decoder, FP8 rows == 0220's reference, the training-time chain == step-by-step drafting, DSA selection == dense below the limit, shards, export round trip, DFlash2 block independence and window; dump -> both trainers -> exports -> evaluator end to end. GPU (mount `train/` next to `tests/`): reference MTP / DFlash2 == engine on the synthetic checkpoint (rank 0's shard), `GLM53_TF_MTP_WEIGHTS` loads an export, replies identical with the dump on / off and decode rows line up; env-gated real-model acceptance parity |
+| `tests/test_decode_kernels_emulator.py` (+ `tests/decode_kernels_emu.py`), `tests/test_decode_kernels_compile.py`, `tests/cuda/test_decode_stream_patches.py`, `tests/cuda/bench_decode_kernels.py` | 0440. CPU (`PYTHONPATH=<tree>/src`): lane-level ports of `exl3_stream.cu` / `q4_stream.cu` (rings, swizzles, cp.async groups landing at random before their wait, NaN-initialised shared memory, random CTA interleavings, tickets) against matrix-level models of exl3.cu's routed path and `_qmm` + `_reduce` with an order-sensitive mma model and exact fma: bit for bit for 1-16-row windows, 4-slot mixes, skewed windows with extra member tiles, every configuration and grid, real K, the real-shape walk; rows alone == in the window; 12 negative controls; knobs, dispatch, the Triton guard, the compat hash. Compile (no GPU): every instantiation for sm_121 (spills, registers, shared memory, CTAs an SM), the PDL prologues, the verbatim helpers, `_qmm`'s TTIR / PTX sequence per shape and bucket (fully fused under 3.7.x; the unfused set under 3.8 printed). GPU: on == off bitwise (real / synthetic shapes, every configuration, PDL, graphs, CTA caps, rows alone, probes), the PDL race test (late writer + busy stream), engines (windows 1-16 graphs / eager, drafted == serial greedy / sampled, resumed == fresh); bench: old vs new µs and GB/s beside a roof probe, every configuration, with a same-bits flag |
+| `tests/test_prefetch_comm.py`, `tests/test_prefetch_comm_compile.py`, `tests/test_roce_protocol_model.py` (extended), `tests/cuda/test_prefetch_comm_patches.py`, `tests/cuda/bench_roce.py --trace` | 0460. CPU (`PYTHONPATH=<tree>/src`, Triton importable): L2PF knobs, plans on fake weights (inside weights, aligned, within budget, read order; chunk heads for one-wave 4-bit launches), expert plans, MTP keys, **the port** (stubbed kernels: `compute_multi` / `mtp_multi` reach the lone forward's a / o / e / f sites in order and join), 0040 compatibility, the one-HCA rule, RoCE knobs and `agreed()`, `trace_summary`; the protocol model with one-HCA ops and inline posts under random schedules (+ two timeout controls). sm_121 (nvcc): the prefetch kernels hold only loads / prefetches, `roce.cu` 64 registers with the lean forms; bindings syntax (`TF_CXX_INC`). GPU: every L2PF mode == off (windows 1-8, graphs / eager, replies for every policy, the Batcher with graph knobs), no weight written; the RoCE kernel with `STRIPE_KB` / `LEAN` over the loop peer, trace stamps ordered |
 | `tests/kvpool_ptx.py` | 0290, a tool (not pytest; no GPU): compiles the touched kernels for sm_121 from a tree; `--against` the output of a tree without 0290 checks the pool-off PTX is identical, and every paged variant compiles |
+| `tests/test_api_context.py`, `tests/test_prompt_tokens.py` (updated), `tests/test_serve_ops.py` (+4) | 0490, host only: `/v1/models`' `max_model_len` / `context_length`; the `context_length_exceeded` 400 (code, param, wording checked against opencode's and Hermes Agent's patterns) for chat, streamed chat and completions; engine refusals in a stream as `invalid_request_error`; `/tokenize`; token-ID prompts (exact `prompt_tokens`, bad ids refused); the boot line; serve.sh's missing-config message, context line, warnings and per-head refusal |
+| `tests/test_vision_prep.py`, `tests/test_vision.py`, `tests/test_vision_interpreter.py`, `tests/test_vision_server.py` | 0500, CPU (89): the processor == transformers' `Glm5NextImageProcessor` bit for bit, `smart_resize` / token counts == transformers'; fetch / decode limits, part shapes, prompt placement and refusals, virtual ids a function of the pixels, the registry; the tower == transformers' `Glm5NextVisionModel` (tiny config, fp32 1e-5, bf16), loading, `Encoder.table`, `Table.fixup`, the two-rank `exchange` in threads; `glue.embed` substitution in the interpreter (BF16 / 4-bit, 4 / 1 copies, never during capture); the HTTP flow (off by default, 400s, `usage`, `/tokenize`), two images vs the same image through `_resume`, `Batcher._resume`, `SessionIndex`, `DiskIndex`, page and entry keys; the lookup cut; the prompt == `Glm5NextProcessor` on the real tokenizer (`GLM53_TF_TOKENIZER_DIR`, `GLM53_TF_VISION_TEMPLATE`) |
+| `tests/cuda/test_vision_patches.py` | 0500 on a GPU: image rows set to real tokens' embedding rows == those tokens (serial / drafted, greedy / sampled, prefill rows 1 / 16 / default / fast, mid-prompt and last chunk), resumed == fresh, another image never resumes past the text, the compiled embed and graph capture; with `GLM53_TF_MODEL`: the checkpoint's tower on a screenshot (1,036 rows, deterministic, bf16 vs fp32, latency, peak memory) |
 | `tests/test_request_log.py` | 0300, host only: settings (off by default), role ids, the prefix compare; a line's fields (sizes, cache source slot / RAM / disk / none, timings, effort, finish), no text in the file (prompt, reply, reasoning, store description), head / system hashes, conversation keys, lcp any / same / other; requests in flight count as earlier partners, later arrivals do not; the window; errors and cancels logged, a failing log never raises (reported once); rotation keeps whole lines; concurrent writers; `GlmApp.run` writes one line a request (also on failure) and nothing when off; `scripts/traffic-report.py` numbers on a synthetic 12k-system-prompt log |
+| `tests/cuda/test_replay_ttft_patches.py` | 0540 (32). Host only: `pfgrid.plan(before=True)` (on-grid snapshot at n - 64 with the cut, RigMark's last pieces, the resend's plan, marks deduplicated; off-grid plans == 0085's for every length / resume / chunk size tried, every snapshot a strict prefix within tail + G; exact plans; the knob). Torch on the CPU, `test_batch_sessions_patches`' hostile fake model: resume at end - grid == fresh (first token, state, reply; exact with cut chunks, exact, fast); the real batcher + store: a resent prompt resumes at (n - 1) // 64 * 64 (0 without the rule), replies == fresh, no more snapshots kept; 4 short prompts together: one round, fewest first, each first token out before the next piece (held without `EMIT_FIRST`), batched == alone. Also: `test_decode_overlap_patches.py`'s emit test with / without `EMIT_FIRST` |
+| `tests/cuda/test_multi_prefill_patches.py` | 0560 (83 host / CPU + 4 GPU). Host only: knob / settings, `more_pieces`, `pack`, sub-blocks per member, the solo guard. Torch on the CPU, test_lean_patches' hash model: a group forward == each member's lone lean chunk bit for bit (last logits, final rows, taps, streams, KDA state / conv, caches) for 2-5 members of 1-600 rows at positions 0-192, 0082's loop and every 0084 variant, EXL3 / MLX, any member order; experts once a group; controls (shared carry, group positions, straddling sub-blocks) caught; the driver's real hooks; two real processes over gloo with 0320's split == lone on both ranks. The real `Batcher` on the hostile fake model: C4 in one group (fewest first, each first token out in turn, replies and final states == alone, 1-3 lockstep chunks); resends resume at n - 64 from the group's snapshots; 4 interleaved sessions with groups (roomy / tiny store) == fresh; a follower forms the same groups; other knobs / image rows / a member's error / decoders in the round; more pieces past BATCH_SHORT; the last member and the solo rule; the idle wait. GPU (synthetic EXL3): 4 prompts grouped == alone, lean and pipelined, greedy and sampled, next turns resumed |
+| `tests/test_memory_safety.py`, `tests/cuda/test_memory_safety_patches.py` | 0550. Host (20; the selection in Triton's interpreter): the size model == `sparse`'s rules and == the blocks `select_pools_blocked` allocates; the growth bound vs W15 (0.74 / 0.78), quadratic, 16 GiB at 1M; the scratch <= 256 MiB at every piece to 1M, admission's reservation; scratch (`grow` / `max`, junk-filled, grown, too small) == `off` == sorted on random / tied / -0.0 / NaN scores; a reserved scratch allocates no key block; meminfo, the page cache credit and margins; W15's copy admits with `available`, waits with `free` (== the old rule on 2,000 cases), the floor, the log; `Batcher._mem_ok` / `SessionStore._can_grow` on fakes; the trimmer (trigger, interval, hysteresis); `drop_file_cache`. GPU: scratch == off == sorted at 70k-1M with 262,148 pools; `memory_reserved` grows by >= half the bound over a 100k -> 230k sweep without the scratch and <= 160 MiB with it; a capture empties the cache; the trim frees; engine replies with scratch + a trim before every chunk == off, serial and drafted |
 | `tests/cuda/test_prefix_share_patches.py` | 0310. Host only: settings, role-token lookup, boundary points, `marks(extra=)` on the exact / fast grid, the `prefix` entry cap replayed by rank 1. Torch on the CPU (0180's hostile fake model, real `Batcher` / `SessionStore`, 0290's pooled slots): today's miss vs the switch's resume, bursts with / without the wait, a cancelled partner, random agent traffic (exact / fast, roomy / tiny, keep 4 / 1, pool roomy / tight) all == fresh + serial, a replaying follower. GPU (synthetic checkpoint): a new session resumes at the system end (exact / fast, greedy / sampled) with replies == alone, a burst of 4 waits and resumes, a follower replays |
 | `tests/cuda/test_expert_tc_patches.py` | 0330. Host only (numpy; the patched source via `TF_SRC`): the helpers copied from `exl3_fast.cu` are the same text, and the epilogue arithmetic lines are fat's; the env switch (tc is a fat-family mode; CFG / TICKET / CTAS parsed and refused); `routed`'s dispatch (tc on the shared input, fat when the sign vectors differ, fast2 for knob 0 and auto's window). A Python model of `exl3_tc.cu` for its 6 configurations and 1 / 3 / 8 / 32 column blocks: items cover every (expert, pass, block group) once (stride and ticket walks); every B value an mma receives is the right member row and k through an emulated ldmatrix.x4 and the m16n8k16 fragment layout (zero-filled rows past the count); every A word is fat's trellis word; the epilogue writes each output of each present block once from the right accumulator; shared-memory and register budgets. The mbarrier protocol simulated with random interleavings and copy completion times: no deadlock, no stage read before it lands or refilled while read, item info never overwritten in use; the control (one arrival too few on "empty") is caught. GPU: tc == fast2 == fat bit for bit (Xd, Y; cfg 0-3; ticket on / off; a CTA cap; 64-8,192 rows, uniform / skewed; a 384-wide shape with 3 blocks and many passes); row subsets and permutations; repeatable; probes launch. Engine: committed state tc == fast2 (lean and not), drafted == serial, resumed == fresh, snapshots shared with fast2 both ways. `tests/cuda/bench_experts.py --tc [--contend] [--variants ...]`: tc configurations, static stride, CTA caps and probes beside fast2 / fat, the DRAM floor column, and every kernel timed again beside a busy side stream |
 | `tests/cuda/test_solo_piece_patches.py` | 0335. Host only: `batchplan.solo_piece`; piece bounds under 3,000 random mixes of solo and normal pieces (on the grid, increasing, ending at the prompt, never more pieces alone); `Batcher._piece` on a fake engine: solo bound only when alone, re-evaluated at the next boundary, `solo_pieces` in the stats; the refused values; lazy Xu (allocated on first use); the memory table. GPU (synthetic EXL3 checkpoint): a fast lean prompt alone prefills in solo pieces == the lone engine; a request admitted mid-prefill makes the next pieces normal, both replies exact; a follower replays the same rounds; lazy Xu engine same reply and smaller lean set |

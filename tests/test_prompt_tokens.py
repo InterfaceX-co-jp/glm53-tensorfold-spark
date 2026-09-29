@@ -244,12 +244,11 @@ def make_app(monkeypatch, limit, mode):
 
 
 def old_check_message(prompt, asked, limit):
-    need = prompt + (int(asked) if asked else 1)
-    if need <= limit:
-        return None
-    detail = f"{prompt} prompt tokens plus max_tokens {int(asked)}" if asked else f"a {prompt}-token prompt"
-    return (f"this request needs a {need}-token context ({detail}), and this server was started for {limit}: "
-            f"restart both ranks with --context {need} or more")
+    """The context check's answer (patches/0490: OpenAI's context_length_exceeded wording and code)."""
+
+    from tensorfold.cuda.server import context_problem
+
+    return context_problem(prompt, int(asked) if asked else None, limit)
 
 
 @pytest.mark.parametrize("mode", ["0", "1", "verify"])
@@ -260,7 +259,8 @@ def test_check_then_run_encodes_once(monkeypatch, mode):
     for limit, asked in ((n + 10, 5), (n + 10, 50), (n, None), (n + 1, None), (4096, None)):
         app, calls = make_app(monkeypatch, limit, mode)
         body = {"messages": copy.deepcopy(messages), "max_tokens": asked}
-        assert app.check(body) == old_check_message(n, asked, limit)
+        got, want = app.check(body), old_check_message(n, asked, limit)
+        assert got == want and getattr(got, "code", None) == getattr(want, "code", None)
         assert calls["n"] == 1
         if app.check(body) is None:
             calls["n"] = 0
