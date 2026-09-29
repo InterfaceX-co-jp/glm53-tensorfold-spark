@@ -108,6 +108,7 @@ Long prompts refused or cut short: [Context smaller than expected](docs/TRYING.m
 ## Contents
 
 - [Quickstart](#quickstart)
+- [RigMark baseline](#rigmark-baseline-2026-09-29)
 - [Benchmarks](#benchmarks)
 - [Real-agent use](#real-agent-use)
 - [Requirements](#requirements)
@@ -118,6 +119,22 @@ Long prompts refused or cut short: [Context smaller than expected](docs/TRYING.m
 - [Layout](#layout)
 - [Licensing](#licensing)
 - [Credits](#credits)
+
+## RigMark baseline (2026-09-29)
+
+[RigMark](https://github.com/alexellis/rigmark) standard suite, unmodified settings (receipt and details in
+[`results/rigmark/`](results/rigmark/README.md)). **A baseline: we expect to improve it over the coming days.**
+
+| RigMark (median) | TensorFold | vLLM TP2 (Alex Ellis, published) |
+|---|---:|---:|
+| Code decode tok/s | **68.6** | 42.6-44.0 |
+| Prose decode tok/s | **43.2** | 18.9-22.2 |
+| Structured decode tok/s | **88.2** | 54.6-64.9 |
+| C1 / C2 / C4 aggregate tok/s | **54.3 / 65.5 / 82.2** | 31.2-31.6 / 42.0-42.8 / 61.1-66.1 |
+| Cold prefill 64K tok/s | 1,621 | **1,905-1,922** |
+| Immediate replay 64K tok/s | 6,304 | **11,364-11,464** |
+
+Different weights and drafter policy than Alex's runs; see the notes in [`results/rigmark/`](results/rigmark/README.md).
 
 ## Benchmarks
 
