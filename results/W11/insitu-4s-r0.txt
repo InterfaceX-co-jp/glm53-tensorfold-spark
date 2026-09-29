@@ -1,0 +1,51 @@
+rounds 162
+('grouped', 'gu', 11)                    calls/round    9.12  median   1065.3 us  mean   1099.5  ms/round  10.031
+('grouped', 'gu', 12)                    calls/round    8.56  median   1108.2 us  mean   1148.5  ms/round   9.833
+('grouped', 'gu', 13)                    calls/round    7.03  median   1185.9 us  mean   1232.7  ms/round   8.667
+('grouped', 'gu', 14)                    calls/round    5.19  median   1189.2 us  mean   1252.4  ms/round   6.502
+('grouped', 'gu', 10)                    calls/round    6.01  median    997.8 us  mean   1035.7  ms/round   6.227
+('_qmm', 1, 197, 4)                      calls/round   34.00  median    160.4 us  mean    162.2  ms/round   5.515
+('grouped', 'dn', 11)                    calls/round    9.12  median    522.0 us  mean    543.3  ms/round   4.957
+('grouped', 'dn', 12)                    calls/round    8.56  median    542.1 us  mean    566.6  ms/round   4.851
+('grouped', 'dn', 13)                    calls/round    7.03  median    585.2 us  mean    608.9  ms/round   4.281
+('gather_kernel',)                       calls/round  115.17  median     20.7 us  mean     36.0  ms/round   4.149
+('_qmm', 1, 1210, 1)                     calls/round    4.89  median    821.7 us  mean    838.0  ms/round   4.097
+('grouped', 'dn', 14)                    calls/round    5.19  median    585.0 us  mean    616.9  ms/round   3.203
+('grouped', 'gu', 9)                     calls/round    3.19  median    948.4 us  mean    974.9  ms/round   3.111
+('grouped', 'dn', 10)                    calls/round    6.01  median    496.0 us  mean    513.5  ms/round   3.087
+('_qmm', 1, 64, 2)                       calls/round   78.29  median     19.5 us  mean     37.7  ms/round   2.950
+('_qmm', 1, 32, 4)                       calls/round   57.58  median     29.7 us  mean     30.9  ms/round   1.777
+('grouped', 'gu', 15)                    calls/round    1.31  median   1288.1 us  mean   1346.8  ms/round   1.762
+('_qmm', 1, 64, 8)                       calls/round   15.58  median    109.8 us  mean    109.8  ms/round   1.710
+('_qmm', 1, 192, 1)                      calls/round   10.99  median    147.2 us  mean    153.1  ms/round   1.683
+('grouped', 'dn', 9)                     calls/round    3.19  median    469.8 us  mean    485.1  ms/round   1.548
+('_qmm', 1, 64, 4)                       calls/round   20.60  median     71.9 us  mean     72.7  ms/round   1.498
+('grouped', 'gu', 16)                    calls/round    0.78  median   1295.9 us  mean   1401.0  ms/round   1.090
+('grouped', 'gu', 8)                     calls/round    1.09  median    892.3 us  mean    924.8  ms/round   1.010
+('grouped', 'dn', 15)                    calls/round    1.31  median    629.7 us  mean    663.8  ms/round   0.869
+('gateup_epilogue_kernel',)              calls/round   44.29  median     17.1 us  mean     17.2  ms/round   0.760
+('rot_in_kernel',)                       calls/round   44.29  median     14.6 us  mean     14.5  ms/round   0.643
+('_qmm', 1, 128, 4)                      calls/round   13.29  median     39.9 us  mean     40.5  ms/round   0.538
+('grouped', 'dn', 16)                    calls/round    0.78  median    640.2 us  mean    686.7  ms/round   0.534
+('_reduce',)                             calls/round  264.67  median      1.7 us  mean      2.0  ms/round   0.531
+('grouped', 'dn', 8)                     calls/round    1.09  median    443.9 us  mean    455.9  ms/round   0.498
+('down_epilogue_kernel',)                calls/round   44.29  median     10.6 us  mean     10.8  ms/round   0.480
+('_qmm', 1, 16, 8)                       calls/round   24.04  median     15.8 us  mean     17.1  ms/round   0.411
+('_qmm', 1, 64, 1)                       calls/round   68.00  median      4.6 us  mean      4.7  ms/round   0.318
+('_qmm', 1, 48, 4)                       calls/round    7.99  median     37.1 us  mean     37.6  ms/round   0.301
+('grouped', 'gu', 2)                     calls/round    0.49  median    306.8 us  mean    306.7  ms/round   0.150
+('grouped', 'gu', 7)                     calls/round    0.12  median   1016.0 us  mean   1003.6  ms/round   0.118
+('_qmm', 1, 3, 8)                        calls/round   13.29  median      8.6 us  mean      8.9  ms/round   0.118
+('grouped', 'gu', 1)                     calls/round    0.71  median    157.7 us  mean    160.4  ms/round   0.114
+('grouped', 'gu', 3)                     calls/round    0.25  median    442.8 us  mean    439.0  ms/round   0.111
+('_swiglu',)                             calls/round   55.28  median      1.7 us  mean      1.9  ms/round   0.102
+('grouped', 'gu', 4)                     calls/round    0.15  median    583.3 us  mean    581.4  ms/round   0.086
+('grouped', 'dn', 2)                     calls/round    0.49  median    157.0 us  mean    158.2  ms/round   0.077
+('grouped', 'gu', 6)                     calls/round    0.08  median    867.8 us  mean    875.4  ms/round   0.070
+('grouped', 'dn', 1)                     calls/round    0.71  median     83.8 us  mean     86.4  ms/round   0.061
+('grouped', 'dn', 7)                     calls/round    0.12  median    497.6 us  mean    494.6  ms/round   0.058
+('grouped', 'dn', 3)                     calls/round    0.25  median    226.8 us  mean    225.9  ms/round   0.057
+('grouped', 'gu', 5)                     calls/round    0.06  median    738.5 us  mean    719.2  ms/round   0.044
+('grouped', 'dn', 4)                     calls/round    0.15  median    291.5 us  mean    293.1  ms/round   0.043
+('grouped', 'dn', 6)                     calls/round    0.08  median    423.9 us  mean    422.4  ms/round   0.034
+('grouped', 'dn', 5)                     calls/round    0.06  median    366.9 us  mean    355.9  ms/round   0.022

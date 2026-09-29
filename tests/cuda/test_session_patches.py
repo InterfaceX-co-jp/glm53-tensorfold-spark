@@ -461,7 +461,9 @@ def _fake_turn(g, prompt, policy: str, tokens: int = 30):
     return out, stats["cached"], state
 
 
-@pytest.mark.parametrize("budget", [400.0, 40.0], ids=["roomy", "tight"])
+# tight: 36 pages (40 until patches/0540, whose exact prompt snapshots end up to 64 tokens earlier and so are a little
+# smaller: one seed stopped evicting at 40); every case evicts with GLM53_TF_SNAPSHOT_BEFORE_END=1 and =0
+@pytest.mark.parametrize("budget", [400.0, 36.0], ids=["roomy", "tight"])
 @pytest.mark.parametrize("policy", ["0", "2"])
 @pytest.mark.parametrize("rows", [64, 200])
 def test_sessions_on_a_hostile_fake_model(monkeypatch, rows, policy, budget):
@@ -801,14 +803,18 @@ def test_rank1_follows_rank0(ckpt):
         follower.follow()
     ix, fx = lead.store.index, follower.store.index
     assert fx.digest() == ix.digest()
-    ix.budget = fx.budget = 4 * max(x.private for x in ix.entries.values()) + 2 * ix.extent_bytes   # evictions
+    # evictions (W15: one extent of shared pages, was two: with patches/0540 a resend's snapshot is the prompt's own
+    # (n - 64), so 6 of 19 saves are duplicates, the entries share one extent and 4 entries + 2 extents never evicted)
+    ix.budget = fx.budget = 4 * max(x.private for x in ix.entries.values()) + 1 * ix.extent_bytes
     for i, name in enumerate("BACBAACB"):
         reply, stats = _gen(lead, turns[name], s, policy="auto:1:1:0")
         shas.append(stats.get("sha256"))
         turns[name] = turns[name] + reply + [i]
     with pytest.raises(_Done):
         follower.follow()
-    assert got == shas and ix.counters["evicted"] > 0 and lead.store.stats["restores"] > 0
+    print("rank1_follows_rank0:", dict(ix.counters), dict(lead.store.stats))
+    assert got == shas
+    assert ix.counters["evicted"] > 0 and lead.store.stats["restores"] > 0, (dict(ix.counters), dict(lead.store.stats))
     assert fx.digest() == ix.digest() and sorted(fx.entries) == sorted(ix.entries)
     assert fx.counters == ix.counters and follower.store.stats == lead.store.stats
 

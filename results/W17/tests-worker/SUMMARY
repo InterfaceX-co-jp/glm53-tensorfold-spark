@@ -1,0 +1,10 @@
+00:07:34 start worker
+00:11:12 worker multi rc=1 218s :: 4 failed, 83 passed in 213.66s (0:03:33)
+00:13:00 worker memsafe rc=0 108s :: 25 passed in 101.40s (0:01:41)
+00:14:46 worker 1m rc=1 106s :: 3 failed, 42 passed in 102.38s (0:01:42)
+00:17:50 worker batch-sessions rc=0 184s :: 28 passed in 181.17s (0:03:01)
+00:19:15 worker session-disk rc=1 85s :: 2 failed, 30 passed in 80.83s (0:01:20)
+00:22:18 worker fastpf rc=0 183s :: 29 passed in 179.10s (0:02:59)
+00:25:59 worker cindep rc=0 221s :: 54 passed in 218.14s (0:03:38)
+00:27:50 worker engine rc=0 111s :: 12 passed in 107.21s (0:01:47)
+00:27:50 done worker

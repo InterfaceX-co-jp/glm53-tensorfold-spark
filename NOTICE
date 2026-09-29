@@ -51,6 +51,22 @@ b12x fast-prefill kernels (patches/0240)
   blocks of all four streams; the one-pass-per-row sparse MLA softmax) on this project's arithmetic; no b12x code is
   copied. The changes are listed in the files' headers and in vendor/TensorFold/THIRD_PARTY_NOTICES.md as patched.
 
+log / exp of ARM Optimized Routines as built into glibc 2.39 (patches/0450)
+  patches/0450-glm-gpu-round.patch (glm5_next/cuda/gpusample.py) re-implements, for the GPU, the float64 log and
+  exp that numpy calls on aarch64: glibc 2.39's __log / __exp (sysdeps/ieee754/dbl-64/e_log.c, e_exp.c), which come
+  from ARM's Optimized Routines (https://github.com/ARM-software/optimized-routines, math/log.c, math/exp.c;
+  Copyright (c) Arm Limited; MIT OR Apache-2.0 WITH LLVM-exception). The algorithm and its coefficient / lookup
+  tables (e_log_data.c / e_exp_data.c, read from Ubuntu's libm.so.6 2.39-0ubuntu8.9 binary and equal to those
+  sources) are reproduced so that the GPU sampler's bits equal the host's; the instruction order follows the
+  binary. tests/libm_a64.py compares against that binary, which each user downloads.
+
+Public text behind the shipped draft vocabulary ranking (patches/0420)
+  The token ranking draft_vocab.txt in patches/0420-glm-draft-vocab.patch holds token ids ordered by frequency,
+  counted by bench/draftvocab_public.py in: OpenAssistant/oasst1 (Apache-2.0), SWE-Gym/OpenHands-SFT-Trajectories
+  (MIT), CPython 3.14.7 Lib/ and Doc/ (PSF License 2.0), denoland/std (MIT) and BurntSushi/ripgrep 14.1.1 (MIT OR
+  Unlicense), at the revisions pinned in that script. No text of these sources is included, only token counts'
+  order.
+
 NVIDIA PyTorch container (nvcr.io/nvidia/pytorch:26.07-py3)
   The Docker image is built FROM this container and is subject to the NVIDIA Deep Learning Container
   License. PyTorch (BSD-3-Clause) and Triton (MIT) come from it.

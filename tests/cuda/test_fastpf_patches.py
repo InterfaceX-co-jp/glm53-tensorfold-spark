@@ -40,6 +40,13 @@ from tensorfold.families.glm5_next.cuda import fastpf  # noqa: E402
 
 gpu = pytest.mark.skipif(not CUDA, reason="CUDA only")
 SAMPLINGS = ["sampled", "greedy"]
+def fastpf_before_end() -> bool:
+    """patches/0540 (GLM53_TF_SNAPSHOT_BEFORE_END, default on): a whole prompt's snapshot strictly before its end."""
+
+    import os
+    return os.environ.get("GLM53_TF_SNAPSHOT_BEFORE_END", "").strip() != "0"
+
+
 GRID = 128                   # the fast engines' chunk grid (GLM53_TF_PREFILL_ROWS=128)
 
 
@@ -521,14 +528,16 @@ def test_fast_resumed_equals_fresh(ef, kernels, sampling):
     p3 = p2 + more(200)
     warm, stats = _gen(ef, p3, s)
     assert stats["cached"] == 384 and warm == _cold(ef, p3, s)
-    # a prompt ending on the grid keeps its end state, pending MTP row included
+    # a prompt ending on the grid keeps its end state, pending MTP row included (patches/0540, W15: with
+    # GLM53_TF_SNAPSHOT_BEFORE_END on, the default, its snapshot is the last grid point strictly before the end, 128)
+    at = GRID if fastpf_before_end() else 256
     p4 = more(256)
     ef.cache = []
     _gen(ef, p4, s)
-    assert len(ef.cache[-1].ids) == 256 and ef.cache[-1].mtp_len == 255
+    assert len(ef.cache[-1].ids) == at and ef.cache[-1].mtp_len == at - 1
     tail = more(2)
     warm, stats = _gen(ef, p4 + tail, s, policy="2")
-    assert stats["cached"] == 256 and warm == _cold(ef, p4 + tail, s)
+    assert stats["cached"] == at and warm == _cold(ef, p4 + tail, s)
     # shorter than the grid: nothing to keep, nothing to resume
     ef.cache = []
     _gen(ef, more(50), s)

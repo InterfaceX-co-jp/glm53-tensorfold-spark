@@ -1,8 +1,9 @@
 # Changes summary
 
 > **Work in progress.** Every number below comes from one pair of DGX Sparks and the abliterated checkpoint
-> `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`, over three days (2026-09-27 to 2026-09-29). Statuses and defaults may
-> change. What changed since the initial public release: [Update 2026-09-29](#update-2026-09-29-patches-0230-0410-test-windows-w1-w10).
+> `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`, over four days (2026-09-27 to 2026-09-30). Statuses and defaults may
+> change. Updates since the initial public release: [2026-09-30](#update-2026-09-30-patches-0420-0560-test-windows-w11-w17),
+> [2026-09-29](#update-2026-09-29-patches-0230-0410-test-windows-w1-w10).
 
 Every engine change is a patch against TensorFold `2f8e514` (0.3.4), applied at image build, with a `GLM53_TF_*` knob
 that defaults to upstream behaviour. Details, knobs and exactness arguments: [`PATCHES.md`](PATCHES.md). Raw numbers:
@@ -12,6 +13,75 @@ that defaults to upstream behaviour. Details, knobs and exactness arguments: [`P
 kernel timings, a microbenchmark or arithmetic, not an end-to-end A/B. **Status**: *on* = set in both production
 configs (`config/prod*.env.example`); *batch* = on in the batch configs (production and 4 x 256k) only; *single* = single-stream config only;
 *opt-in* = off unless you set it; *rejected* = tried, measured, left off; *superseded* / *tool* as noted.
+
+## Update 2026-09-30 (patches 0420-0560, test windows W11-W17)
+
+Since the 2026-09-29 update (patches 0001-0410), 14 patches were added (0420-0560, 71 in total) and seven GPU test
+windows run (W11-W17; `docs/RESULTS.md`, `results/W11`-`W17`, `results/FINAL-20260930/`, `results/rigmark/`). The
+production config (`config/prod.env.example`) is W17's: image b9 = patches 0001-0490 + 0500 + 0540 + 0550 + 0560, image
+input on, replay snapshots at n - 64, reasoning in the `reasoning` field only, multi-slot prefill on
+(`GLM53_TF_MULTI_PREFILL=1`), 0550 built in but off. Its gates (W17, load M6): exact 10/10 and batchexact 4/4 twice,
+13/13 glmbench reply hashes equal to b7, 92/92 grouped replies equal to the same request alone, prefill 24.5k / 98k
+1,603-1,612 tok/s, MMLU-200 88.0%, refusals 0/10, needle at 314k found, no OOM; the 8 GiB memory gate was missed after
+W17's heavier warm-up by every config, the previous production config included (4 x 250k stress min 7.50 / 6.92 GiB,
+b7 7.47 / 7.41; see RESULTS W17). RigMark, 3 runs averaged (2026-09-30, mean with min-max): code / prose / structured
+67.9 (67.4-68.6) / 43.0 (42.2-43.5) / 88.8 (88.6-89.0) tok/s, C1 / C2 / C4 53.1 / 70.1 / 91.0 (89.5-92.1), cold 64K
+1,620 (1,618-1,621), replay TTFT 64K 0.27 (0.27-0.27) s, C4 per-stream TTFT 0.89 (0.88-0.89) s.
+
+Adopted (on in `config/prod.env.example`):
+
+| Patch | What | Gain (measured) | Window |
+| --- | --- | --- | --- |
+| 0460 `glm-prefetch-comm` | L2 prefetch of the next kernels' weights in every decode path, incl. the batcher's (`GLM53_TF_L2PF=1`, `_MB=8`); two bugs found by its unit tests fixed before any load | 1 stream +2.4-2.5%, lone requests +2.8-3.2%, 4 streams +1.2%; reply hashes equal | W12 |
+| `GLM53_TF_BATCH_CAPTURE_AFTER=8` (0200's knob, was 3) | capture a 4-slot round's graph after 8 sightings (keys rarely repeat; a capture costs a forward) | 4 streams +2.0% (with 0460: +2.8%, 81.2 tok/s) | W11, W12 |
+| 0490 `glm-api-context` | `/v1/models` `max_model_len` / `context_length`, OpenAI `context_length_exceeded` 400s, `POST /tokenize`, token-id prompts on `/v1/completions`, the KV pool sized to the slot capacity (a request within 64 tokens of 1M was refused); host-side, on by default | functional (RigMark's prefill phase needs it); same bits | W12 |
+| 0500 `glm-vision` | image input: OpenAI `image_url` parts (`data:` and http(s)), the checkpoint's BF16 vision tower on rank 0 (1.13 GB), preprocessing bit for bit with transformers' processor, image rows as content-derived virtual token ids so every cache tells images apart (`GLM53_TF_VISION=1`, 64 / 64 MB caches); one bug (MTP head graphs in prefill absorb) found and fixed in W14 | screenshots / receipts / 12 px text / counts / charts read correctly; TTFT 0.76 s (512 x 512) to 2.8 s (1080p); text bit-identical on / off | W14, W15 |
+| 0540 `glm-replay-ttft` | a prompt's snapshot at its last 64-grid point strictly before its end (`GLM53_TF_SNAPSHOT_BEFORE_END`, default on); a piece's first token emitted when the piece ends (`GLM53_TF_EMIT_FIRST`, default on) | identical 8K / 32K / 64K prompt resent: TTFT 5.1 / 9.9 / 10.4 -> 0.21-0.26 s, byte-identical output (negative controls in RESULTS W15 §6); C4 first tokens median 1.46 -> 0.93 s without thinking (none with thinking); cold 8K grid-aligned -1.8% | W15 |
+| `GLM53_TF_REASONING_FIELDS=reasoning` (0160's knob) | thinking in `reasoning` only, as the vLLM kit sends it (RigMark counted `both` twice) | functional | W15 |
+| 0560 `glm-multi-prefill` | a round's prefill pieces in one forward: each member's rows cut into its own sub-blocks, the router and routed experts once over every row, each member with the bits it gets alone (`GLM53_TF_MULTI_PREFILL=1`) | C4 per-stream first tokens (RigMark shape, thinking low) 1.64 -> 0.82 s, C2 -18%; RigMark C4 aggregate 81.8-82.8 -> 91.0 tok/s, C4 TTFT 1.63-1.91 -> 0.89 s; 92/92 grouped == alone, prefill and decode unchanged; -0.5 GiB on the worker in the 4 x 250k stress | W17 |
+
+Measured and not adopted (the patches stay in the series, off by default):
+
+| Patch | Result | Window |
+| --- | --- | --- |
+| 0440 `glm-decode-stream` | persistent streaming routed-expert (E1) and 4-bit GEMV (E2) kernels, same bits: bitwise and PDL race tests pass; E1 0.74-0.80x of today's kernels in the microbench (~160 GB/s, loads in flight), E2 -3.9% at 1 stream end to end | W12 |
+| 0450 `glm-gpu-round` | exact GPU sampler (glibc's aarch64 `log` / `exp` ported bit for bit) and GPU-resident batch rounds: exact in every mode; sampler 0%, resident -2.3% at 1 stream / +0.5-1.2% at 4 streams, PEEK=0 -4% | W12 |
+| 0460's RoCE latency knobs (`GLM53_TF_ROCE_STRIPE_KB` / `_INLINE` / `_LAZY_CQ` / `_LEAN`), L2PF 4 MiB, site `e` | within bench noise; +0.8%; 0% | W12 |
+| `GLM53_TF_BATCH_GRAPHS=0` | 4 streams +1.9%, but lone requests in slots 1-3 -3% (0510's `lone` mode is the prototype that keeps both) | W11, W12 |
+| 0510 `glm-batch-graphs-lone` | lone-slot graphs (`BATCH_GRAPHS=lone`): 4 streams +0.4%, under the +0.7% bar; split verify graphs (`VERIFY_SPLIT=4`): 1 stream -0.5% (the real verify graph launch costs only ~11-14 us host); same bits | W16 |
+| 0520 `glm-hc-fused` | microbenchmark gate failed (fused / Triton 0.58x at 1 row, 0.92-0.98x at 2-4 rows); no server load; same bits | W16 |
+| 0530 `glm-http-pin` | `CPU_PIN=http` with locked clocks: 4 streams +0.7%, inside the noise band (a trace-only load gave +1.1%) and confounded with the clock lock; needs a clean A/B | W16 |
+| 0550 `glm-memory-safety` | in the production image, off (`GLM53_TF_ADMIT_MEM=free`, `_SELECT_SCRATCH=off`, `_ALLOC_TRIM_GB=0`): the 314k needle's dip 1.7 instead of 4.0 GiB and the page-cache probe passed, but the first long prefill after a burst of short requests ran -9.8% / -3.5% (and 1,512 / 1,541 after the needle) in 2 of 4 prefill pairs, never with it off; next: the same sequence with only the trim off | W17 |
+| DFlash drafter comparison | modal-labs `GLM-5.3-Flash-DFlash`: tokens a round -8.2% prose / -8.5% code / -17.5% agent, glmbench -2.5%: not adopted; incoai `bf582e4e`: parity with production `7d74cdd` (acceptance within +-0.01, greedy decode -2.6 / -2.3 / +2.8%), not a win; production keeps `7d74cdd` | W16 |
+
+Offline only (CPU-tested, off; GPU plans in each doc; 0510-0530 were measured in W16, 0550 and 0560 in W17, above):
+
+| Patch | What | Estimate / status |
+| --- | --- | --- |
+| 0420 `glm-draft-vocab` | the drafters' head over a ranked token list, per rank, with a CJK-safe fallback (`GLM53_TF_DRAFT_VOCAB`) | +0.5-0.8% at 1 stream with a list from real agent traffic; the shipped list is built from public text (`bench/draftvocab_public.py`; the study's list came from private sessions) and covers less (79% vs 90% at 16k ids): docs/DRAFT-VOCAB.md |
+| 0430 `glm-draft-dump` | drafter-training records (`GLM53_TF_DRAFT_DUMP`) and a distilled MTP head override (`GLM53_TF_MTP_WEIGHTS`); trainers in `train/` | tool; reads only, replies byte-identical |
+| 0470 `glm-nonexpert-q8` | 8-bit non-expert weights and a per-class precision map | -6.5% to -16% decode, +0.8-2.0 GiB a node, about a point of MMLU at most: docs/QUALITY-PLAN.md |
+
+Measurement and analysis: W11 (nsys of the decode round, bandwidth / launch probes, per-position draft acceptance;
+`docs/DECODE-PLAN.md` updated), `docs/THEORY-2.md` (the decode round's critical path and 12 ranked ideas, the source
+of 0510-0530), W13 (RigMark baseline), `docs/DECODE-KERNELS.md`, `docs/GPU-ROUND.md`, `docs/PREFETCH-COMM.md`,
+`docs/HC-FUSED.md`, `docs/VISION.md`, `docs/REPLAY-TTFT.md`, `docs/MEMORY-SAFETY.md`, `docs/MULTI-PREFILL.md`,
+`docs/QUALITY-PLAN.md`, `docs/DRAFT-VOCAB.md`, `docs/DRAFTER-TRAINING.md`, `docs/DRAFTER-SEARCH.md` (no public drafter
+trained for this abliterated target), `docs/SFXNZ-AUDIT.md` (the sfxnz NVFP4 vLLM kit), `docs/UPSTREAM-0362-AUDIT.md`
+(TensorFold 0.3.6.2: not rebased; its EXL3 kernels do not reach the GLM path and their ideas are inside 0440; a
+rebase is deferred to after RigMark), `docs/RIGMARK.md`.
+
+Launcher, tools and data: `scripts/rigmark/` (turnkey RigMark runs), `serve.sh build` takes `PATCHES="..."` (a patch
+subset, e.g. exactly image b7), `bench/longexact.py` (exactness past the indexer's top-2,048), `bench/mmlu_full.py`,
+`bench/divergence.py`, `bench/gendata.py`, `bench/acceptpos.py`, `bench/pagecache_probe.py`, `bench/draftvocab.py` /
+`draftvocab_public.py`, `train/`; synthetic vision test images with ground truth (`results/W14/img/`, `mkimg.py`).
+Memory notes: with the tower the head node binds as much as the worker (W15 stress 8.27 / 8.28 GiB); the 314k needle
+after the stress and MMLU dipped to 6.39 / 6.42 GiB for ~35 s (explained in docs/MEMORY-SAFETY.md, 0550); a large file
+copy on the head node serialized concurrent requests (page cache counted as used; 0550). W17's heavier sequence (~200
+short requests first) took every config under the 8 GiB stress bar, the previous production config b7 included
+(production b9: stress 7.50 / 6.92 GiB, needle 6.04 / 5.46; b7 7.47 / 7.41 and 6.21 / 5.81; no OOM). `serve.sh start`
+now drops the page cache before a start and checks rank 0's request slot count (W16: a start after a `docker load`
+came up with 1 slot and no error).
 
 ## Update 2026-09-29 (patches 0230-0410, test windows W1-W10)
 
@@ -86,7 +156,10 @@ image lacks it (0230). Memory notes: the worker node binds; a 314k needle right 
 | 09-28 16:35 | W6: + 0290 shared KV pool | - | - / 1,252 / 1,250 | **4 requests, 1M pool, 1M a request** | needle at 358k found; 4 x 300k overfill stress passes |
 | 09-28 19:15 | W8: + 0300 / 0310 / 0320 / 0335, 8,192-row lone chunks | - | - / 1,468-1,473 / 1,447-1,451 | same | 4-session burst over an ~18k system prompt 28 s instead of 72 s |
 | 09-28 23:26 | W9: + 0230/0350 RoCE, 0360 b12x bit 4, back to 4,096-row chunks (memory) | - | - / 1,499 / 1,496 | same | decode +7% (1 stream) / +4% (4 streams); stress minimum 9.72 / 8.67 GiB |
-| 09-29 04:25 | W10: + 0390 MLA expand v2, 0370 decode overlap, 0380 16-row verify (production now) | 44.6 / 100.6 | - / ~1,607 (24.5k) / ~1,600 (98k) | same | edit cells 111-116 tok/s; 4 streams ~78 aggregate; MMLU-200 88.0% |
+| 09-29 04:25 | W10: + 0390 MLA expand v2, 0370 decode overlap, 0380 16-row verify | 44.6 / 100.6 | - / ~1,607 (24.5k) / ~1,600 (98k) | same | edit cells 111-116 tok/s; 4 streams ~78 aggregate; MMLU-200 88.0% |
+| 09-29 17:15 | W12: + 0460 L2 prefetch, graph capture after 8 (image b5, + 0490 API fixes) | 1 stream +2.5% | - / 1,602 / 1,579-1,612 | same | 4 streams 81.2 aggregate; RigMark W13: code / prose / structured 68.6 / 43.2 / 88.2 |
+| 09-29 21:17 | W15: + 0500 image input, 0540 replay / first token (image b7, production now) | within noise of W12 | - / 1,610 / 1,607 | same, + images | identical-prompt replay 0.21-0.26 s TTFT at 8K-64K; RigMark code / prose / structured 67.5 / 44.0 / 89.0 |
+| 09-30 03:45 | W17: + 0560 multi-slot prefill on, 0550 in the image but off (image b9, production now); RigMark 3 runs averaged | RigMark code / prose 67.9 / 43.0 | - / 1,606 / 1,610; RigMark cold 64K 1,620 | same, + images | RigMark C4 91.0 aggregate, C4 TTFT 0.89 s; replay TTFT 64K 0.27 s |
 
 ## Engine patches, ordered by impact
 
@@ -158,3 +231,6 @@ image lacks it (0230). Memory notes: the worker node binds; a 314k needle right 
 | preflight checks | `serve.sh preflight` also checks docker, the CX7 netdev address and `HEAD_IP`, the weights / drafter snapshots, MemFree, `sudo -n`, CUDA processes and the RoCE failure marker on both nodes, with the fix in each message | on |
 | `scripts/check-public.sh` | scans the tree for private IPs, hostnames, keys and tokens before publishing | tool |
 | benchmarks (`bench/`) | `glmbench.py` (decode / prefill / exactness), `multiturn.py` (sessions, follow-ups, concurrency, stall, slots, memory stress), `quality.py` (MMLU-200 + refusals), `toolcall_harness.py`, `fp8ab.py` (reply agreement / needle A/B) | tool |
+| RigMark runs (`scripts/rigmark/`) | pinned RigMark install, preflight (chat, `/tokenize`, token-id completions, reasoning fields), metadata, standard-suite run, compare against published receipts; `docs/RIGMARK.md` | tool |
+| patch subsets at build | `PATCHES="0001 0002 ..." scripts/serve.sh build` passes the Dockerfile's `PATCHES` build argument (unset: every patch), e.g. to build exactly the tested production image b7 (`results/W15/build-patches.txt`) | tool |
+| benchmarks, 2026-09-30 | `longexact.py` (drafted == serial and batched == alone past the indexer's top-2,048), `mmlu_full.py` (full MMLU, 0 / 5-shot, resumable, paired compare), `divergence.py` (teacher-forced KL / top-1 from 0430 dumps), `gendata.py` (drafter training prompts from open datasets), `acceptpos.py`, `pagecache_probe.py`, `draftvocab.py` / `draftvocab_public.py` | tool |

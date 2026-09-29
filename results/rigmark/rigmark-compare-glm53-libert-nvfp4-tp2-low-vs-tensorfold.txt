@@ -1,0 +1,40 @@
+| Measurement | glm53-libert-nvfp4-tp2-low-v2 | glm53-flash-exl3-tensorfold-tp2-low | Right/left |
+|---|---:|---:|---:|
+| Code decode, tok/s | 44.0 [31.6–47.7] | 68.6 [66.5–69.3] | 1.56× |
+| Code TTFT, seconds ↓ | 0.602 [0.595–0.844] | 0.505 [0.492–0.528] | 0.84× |
+| Code last output, seconds ↓ | 46.447 [42.563–68.656] | 26.312 [25.490–27.759] | 0.57× |
+| Prose decode, tok/s | 18.9 [17.8–19.3] | 43.2 [43.0–43.5] | 2.29× |
+| Prose TTFT, seconds ↓ | 0.487 [0.482–0.602] | 0.403 [0.390–0.449] | 0.83× |
+| Prose last output, seconds ↓ | 55.659 [52.036–56.905] | 24.057 [22.545–25.741] | 0.43× |
+| Structured decode, tok/s | 64.9 [63.9–66.8] | 88.2 [87.3–89.1] | 1.36× |
+| Structured TTFT, seconds ↓ | 0.473 [0.453–0.481] | 0.461 [0.459–0.481] | 0.97× |
+| Structured last output, seconds ↓ | 7.292 [7.231–10.875] | 8.238 [8.162–8.335] | 1.13× |
+| Cold prefill 8,192, tok/s | 1,812.9 [1,810.2–1,816.7] | 1,597.8 [1,590.6–1,605.0] | 0.88× |
+| Warm replay 8,192, tok/s | 1,811.6 [1,805.1–1,812.9] | 1,597.2 [1,584.0–1,615.5] | 0.88× |
+| Cold prefill 8,192 TTFT, seconds ↓ | 4.519 [4.509–4.526] | 5.127 [5.104–5.150] | 1.13× |
+| Cold prefill 32,768, tok/s | 1,907.9 [1,907.5–1,912.6] | 1,641.2 [1,638.3–1,646.4] | 0.86× |
+| Warm replay 32,768, tok/s | 11,045.9 [11,015.6–11,089.9] | 3,318.7 [3,303.8–3,320.9] | 0.30× |
+| Cold prefill 32,768 TTFT, seconds ↓ | 17.175 [17.132–17.179] | 19.965 [19.903–20.001] | 1.16× |
+| Cold prefill 65,536, tok/s | 1,921.6 [1,921.0–1,922.6] | 1,621.0 [1,620.1–1,622.7] | 0.84× |
+| Warm replay 65,536, tok/s | 11,363.5 [11,356.3–11,407.0] | 6,303.9 [6,263.8–6,305.3] | 0.55× |
+| Cold prefill 65,536 TTFT, seconds ↓ | 34.105 [34.088–34.116] | 40.430 [40.387–40.451] | 1.19× |
+| C1 short code-load end-to-end tok/s | 31.6 [30.0–31.6] | 54.3 [53.1–54.6] | 1.72× |
+| C1 per-stream TTFT, seconds ↓ | 0.602 [0.590–0.613] | 0.483 [0.467–0.517] | 0.80× |
+| C2 short code-load end-to-end tok/s | 42.0 [41.7–45.1] | 65.5 [64.7–68.3] | 1.56× |
+| C2 per-stream TTFT, seconds ↓ | 0.676 [0.496–1.033] | 0.925 [0.485–1.070] | 1.37× |
+| C4 short code-load end-to-end tok/s | 66.1 [64.3–70.1] | 82.2 [80.7–83.6] | 1.24× |
+| C4 per-stream TTFT, seconds ↓ | 0.814 [0.643–0.829] | 1.906 [0.471–1.931] | 2.34× |
+
+| Basic output gate | glm53-libert-nvfp4-tp2-low-v2 | glm53-flash-exl3-tensorfold-tp2-low |
+|---|---:|---:|
+| Code | 5/5 | 5/5 |
+| Prose | 5/5 | 5/5 |
+| Structured | 5/5 | 5/5 |
+
+Warning: model IDs differ; this is an appliance comparison, not a topology-only comparison.
+
+Warning: comparison forced despite mismatches: protocol.version, protocol.repository_revision, run.comparison_id, protocol.repository_source_sha256
+
+Benchmark identity:
+- glm53-libert-nvfp4-tp2-low-v2: git:046e92cbe941 clean
+- glm53-flash-exl3-tensorfold-tp2-low: git:c5a0db01b054 clean

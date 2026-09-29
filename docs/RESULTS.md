@@ -1,15 +1,20 @@
 # Results
 
-> **Work in progress.** Measured on one pair of DGX Sparks, 2026-09-27 to 2026-09-29, with the **abliterated** checkpoint
-> below. The sections are in the order the work happened; the newest ones are the current state: **W10** (the end of
-> this file) for the production config (`config/prod.env.example`: 4 requests sharing a 1M-token KV pool), "Stacked run
-> and production config" for the older single-stream config. The public repo carries the benchmark JSON and the
-> window scripts of the runs in `results/` (E*, F*, L*, M*, P*, Q*, A1, B1, B2, S1, X1, Y1, Z1, Z2, W1-W10, roofline,
-> sim0340, sim0380); logs (`*.log`, `*.out`, `*.err`), nsys traces, test output of the early runs and some runs (B3,
-> K0, K1, P1, T*) are summarized here only. Hosts in the JSON were normalized to `127.0.0.1` / `<worker-ssh>`, node
-> names to head / worker, and paths in the window scripts to `$HOME/glm53-tensorfold-spark`. Config names refer to
-> the `config/*.env.example` files; `results/W9/prod.env.before-W9` and `results/W10/prod.env.before-W10` are the
-> production config before each window, with the same placeholders.
+> **Work in progress.** Measured on one pair of DGX Sparks, 2026-09-27 to 2026-09-30, with the **abliterated** checkpoint
+> below. The sections are in the order the work happened; the newest ones are the current state: **W17** (the end of
+> this file) for the production config (`config/prod.env.example`: 4 requests sharing a 1M-token KV pool, image input,
+> replay snapshots, multi-slot prefill) and its 3-run averaged RigMark numbers, W15 for image input and replay, W10-W12 for the text-only stack it grew from, "Stacked run and production config" for the older
+> single-stream config. The public repo carries the benchmark JSON and the window scripts of the runs in `results/`
+> (E*, F*, L*, M*, P*, Q*, A1, B1, B2, S1, X1, Y1, Z1, Z2, W1-W12, W14-W17, FINAL-20260930, rigmark (W13, W15's two
+> RigMark runs and W17's three), roofline, sim0340, sim0380, theory2, THEORY2-SESSION, upstream-0362, draftvocab); logs (`*.log`, `*.out`, `*.err`,
+> RigMark's `run.log`), nsys traces, test output of the early runs and some runs (B3, K0, K1, P1, T*) are summarized
+> here only, so some file names below point at logs that are not in the repo. Hosts in the JSON were normalized to
+> `127.0.0.1` / `<worker-ssh>`, node names to head / worker (also in file names: `tests-head/`, `probe-head.log`),
+> and paths in the window scripts to `$HOME/glm53-tensorfold-spark`. `results/W12/n1-corpus.txt` (= W15's, the long
+> prompts of N1, cut from an earlier copy of this repo's docs) had its four node-name mentions replaced the same
+> way, so its prompts, and N1's reply hashes, differ slightly from the ones measured. Config names refer to the
+> `config/*.env.example` files; `results/W*/prod.env.before-W*` are the production config before each window, with the
+> same placeholders.
 
 GLM-5.3-Flash abliterated EXL3 (`neko-legends/GLM-5.3-Flash-Uncensored-EXL3` @ `07135ec0`) on two DGX Sparks
 (GB10, TP=2 over the 200 Gb/s CX7 link). Three stacks on the same pair, the same weights and the same client:
@@ -1026,3 +1031,1070 @@ Ops notes: window 2's restore ran twice (a stray `restore.sh` without a name bef
 02:26:50 and 02:27:32, both verified; `windows.log` line "w restored"). The 0370 nsys capture and the plan's arrival-latency
 check were not run. `pgrep -f` inside the ssh commands matched the ssh's own shell again (harmless here: used for
 listing only).
+
+## W11: decode measurement (2026-09-29 09:34-10:27, prod down 53 min) — measurement only, nothing adopted
+
+Step 1 of `docs/DECODE-PLAN.md` on today's production (`config/prod.env`: image `glm53-tensorfold:b4`, RoCE all-gathers,
+b12x 4, `MLA_EXPAND=v2`, `DECODE_OVERLAP=1`, `MAX_DRAFT_ROWS=16`): nsys of single-stream prose / code and 4 streams, a
+bandwidth and launch probe on one GB10, ncu of the decode kernels, the 4-stream CUDA-graph policy, and per-position draft
+acceptance on prose / code / agent-like content. Files: `results/W11/` (scripts, logs, `tables.md`, `dec-*.json`,
+`insitu-*.txt`, `accept*.json`); the four nsys reports are on the head node in `~/w11-traces/` (not in git, 40-67 MB).
+The updated decomposition is in `docs/DECODE-PLAN.md` (sections 0, 1, 3 and 4 now use these numbers).
+
+### 1. Method
+
+- **Window 1 (prod stopped, 09:34-09:38):** `probe.cu` (plain streaming read / copy kernels over one decode round's byte
+  volumes; launch overhead; PDL) on both GPUs at once, `kbench.py` (the production decode kernels: `exl3_mm`'s grouped
+  decode path and `qmm.matmul`, random weights of the real per-rank shapes, one GPU), ncu on `kbench.py --ncu`, and a
+  check whether nsys GPU-metrics sampling exposes DRAM bandwidth on GB10 (`bench.sh`).
+- **Capture loads (W7's method):** `load.sh NAME nsys` runs `scripts/serve.sh` with the nsys shim (idle session, `nsys
+  launch --trace=cuda-sw,nvtx --cuda-graph-trace=node`), `SYS_ADMIN`, and `results/W11/profile.py` (W7's NVTX copy) on
+  both ranks; `cap.sh` / `cap4.sh` send the requests uncaptured first (`ctl*.jsonl`), then open **one** nsys window
+  (`cap*.jsonl`); requests are 4 s apart so the analysis can split them. Greedy, thinking off.
+  - Load `nsys` (09:39): chat 256, essay 384, code (LRU module) 384, 4 x prose 384. **Under nsys the slot rule admitted
+    one slot** (MemFree 14.2 GiB after the engine's buffers, prod 18.1: `GLM53_TF_BATCH=4: only 1 sequence(s) fit`), so
+    the four prose requests ran one after another; they count as more single-stream prose.
+  - Load `nsys4` (09:44): the same with `GLM53_TF_BATCH_RESERVE_GB=8` (admission reserve only; 4 slots): 4 x prose 384
+    concurrent, then chat 256.
+- **Analysis:** `w11dec.py` (W7's `dec.py` rewritten: the RoCE `gather_kernel` is the exchange family; phases from the
+  NVTX ranges; distinct experts per verify layer U from kbench's single-GPU `grouped_kernel` fit; dense bytes by launch
+  grid from the prepared manifest's q4 shapes; host gaps between rounds). Checked against the W7 `mix-r0` trace: it
+  reproduces W7's 60.0 / 125.5 ms rounds and families. `tables.py`, `insitu.py`, `accept.py`, `graphs_summary.py`.
+- **Capture overhead:** the same requests uncaptured vs captured (engine `verify_ms + draft_ms` a round): prose 53.3 ->
+  54.3 ms (+2.0%), code 63.6 -> 64.7 (+1.8%), 4 streams 121.3 ms uncaptured (`decode_s` / rounds) vs 122.0 in the
+  trace. Same reply hashes captured and uncaptured. GPU clock 2,223-2,242 MHz, 58-65 °C during the captures.
+
+### 2. The decode round, measured (rank 0; rank 1 within 0.02 ms)
+
+| per round | 1 stream, prose (361 rounds) | 1 stream, code (91) | 4 streams, prose (162) |
+| --- | ---: | ---: | ---: |
+| **round, ms (captured / uncaptured)** | **54.6 / 53.3** | **64.7 / 63.6** | **122.0 / 121.3** |
+| tokens a round | 2.42 | 4.16 | 9.1 (4 x 2.28) |
+| largest verify window, rows (mean) | 3.5 | 5.1 | 11.8 |
+| routed experts (`grouped_kernel` + rot_in / epilogues) | 27.8 | 36.8 | 75.5 |
+| distinct experts a verify layer U (kbench fit; R = 1 proportional) | 20.1 (21.3) | 27.8 (28.3) | 59.9 (57.5) |
+| trellis GB a round and rank; `grouped_kernel` GB/s | 5.47; 205 | 7.46; 211 | 16.1; 220 (15.2; 208) |
+| dense q4 GEMV (`_qmm` + `_reduce` + `_swiglu`) | 16.1 | 16.5 | 21.7 |
+| q4 GB a round; GB/s | 2.75; **175** | 2.78; 173 | 3.51; 169 |
+| RoCE all-gathers: count, median (mean) us | 100, 14.5 (23.1) | 101, 17.3 (27.2) | 115, 20.5 (35.9) |
+| exchanges exposed (nothing else running) | **2.3** | 2.8 | 4.2 |
+| NCCL (2 control all-gathers a round) | 0.02 | 0.04 | 0.08 |
+| DSA attention + indexer | 2.1 | 2.1 | 4.8 |
+| KDA | 1.6 | 1.7 | 6.0 |
+| hc | 1.45 | 1.5 | 1.8 |
+| router / grouping / combine | 1.2 | 1.2 | 1.6 |
+| norms / elementwise / memcpy / sampling | 0.3 | 0.3 | 1.2 |
+| **GPU idle inside the round** (of it inside the verify forward) | **1.8** (1.1) | 1.7 (0.9) | 5.1 (2.5) |
+| host gap between rounds | 0.00 | 0.01 | 0.01 |
+| kernels a round | 1,853 | 1,879 | 2,621 |
+| by launch phase: verify forward / drafting / sampling / other | 48.0 / 4.3 / 0.08 / 0.4 | 57.8 / 4.4 / 0.08 / 0.7 | 102.9 / 11.4 / 0.6 / 1.4 |
+| host time in the drafting ranges (propose, MTP chains) | 5.0 | 5.3 | 16.7 |
+| rounds mostly graph-replayed | 348 / 361 | 62 / 91 | 8 / 162 (fresh server) |
+| floor (235 GB/s experts, 230.5 dense, 0.3 exchanges, small kernels) | 37.2 = 68% | 45.8 = 71% | 89.0 = 73% |
+
+Against W7 (pre-RoCE, pre-0370): the 1-stream round is 59.5 -> 54.6 ms captured. **Exchanges 4.8 -> 2.3 ms** (RoCE:
+100 a round at 14.5 us median; the mean is 23 us because of peer-wait skew). **GPU idle 4.65 -> 1.8 ms and the gap
+between rounds ~0.9 -> 0.00 ms** (0370: the next round's plan rides on the sampler exchange; rounds are back to back).
+Attention 2.6 -> 2.1 (0390). Experts and dense are unchanged in kind: they are **81% of the 1-stream round** (44 of
+54.6 ms) and 80% at 4 streams.
+
+Per window size (1 stream, all three single-stream segments, captured): R = 2 / 3 / 4 / 5 / 6 / 7 / 8 rows cost 44.5 /
+51.2 / 57.8 / 64.6 / 68.0 / 76.5 / 82.7 ms (**~6.4 ms a row**, U grows ~5 experts a row: 12 / 18 / 23 / 28 / 31 / 38 /
+42). The 7- and 8-row windows (DFlash2 blocks) run eager in the lone-slot path, with **no idle penalty** (1.25-1.36 ms
+idle vs 1.8 for graph rounds): the W7 finding "eager / capture rounds hold 55% of the idle" no longer holds after 0370.
+
+### 3. Decode kernels in situ vs alone vs a plain read of the same bytes
+
+| kernel (launch grid) | bytes | in situ, 1 stream (median) | alone (`kbench`, M = 4) | plain read (`probe`) |
+| --- | ---: | ---: | ---: | ---: |
+| head 77,440 x 4,096 (1, 1210, 1), 2.6 calls a round | 178.4 MB | 834 us = 214 GB/s | 828 us = 216 | 750 us = 238 |
+| KDA proj 12,576 x 4,096 (1, 197, 4), 34 | 29.0 MB | 147 us = 197 | 155 = 187 | 123 = 235 |
+| dense MLP gate/up 12,288 x 4,096 (1, 192, 1) | 28.3 MB | 149 us = 190 | 150 = 189 | 120 = 235 |
+| DSA o / MTP eh 4,096 x 8,192 (1, 64, 8), 13 | 18.9 MB | 100 us = 189 | 110 = 171 | 80 = 235 |
+| dense MLP down 4,096 x 6,144 (1, 64, 4) | 14.2 MB | 73.5 us = 193 | 89 = 158 | 62 = 229 |
+| shared gate/up, DSA proj 2,048 x 4,096 (1, 32, 4), 55 | 4.7 MB | 28.5 us = 166 | 34 = 138 (launch-bound) | 22 = 215 |
+| KDA fb / gb 4,096 x 128 (1, 64, 1), 68 | 0.29 MB | 4.4 us = 67 | - | 2.7 = 111 |
+| `_reduce` (split-K sums), 224 calls a round | - | 1.1 us each, 0.29 ms a round | | |
+| `grouped_kernel` gate/up, R = 1 (MTP step, U = 8 exactly) | 33.6 MB | 157 us = **214** | 162 = 207 | 144 = 233 |
+| `grouped_kernel` down, R = 1 | 16.8 MB | 83 us = **202** | 82 = 204 | 74 = 227 |
+| `grouped_kernel` gate/up, R = 3 / R = 12 | U 17-20 / 54-60 | 378 / 1,108 us | 333 (U 17) / 1,023 (U 54): 214 / 221 | 303 (U 17) / 905 (U 51): 235 / 236 |
+
+- The in-situ kernels run at their isolated speed or faster (no contention penalty; the head is within 1%). **The gap is in the kernels, not the system:** a plain read of the same bytes is 10-15% faster for the
+  experts and 15-25% for the mid-size dense shapes; small dense shapes run at a third to a half of the plain read.
+- **ncu** (`ncu-kb-raw.csv`; ncu locks clocks, so its times are not used): `grouped_kernel<8,4>` 108 registers, 128-thread
+  CTAs, 3 CTAs an SM (shared memory limit) = 25% theoretical occupancy, ~25% warps active, SM throughput 18-25%;
+  `_qmm` 127 registers, 4 CTAs an SM (register limit) = 33% occupancy, 29-50% of peak memory-pipe throughput. Both are
+  latency-bound streamers with few bytes in flight an SM, not ALU-bound: the E1 / E2 lever is more loads in flight
+  (deeper `cp.async` pipelines, more CTAs), not arithmetic. **GB10 exposes no `dram__*` counters to ncu 2026.2 and no
+  DRAM metric to nsys GPU-metrics sampling** (`gm.log`), so in-situ bytes stay inferred (U from kernel time).
+
+### 4. Attainable bandwidth on one GB10 (`probe.cu`, both GPUs agree within 1%)
+
+| access | size | read GB/s | copy GB/s (read + write) |
+| --- | --- | ---: | ---: |
+| one MoE layer's experts, gathered (U random of 288) or contiguous, gate+up / down | U 8-65: 34-273 MB / 17-136 MB | **233-238 / 227-237**, gathered = contiguous | - |
+| a round's expert reads: 42 layers x (gate/up, down), 84 launches back to back | U 8-51: 2.1-13.5 GB | **235-237** | - |
+| the verify's whole dense q4 set, 304 launches in layer order | 2.36 GB | **230.5** | - |
+| one launch, cold | 0.25 / 1 / 2 / 4 / 8 / 16 / 32 MB | 95 / 138 / 179 / 201 / 219 / 229 / 232 | 188 / 177 / 200 / 208 / 215 / 219 / 219 |
+| one launch, cold | 64 MB-1 GB | 233-236 | 216-220 |
+
+- **Ceiling: 235 GB/s** for streaming reads of the expert volumes (86% of the 273 GB/s nominal), whether the experts
+  are gathered or contiguous; 230.5 for the dense set with its small matrices; a launch needs ~8 MB to reach 219 and
+  ~16 MB to reach 229. ROOFLINE's 230 is confirmed (slightly conservative). The probe ran at 2,418 MHz SM clock (prod is
+  capped at 2,250; reads are DRAM-bound).
+- **Launch overhead** (`probe.cu`): an empty kernel costs 1.62 us eager, 0.47 us inside a CUDA graph. Between dependent
+  kernels in a graph the last block of one and the first work of the next are **0.73 us** apart; with **PDL**
+  (`cudaLaunchAttributeProgrammaticStreamSerialization` + `griddepcontrol.wait` / `launch_dependents`) **0.42 us**, and
+  a 1 MB-read kernel chain goes 6.20 -> 5.76 us a kernel. **PDL works on sm_121** (GB10): with it every dependent
+  kernel that reads 1-4 MB started its prologue before the previous one ended (399 of 399; 4.8 us early on 5.3 us
+  kernels), in eager streams and in captured graphs. At ~1,850 kernels a 1-stream round, -0.31 us a boundary is ~0.6 ms
+  a round.
+
+### 5. CUDA graphs at 4 streams (`graphs.sh`: batchexact, then `multiturn.py --modes concurrent --streams 4 --reps 3
+--long-tokens 512` twice: pass a right after load, pass b on the warm graph set)
+
+| load | aggregate tok/s, pass a / pass b (3 reps each) | mean of 6 | request-rounds graph / eager / capture % (a; b) | batchexact |
+| --- | --- | ---: | --- | --- |
+| DEF (prod: `CAPTURE_AFTER=3`) | 83.3 75.7 76.7 / 83.0 74.6 77.3 | 78.4 | 11/80/7; 22/66/11 | 4/4 |
+| **G0: `GLM53_TF_BATCH_GRAPHS=0`** | 84.4 77.2 79.2 / 84.0 76.9 79.4 | **80.2 (+2.6%)** | 0/97/0; 0/97/0 | 4/4 |
+| CA8: `GLM53_TF_BATCH_CAPTURE_AFTER=8` | 84.2 76.4 78.2 / 83.9 77.0 79.4 | 79.9 (+2.2%) | 2/97/1; 7/92/1 | 4/4 |
+| DEF2 (prod again, control) | 82.1 74.6 77.2 / 82.9 74.3 76.4 | 77.9 | 13/80/7; 28/60/12 | 4/4 |
+
+Percentages vs the mean of DEF and DEF2 (which agree within 0.6%). Every G0 rep beats the same rep and pass of both
+controls (+1.2 to +3.9%). The graph keys of 4-slot rounds (slots x rows x context buckets) rarely repeat in 6 x 512 tokens: 60-80%
+of rounds run eager and 7-12% pay a capture (a warm-up forward + capture + instantiate); the graph rounds do not win the
+captures back. Engine ms a round (verify + draft): 113.4-115.2 (DEF) vs 109.8-111.4 (G0 / CA8). **F0 is worth +2.2-2.6%
+at 4 streams**, exact (batchexact 4/4 on every load). Not measured: lone requests in slots 1-3, which use the same
+multi-sequence graph keys (a single stream on slot 2 ran 22% eager, 8% capture rounds in load `nsys4` and was 2% slower
+than on slot 0); the adoption A/B should include them. Not adopted here (measurement window).
+
+### 6. Draft acceptance on real content (baseline for drafter retraining; `w11req.py`, `accept.py`)
+
+14 prompts: prose (glmbench chat, essay, hashmap; tides; a letter), code (LRU module, fib, a Go queue, a React table),
+agent-like (glmbench's edit source renamed / print-to-log as whole-file rewrites, a unified diff, 25 JSON records, a
+plan with shell commands), each greedy and sampled (T 1, top-k 20, top-p 0.95), 512 tokens (1,024 for the rewrites and
+JSON); plus 2 prose prompts with thinking on (1,024). Positions: a_j = P(draft j kept | drafts 1..j-1 kept) and
+p_j = P(draft j kept) (cumulative, what vLLM reports).
+
+**Untruncated** (`tf_policy` `4` = MTP 4 drafts every round, `f7` = DFlash2 7-draft blocks every round; load DEF2, 384
+tokens, 1,024 / 768 for agent):
+
+| drafter, class | rounds | a_1 .. a_7 (conditional) | p_1 .. p_4 (cumulative) | tokens a round |
+| --- | ---: | --- | --- | ---: |
+| MTP x4, prose | 1,549 | 0.72 0.60 0.51 0.44 | **0.72 0.43 0.22 0.10** | 2.48 |
+| MTP x4, code | 887 | 0.90 0.79 0.75 0.60 | 0.90 0.71 0.53 0.32 | 3.46 |
+| MTP x4, agent | 1,580 | 0.94 0.90 0.84 0.73 | 0.94 0.84 0.71 0.51 | 3.99 |
+| DFlash2 x7, prose | 1,427 | 0.68 0.63 0.59 0.62 0.60 0.48 0.62 | 0.68 0.43 0.26 0.16 | 2.69 |
+| DFlash2 x7, code | 700 | 0.87 0.81 0.79 0.78 0.80 0.76 0.80 | 0.87 0.71 0.56 0.44 | 4.39 |
+| DFlash2 x7, agent | 1,095 | 0.90 0.90 0.91 0.93 0.90 0.90 0.89 | 0.90 0.81 0.74 0.68 | 5.76 |
+
+Greedy and sampled agree within 0.03 at every position. The stock MTP head's prose profile **0.72 / 0.43 / 0.22** equals
+DECODE-PLAN's 0.74 / 0.45 / 0.22 (cumulative). DFlash2 is not better than MTP on prose at any position (0.68 vs 0.72 at
+position 1, the same 0.43 at position 2); it wins only through depth on code / agent content.
+
+**Production policy** (auto: DFlash2 greedy rounds, MTP sampled, lookup, cost-derived depths; load DEF):
+
+| class | greedy: tok/s, tokens a round (rounds m / f / l) | sampled: tok/s, tokens a round |
+| --- | --- | --- |
+| prose (5) | 46.2, 2.39 (587 / 483 / 0) | 46.2, 2.28 (MTP only) |
+| prose, thinking on (2) | 47.3, 2.48 (369 / 455 / 0) | - |
+| code (4) | 64.6, 4.10 (183 / 315 / 0) | 55.9, 3.32 |
+| agent-like (5) | 83.6, 6.34 (258 / 264 / 110) | 77.1, 5.30 |
+
+With the policy's depth cut, conditional acceptance of the drafts it does send is 0.71-0.73 at position 1 for prose
+and flat (0.6-0.7) behind it; mean depth 1.9-2.0 (MTP) and 2.8 (DFlash2) on prose. Lookup rounds on the rewrites keep
+15.5 tokens (of 16 rows). Full tables: `accept-DEF.json`, `acceptfix-4.json`, `acceptfix-f7.json`.
+
+### 7. What changed in the +40% decomposition (details: DECODE-PLAN.md)
+
+- Today, measured: 1 stream prose **53.3 ms, 2.42 tokens = 45 tok/s**; code 63.6 ms, 4.16 tokens; 4 streams **121.3 ms,
+  9.1 tokens = 75 tok/s** (77.9-78.4 on the multiturn prompts). The plan's reconstruction (54.4 ms) was within 2%, but
+  its split was not: idle 1.8 ms (est. 3.8), exchanges 2.3 (est. 1.7), dense 175 GB/s (assumed 190).
+- Larger than estimated: **E2 dense q4** (-1.9 -> **-3.0 ms**: 175 GB/s against a 230.5 ceiling for the same set),
+  **E8 RoCE** (-0.4 -> -0.8), **E7 vocab trim** (the head runs 2.6 times a 1-stream round and 4.9 at 4 streams:
+  -0.8 -> -1.0 / -1.2 -> -2.5 ms), **F0** (now measured +2.2-2.6%).
+- Smaller: **E5 graph coverage for a lone stream** (-1.0 -> -0.2: eager rounds have no idle penalty after 0370),
+  **E6 device sampling** (-1.0 -> -0.6: 1.8 ms idle left in total).
+- Confirmed: E1 experts (205-214 GB/s in situ vs a 235 ceiling: -2.7 ms mid), E4 (PDL available on sm_121, worth ~0.6
+  ms of the 1.5 mid).
+- Engineering mid: -10.5 ms 1 stream (**+25%**), -25 ms 4 streams (**+26%**); with the middle drafter case **+38% / +42%**.
+  The 4-stream mid is lower than the plan's +28% / +44%: in situ the 4-stream expert reads already run at 208-220 GB/s,
+  so F1 has less room than the 193 GB/s W7 figure suggested.
+
+Ops notes: the first `load.sh nsys` wrote an empty `serve-w11.sh` (a sed `#` delimiter inside the replacement) and
+"started" nothing in 2 s; fixed (python edit), started at 09:39. Under nsys the 4th slot did not fit (above); the second
+capture load used `GLM53_TF_BATCH_RESERVE_GB=8`. One nsys window per server start was kept (two starts, two windows).
+`pkill -f` of a waiting loop from inside `ssh` killed that ssh's own shell again (W8's note); nothing else affected.
+Prod restored 10:27 from `config/prod.env`: ready in 25 s, canary ok (decode 80.5 tok/s), 4 slots, RoCE connected,
+https `/v1/models` ok, `17*23` -> `391`, watchdog timer active (its 10:27 tick exited 0), lease refresher stopped,
+lease deleted, `/var/tmp/w11` removed on both nodes (reports kept in `~/w11-traces/`).
+
+## W12: decode A/B (0440 / 0450 / 0460 / 0490, the 4-stream graph policy), 2026-09-29 (12:49-17:13, one window, prod down 4 h 24 min) — 0460 L2 prefetch (8 MiB) and `CAPTURE_AFTER=8` adopted on image b5
+
+One window with prod stopped: the GPU plans of DECODE-KERNELS §8 (0440), GPU-ROUND §6 (0450) and PREFETCH-COMM §6
+(0460), the 0490 checks, SFXNZ-AUDIT's N1 (exactness past the indexer's top-2,048) and the 4-stream graph policy from
+W11, then a combined candidate through the full gate set. Files: `results/W12/` (`tests-head/SUMMARY`, `tests-worker/SUMMARY`, `roce/`,
+`cmp.py` / `lone.py` print the tables below from the per-load files, `loads.log`, `windows.log`).
+
+**Image `glm53-tensorfold:b5`** = every patch through 0490 (`build-patches.txt`: 0420 / 0430 / 0470 present but off;
+**0500 not included**), built on the head node, loaded on the worker node, tagged on both. Two **0460 bugs** found by the unit tests
+and fixed in `patches/0460-glm-prefetch-comm.patch` before any engine load (the first b5 never served; it is
+`glm53-tensorfold:b5-pre460fix` on the head node only):
+
+- `roce.py` `_ext()`: the new comment on the `load(name="tensorfold_glm_roce_v3", ...)` line swallowed the
+  `sources=[...]` argument (`# patches/0460: ... sources=[...]` on one line). The extension could not build, so **any
+  image with 0460 would have fallen back from RoCE to NCCL**, knobs off included (`test_roce_patches.py`: 6 failed, 19
+  errors; after the fix 25 passed).
+- `l2pf.cu`: `cp.async.bulk.prefetch.L2` without an `__CUDA_ARCH__ >= 900` guard. The image's `TORCH_CUDA_ARCH_LIST`
+  also builds compute_80, where ptxas refuses it, so `GLM53_TF_L2PF=1` could not load (offline, the compile test built
+  sm_121 only). Guarded, with a line-prefetch loop for the pre-sm_90 targets (never run on GB10).
+
+Test-harness fixes (tests only): the PDL race test's and the bench's roof-probe `load_inline` helpers had no C++
+declaration of their function (`'late' / 'probe' was not declared in this scope`).
+
+### 0. Control: b5 with every new knob off == production b4 (this also gates 0490)
+
+Three control loads spread over the window (C at the start, C2 after the 0440 / 0460 loads, C3 at the end):
+
+| check | C / C2 / C3 | prod b4 |
+| --- | --- | --- |
+| reply sha (ab.py 24.5k / 98k) | 8794a3463259cc2f in every load | 8794a3463259cc2f |
+| exact / batchexact / W9 transcripts (alone and together) | 10/10, 4/4, identical to W9 load A, every load | same |
+| glmbench tf / tweet / kit / edit (13 cells x 3) reply hashes | equal in all three controls and in every other load | - |
+| N1 (§2) reply shas | 12 / 12 equal to prod b4 | - |
+| 1 stream (geomean of 13 cells), each vs the mean of the three | +0.1 / +0.0 / -0.1% | - |
+| 4 streams (mean of 6 reps) | 78.6 / 79.2 / 79.3 tok/s | W11: 77.9-78.4 |
+| lone-request probe (8 x 384 tokens, prompt by prompt) | within +-0.3% of each other | - |
+| prefill 24.5k / 98k (tok/s) | 1,611 / 1,605; 1,609 / 1,609; 1,622 / 1,618 | W10 FIN 1,614 / 1,602 |
+
+**0490** (on in every load): `tests/test_api_context.py` + `test_prompt_tokens.py` in the image 20 passed, 1 skipped
+(no tokenizer dir); `/v1/models` gives `max_model_len` = `context_length` = 1,048,576; a request of 13 + 1,048,576
+tokens gets HTTP 400 `context_length_exceeded` with OpenAI's wording; the pool edge, 13 + 1,048,531 = 1,048,544
+tokens (32 under CONTEXT, reservation 64 over it), is **admitted** and answers `OK` (b4 refuses it as more than the
+whole pool); boot line `KV pool: 1048832 tokens` (4,097 pages). `api-C*.json`.
+
+### 1. Kernel GPU tests and microbenches (prod stopped, everything under `timeout`)
+
+| test | result |
+| --- | --- |
+| offline suites in the image | 0440 emulator 61 passed; compile 6 passed, **Triton 3.7.1: every `_qmm` epilogue fused** (E2 allowed); 0460 host / compile / RoCE protocol model 190 passed; 0450 compile / interpreter 2 passed (the rest need the interpreter without a GPU) |
+| 0440 E1 / E2 bitwise + **PDL race** (`test_decode_stream_patches.py -k "experts or qmm or pdl"`) | **16 passed** (after the harness fix; before it the race test could not build its helper) |
+| 0440 engines (`-k "windows or replies or resume or timing"`) | 9 passed; `test_decode_patches` / `test_batch_parallel_patches` with E1 + E2 on: 7 / 26 passed; `test_deep_verify_patches` 4 passed + the known W10 coverage assert (`deepest >= 9`, replies equal serial before it) |
+| 0440 `bench_decode_kernels.py` (`kbench.json`, every row `same bits`, 1,062 timed variants) | **gate failed**: see below |
+| 0450 KDA fold bitwise (`replay_slots` == `replay_layers`, `chain_slots` == replay + `chain`, rows 1-16, prologues 0-16) | **8 passed** |
+| 0450 sampler at scale (`sampler.py`: `self_check`'s two halves at size) | **104,857,600 keyed draws** (100 seeds x 2^20 rows, 2 ranks x 28 candidates with ties, T 0.7, top-k 20, top-p 0.9) and **2.5 x 10^9 libm values** (log, log of -log, exp) against the node's numpy / `choose_rows`: **0 differences** |
+| 0450 synthetic-engine tests (`test_gpu_round_patches.py`, `TRITON_INTERPRET=0`) | 7 failed (4 requests == serial for sample / resident / 1, the lone request + resume): **a harness artifact**, see below. The real engine is exact (§3) |
+| 0450 regressions with `GPU_ROUND=1` | `test_decode_overlap_patches` 29 passed; `test_batch_parallel_patches` 5 failed / `test_batch_sessions_patches` 5 failed, all sampled cases or `sample_drafts` on CPU tensors (the same artifact; one test passes CPU logits to the device path) |
+| 0460 `test_prefetch_comm_patches.py` (L2PF bulk / lines / touch, sites a f o e, the Batcher, RoCE loop runtime with `STRIPE_KB` 0 / 32 x `LEAN` 0 / 1 eager and in graphs) | **25 passed** (after the two 0460 fixes); `test_roce_patches` 25, `test_comm_patches` 15, `test_batch_parallel_patches` with L2PF 26, `test_decode_stream_patches -k pdl` with L2PF 1 passed |
+
+**0440 microbench** (one GPU, median of 7 graph replays over 3 weight copies; best configuration of 7 E1 / 4 E2
+settings, PDL on or off):
+
+| window / shape | old (production) | best new | new / old | gate |
+| --- | --- | --- | ---: | --- |
+| experts R 1 / 2 / 4 (U 8 / 13 / 22) | 241 / 381 / 637 us (209-217 GB/s) | 309 / 501 / 847 us (163 GB/s; cfg 8,3,8,3 + PDL) | **0.78 / 0.76 / 0.75** | >= 1.05: fail |
+| experts R 8 / 16, 4-slot mixes (U 35-110) | 201-218 GB/s | 160-163 GB/s | 0.74-0.80 | - |
+| E1 probe 1 (no trellis decode) / probe 2 (no mma), U 8 / 22 | - | 319 / 323 us; 864 / 873 us | = new | data movement is the limit, not the ALU |
+| dense 77,440 x 4,096 (head), M 1-16 | 816-852 us (209-218 GB/s) | 994-1,016 us | **0.82-0.86** | fail |
+| dense 12,576 x 4,096 (KDA proj) | 137-149 us | 162-171 us | 0.85-0.89 | fail |
+| dense 12,288 x 4,096 (MLP gate/up) | 135-140 us | 151-153 us | 0.89-0.91 | fail |
+| dense 4,096 x 8,192 (DSA o / MTP eh) | 91-97 us | 105-107 us | 0.87-0.91 | fail |
+| dense 4,096 x 6,144 (MLP down) | 77 us | 76-81 us | 0.96-1.01 | fail |
+| dense small (2,048 x 4,096; 8,192 x 1,536 / 512; 4,096 x 1,024 / 4,096; 4,096 x 128) | 3-58 us | | 1.1-2.1x | (L2-resident in the bench: 3 copies < 24 MB) |
+
+E1's persistent ring streams at ~160 GB/s whatever the configuration, and removing the decode or the mma changes
+nothing: the loads in flight per warp are too few for GB10's latency. E2 wins only the small shapes, which the bench
+keeps in L2; every shape that carries the bytes of a round loses 10-18%. Per the plan: stop E1. One engine load of
+E2 anyway (below) measured the sign: -3.9%. No PDL / E1 engine loads.
+
+### 2. N1: exactness past the indexer's top-2,048 (`bench/longexact.py`, new)
+
+Three prompts of repo text (8,743 / 16,889 / 32,098 tokens, a different slice each, `n1-corpus.txt` frozen from
+`docs/PATCHES.md` at HEAD), 512-token replies, thinking off: drafted vs serial (`"draft": false`) greedy (drafted
+first, cold) and sampled (T 1, top-k 20, top-p 0.95, seed 1234; serial first, cold), then all six requests again
+batched (4 + 2 at once) against their drafted replies alone.
+
+| config | drafted == serial | batched == alone | reply shas vs prod b4 |
+| --- | --- | --- | --- |
+| prod b4 (before the window, live) | **6/6** | **6/6** | - |
+| C (b5, knobs off) | 6/6 | 6/6 | 12/12 equal |
+| FIN (the candidate, §4) | 6/6 | 6/6 | 12/12 equal |
+
+No sign of the vLLM kpool class of bug (rejected drafts corrupting indexer pool keys): every decode token at these
+lengths selects 2,048 of 8.7k-32k rows. Drafted decode at 8k / 16k / 32k: 55.7 / 49.9 / 45.4 tok/s greedy on prod,
+59.1 / 51.8 / 46.1 on FIN; serial 31.0-31.5 -> 32.6-32.8 (+4-5%: the 1-row window gains most from the L2 prefetch).
+
+### 3. Engine A/B (one load a setting, `config/prod.env` + the knob on b5; `ab.sh`)
+
+Per load: exact, batchexact, the W9 transcripts, ab.py 24.5k / 98k once (reply sha, prefill), `glmbench --suites
+tf,tweet,kit,edit --reps 3` (13 cells: **1 stream**, geometric mean of the per-cell medians; prose = tf chat T 0 / 1,
+kit hashmap / essay; code = tf code T 0 / 1, tweet code; edit = the three rewrites), `multiturn --modes concurrent
+--streams 4 --reps 3` twice (**4 streams**, mean of 6), and a **lone-request probe** (`slots.py`: 8 fresh 384-token
+prose prompts one after another; the batcher gives a fresh lone request the least recently used slot, so they cover
+slots 0-3 twice; compared prompt by prompt). Everything vs the mean of C / C2 / C3.
+
+| load | knob | 1 stream: all / prose / code / edit | 4 streams | lone probe: slot 0 / slots 1-3 | exact, batchexact, transcripts, 13/13 cell hashes, sha | result |
+| --- | --- | --- | --- | --- | --- | --- |
+| C / C2 / C3 | none | +0.1 / +0.0 / -0.1% | 78.6 / 79.2 / 79.3 | +-0.3% | all pass | control |
+| E2 | `DEC_QMM=1` (0440 E2) | **-3.9** / -5.3 / -4.5 / -2.1% | 76.6 (-3.1%) | -4.0 / -3.8% | all pass | off |
+| G0 | `BATCH_GRAPHS=0` | +0.1 / -0.4 / +0.4 / +1.0% | 80.5 (+1.9%) | -1.4 / **-3.1%** (slots 1-3 run eager: -1.6 to -5.2%) | all pass | off (< +2%, lone slots slower) |
+| CA8 | `BATCH_CAPTURE_AFTER=8` | -0.2 / -0.4 / -0.7 / +0.6% | 80.6 (**+2.0%**) | +1.6 / -0.0% | all pass | **adopt** |
+| PF | `L2PF=1` (bulk, sites a,f,o, 4 MiB) | +0.8 / +0.8 / +0.3 / +1.0% | 78.9 (-0.1%) | +2.7 / +2.3% | all pass | below +1.5% |
+| PFE | `L2PF=1`, sites a,f,o,e | +0.4 / +1.2 / -0.1 / -0.4% | 78.9 (-0.1%) | +3.1 / +1.5% | all pass | off |
+| PF8 | `L2PF=1`, `L2PF_MB=8` | **+2.4** / +2.9 / +2.5 / +1.7% | 80.0 (+1.2%) | +3.5 / +2.6% | all pass | **adopt** |
+| GRS | `GPU_ROUND=sample` | -0.1 / -0.4 / -0.2 / +0.5% | 78.7 (-0.4%) | -0.6 / +1.2% | all pass | neutral: off |
+| GRR | `GPU_ROUND=resident` | -2.3 / -2.6 / -5.9 / +0.0% (tf code greedy -18%, hashmap -8%) | 79.4 (+0.5%) | -4.2 / +0.4% | all pass | off |
+| GR1 | `GPU_ROUND=1` | -2.3 / -1.7 / -5.2 / -0.9% (tf code greedy -16%) | 80.0 (+1.2%) | -0.9 / -0.9% | all pass | off |
+| GR1L | `GPU_ROUND=1`, `PEEK=0` | -4.3 / -5.8 / -8.5 / -1.2% | 75.6 (-4.3%) | -5.2 / -4.9% | all pass | off |
+
+Bars (the patch docs): 0440 1 stream >= +3%; 0460 >= +1.5% 1 stream, 4 streams not lower; 0450 >= +3% at 4 streams
+(median) and 1 stream not lower; graph policy >= +2% at 4 streams with lone requests in slots 1-3 not slower.
+
+- **Every load is exact**: exact 10/10, batchexact 4/4, transcripts identical to W9 A, the reply sha, and all 13
+  glmbench cells' reply hashes equal to the controls in every load (0440 E2, 0450 in all four modes, 0460 at every
+  setting). The 0450 synthetic-test failures (§1) do not reproduce on the model.
+- **0450's failing GPU tests are the harness**, not the sampler: the one-GPU tests play rank 1 with a copy of rank 0's
+  candidates (`_TwoCopies`, `_Gather`), so every id appears twice with the same value. The host's lexsort takes one;
+  the device kernel's greedy pick adds the tied winners (instrumented: local id 88 -> 176, 491 -> 982). Real ranks
+  hold disjoint vocabulary halves, so the duplicate cannot occur (and the engine loads are exact), but the device pick
+  and the host rule disagree on exact duplicates: a latent difference to fix in the kernel or the tests.
+- **W11's open question on `BATCH_GRAPHS=0`**: lone requests in slots 1-3 do run graphs today (same speed as slot 0);
+  with graphs off they run eager and lose 1.6-5.2%, and since the batcher rotates fresh lone requests over the least
+  recently used slot, three of four land there. `CAPTURE_AFTER=8` keeps them (+0.0%) and gives the same 4-stream gain.
+- **0460**: 8 MiB a site (plans 338-368 MiB a rank) clears the bar; 4 MiB does not; the device-indexed expert site
+  `e` adds nothing. The 1-row serial windows gain most (N1: +4-5%).
+
+**RoCE knobs (0460 E8, `roce.sh`, bench `--trace 4096` both nodes, bits equal everywhere):** per-op graph latency
+(us) at 16 / 32 / 64 / 128 / 256 KiB: base 11.9 / 13.4 / 15.5 / 21.3 / 27.8 and base again 12.5 / 13.3 / 15.6 / 19.9 /
+27.9 (the noise is +-0.5-1.4 us); `LEAN=1` 11.1 / 13.1 / 15.3 / 19.8 / 27.5; `STRIPE_KB=32` 14.2 / 13.4 / 16.4; `=64`
+12.7 / 14.4 / 15.6; `INLINE=256` 12.0 / 13.4 / 15.5; `LAZY_CQ=1` 12.1 / 14.0 / 15.5; all together 11.5 / 14.8 / 15.4.
+Only `LEAN` comes near the 0.3 us bar at 16-64 KiB (-0.2 to -1.4 us, within the base-to-base spread); at ~100
+exchanges a round that is <= 0.1 ms (~0.2%), below any engine A/B, so **no RoCE knob went to stress or an engine load**.
+The trace's `notice` component prints garbage (~1.8 x 10^15 us: a clock-domain mix-up in the stamp), the others look
+sane: wait 5-18 us p50, of it skew 8-30 us across the two ranks, transport 0.9-2.2 us.
+
+### 4. Combined candidate FIN = prod + `L2PF=1` + `L2PF_MB=8` + `BATCH_CAPTURE_AFTER=8` (b5): full gates (`gates.sh FIN`)
+
+| gate | FIN | bar |
+| --- | --- | --- |
+| exact / batchexact, before and after the stress + MMLU | 10/10, 4/4; 10/10, 4/4 | 10/10, 4/4 |
+| W9 transcripts (6 prompts greedy / sampled alone, 4 together) | identical to W9 load A | identical |
+| glmbench reply hashes (13 cells x 3) | 13/13 equal to the controls | equal |
+| reply sha, 24.5k / 98k x 2 | 8794a3463259cc2f in every cell | same |
+| N1 (§2) | drafted == serial 6/6, batched == alone 6/6, 12/12 shas == prod b4 | all |
+| decode vs the b5 controls (= prod b4) | **1 stream +2.5%** (prose +3.3, code +2.8, edit +1.0; every cell but print-to-log up); **4 streams 81.2 tok/s, +2.8%** (84.6 78.4 80.3 / 86.4 77.1 80.4); lone probe **+3.2%** (slot 0 +2.8, slots 1-3 +3.3) | not lower |
+| prefill 24.5k / 98k (tok/s) | 1,602 / 1,579; 1,604 / 1,612 (controls 1,601-1,622; the 1,579 run is the low one, as W10 FIN's 1,577) | not lower |
+| 4 x ~250k stress MemAvailable min, head / worker | **9.74 / 8.32 GiB**, PASS; filled in 785 s, longest decode gap 3.9 s | >= 8 |
+| OOM kills (dmesg, both nodes) | 0 / 0 (the 2 `out of memory` lines on the worker node are NVRM allocation messages at 13:51-13:52, during b5's first start, below) | 0 |
+| MMLU-200, refusals | **88.0%** (176/200), 0/10 | >= 87% |
+| needle, 314,326 tokens alone after the stress + MMLU | **found** cold and resumed (cold prefill 1,347 tok/s, decode 61.8; resume 314,304 cached in 0.25 s, decode 71.1) | found |
+| /health | 410 requests, 0 errors | - |
+
+**All gates pass.** Two notes:
+
+- **Memory during the needle.** MemAvailable sampled every 2 s over the whole gate run bottomed at **8.27 / 6.58 GiB**,
+  in the needle's last 30 s on the worker node (14 samples under 8), after the stress and MMLU left the pool and session store
+  full; no OOM. W10 FIN saw the same pattern at 8.55 / 7.39 and recorded it as an open end. The stress minimum on
+  worker is also ~1 GiB under W10 FIN's (8.32 vs 9.36) while the idle footprint after load differs by 0.2-0.4 GiB
+  (MemAvailable at `engine ready` on the worker node: FIN 16.9, C3 17.1, W10 FIN 17.3 GiB), so most of the gap is the longer
+  gate sequence before the stress (ab.sh, a second ab.py, N1's six long sessions), W9's ~3 GiB drift effect. No
+  like-for-like needle-after-stress control on b4 exists; the stress gate (the documented worst case) passes.
+- **b5's first start** loaded from the checkpoint (0470 keys the prepared folders by precision, so b4's did not match),
+  wrote new prepared folders (~84 GB a node) and, with the page cache full, **fit only 1 slot** (canary 32 tok/s); that
+  load was aborted before any measurement (`first-start/`) and every later start read the prepared folders (ready in
+  ~75 s, 4 slots). The NVRM `Out of memory` lines on the worker node are from that start.
+
+**Adopted:** `config/prod.env` -> `IMAGE=glm53-tensorfold:b5`, `GLM53_TF_L2PF=1`, `GLM53_TF_L2PF_MB=8`,
+`GLM53_TF_BATCH_CAPTURE_AFTER=8` (was 3); everything else as W10 (the previous file is
+`results/W12/prod.env.before-W12`). 0490 comes with the image (on by default). Not adopted, knobs off: 0440
+(`DEC_QMM` -3.9%, `DEC_EXPERTS` 0.75x in the bench), 0450 (`GPU_ROUND` every mode), `BATCH_GRAPHS=0`, L2PF at 4 MiB
+and site `e`, 0460's RoCE knobs. Prod restarted on it at 17:13: ready in 26 s, canary ok (decode 73.7 tok/s), 4 slots,
+RoCE connected, the `l2pf: bulk, 8 MiB a site` line on both ranks, https `/v1/models` ok (now with `max_model_len`
+1,048,576), `17*23` -> `391`, live `exact` 10/10, watchdog timer active (its 17:13 tick exited 0), lease refresher
+stopped, lease deleted. The NVMe session store starts cold (new image id).
+
+**What W12 says about the decode plan** (DECODE-PLAN updated): of the engineering items built so far only E3 (L2
+prefetch, +2.4% 1 stream) and F0's gentle form (+2.0% at 4 streams) paid. E1 / E2 as built are slower than the
+kernels they replace (E1's ring is capped at ~160 GB/s by loads in flight; E2 loses every large shape), and 0450's
+resident rounds cost more than they save at 1 stream and recover +0.5-1.2% at 4. Measured today vs W11: 1 stream +2.5%,
+4 streams +2.8%.
+
+Ops notes: `pkill -f` from an ssh command killed that ssh's own shell once more (worker, 13:07; nothing else hit),
+after which processes were stopped by PID. An `rsync` of three source paths without `-R` put `results/W12` at the
+repo root on the head node once (removed). Editing `tests-node.sh` while a copy ran on the worker node was harmless (bash had parsed
+the step list). The first `g-unit` run was killed at 18 min: the module forces `TRITON_INTERPRET=1`, so on the GPU
+node its kernels ran in the CPU interpreter; `g-unit0` reran it with `TRITON_INTERPRET=0` (its own 3-second check).
+One lease refresher restart at 15:59 (a new 240-minute cap).
+
+## W13: RigMark on TensorFold production (2026-09-29 17:19-17:29, prod b5 serving, no restart) — standard suite, all runs valid
+
+RigMark's standard suite against production as it serves (image `glm53-tensorfold:b5`, `config/prod.env`), no vLLM run:
+the comparison is against Alex Ellis's two published GLM-5.3 TP2 vLLM receipts. Files: `results/rigmark/tensorfold-20260929/`
+(receipt `glm53-flash-exl3-tensorfold-tp2-low.json` + `.sha256`, card, `run.log`, `command.txt`, `metadata.json`,
+`preflight.json`, `models.json`, `requests.jsonl` = the server's 0300 request log for the run, no text),
+`results/rigmark/compare-published-20260929.md` (`compare_published.py`: the table below with every row),
+`results/rigmark/rigmark-compare-*-vs-tensorfold.txt` (RigMark's own `compare --allow-mismatch` against each receipt).
+
+- **How.** `scripts/rigmark/install.sh` cloned RigMark to `~/rigmark` on the head node at the pin `c5a0db01b054` (clean),
+  then `scripts/rigmark/run.sh tensorfold`: standard settings (no count / length / depth / concurrency flags),
+  `--extra-body '{"chat_template_kwargs":{"reasoning_effort":"low"}}'`, comparison ID
+  `2026-09-glm53-exl3-2xspark-vllm-vs-tensorfold-v1`, loopback client on the head node, 643 s.
+- **Preflight** (`preflight.json`): chat, `/tokenize` and token-ID `/v1/completions` all ok (0490), so the prefill phase
+  ran (no `--skip-prefill`); thinking on with the low-effort body. One gap: reasoning is sent as both
+  `delta.reasoning` and `delta.reasoning_content`, so the receipt's `reasoning_characters` are doubled (timings and
+  tokens unaffected). `GLM53_TF_REASONING_FIELDS` needs a restart, so production was left as it is and the column is
+  halved below.
+- **Quiet endpoint.** `/health` inflight 0 at the start; the request log shows requests n = 27-82 during the run, all
+  RigMark's (15 decode, 18 prefill, 21 concurrency, 2 preflight): no other traffic. The watchdog timer stayed on
+  (read-only ticks). The receipt's `competing_traffic` text says "test window held" (a fixed string in `run.sh`);
+  no window was held, the endpoint was idle.
+
+**Card** (`rigmark report` regenerates it byte-identical from the receipt):
+
+```
+│  ●  15/15 BASIC OUTPUT GATES PASSED                                                      │
+│  MODEL      GLM-5.3-Flash-EXL3                                                           │
+│  APPLIANCE  2x NVIDIA DGX Spark (GB10, 128 GB unified memory each)                       │
+│  RUN        reasoning=low  •  protocol=1.1.0                                             │
+│  SOURCE     git:c5a0db01b054  •  clean                                                   │
+│  CODE              68.6 tok/s      26.3s last     66.5–69.3     ✓ 5/5                    │
+│  PROSE             43.2 tok/s      24.1s last     43.0–43.5     ✓ 5/5                    │
+│  STRUCTURED*       88.2 tok/s       8.2s last     87.3–89.1     ✓ 5/5                    │
+│  64K PREFILL   cold 1,621 tok/s  •  immediate replay 6,304 tok/s                         │
+│  AGGREGATE   C1 54.3  •  C2 65.5  •  C4 82.2 tok/s                                       │
+│  C4 OUTPUT STATE   normal stop 0/12  •  visible 12/12  •  reasoning may be included      │
+│  JSON       sha256:4af01c23364e22b6…                                                     │
+```
+
+**Validity** (every check RigMark makes, plus the receipt itself):
+
+| check | result |
+| --- | --- |
+| basic output gates (visible answer, `finish_reason` stop, `[DONE]`) | 15/15 (code 5/5, prose 5/5, structured 5/5) |
+| structured output: exact 50-object JSON array | 5/5 valid; all 5 outputs identical (one sha) |
+| prefill: server `prompt_tokens` == requested depth | 18/18 rows (8,192 / 32,768 / 65,536, cold and replay) |
+| concurrency streams | 21/21 visible; all stop at the 256-token cap (`length`), as in both published receipts (a capacity test) |
+| receipt | `sha256sum -c` ok; RigMark tree clean at the pin; protocol 1.1.0, prompts 1.0.0 (`0c3ac401…`) |
+| strict `rigmark compare` vs either published receipt | refused, as expected: protocol 1.0 vs 1.1, revision, comparison ID, source sha differ; `--allow-mismatch` used for the files above |
+
+Nothing was flagged invalid.
+
+**Side by side with the published vLLM TP2 receipts** (medians; ratios = ours / theirs; full table with ranges, TTFTs,
+token and reasoning counts in `compare-published-20260929.md`):
+
+| metric | TensorFold (ours) | vLLM TP2 k=7 (`glm53-libert-nvfp4-tp2-low`) | vLLM TP2 adaptive (`glm53-libert-nvfp4-tp2-adaptive-low`) | ours / k=7 | ours / adaptive |
+|---|---:|---:|---:|---:|---:|
+| code decode tok/s (5-run range) | **68.6** (66.5-69.3) | 44.0 (31.6-47.7) | 42.6 (39.0-44.7) | 1.56x | 1.61x |
+| code time to last output s | **26.3** | 46.6 | 50.2 | 0.57x | 0.52x |
+| prose decode tok/s | **43.2** (43.0-43.5) | 18.9 (17.8-19.3) | 22.2 (21.8-22.3) | 2.29x | 1.95x |
+| prose time to last output s | **24.1** | 55.7 | 45.4 | 0.43x | 0.53x |
+| structured ceiling tok/s | **88.2** (87.3-89.1) | 64.9 (63.9-66.8) | 54.6 (53.0-55.7) | 1.36x | 1.61x |
+| structured time to last output s | 8.2 | **7.3** | 8.7 | 1.13x | 0.95x |
+| structured completion tokens | 687 | 441 | 441 | 1.56x | 1.56x |
+| TTFT s, code / prose / structured | 0.51 / 0.40 / 0.46 | 0.60 / 0.49 / 0.47 | 0.59 / 0.47 / 0.47 | 0.84-0.98x | 0.86-0.97x |
+| cold prefill 8K / 32K / 64K tok/s | 1,598 / 1,641 / 1,621 | **1,813 / 1,908 / 1,922** | 1,835 / 1,898 / 1,905 | 0.88 / 0.86 / 0.84x | 0.87 / 0.86 / 0.85x |
+| immediate replay 8K / 32K / 64K tok/s | 1,597 / 3,319 / 6,304 | 1,812 / **11,046 / 11,364** | 1,831 / 11,339 / 11,464 | 0.88 / 0.30 / 0.55x | 0.87 / 0.29 / 0.55x |
+| C1 / C2 / C4 aggregate tok/s | **54.3 / 65.5 / 82.2** | 31.6 / 42.0 / 66.1 | 31.2 / 42.8 / 61.1 | 1.72 / 1.56 / 1.24x | 1.74 / 1.53 / 1.34x |
+| C1 / C2 / C4 per-stream decode tok/s | **60.5 / 37.5 / 24.6** | 33.9 / 23.9 / 18.7 | 33.1 / 24.9 / 16.4 | 1.78 / 1.57 / 1.32x | 1.83 / 1.51 / 1.50x |
+| C1 / C2 / C4 per-stream TTFT s | 0.48 / 0.93 / 1.91 | 0.60 / 0.68 / **0.81** | 0.54 / 1.07 / 0.78 | 0.80 / 1.37 / 2.34x | 0.89 / 0.86 / 2.46x |
+| reasoning chars, prose (ours halved) | 60 | 60 | 60 | | |
+
+**Not a strict comparison.** The three receipts differ in things RigMark does not control, so this is an appliance
+comparison in RigMark's sense (same corpus, settings, request body, counts, lengths, depths, concurrency), not an
+engine-only or matched sweep:
+
+- **Weights.** Ours: `neko-legends/GLM-5.3-Flash-Uncensored-EXL3` (abliterated, EXL3 4-bit experts, non-expert
+  weights re-quantized to 4-bit at load). Alex's: `LibertAIDAI/GLM-5.3-Flash-NVFP4` (ModelOpt NVFP4). The outputs
+  differ (e.g. our structured answer is pretty-printed JSON, 687 tokens / 1,600 chars, against their compact 441 /
+  1,299), so the structured ceiling and time-to-last-output rows compare different token streams.
+- **Drafting.** Ours: DFlash2 `7d74cdd` + the MTP head, cost-derived depth up to 7, verify windows up to 16 rows,
+  suffix lookup. Theirs: DFlash2 `bf582e4` at k=7 (static) or adaptive k=3/5.
+- **Engine and memory.** TensorFold with our patches vs vLLM `0.1.dev20051`; FP8 latent KV, 1,048,576 context,
+  4 slots vs FP8 E4M3 KV, 262,144 context, 6 sequences.
+- **Hardware and runs.** A different pair of Sparks (same model, both direct-link 200 Gb/s RoCE), a different day,
+  protocol 1.1.0 vs 1.0.0, x86 vs aarch64 client. RigMark refuses the pair strictly; no rerun of theirs on our pair.
+
+**Readings.**
+
+- Decode (the drafter-driven phases) is well ahead: code +56-61%, prose +95-129%, C1 +72-74%. This matches the
+  internal gap between TensorFold and our own vLLM kit (W1-W12); the prose gap is larger than code's because GLM's
+  prose accepts few DFlash2 drafts and TensorFold's MTP + cost-derived depth recovers more of it.
+- Cold prefill is 12-16% below vLLM NVFP4 (1,598-1,641 vs 1,813-1,922 tok/s): the known prefill gap (PREFILL-ANALYSIS).
+- **Immediate replay is where TensorFold loses clearly**, and the request log says why: the replays resumed
+  **0 / 16,384 / 49,152** tokens at 8K / 32K / 64K (`cache_src` ram). RigMark's depths are exact multiples of the
+  prefill grid, so the prompt's last grid snapshot is the whole prompt, and a resume needs a strict prefix
+  (`decode._prefill`); the next snapshot down is the 16,384-token mark (`GLM53_TF_SESSION_EVERY`). A replay re-prefills
+  the last 8-16K tokens (9.8-10.3 s). Chat prompts are rarely on the grid, so agents resume within 64 tokens of the
+  end (W14's image conversations: 448 of 481); the RigMark case is an edge. Fix idea (not done): when a prompt ends on
+  the grid, also keep the snapshot one grid step earlier; the 32K / 64K replays would then prefill 64 tokens.
+  **Done offline as patches/0540 (the snapshot moves to n - 64; docs/REPLAY-TTFT.md; GPU run pending).**
+- C4: aggregate +24-34%, per-stream decode +32-50%, but per-stream TTFT 1.9 s vs 0.8 s: the batcher admits the
+  concurrent prompts one prefill piece at a time (`queue_s` 0.47-0.91 s, request log), where vLLM prefills them
+  together. patches/0540 (offline) emits each first token when its piece ends (0370 held it to the round's end);
+  multi-slot prefill analysed in docs/REPLAY-TTFT.md.
+
+## W14: vision (patch 0500) on the GPU, image b6 (2026-09-29, three windows 17:32-17:39, 17:45-18:25, 18:26-18:32; prod down 53 min) — works, one 0500 bug fixed, not adopted
+
+docs/VISION.md §7 on the Sparks. Files: `results/W14/` (`run-window.sh`, `run-window2.sh` the whole sequence;
+`tests/`, `tests-worker/` GPU tests; `*-V0` / `*-V1` text gates; `correct-V1.*`, `cache-V1.*`, `ttft-V1.*`, `stress-V1.*`,
+`needle-V1.*`, `mem-V1.log` + `mem-marks.txt`, `replay-V1R.*`, `fresh-V1F.*`, `pair2-*.json`, `disk1/2.json`,
+`pixels.json`; `img/` the generated test images with `truth.json` (`mkimg.py`, all synthetic); `vis.py` the client;
+`hf_tower.py` / `tower_ours.py` the tower against transformers).
+
+**Image `glm53-tensorfold:b6`** = b5's patch list (0001-0490, `build-patches.txt`) + 0500, built on the head node, loaded on
+worker, tagged `b6` on both. 0500 applies on the stack through 0490 (file by file with `patch`, no rejects; the whole
+stack through 0530 also applies with the fixed 0500). The first b6 (`b6-premtpfix`, head only) failed the GPU test
+and never served.
+
+**0500 bug found and fixed (`patches/0500-glm-vision.patch`, a `decode.py` hunk):** the MTP head's prefill absorb
+(`decode.absorb` -> `Engine.mtp`) replays the head's **CUDA graphs**, which cannot do `glue.embed`'s row substitution,
+so an image's virtual ids (>= 2^24) were read as vocabulary rows: an illegal memory access
+(`test_image_rows_equal_their_tokens`, pinned with `CUDA_LAUNCH_BLOCKING=1` to `decode.mtp`'s `g.replay()`; every
+later test then failed on the poisoned context). VISION.md's "graphs only ever hold decode windows" missed the head's
+graphs. Fix: `Engine.mtp` runs eager (no graph, no long-context graph) when `vision.ACTIVE` is set and the rows carry
+virtual ids. Production's config was not exposed (latent KV + `GLM53_TF_MTP_PREFILL_CACHE=1` absorbs through
+`pfglue.cache_absorb`, eager), but `MTP_PREFILL_CACHE=0` or the per-head KV cache would have crashed rank 0 on the
+first image.
+
+### 1. GPU tests (prod stopped)
+
+| test | result |
+| --- | --- |
+| `tests/cuda/test_vision_patches.py` (synthetic engine; real tower via `GLM53_TF_MODEL`), after the fix | **7 passed**, 1 failed: the real-tower test's bf16-vs-fp32 bound (below) |
+| the same on the production MTP path (`GLM53_TF_LATENT_KV=1`, `GLM53_TF_MTP_PREFILL_CACHE=1`, bf16 latent: the synthetic checkpoint's 128-wide latent cannot take fp8) | **7 passed** |
+| TensorFold's `test_glm_engine.py` in b6 (worker) | 12 passed |
+| host vision tests in the image (`test_vision_prep`, `test_vision`, `test_vision_server`) | 58 passed, 26 skipped (the transformers-parity checks: no transformers in the image; parity was verified offline) |
+| real tower, 1024 x 768 | 1,036 rows, **deterministic** (two runs bit-identical), 196-199 ms (27 TFLOP/s), peak +1.43 GB with the 1.13 GB tower |
+| real tower, 3840 x 2160 | 7,973 rows, 2.75 s, peak +2.35 GB |
+| bf16 vs fp32, same tower | 0.059 relative: **fails the test's 2% bound**, see next row |
+| against transformers' `Glm5NextVisionModel` (head venv, transformers 5.17, same inputs) | transformers' own bf16 vs fp32: **0.060** (random image) / 0.168 (screenshot); ours 0.059 / 0.180. Our fp32 vs theirs fp32: 0.004 (row cosine min 0.996) / 0.021 (mean cosine 0.99955; their Conv3d patch embed runs on cuDNN with TF32). The tower matches the reference; the 2% bound is below what bf16 gives on this model and should be ~8% (test not changed) |
+
+Latency is 2.2-2.6x VISION.md's estimate (75-90 ms for 1024 x 768), still 14% of that image's TTFT (§4 below).
+
+### 2. Text unchanged: vision on vs off (b6), and vs production
+
+| check | V0 (`GLM53_TF_VISION` unset) | V1 (`GLM53_TF_VISION=1`) |
+| --- | --- | --- |
+| exact (glmbench) | 10/10 | 10/10 |
+| batchexact | 4/4 | 4/4 |
+| W9 transcripts (alone, together == alone) | identical to W9 load A | identical to W9 load A |
+| reply sha, ab.py 24.5k / 98k (cold and warm) | 8794a3463259cc2f x4 | 8794a3463259cc2f x4 |
+| glmbench tf / tweet / kit / edit reply hashes (13 cells) | = V1 13/13, = W12 FIN 13/13 | = V0 13/13 |
+| 1 stream geomean (13 cells, 1 rep) / prefill 24.5k, 98k | 73.1 tok/s / 1,608, 1,617 | 73.6 / 1,615, 1,612 (W12 FIN 73.4 / 1,602-1,612) |
+| MemAvailable at engine ready, head / worker | 17.8 / 16.5 GiB (first start: kernel compile, ready 209 s) | 17.3 / 16.8 GiB (ready 60 s; boot line `vision tower: 1.13 GB on the GPU (7.3s)`) |
+| /health errors, r0 error lines | 0, 0 | 0, 0 |
+
+### 3. Real images (V1, greedy, `reasoning_effort` low; max where noted)
+
+| check | result |
+| --- | --- |
+| (a) describe a 1920 x 1080 desktop screenshot (2 windows, calculator display, taskbar clock) | both titles exact (`notes.txt - Text Editor`, `Calculator`), display `391`, clock `14:32`, the note's 6 lines quoted |
+| (a) describe a 1024 x 768 drawn scene (JPEG) | house, door, window, tree, sun, sky, grass |
+| (b) read a terminal screenshot (3 commands + output) | low: CER 0.118, only because it also copied the window title `user@demo: ~` (every command / output line exact); **max: CER 0.000** |
+| (b) a 12 px paragraph (3 lines) / a receipt | **CER 0.000** / TOTAL 22.50 and all 4 items |
+| (c) count 3 / 7 / 12 circles, a 5 x 4 star grid | 3, 7, 12, 20 at low and at max (8/8) |
+| (d) two charts in one message, "which is larger", both chart orders x images-first / text-first | 4/4 right, both values quoted |
+| (e) RGBA PNG, black text on transparent | `TRANSPARENT OK 42` (reads as text on white) |
+| (f) `http://` URL (local `http.server` on the head) vs the same image as `data:` | same `prompt_tokens`, **byte-identical reply**; bare-string `image_url` shape ok |
+| refusals (400, `param: messages`, nothing streamed) | 30 MB image (`MAX_BYTES`), 10k x 10k (`MAX_PIXELS`, from the header), 20k x 20k (Pillow's own decompression-bomb check fires first), dead URL, 9 images, `file:` scheme; the next text request is served (`391`), `/health` ok, 0 errors |
+| `usage.prompt_tokens` | text + rows (e.g. 1,036 rows for 1024 x 768), as VISION.md; no vLLM-kit comparison run (skipped: prod down for the kit start; counts already equal transformers' processor offline) |
+
+### 4. Caches
+
+| check | result |
+| --- | --- |
+| same image conversation twice | 2nd `cached` 448 of 481 (the 64-row grid point), tower not rerun (`encoded` 0), **reply identical** |
+| 3 turns, image in turn 1 | turns 2 and 3 `cached` 320 (past the image: 285 rows in a 324-token prompt, ending before position 320), `encoded` 0 |
+| image B after image A, same text (28 text tokens before the image) | B `cached` 0 (<= 28), B's reply == **B alone on a fresh session dir** (V1F) |
+| the same with 825 text tokens before the image (D2 after D1) | B `cached` 0: no snapshot inside the shared text yet (the store puts a fork mark there for the next request, SESSION_FORK_MIN 512); B's reply == B fresh (e68ffbc90c288686). The image rows never resumed across images |
+| NVMe tier: restart, same conversation | the 390-token 3-turn conversation is under `GLM53_TF_SESSION_DISK_MIN` (1,024) and was not written: served cold, reply identical. A 2,735-token screenshot conversation (D1), restart (D3): **`restored_disk`**, 2,688 cached from NVMe (115 MB in 57 ms), **reply identical**. The tower reran after the restart (0.74 s; the row cache is per process) although no image row was prefilled: a small follow-up (skip encoding when the resume covers every image row) |
+
+### 5. Memory under 4 x 250k with vision on (V1, after the image and cache checks, tower + row caches warm)
+
+| phase | MemAvailable min head / worker | bar / reference |
+| --- | --- | --- |
+| stress fill (4 x ~250k, 773 s; longest decode gap 3.9 s) | **9.43 / 9.82 GiB**, PASS | >= 8; W12 FIN 9.74 / 8.32 |
+| an image request right after the stress (pool and store full) | served (`7`), no dip below the stress minimum | |
+| needle (298,352 tokens, alone after the stress) | **8.34 / 9.07 GiB**; found cold (1,383 tok/s) and resumed (298,304 cached) | W12 FIN 8.27 / **6.58** (worker) |
+| OOM kills | 0 / 0 (the worker node's 2 `out of memory` lines are W12's NVRM messages) | 0 |
+
+With the tower rank 0 is now the lower node (it was ~1 GiB above rank 1 without it). The needle dip stayed above
+8 GiB here, but this run had no MMLU / N1 / second ab.py before it, which W12's 6.58 GiB followed; it is not a
+like-for-like answer to that open end.
+
+### 6. TTFT per image size (V1, thinking off, 8-token reply, 3 unique images a size, medians)
+
+| image | prompt tokens (rows) | TTFT | tower (`vision_s`) | LM prefill (`prefill_s`) | tower share |
+| --- | --- | --- | --- | --- | --- |
+| 512 x 512 | 397 (361) | 0.76 s | 0.058 s | 0.69 s | 8% |
+| 1024 x 768 | 1,071 (1,036) | 1.44 s | 0.196 s | 1.20 s | 14% |
+| 1920 x 1080 | 2,724 (2,691) | 2.82 s | 0.657 s | 2.07 s | 23% |
+| 3840 x 2160 | 8,009 (7,973) | 8.10 s | 2.66 s | 5.25 s | 33% |
+
+The tower is slower than VISION.md §4 (27 TFLOP/s against the 55-65% of peak assumed) and its share grows with size;
+the LM prefill of the rows is as estimated (~0.9-1.5k tok/s at these lengths).
+
+**Not adopted** (as asked): `config/prod.env` unchanged; production restored to b5 after each window (17:39, 18:25,
+18:32: `/v1/models` local and https, `17*23` -> `391`, canary ok 76.8 tok/s, watchdog timer active, refresher killed,
+lease deleted; the prod container has no `GLM53_TF_VISION`). The b5 NVMe session store restarted cold (the test loads'
+session compat dirs pushed it out, as in W12). To adopt later: IMAGE b6 + `GLM53_TF_VISION=1`; rank 0 becomes the
+low-memory node; relax the tower test's bound; consider `GLM53_TF_VISION_FETCH=0` if the API is ever exposed.
+
+## W15: vision + replay/TTFT in prod (2026-09-29, one window 19:43-21:18, prod down 1 h 35 min) — image b7 with 0500 + 0540, `GLM53_TF_VISION=1` and `GLM53_TF_REASONING_FIELDS=reasoning` adopted
+
+Files: `results/W15/` (`run-window.sh` the whole window; `tests.sh` every test run, logs in `tests-cpu/`, `tests-gpu/`,
+`tests-gpu2/`, `tests-gpu3/`, `tests-worker/`; `gates.sh` = W12's gate sequence with phase marks and a PRE hook; `B7` the
+candidate's gate files, `B7b` its restart for the replay / C4 / cache checks, `E0` the EMIT_FIRST=0 control, `b5ctl*`
+live production b5 before the window; `replay.py`, `c4.py`, `vis.py` (W14's with the sha over `reasoning`),
+`meminfo.sh`, `cmp.py` (W12's, reads `W12/...` tags), `rigcmp.py`; `prod.env.before-W15`).
+
+**Image `glm53-tensorfold:b7`** = b5's patch list (0001-0490, as `results/W12/build-patches.txt`) + 0500 + 0540
+(`build-patches.txt`), built on the head node (0510-0530 skipped; 0540 applies with offsets only, it was written on the stack
+through 0530), shipped with `docker save | docker load` to the worker node, tagged `b7` on both. The whole stack through 0540 also
+still applies.
+
+### 1. Tests
+
+| run | result |
+| --- | --- |
+| CPU, in b7, prod still serving (`tests-cpu/`) | `test_replay_ttft_patches` 32 passed; `test_session_patches` 21 passed (11 GPU-only skipped); `test_decode_overlap_patches` 30; host vision (`test_vision_prep`, `test_vision`, `test_vision_server`) 58 passed, 26 skipped (transformers parity); `test_api_context` + `test_prompt_tokens` + `test_openai_compat` 42 passed |
+| GPU, first pass (`tests-gpu/`, head) | replay 32, batch sessions 28, cindep 54, overlap 30 passed; **vision 7 + 1 failed, vision latent path 6 + 1, fastpf 25 + 4, session 31 + 1**; worker: TensorFold's `test_glm_engine.py` **10 + 2 failed**, replay 32 |
+| cause of all 9 failures | expectations of the old snapshot rule, not 0540's code: each asserted a resume at the prompt's end (`cached == len(first)`, a 256-token on-grid snapshot, a next turn resuming >= 112 of 112 tokens) or a store eviction that 0540's smaller / duplicate snapshots no longer force. With `GLM53_TF_SNAPSHOT_BEFORE_END=1` the snapshot is at `(n - 1) // 64 * 64` (64 of 70, 64 of 112, 128 of 256 on the tests' 128 grid), exactly 0540's documented rule; every later exactness assert in those tests (resume == fresh, rank 1 == rank 0) passed once the expectation was fixed |
+| test updates (tests only) | `test_fastpf_patches.py`: the on-grid case expects the snapshot at 128 with the knob on, 256 off; `test_vision_patches.py`: tail 30 tokens (was 9) so the last grid point (128) lies past the image, assert `cached >= text + image`; `test_session_patches.py::test_rank1_follows_rank0`: budget 4 entries + 1 extent (was + 2: with 0540, 6 of 19 saves are duplicates, the entries share one extent and nothing was evicted), asserts split; TensorFold's `test_glm_engine.py` (`test_resumed_prompts_equal_fresh_prefills`): a hunk added to `patches/0540` expecting `(len(first) - 1) // 64 * 64` with the knob on (b7's image predates the hunk; the runs mount the patched file, the source files of b7 are byte-identical to the updated patch's) |
+| GPU, after the updates (`tests-gpu2/`, `tests-gpu3/`, `tests-worker/`) | vision **8 passed** incl. the real tower (bf16 vs fp32 **0.0591**, under the 8% bound; W14 0.059), vision latent path 7, fastpf 29 with the knob on and 29 off, session **32 on and 32 off** (evicted 14 / restores 5 on, 14 / 6 off), vision with the knob off 7, `test_glm_engine.py` **12 on and 12 off** |
+
+### 2. Candidate B7 = `config/prod.env` + IMAGE b7 + `GLM53_TF_VISION=1`, `GLM53_TF_VISION_CACHE_MB=64`, `GLM53_TF_VISION_PREP_MB=64`, `GLM53_TF_REASONING_FIELDS=reasoning` (0540's knobs default on)
+
+First start of the new image: ready in 206 s (kernel JIT for the new image id), then 30-40 s; boot lines `vision tower:
+1.13 GB on the GPU`, `image_url parts on`, MemAvailable at engine ready 16.7 / 16.1 GiB. Order: the image checks first
+(so the tower and its caches are warm for the stress), then W12's `gates.sh` sequence unchanged (ab.sh, ab.py again, N1,
+4 x 250k stress, MMLU-200, exact / batchexact again, needle), MemAvailable every 2 s with phase marks; then a restart (B7b)
+for the replay, regenerate, C2 / C4 and image-cache checks on a fresh server.
+
+| gate | B7 / B7b | bar / reference | |
+| --- | --- | --- | --- |
+| exact / batchexact, before and after the stress + MMLU | 10/10, 4/4; 10/10, 4/4 | 10/10, 4/4 | pass |
+| W9 transcripts (alone, together == alone) | identical to W9 load A | identical | pass |
+| reply sha, ab.py 24.5k / 98k x 2 | 8794a3463259cc2f in every cell | same | pass |
+| glmbench tf / tweet / kit / edit (13 cells x 3) reply hashes | **13/13 equal to W12** (controls and FIN) | equal | pass |
+| N1 (`bench/longexact.py` 8.7k / 16.9k / 32.1k) | drafted == serial 6/6, batched == alone 6/6, **12/12 shas == W12 FIN and prod b4** | all | pass |
+| prefill 24.5k / 98k (tok/s) | 1,610 / 1,607; 1,605 / 1,606 | W12 FIN 1,602 / 1,579; 1,604 / 1,612 (98k within -1%) | pass |
+| cold prefill of grid-aligned prompts (token ids, RigMark's shape, median of 3) | 8,192: **1,565** (5.24 s); 32,768: 1,636; 65,536: 1,619; off-grid 32,700: 1,640 | b5 live the same day: 1,593 / 1,631 / 1,618 / 1,634; W13 1,598 / 1,641 / 1,621 | 8K **-1.8%** (bar -4%): 0540's one extra 64-row chunk, ~0.09 s; 32K / 64K +0.3% / +0.1% |
+| decode 1 stream (13-cell geomean) / 4 streams (mean of 6) | **-0.4%** vs W12 FIN (every cell within -2.3..+1.2%); **80.6 tok/s** | W12 FIN 81.2 (its passes 81.0 / 81.4; W12 controls 78.6-79.3) | within noise |
+| lone-slot probe | 53.0 / 53.9 / 52.0 / 54.7 tok/s (slots 0-3) | W12 FIN 53.9 / 52.0 / 54.8 / 53.0 | same |
+| replay: identical token-id prompt resent (3 pairs a depth) | 8K / 32K / 64K: **cached 8,128 / 32,704 / 65,472 (= n - 64)**, 1 piece, **TTFT 0.23 / 0.26 / 0.29 s** (max 0.296); off-grid 32,700: 32,640, 0.24 s; the 8 tokens equal cold's every time | cached n - 64, TTFT <= 0.5 s; b5 live: cached 0 / 16,384 / 49,152, TTFT 5.13 / 10.2 / 10.9 s | pass |
+| chat regenerate (14,035-token prompt, greedy and seeded T 1) | 2nd cached 14,016, TTFT 8.78 -> 0.18 s, replies identical | within 64, identical | pass (off-grid: as b5) |
+| C4 first tokens (4 x ~100-token prompts released together, 256 tokens, 3 rounds; `c4.py`) | thinking off: first tokens staggered per piece, **0.34 / 0.68 / 1.10 / 1.44 s**, median **0.93 s**; with `GLM53_TF_EMIT_FIRST=0` (load E0) 0.38 / 1.49 / 1.49 / 1.49, median 1.46 s. Thinking on (RigMark's `reasoning_effort` low): median 1.68 s, the 2nd-4th still together | 0540 §2 | mechanism works (-36% median C4 TTFT without thinking); **no effect with thinking on**, see below |
+| images (`vis.py correct` / `cache`, before the gates and again on B7b) | screenshot: both window titles, calculator `391`, clock `14:32`; scene objects; receipt TOTAL 22.50 + 4 items; 12 px paragraph CER 0.000; terminal CER 0.000 at max (0.118 at low: copies the title, as W14); circles 3 / 7 / 12 and 20 stars at low and max; two-chart comparison 4/4; RGBA; URL == data: (same prompt, same reply); 30 MB / 20k x 20k / dead URL / 9 images / `file:` are 400s and the next request is served; same image conversation twice: 2nd cached 448 of 482, tower not rerun, reply identical; turns 2-3 of a receipt conversation cached 320 | W14 | pass (every answer as W14) |
+| MMLU-200, refusals | **88.0%** (176/200), 0/10 | >= 87% | pass |
+| 4 x ~250k stress, MemAvailable min head / worker | **8.27 / 8.28 GiB**, filled in 775 s, longest decode gap 3.85 s | >= 8 (W12 FIN 9.74 / 8.32; W14 V1 9.43 / 9.82) | pass, 0.27 GiB of margin |
+| needle 314,305 tokens alone after the stress + MMLU | found cold (1,368 tok/s, decode 68.5) and resumed (314,304 cached in 0.13 s, decode 77.3); an image right after it served (`7`) | found | pass |
+| OOM kills / engine errors | 0 / 0 (dmesg counts unchanged: 0 / 1, the worker node's line is W12's NVRM message); /health 440 requests, 0 errors | 0 | pass |
+
+**C4 with thinking on.** `GLM53_TF_EMIT_FIRST` hands a piece's first token to its caller at once (thinking off shows it:
+each first token leaves as its own piece ends). With thinking on, the first generated token streams no text (a
+`max_tokens: 1` request at effort low or high returns neither content nor reasoning: a template / think-tag token), so
+the first visible delta is the first decode round's, and that round still waits for the round's other pieces. RigMark's C4 (reasoning low) therefore sees no change from 0540 §2; getting it there needs
+multi-slot prefill (REPLAY-TTFT §2) or the first decode round of a finished piece run before the next piece.
+
+### 3. Memory
+
+- **Stress.** 8.27 / 8.28 GiB: head is ~1.5 GiB lower than W12 FIN (the tower's 1.13 GB, its transients and the 64 +
+  64 MB caches, warm from the image checks); worker as W12 (8.32). Both nodes now sit at the same floor.
+- **The needle dip, W12's sequence re-run** (ab.sh, ab.py, N1, stress, MMLU, exact, needle; the image checks before
+  them): MemAvailable minimum over the gates **6.39 / 6.42 GiB** (W12 FIN 8.27 / 6.58; W14 V1, without MMLU / N1 before,
+  8.34 / 9.07), 17 / 16 two-second samples under 8 GiB, all inside the needle's cold prefill, lowest 4 s before it
+  ended; no OOM; back to 11.6 / 11.6 when it ended. Phase minima: image checks 13.4, ab.sh 11.4, N1 10.8, stress 8.27,
+  MMLU 9.3, needle 6.4 (`mem-B7.log`, `mem-marks-B7.txt`).
+- **What it is** (`meminfo-needle-B7b.log`: the needle alone on the fresh B7b, 298,388 tokens, with Cached / Dirty /
+  AnonPages / Shmem sampled): MemAvailable 12.3 -> **9.3 GiB** on both nodes, all of it in **MemFree** (page cache,
+  dirty pages, anon and shmem flat), flat for the first ~60% of the prefill and falling over its last ~90 s, then
+  14.1 GiB when the request ends. So it is device memory the engine takes at the end of a lone ~300k prefill (context-
+  length-sized working buffers of the last chunks) and releases after; it is not the session store, the NVMe tier's
+  page cache or a leak. After the stress + MMLU the needle starts ~1.4 GiB lower (10.9) and the drop is larger at 314k
+  (4.5 GiB), which gives the 6.4 floor. With the tower, head now dips as far as worker did in W12. The stress gate
+  (the documented worst case for four slots) passes; a lone prompt near 1M tokens would dip further than 314k's and was
+  not measured.
+- **Page cache can serialize concurrent requests (found on b5 before the window).** While `docker save` of b7 was
+  streaming 36 GB from the head node, the C4 control on production ran its rounds 2-3 one request at a time (queue 6.3 / 12.5 /
+  18.6 s: `c4-b5ctl.log`): head had MemFree 2.1 GiB (16.8 GiB of page cache), and the batcher admits a request beside
+  others only while free device memory (`torch.cuda.mem_get_info`) less the store's headroom is >= `GLM53_TF_BATCH_ADMIT_GB`
+  (2); on GB10 that free figure evidently tracks MemFree, not MemAvailable (reclaimable page cache does not count). After `drop_caches` the same run was normal (`c4-b5ctl2.log`). Large
+  file operations on the head node (image saves, copies, possibly a long-filled NVMe session tier) silently cost concurrency;
+  not changed here.
+
+### 4. Adopted
+
+`config/prod.env`: `IMAGE=glm53-tensorfold:b7`, `GLM53_TF_VISION=1`, `GLM53_TF_VISION_CACHE_MB=64`,
+`GLM53_TF_VISION_PREP_MB=64`, `GLM53_TF_REASONING_FIELDS=reasoning` (0540's `GLM53_TF_SNAPSHOT_BEFORE_END` /
+`GLM53_TF_EMIT_FIRST` default on), header with these gates and the revert (previous file `results/W15/prod.env.before-W15`).
+Production restarted on it at 21:17: ready in 32 s, canary ok (decode 81.8 tok/s), local and https `/v1/models` ok,
+`17*23` -> `391`, **an image request over https** (`data:` receipt PNG -> `22.50`, 285 image rows), a thinking reply
+carries `reasoning` only (no `reasoning_content`), live exact 10/10, watchdog timer active (its first tick exited 0),
+lease refresher gone, lease deleted. Note for clients: anything that reads only `reasoning_content` no longer sees the
+thinking (the vLLM kit never sent it either). `GLM53_TF_VISION_FETCH` stays 1 (http(s) image URLs are fetched from
+the head node's network; the endpoint is private-network only).
+
+### 5. RigMark on the new production (two runs, prod serving, no restart; not published)
+
+`scripts/rigmark/run.sh tensorfold` twice against b7 production, RigMark pinned at `c5a0db01b054` (clean), standard
+suite, `reasoning_effort` low, new comparison IDs `2026-09-glm53-exl3-2xspark-tensorfold-w15-b7-v1` (run 1, 21:19-21:29)
+and `-v2` (run 2, 21:37-21:47), so no earlier sweep's prompt could be in the NVMe session tier. Files:
+`results/rigmark/tensorfold-20260929-w15/` and `tensorfold-20260929-w15-run2/` (receipt + sha256, card, run.log,
+metadata, preflight, `requests.jsonl` = the request log of the run; the directories were renamed after the run, so
+`command.txt` still names `tensorfold-20260929-141934` / `-143739`), `results/W15/rigmark-w13-w15.md` (table below).
+Both runs valid: 15/15 basic output gates, preflight gaps none (reasoning is no longer sent twice), every prefill row's
+`prompt_tokens` == depth. Run 1 overlapped three 1-token probe requests of ours (21:21:12, < 0.4 s, during code run 4).
+
+| metric (median) | W13 b5 | W15 b7 run 1 | W15 b7 run 2 | vLLM TP2 k=7 (Alex) |
+|---|---:|---:|---:|---:|
+| code / prose / structured decode tok/s | 68.6 / 43.2 / 88.2 | 67.5 / 44.0 / 89.0 | 67.2 / 42.7 / 88.7 | 44.0 / 18.9 / 64.9 |
+| code / prose / structured TTFT s | 0.50 / 0.40 / 0.46 | 0.51 / 0.40 / 0.46 | 0.49 / 0.44 / 0.48 | 0.60 / 0.49 / 0.47 |
+| prose reasoning characters | 120 raw (60 sent twice) | **60** | 0 (empty thinking at low effort) | 60 |
+| cold prefill 8K / 32K / 64K tok/s | 1,598 / 1,641 / 1,621 | 1,559 / 1,635 / 1,619 | 1,564 / 1,638 / 1,619 | 1,813 / 1,908 / 1,922 |
+| immediate replay 8K / 32K / 64K tok/s | 1,597 / 3,319 / 6,304 | **38,881 / 146,067 / 257,263** | **37,117 / 142,316 / 250,472** | 1,812 / 11,046 / 11,364 |
+| replay TTFT 8K / 32K / 64K s | 5.13 / 9.87 / 10.4 | 0.21 / 0.22 / 0.25 | 0.22 / 0.23 / 0.26 | 4.52 / 2.97 / 5.77 |
+| C1 / C2 / C4 aggregate tok/s | 54.3 / 65.5 / 82.2 | 54.8 / 67.0 / 81.8 | 54.3 / 67.3 / 82.8 | 31.6 / 42.0 / 66.1 |
+| C1 / C2 / C4 per-stream TTFT s | 0.48 / 0.93 / 1.91 | 0.49 / 0.95 / 1.63 | 0.48 / 0.76 / 1.91 | 0.60 / 0.68 / 0.81 |
+
+Against W13: replay 24x / 44x / 41x faster (0.2-0.26 s at every depth), reproduced within 5% by run 2; cold 8K -2%
+(0540's extra chunk on a grid-aligned prompt; 32K / 64K equal); decode and aggregates within run-to-run noise (code
+-2% in both runs, prose -1..+2%, structured +1%); C4 per-stream TTFT 1.63 / 1.91 s (W13 1.91): unchanged within noise,
+as §2 explains (thinking on). Reasoning characters are now single-counted (60 = vLLM's 60).
+
+### 6. Replay verification (is ~146k tok/s at 32K real?)
+
+**What the number is.** RigMark's "immediate replay tok/s" is `prompt_tokens / TTFT` of an identical resend. The
+request log of both runs (`requests.jsonl`, 9 replays each) has every replay at **`cached` = n - 64** (8,128 / 32,704 /
+65,472), `cache_src` `slot` (the slot's own prompt snapshot, still on the GPU), **1 piece, `prefill_s` 0.17-0.20 s**,
+server `first_s` 0.18-0.23 s; RigMark's client TTFT adds 0.02-0.04 s (0.21-0.27 s). So 32,768 / 0.224 s = 146k tok/s is
+an effective rate: 32,704 tokens are not recomputed, the last 64 are (a real 64-row prefill chunk through all layers,
+~0.17 s, about what a cold 54-token prompt costs: 0.285 s in W13), then the first token is sampled. The cold runs of the
+same prompts took 5.2 / 20.0 / 40.4 s with `cached` 0 and 2 / 8 / 16 pieces.
+
+**Same output as computing it.** RigMark's receipts: each replay's 8-token output sha == its cold run's, 9/9 in both
+runs. `verify.py` (`verify-prod.log` / `.json`, production, API only): prompts of exactly 8,192 / 32,768 / 65,536 token
+ids this server had never seen (the log: `cached` 0, `cache_src` none: computed from scratch), 64 greedy tokens with
+`ignore_eos`; the replay and a second replay (`cached` n - 64, TTFT 0.31-0.34 s) returned the **byte-identical 64
+tokens** at all three depths. (A restart to compare against another server process was not done: it would cost prod
+downtime and add nothing a never-seen prompt does not; resume == fresh is also covered by the GPU tests of §1, knob on
+and off, and by N1 / the W9 transcripts.)
+
+**Negative controls** (each variant sent once after its base; `cached` must never exceed the prefix the variant shares
+with anything stored):
+
+| variant (one token changed at) | 8,192 | 32,768 | 65,536 | expected |
+| --- | --- | --- | --- | --- |
+| start (position 3) | cached 0, 5.43 s | 0, 20.9 s | 0, 42.2 s | 0 (cold) |
+| middle (0.52 n: 4,259 / 17,039 / 34,078) | 0, 5.71 s | 16,384 (ram), 11.0 s | 32,768 (ram), 21.9 s | the last session mark before the change (every 16,384), rest re-prefilled |
+| near the end (n - 10) | 8,128 (slot), 0.31 s | 32,704 (ram), 0.33 s | 65,472 (ram), 0.36 s | n - 64: the snapshot lies before the change |
+| end - 100 (n - 100) | 4,224 (ram), 2.81 s | 17,024 (ram), 10.4 s | 49,152 (disk), 11.1 s | below the change: n - 64 contains it |
+| a different prompt, same length | 0, 5.44 s | 0, 21.0 s | 0, 43.3 s | 0 (cold) |
+
+Every `cached` is at or below the changed position. The 4,224 and 17,024 are the fork marks the store placed where the
+"middle" variants diverged from the base (4,259 / 17,039 rounded down to the 64-grid; `GLM53_TF_SESSION_FORK_MIN`),
+valid prefixes of the n - 100 variants too; 49,152 is a session mark read back from the NVMe tier. Each variant's output
+differs from the base's except the 64K "middle" one (sha equal): one word changed 31k tokens before the end of a
+numbered-line document does not change the next 64 greedy tokens; its log shows 32,768 cached and 32,768 re-prefilled
+(21.8 s), so it was recomputed, not served from the base.
+
+**Why vLLM replays at ~11k tok/s** (Alex's receipts, `vLLM 0.1.dev20051`, and our vLLM kit's copy of the same machinery, read
+only):
+
+- The receipts' replay TTFTs (TP2 k=7): 4.52 / 2.97 / 5.77 s at 8K / 32K / 64K against cold 4.52 / 17.2 / 34.1 s. At the
+  cold rate that is a recomputed tail of ~8,200 / ~5,700 / ~11,100 tokens: the whole prompt at 8K, and a tail that
+  doubles from 32K to 64K. The adaptive receipt is the same (8,208 / 5,485 / 10,892); a TP4 receipt recomputes ~3-3.7k
+  at every depth (40.9k tok/s at 64K).
+- vLLM's prefix cache for this hybrid model can only restore the KDA (linear-attention) recurrent state at page-aligned
+  checkpoints: with prefix caching on it forces `mamba_cache_mode = "align"` (`model_executor/models/config.py` ~621-643),
+  the state is saved only when a scheduler step ends on a page boundary (our kit sets `MAX_NUM_BATCHED_TOKENS=3584`
+  for exactly that, `.env`: "prefix caching NEEDS chunk ends on page boundaries"), a hit is capped at `num_tokens - 1`
+  and then rounded down to a whole block (`v1/core/kv_cache_manager.py` ~258), the DSA indexer's scratch cache never
+  prefix-caches (so no sub-page hits), and with a DFlash drafter every cache group drops its last matched page. The
+  replay therefore restarts from an aligned checkpoint several thousand tokens before the end and re-prefills that
+  tail; at 8K the only checkpoint falls in the dropped page, so nothing is reused (replay == cold). Consistent with
+  those rules, not checked against Alex's exact source (his image is not on our Sparks): a 3,584-token page and
+  7,168-token checkpoints give exactly 8,192 / 4,096 / 8,192 recomputed tokens plus ~0.17 s, which fits all six TP2
+  numbers.
+- TensorFold keeps a snapshot of the whole state (latent KV + KDA state + MTP / DFlash2 context) at n - 64 for every
+  prompt (0540) and resumes there, so an identical resend recomputes 64 tokens at any depth. Our own (unpublished)
+  build of the vLLM kit patched the same limits (64-token hits, drafter-group page drop, an n - 1 tail floor) and
+  recorded 0.26 s exact replays, so the gap is vLLM's stock hybrid caching, not a TensorFold shortcut.
+
+## W16: THEORY-2 prototype session on the prod stack (image b8) + drafter comparison (2026-09-29, one window 22:10-23:55, prod down 1 h 45 min) — nothing adopted, prod stays on b7
+
+Files: `results/W16/` (`session.log`, not in the public repo, first; `window.sh` = `results/THEORY2-SESSION/run.sh all` with Part B in its
+`AFTER_LOADS` hook; `summary.txt` = run.sh's own summary against load C, **`summary-C2ctl.txt` the valid one, against
+C2**; `probes-head/`, `probes-worker/`; `rocetrace-K.txt`, `lines-CT-r0.txt`, `lines-VS-r0.txt`; `DS/` Part B with
+`DS/dscmp.txt`; `drafters.sh`, `dscmp.py`, `w16req.py` = W11's driver with a `POLICIES` env). The THEORY2-SESSION
+scripts (prepared as W13 on b5, never run as such: the W13 / W14 labels went to RigMark and vision) were relabelled
+W13 -> W16 and b6 -> b8, the control switched to prod as it runs (`config/prod.env`, image b7, vision on), GR made
+skippable (`W16_SKIP_GR`, default on) and `probes/littles.cu` fixed (below).
+
+**Image `glm53-tensorfold:b8`** = b7's list (`results/W15/build-patches.txt`) + 0510 / 0520 / 0530
+(`results/W16/build-patches.txt`); all five of 0500-0540 apply in order with offsets only. Built on the head node, shipped with
+`docker save | docker load`, tagged `b8` on both nodes. The prepared weight folders are reused (0510-0530 touch no
+`WEIGHT_CODE` module). Every b8 load served the **same bits** as b7: exact 10/10, batchexact 4/4, W9 transcripts
+identical, reply sha 8794a3463259cc2f, and all 10 glmbench cell hashes == the control.
+
+Schedule: at 22:50 the wrap-up was moved to ~00:30 (0550 / 0560 and the averaged suite need the GPUs).
+GR (nsys) was skipped, and the stock-base (abliteration-gap) arm was dropped.
+
+### 1. Probes (no server; clocks locked at 2,250 MHz; head and worker in parallel, 22:10-22:14)
+
+| item | probe | result | gate |
+| --- | --- | --- | --- |
+| CPU suites (0510 / 0530 / hc_fused, in b8) | pytest | 169 passed | |
+| 0510 GPU (split / probe / lone: same bits) | `test_batch_graphs_lone_patches.py` | 19 passed | |
+| 0520 GPU bits vs Triton | `test_hc_fused_patches.py` | 76 passed | |
+| 2 verify graph launch | `glprobe.py`, 1,650-node graph | first-node delay **4 us** uncaptured (host 4 us); under nsys `graph` 193 us, `node` 188 us; splitting into 2 / 4 / 8 pieces costs 26 / 90 / 200 us end-to-end | **FAIL** (>= 400 us to build the split). THEORY-2's 1.1 ms exposure was nsys inflation |
+| 3 fused hc boundary | `bench_hc_fused.py`, cold, 50 MB predecessor | fused / Triton 0.58x at R = 1 (pdl), 0.92-0.98x at R = 2-4, 1.1-1.4x at R = 6-16; geomean 1.02x; same bits | **FAIL** (<= 50% at rows 1-16), so load H was skipped |
+| 7 E2 small dense shapes cold | `bench_decode_cold.py --mode both` | rotate / flush speed-up on < 8 MB shapes: KDA f_b/g_b 1.70 / 1.38x, shared down 1.47 / 1.18x, index q_b 1.35 / 1.26x, DSA kv_b 1.28 / 1.21x, index k 1.25 / 1.14x; >= 14 MB shapes 0.82-1.05x | **PASS**: `GLM53_TF_DEC_QMM_MAX_MB` candidate **3.5** (every shape at or below it passes cold) |
+| 8 memory pipeline | `littles.cu` | first run: `cudaFuncSetAttribute(MaxDynamicSharedMemorySize, optin)` **invalid argument** (`bulk_kernel` has 128 B static smem, so opt-in + static > the limit). Fixed (the limit minus `sharedSizeBytes`, and the bulk sweep's fit check + 128 B) and re-run `--quick` at 23:55: `ld.global.nc` tile **232.7 GB/s at 4 KB/SM in flight** (D1 C2, 8 warps/SM, 54 regs); cp.async 6 KB/SM (234); bulk 8-16 KB/SM (234-237); idle random chase 1,158 ns/step, x2.7 beside 1 streaming CTA/SM | **PASS** (>= 230 GB/s, <= 4 KB/SM, <= 112 regs) |
+
+### 2. Server loads (THEORY2 "full set" each: exact, batchexact, transcripts, ab.py 24.5k / 98k, glmbench tf,kit,edit x3, 4 streams x6, lone slots)
+
+**Control C was not a control.** It started at 22:14, right after b8's 36 GB `docker load` on the worker node; rank 1 had
+~2.4 GB less free memory after its engine step (MemFree 13.1 vs 15.5 GiB in L), the batcher's fit check
+(`free - per - store_budget >= BATCH_RESERVE_GB`, both ranks) failed, and C served with **1 batch slot** (4 streams
+60.4 tok/s, every round `alone`). C's bits and 1-stream numbers are valid; its 4-stream / slot numbers are not, and
+run.sh's own `summary.txt` (+34% at 4 streams for every load) is wrong for that reason. **C2** (23:04: the same
+prod config, page cache dropped on both nodes first, 4 slots) ran as the first drafter arm (inco-7d7) with the same
+full set; `summary-C2ctl.txt` uses C2 alone.
+
+| load (vs C2) | knobs | exact / bexact / sha / hashes | 1 stream geo | code-like | prose | sampled | 4 streams (mean of 6) | lone slots | gate |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| C2 | prod (b7) | 10/10, 4/4, ok, 10/10 | 0 | 0 | 0 | 0 | 80.55 tok/s | 0 | |
+| L | `BATCH_GRAPHS=lone` | same | +0.2% | +0.6% | +0.4% | -0.9% | 80.87 (**+0.4%**) | +0.7% | item 1: 4s >= +0.7% **FAIL** |
+| CT | trace + `GRAPH_PROBE=100` (short set) | hashes 7/7 == C | (x1) | | | | 81.47 (x3) | | skew baseline |
+| K | `-lgc 2250,2250` + `CPU_PIN=http` + trace | same | -0.2% | -0.2% | +0.1% | -0.7% | 81.12 (+0.7%) | +0.7% | item 6: 4s +0.7% at the bar; skew 42.6 -> 29.1 us an exchange (-32%) **PASS on paper**, see below |
+| VS | `VERIFY_SPLIT=4` + `GRAPH_PROBE=100` | same | -0.5% | -0.3% | -0.1% | -1.4% | 81.02 (+0.6%) | -0.4% | item 2: 1s >= +0.4% **FAIL** |
+| H | `HC_CUDA=1` | skipped: item 3's microbench gate failed | | | | | | | |
+| GR | `GPU_ROUND=resident` + nsys | skipped (schedule) | | | | | | | next window |
+
+- **Every b8 load sits within +0.4 to +1.1% of C2 at 4 streams, including CT, which has no speed knob at all** (b8 with
+  only the trace on, 81.47 over 3 reps). That is the noise band; nothing here is a measured gain.
+- **K is not adoptable as tested.** Its 4-stream +0.7% equals CT's noise; its skew improvement compares a
+  clock-locked load (45,056 paired exchanges) against an unlocked control with only 8,192 (two dumps from the short
+  CT set), so clocks and pinning are confounded. `threads-K-r0.txt`, taken at idle, shows every `tf-serve` thread
+  still allowed on 0-19 (the HTTP threads are created per request). A clean A/B needs `CPU_PIN=http` alone on unlocked
+  clocks against a traced control of the same length.
+- **The real verify graph launch is cheap** (`lines-CT-r0.txt`, `('main', R, 1)`): replay host p50 11-14 us, first node
+  +12-15 us (p90 <= 24). In 4 pieces (`lines-VS-r0.txt`): host 26-45 us, first piece +7-18 us. The split only adds
+  host time, as the synthetic probe said.
+
+**Adoption:** none. L and VS fail their bars, H did not reach a load, and K's pass is noise plus a confound. None of
+them had time for the full gates (MMLU-200, 4 x 250k stress, needle) after the schedule change, so the rule (bar AND
+full gates) could not be met anyway. **Next build:** item 7's size knob (`GLM53_TF_DEC_QMM_MAX_MB=3.5`: 0440's dense
+kernel only for shapes <= 3.5 MB) and item 8's kernel design (`ld.global.nc` at 4 KB/SM in flight is enough for
+232 GB/s), both on their probe gates.
+
+### 3. Drafter comparison (DRAFTER-SEARCH §6; prod config b7, one `DRAFTER=` start each, 23:03-23:55)
+
+The arms: incoai `7d74cdd` (current prod, baseline; this start also ran C2's full set), modal-labs
+`GLM-5.3-Flash-DFlash@dae6d31`, and incoai `bf582e4e`. They were downloaded to both nodes' HF caches before the window.
+The modal-labs `LICENSE` is **MIT** ("Copyright (c) 2026 Z.AI Co., Ltd"); its card says `license: mit`.
+
+Hygiene: every arm's reply sha equals the baseline's on every request (acceptfix 28/28 f7 rows, accept 30/30, glmbench
+10/10 cells) and equals **W11's `acceptfix-f7` / `-4` rows (56/56)**. The MTP control rows reproduce W11's table
+exactly (prose a_1..4 0.725 / 0.600 / 0.507 / 0.437, tok/rnd 2.475; code 3.463; agent 3.992).
+
+Untruncated DFlash2 (`tf_policy "f7"`, 7-draft block every round, thinking off, greedy + sampled):
+
+| class | arm | rounds | p_cum pos 1..4 | tokens a round | vs 7d74cdd | §5 bar |
+| --- | --- | ---: | --- | ---: | --- | --- |
+| prose | incoai 7d74cdd | 1,427 | 0.681 / 0.430 / 0.255 / 0.158 | 2.689 | | |
+| prose | modal-labs | 1,554 | 0.653 / 0.387 / 0.213 / 0.114 | 2.468 | -0.028 / -0.043 / -0.042 / -0.044, **-8.2%** | FAIL (>= -0.01 each) |
+| prose | incoai bf582e4e | 1,419 | 0.689 / 0.438 / 0.250 / 0.153 | 2.705 | +0.008 / +0.008 / -0.005 / -0.005, +0.6% | pass |
+| code | incoai 7d74cdd | 700 | 0.874 / 0.707 / 0.560 / 0.437 | 4.387 | | |
+| code | modal-labs | 765 | 0.855 / 0.681 / 0.502 / 0.379 | 4.014 | **-8.5%** | FAIL (>= -3%) |
+| code | incoai bf582e4e | 681 | 0.888 / 0.708 / 0.578 / 0.462 | 4.508 | +2.8% | pass |
+| agent | incoai 7d74cdd | 1,095 | 0.897 / 0.810 / 0.737 / 0.684 | 5.762 | | |
+| agent | modal-labs | 1,327 | 0.888 / 0.770 / 0.656 / 0.540 | 4.754 | **-17.5%** | FAIL |
+| agent | incoai bf582e4e | 1,101 | 0.899 / 0.810 / 0.741 / 0.672 | 5.730 | -0.6% | pass |
+
+| | incoai 7d74cdd | modal-labs | incoai bf582e4e |
+| --- | ---: | ---: | ---: |
+| draft ms a round (f7 rows) | 4.09 | 4.61 (+12.7%) | 4.04 (-1.3%) |
+| production policy, greedy decode tok/s: prose / code / agent | 48.97 / 68.11 / 86.30 | 47.62 / 61.69 / 84.49 (-2.8 / **-9.4** / -2.1%) | 47.71 / 66.54 / 88.76 (-2.6 / -2.3 / +2.8%) |
+| sampled: prose / code / agent | 48.03 / 57.91 / 80.39 | 47.99 / 56.76 / 80.49 | 48.13 / 57.96 / 80.41 |
+| glmbench tf,kit,edit x3, geo-mean (hashes == base) | 0 (10/10) | **-2.5%** (10/10); kit hashmap -6.9%, structured -6.6%, tf chat -5.3% | +0.9% (10/10); one outlier cell tf chat greedy +14.7%, hashmap -6.3% |
+| exact / batchexact | (C2: 10/10, 4/4) | 10/10, 4/4 | not run |
+
+- **modal-labs is not adopted.** It fails every §5 bar. Its acceptance falls with depth (agent position 4: -0.14), it
+  drafts 13% slower (6 layers against 5), and it is 2.5% slower on glmbench. It loads and runs exact (the canary's
+  TPR stayed healthy), so the tap convention is right; it simply drafts our abliterated target worse. It is not
+  worth using as the public kit's default drafter or as the T2 warm start either. DFlash2-G stays the T2 candidate
+  (DRAFTER-SEARCH §5).
+- **incoai bf582e4e is parity, not a win.** Acceptance is within ±0.01 at positions 1-4 on prose, +2.8% tokens a round
+  on code and -0.6% on agent. Its production-policy greedy tok/s is lower on prose and code by 2-3%, so the "not lower
+  on any class" bar fails at this sample size, and it had no exact / batchexact run. Prod stays on 7d74cdd.
+- **The abliteration-gap arm** (`brandonmusic/GLM-5.3-Flash-tr3-4bpw`, stock base, same EXL3 format as ours) was not
+  run: cut by the schedule. It would also need `GLM53_TF_PREPARED_WRITE=0` (a third prepared key a rank would evict
+  one of the two kept) and a cold checkpoint load (~164 GB read on each node). `drafters.sh` has the arm (`stock`).
+
+### 4. Production
+
+Restore at 23:55:04 (`run.sh` EXIT path), after dropping the page cache on both nodes. Prod was started from
+`config/prod.env` unchanged (image b7, vision on, DRAFTER incoai 7d74cdd), attempt 1: canary ok (3 probes,
+tokens/round 5.71, decode 73.0 tok/s), local and https `/v1/models` ok, 17*23 -> 391, **batching 4 requests** (4
+slots). Clocks were restored to `-lgc 300,2250`, the watchdog timer is active, the lease refresher was killed and the
+lease deleted, and no `w16-*` containers are left.
+
+**Operational finding (prod risk): the 4-slot fit has ~1-2 GB of margin on rank 1.** A start right after a large file
+read (here b8's `docker load`) comes up with **1 slot and no error**: 4 concurrent requests are then served one after
+another. `MEM_GATE_DROP_CACHES=1` does not help, because the gate compares `MemAvailable` (page cache counts as
+available) and drops caches only below 108 GiB. Suggested fix for the next build: drop caches unconditionally before
+a start, or have serve.sh check the `batching N requests` line against `GLM53_TF_BATCH` and restart / alert. The
+watchdog's health check does not look at slot count.
+
+## W17: 0550 (memory safety) + 0560 (multi-slot prefill) on the GPU, image b9, and final averaged numbers (2026-09-30, one window 00:06-02:59, prod down 2 h 53 min) — 0560 adopted (`GLM53_TF_MULTI_PREFILL=1`), 0550 built in but off; prod on b9
+
+Files: `results/W17/` (`window-start.sh`, `run-window.sh` B9 / C7, `run-M6.sh`, `gates.sh` / `ab.sh` = W15's, `load.sh` and
+`restore.sh` now drop the page cache on both nodes before every start and check the slot count (`dropc.sh`,
+`slotcheck.sh`), `tests.sh`, `mpf.py` (grouped == alone on the real model), `s900.py` (prepared, not run), `cmpglm.py`,
+`diag_multi.py`; per load `*-B9*`, `*-C7*`, `*-M6*`, `meminfo-*.log` (MemAvailable / MemFree / Cached / Dirty / Anon every
+2 s), `mem-marks-*.txt`; `tests-head/`, `tests-worker/`, `tests-probe01/`, `tests-probe02/`; `prod.env.before-W17`) and
+`results/FINAL-20260930/` (phase 2).
+
+**Image `glm53-tensorfold:b9`** = b7's list + 0550 + 0560 (`results/W17/build-patches.txt`; both apply cleanly with
+`git apply`), built on the head node with `--build-arg PATCHES` (serve.sh build passes none = every patch), shipped with
+`docker save | docker load`, tagged `b9` on both nodes. Prepared weights reused.
+
+**serve.sh fix (`scripts/serve.sh` in this update).** W16's load C came up with 1 batch slot after a `docker load`.
+`serve.sh start` now drops the page cache (`echo 3`, sudo -n) on a node whose MemAvailable - MemFree >= 4 GiB (with
+`MEM_GATE_DROP_CACHES=1`, as in prod.env), and after `/v1/models` reads rank 0's `N request slot(s)`: fewer than
+`GLM53_TF_BATCH` -> stop, drop the caches on both nodes, restart (at most `SLOT_RETRIES=2`), then exit 3. Every W17
+start (B9, C7, M6, the adopt restart) also dropped the caches explicitly first and came up with **4 slots**.
+
+### 1. Tests (prod stopped, both nodes in parallel, every run under `timeout`)
+
+| run | head | worker |
+| --- | --- | --- |
+| page-cache probe (0550 step P, `bench/pagecache_probe.py`, 20 GiB of a prepared `data.bin` read, then 1 GiB device steps) | **`cache_reclaimed` true**, no `failed_at`: 101 GiB allocated from MemFree 94.5, Cached 20.9 -> 5.7 GiB, 0.04 s a GiB step past MemFree (as below it) | same: 99 GiB, Cached 20.9 -> 6.3 |
+| `test_memory_safety_patches.py` (0550) | **25 passed** | **25 passed** |
+| `test_multi_prefill_patches.py` (0560) | 83 passed, **4 failed** | 83 passed, 4 failed (same) |
+| regressions | lean 53, overlap 149, prefill_pp 15 (+1 skip), replay 32 | batch_sessions 28, fastpf 29, cindep 54, TensorFold `test_glm_engine.py` 12; `test_1m` 42 + 3 failed, `test_session_disk` 30 + 2 failed |
+
+- The 4 `test_gpu_group_equals_alone` failures are in its second-wave assert `cached > 0`: every reply equals the lone
+  engine's in both waves; a 149-token next turn is not resumed. `diag_multi.py` (3 waves, per-member stats, knob on and
+  off) shows the **same `cached` with the knob off** (0 for the < 256-token members, 256 for the 300-token one): the
+  test's expectation, not 0560.
+- `test_1m` (3) and `test_session_disk` (2, `GLM53_TF_KV_DTYPE=fp8 is laid out for a 512-wide latent, not 128`) fail
+  **identically on b7**; `test_1m` passes 45/45 with `GLM53_TF_SNAPSHOT_BEFORE_END=0` (0540's rule: resume at
+  `(n - 1) // 64 * 64`, the W15 class of expectation). Not new.
+- Since the probe passed, `GLM53_TF_ADMIT_MEM=available` stays 0550's default.
+
+### 2. Loads (each: page cache dropped, 4 slots checked; the same sequence for all three)
+
+Sequence: PRE = `mpf.py group` (below) + `c4.py` thinking low and off; then W15's `gates.sh` unchanged (ab.sh set, ab.py
+again, N1, 4 x ~250k stress, MMLU-200, exact / batchexact again, needle ~314k alone), meminfo every 2 s. This PRE is
+~200 short requests, so the whole history is heavier than W15's (which started the gates with a 1-minute image check).
+
+- **B9** = `config/prod.env` + IMAGE b9 + `GLM53_TF_MULTI_PREFILL=1` (0550's defaults on)
+- **C7** = production as it was (b7, `config/prod.env` unchanged): the control, added when B9 missed the stress bar
+- **M6** = B9 with 0550 off (`GLM53_TF_ADMIT_MEM=free GLM53_TF_SELECT_SCRATCH=off GLM53_TF_ALLOC_TRIM_GB=0`) = 0560 alone
+
+| gate | B9 (0550 + 0560) | M6 (0560 alone) | C7 (b7 control) | bar |
+| --- | --- | --- | --- | --- |
+| exact / batchexact, before and after the stress + MMLU | 10/10, 4/4; 10/10, 4/4 | same | same | pass |
+| W9 transcripts (alone == W9 A, together == alone) | True, 4/4 | True, 4/4 | True, 4/4 | pass |
+| reply sha (ab.py, every cell) | 8794a3463259cc2f | same | same | pass |
+| glmbench 13 cells: hashes / 1-stream geomean | **13/13 == b7 (W15)**, -0.36% vs W15 B7, +0.03% vs C7 | 13/13 == C7, +0.26% | 13/13 | pass |
+| N1 | 6/6 + 6/6, **18/18 shas == W15** | 18/18 | 18/18 | pass |
+| **grouped == alone on the real model** (`mpf.py`, 92 requests) | **92/92**, 89 cold sends in a group forward (`multi` 2-4) | **92/92**, 90 grouped | 92/92 (never grouped) | pass |
+| C4 per-stream TTFT, RigMark shape, reasoning low (3 rounds, median) | **0.78 s** (max 0.80) | **0.82 s** | 1.64 s (W15 B7b 1.68) | <= 0.8 target; -52% |
+| C4 thinking off / C2 low / C2 off | 0.62 / 0.59 / 0.46 s | 0.63 / 0.57 / 0.45 | 0.92 / 0.69 / 0.55 | improved |
+| prefill 24.5k / 98k (ab.py) | **1,454 / 1,550** (first, after PRE), 1,608 / 1,597; after the needle 1,577 / 1,594 and **1,512 / 1,541** | 1,603 / 1,612, 1,610 / 1,610 | 1,613 / 1,576, 1,605 / 1,614 | **B9 fails** "not lower" |
+| decode 4 streams (mean of 6) / lone slots | 82.1 / 51.6-57.1 | 82.5 / 52.0-57.4 | 81.2 / 51.6-57.0 | within noise |
+| MMLU-200, refusals | 88.0%, 0/10 | 88.0%, 0/10 | 88.0%, 0/10 | pass |
+| 4 x 250k stress, MemAvailable min head / worker | 7.37 / 6.89 | 7.50 / 6.92 | 7.47 / 7.41 | >= 8: **all three fail** after this history |
+| needle ~314k after stress + MMLU: found / min | found (resend cached n - 18 in 0.24 s) / **7.92 / 7.48** (dip 1.7 GiB) | found / 6.04 / 5.46 | found / 6.21 / 5.81 (dip 1.9 / 4.0) | |
+| **minimum over all gates** | **7.37 / 6.89** | 6.04 / 5.46 | 6.21 / 5.81 | |
+| NVRM `NV_ERR_NO_MEMORY` lines on the worker node (non-fatal, 0 engine errors) | 4 (during the stress minimum) | 0 | 1 (needle minimum) | |
+| OOM kills / engine errors / request errors | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | pass |
+
+**Memory attribution.** After the same PRE, MemAvailable was B9 11.9 / 11.5, C7 12.4 / 12.0 (0.5 GiB less with b9,
++0.3 GiB host AnonPages); at the stress start B9 9.4 / 8.9, C7 10.1 / 9.9. During the stress B9 dips 2.0 GiB, C7
+2.5-2.7 (0550's scratch). M6 = 0560 alone reaches B9's stress floor (7.50 / 6.92), so the worker node's -0.5 GiB there is
+**0560's** (the group forwards' larger transients); the needle floor is 0550's: with it the lone 314k dip is 1.7 GiB
+(W15: 4.5), without it 4.0 on the worker node. The absolute 8 GiB stress bar was set on W15's lighter sequence; the control
+misses it in this one too.
+
+**0550's prefill.** Only B9 had slow long prefills: the first ab.py after the PRE (1,454 / 1,550: -9.8% / -3.5%, same
+piece count) and the second pair after the needle (1,512 / 1,541); C7 and M6 never (1,576-1,614). The difference
+between B9 and M6 is 0550's three knobs. Not isolated further (no time): the trim (`empty_cache` at most every 10 s
+when > 2 GiB unused) or the scratch's growth before a prefill are the candidates. 0550's memory results are real and
+large for long lone prompts (the 1M bound in MEMORY-SAFETY.md), so it stays in the image, off.
+
+### 3. Adopted
+
+- **0560: adopted** (`GLM53_TF_MULTI_PREFILL=1`): same bits everywhere (92/92 on the real model, batchexact,
+  transcripts, N1, 13/13 hashes), C4 first tokens -52% with thinking on (the case 0540 could not reach), C2 -18%,
+  prefill and decode unchanged. Cost: -0.2 / -0.35 GiB of the needle floor and -0.5 GiB on the worker node in the 4 x 250k stress.
+- **0550: not adopted** (fails "prefill not lower" in 2 of 4 B9 prefill pairs), its knobs set off in prod.env so b9
+  behaves as b7 + 0560 (0550's unconditional part, dropping its own session-tier writes from the page cache, stays).
+  Next: B9 with `GLM53_TF_ALLOC_TRIM_GB=0` (scratch + admission only) through the same sequence, prefill x4.
+- Not run (time): the ~900k prompt beside 3 busy slots (`s900.py` ready), 0550's C4-under-a-copy test.
+
+`config/prod.env`: `IMAGE=glm53-tensorfold:b9`, `GLM53_TF_MULTI_PREFILL=1`, `GLM53_TF_ADMIT_MEM=free`,
+`GLM53_TF_SELECT_SCRATCH=off`, `GLM53_TF_ALLOC_TRIM_GB=0`, header with the gates and the revert (previous file
+`results/W17/prod.env.before-W17`). Production restarted on it at 02:59 (page cache dropped, ready in 34 s, **4 request
+slots**, canary ok 74.8 tok/s, local and https `/v1/models`, `17*23` -> `391`), watchdog timer active, lease refresher
+gone, lease deleted.
+
+### 4. Final numbers on the adopted config (phase 2: prod serving, 3 rounds, 03:00-03:45)
+
+`results/FINAL-20260930/` (`final.sh`, `summarize.py`, `summary.md` with every round, the vLLM and "this morning"
+tables). Each round = RigMark standard suite (new COMPARISON_ID `...-tensorfold-w17-final-rN`), glmbench tf / kit / edit
+x3, multiturn concurrent 1 / 4 streams x3, ab.py 24.5k / 98k; then MMLU-200 and exact / batchexact once. All rounds valid
+(15/15 RigMark gates each, reply sha 12/12, greedy glmbench hashes identical across rounds).
+
+| metric (mean of 3, min-max) | W17 prod (b9 + 0560) | W15 prod (b7) runs 1 / 2 | vLLM TP2 k=7 (Alex) |
+| --- | ---: | ---: | ---: |
+| RigMark code / prose / structured decode tok/s | 67.9 / 43.0 / 88.8 | 67.5 / 44.0 / 89.0; 67.2 / 42.7 / 88.7 | 44.0 / 18.9 / 64.9 |
+| RigMark cold prefill 8K / 32K / 64K tok/s | 1,560 / 1,634 / 1,620 | 1,559 / 1,635 / 1,619 | 1,813 / 1,908 / 1,922 |
+| RigMark replay TTFT 8K / 32K / 64K s | 0.22 / 0.25 / 0.27 | 0.21 / 0.22 / 0.25 | 4.52 / 2.97 / 5.77 |
+| RigMark C1 / C2 / C4 aggregate tok/s | 53.1 / **70.1 / 91.0** (C4 89.5-92.1) | 54.8 / 67.0 / 81.8; 54.3 / 67.3 / 82.8 | 31.6 / 42.0 / 66.1 |
+| RigMark C1 / C2 / C4 per-stream TTFT s | 0.49 / **0.65 / 0.89** | 0.49 / 0.95 / 1.63; 0.48 / 0.76 / 1.91 | 0.60 / 0.68 / 0.81 |
+| glmbench tf chat / tf code / kit structured (T=0) | 48.0 / 83.3 / 105.5 | 47.9 / 83.5 / 105.7 (W15 B7) | |
+| concurrent 1 / 4 streams aggregate | 60.3 / 82.8 (82.6-83.0) | - / 80.6 | |
+| ab.py prefill 24.5k / 98k | 1,606 (1,600-1,611) / 1,610 (1,607-1,612) | 1,610 / 1,607 | |
+| MMLU-200 / refusals; exact; batchexact | 88.0% / 0 of 10; 10/10; 4/4 | 88.0%; 10/10; 4/4 | |
+
+Against "this morning's image" (chat 44.6, code 77.6, structured 100.6, 4 users ~78, prefill 1,607): +7.7%, +7.4%,
++4.9%, +6.2%, -0.1% / +0.2% (most of that is W12-W15's; W17 adds the concurrency: C4 aggregate +10% and C4 first
+tokens -45..-53% vs W15 on RigMark).
+
+The three RigMark receipts of this run are in `results/rigmark/tensorfold-20260930-w17-final-r1` / `-r2` / `-r3`
+(comparison IDs `2026-09-glm53-exl3-2xspark-tensorfold-w17-final-r1..r3`, RigMark `c5a0db01b054` clean, standard suite,
+reasoning low; receipt sha256 `fbaf073b...`, `bbc1af37...`, `4dca115c...`), with the server's request log of each run
+(`requests.jsonl`: every replay row `cached` = n - 64 from the slot, 9/9 a run). Mean of the three runs' medians, with
+min-max, against Alex Ellis's vLLM TP2 k=7 receipt (from `results/FINAL-20260930/summary.md`):
+
+| RigMark (mean of 3, min-max) | TensorFold (b9, W17 prod) | vLLM TP2 k=7 (Alex) | ratio (mean) |
+| --- | ---: | ---: | ---: |
+| code decode tok/s | 67.9 (67.4-68.6) | 44.0 | 1.54x |
+| prose decode tok/s | 43.0 (42.2-43.5) | 18.9 | 2.28x |
+| structured decode tok/s | 88.8 (88.6-89.0) | 64.9 | 1.37x |
+| cold prefill 8K / 32K / 64K tok/s | 1,560 (1,556-1,562) / 1,634 (1,631-1,637) / 1,620 (1,618-1,621) | 1,813 / 1,908 / 1,922 | 0.86x / 0.86x / 0.84x |
+| immediate replay 8K / 32K / 64K tok/s | 36,474 / 132,814 / 243,980 | 1,812 / 11,046 / 11,364 | 20x / 12x / 21x |
+| replay TTFT 8K / 32K / 64K s | 0.22 (0.22-0.23) / 0.25 (0.24-0.25) / 0.27 (0.27-0.27) | 4.52 / 2.97 / 5.77 | 20x / 12x / 21x |
+| C1 / C2 / C4 aggregate tok/s | 53.1 (52.1-53.9) / 70.1 (68.8-70.9) / 91.0 (89.5-92.1) | 31.6 / 42.0 / 66.1 | 1.68x / 1.67x / 1.38x |
+| C1 / C2 / C4 per-stream TTFT s | 0.49 / 0.65 / 0.89 (0.88-0.89) | 0.60 / 0.68 / 0.81 | 1.22x / 1.04x / 0.91x |
+
+Not a strict RigMark comparison (different weights: abliterated EXL3 4-bit here vs LibertAIDAI NVFP4; drafter, context
+limit, protocol, day and machines differ; `results/rigmark/README.md`). Where we are behind: cold prefill (0.84-0.86x)
+and C4 per-stream TTFT (0.89 vs 0.81 s). Replay is identical-prompt caching (n - 64 resumed), not a faster prefill.
+
+### 5. Notes
+
+- Harness slip: `run-window.sh` was edited while bash was executing it (to add the B9b steps), so B9's run continued
+  into the new B9b lines after its gates (an extra ab.py pair: the post-needle 1,577 / 1,594 and 1,512 / 1,541) and then
+  stopped on a syntax error. B9's gates had all completed; C7 and M6 ran from frozen copies (`run-window-exec.sh`,
+  `run-M6.sh`). B9b (restart + mpf alone + replay) was not needed: B9's own lone sends were already cold (`cached` 0)
+  and the needle / ab.py resends showed the n - 64 rule (`cached` = (n - 1) // 64 * 64).
+- final.sh's RigMark rename missed (the UTC stamp sorts before `-w15`); the three dirs were renamed by stamp afterwards.
+- Memory risk that remains in prod (0550 off): a lone prompt far beyond 314k still grows the allocator's key blocks
+  quadratically (MEMORY-SAFETY.md: ~16 GiB bound at 1M); M6's 314k needle floor was 6.04 / 5.46 GiB. The ~900k test
+  (`s900.py`) was not run on prod for that reason. 0550 fixes it; its prefill regression is the next thing to isolate.

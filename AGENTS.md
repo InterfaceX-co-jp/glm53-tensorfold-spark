@@ -118,6 +118,9 @@ healthy production start includes:
 [tensorfold] serving GLM-5.3-Flash-EXL3 at http://127.0.0.1:8000/v1 on CUDA, rank 0 of 2 (...; loaded in ...s)
 ```
 
+With `GLM53_TF_VISION=1` (production) rank 0 also loads the vision tower (`vision tower: 1.13 GB on the GPU`,
+`image_url parts on`). The first start of a new image can take ~200 s more while kernels compile.
+
 ## 5. Verify
 
 ```bash
@@ -128,8 +131,24 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
   "messages": [{"role": "user", "content": "Write a Python function that reverses a linked list."}]}'
 ```
 
-The reply has `choices[0].message.content` (and `reasoning_content`: thinking is on by default, effort high) and a
-`tensorfold` object with decode tok/s (~40-100 depending on the text). Optional: `python3 bench/glmbench.py --base
+The reply has `choices[0].message.content` (and `reasoning`: thinking is on by default, effort high; production sends
+it in `reasoning` only, `GLM53_TF_REASONING_FIELDS=both` adds `reasoning_content`) and a `tensorfold` object with
+decode tok/s (~40-100 depending on the text).
+
+Image input (production has it on): make a small PNG (any screenshot; or `python3 -c "from PIL import Image,
+ImageDraw; im=Image.new('RGB',(400,120),'white'); ImageDraw.Draw(im).text((20,40),'17 x 23 = 391',fill='black');
+im.save('/tmp/t.png')"`) and ask about it:
+
+```bash
+IMG=$(base64 -w0 /tmp/t.png)
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "GLM-5.3-Flash-EXL3", "max_tokens": 512,
+  "messages": [{"role": "user", "content": [{"type": "text", "text": "What text is in this image?"},
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$IMG"'"}}]}]}'
+```
+
+The reply quotes the text; `usage.prompt_tokens` includes the image's rows. A malformed image is an HTTP 400 with
+`param: "messages"`. `docs/VISION.md` has every limit and knob. Optional: `python3 bench/glmbench.py --base
 http://127.0.0.1:8000 --model GLM-5.3-Flash-EXL3 --suites exact` must report 10/10 identical.
 
 Client settings: base URL `http://127.0.0.1:8000/v1`, model `GLM-5.3-Flash-EXL3`, **context window 1,048,576**,
@@ -154,12 +173,15 @@ auth in front, and ask the user first.
 | `no image glm53-tensorfold:dev on the worker` | the image was built but not shipped | `scripts/serve.sh build` again (it ships it) |
 | `the weights are not in the worker's HF cache (...)` | download on one node only, or another revision | the `hf download` line it prints, on that node |
 | `a node's GPU is degraded` (preflight) | a GB10 clock / power clamp; survives warm reboots | a full power drain of that node (docs/OPS-GPUWATCH.md); ask the user |
+| Image request: `400 ... image ...` | the URL cannot be fetched from the head node, the image is over 20 MiB / 64 M pixels, more than 8 images, or `GLM53_TF_VISION` is off | send it as a `data:` URL; resize it; check the knob in `config/prod.env` (restart after a change) |
+| Thinking missing in a client | production sends thinking in `reasoning` only | `GLM53_TF_REASONING_FIELDS=both` in `config/prod.env`, restart |
+| Concurrent requests run one at a time while a large file is copied on the head node | page cache counted as used memory at admission (docs/RESULTS.md W15) | let the copy finish or drop caches. `scripts/serve.sh start` drops the page cache before a start and checks rank 0's slot count (a start with fewer than `GLM53_TF_BATCH` slots restarts, then exits 3). 0550's admission fix is in the image but off (docs/RESULTS.md W17) |
 | Canary `FAIL` / tokens a round ~1.0 | the drafter is missing or mismatched | check `DRAFTER` exists on both nodes, or set `DRAFTER=` empty (MTP drafts only) |
 
 ## 7. Do not change these knobs
 
 Every value in `config/prod.env.example` other than the fields in step 3 is the tested production setting (docs/
-RESULTS.md W1-W10: exactness, memory stress at 4 x 250k tokens, quality). Changing one means an untested config.
+RESULTS.md W1-W17: exactness, memory stress at 4 x 250k tokens, quality, images). Changing one means an untested config.
 In particular, leave these as they are unless the user asks for an experiment:
 
 - `CONTEXT=1048576`, `MAX_TOKENS=32768`, `GLM53_TF_KV_POOL_TOKENS=1048576`, `GLM53_TF_BATCH=4`
@@ -169,6 +191,14 @@ In particular, leave these as they are unless the user asks for an experiment:
 - `GLM53_TF_SESSION_GIB=2`, `GLM53_TF_BATCH_RESERVE_GB=11`, `GLM53_TF_BATCH_ADMIT_GB=2`,
   `GLM53_TF_SESSION_RESERVE_GIB=6`, `MEM_GATE_GIB=108`, `MEM_GATE_DROP_CACHES=1`: the memory margins
 - `GLM53_TF_COMM_BACKEND=roce` + `GLM53_TF_ROCE_MARK` (falls back to NCCL by itself)
+- `GLM53_TF_L2PF=1`, `GLM53_TF_L2PF_MB=8`, `GLM53_TF_BATCH_CAPTURE_AFTER=8` (decode, W12)
+- `GLM53_TF_VISION=1` with `GLM53_TF_VISION_CACHE_MB=64` / `GLM53_TF_VISION_PREP_MB=64` (sized for the memory stress;
+  the default 256 MB caches were not stress-tested). Turning vision off is safe (text is bit-identical) and gives
+  the head ~1.1-1.9 GiB back; `GLM53_TF_VISION_FETCH=0` refuses `http(s)` image URLs (only `data:`), which you
+  should set if anything but the user's own clients can reach the API
+- 0540's `GLM53_TF_SNAPSHOT_BEFORE_END` / `GLM53_TF_EMIT_FIRST`: on by default, leave them unset
+- `GLM53_TF_MULTI_PREFILL=1` (0560, W17) and 0550's three knobs set off (`GLM53_TF_ADMIT_MEM=free`,
+  `GLM53_TF_SELECT_SCRATCH=off`, `GLM53_TF_ALLOC_TRIM_GB=0`): 0550 on slowed long prefills in W17
 - knobs documented as measured and not adopted (`docs/PATCHES.md`): do not turn them on
 - `HOST=127.0.0.1` (no auth on the API)
 
@@ -185,5 +215,10 @@ scripts/serve.sh xid 2h      # NVIDIA Xid events on both nodes
 ```
 
 Watchdog (optional, restarts a dead pair): `scripts/systemd/glm53-tf-watchdog.{service,timer}`, see its header;
-docs/TRYING.md section 8. Before leaving the server unattended, watch the worker's MemAvailable during the first
-long sessions: it is the binding node.
+docs/TRYING.md section 8. Before leaving the server unattended, watch both nodes' MemAvailable during the first
+long sessions: with the vision tower on the head node both nodes bind (W17, after a heavy warm-up: 7.50 / 6.92 GiB
+at the 4 x 250k stress and 6.04 / 5.46 GiB during a 314k prompt after it, under the 8 GiB target, no OOM;
+docs/MEMORY-SAFETY.md). A prompt far beyond 314k beside 3 busy slots has not been memory-tested (0550 bounds it; it is off).
+
+To reproduce the RigMark numbers: `scripts/rigmark/install.sh`, then `scripts/rigmark/run.sh tensorfold` on the head
+node while nothing else uses the server (docs/RIGMARK.md).

@@ -1,0 +1,284 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+index 6c298ee..fc6b752 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batch.py
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -59,7 +59,8 @@ the request goes to the free slot already holding most of the entry's pages, and
+ that slot's caches (restore = copy-in: the slot owns its copy, so later evictions never touch it) and resumes its
+ first piece from the entry's snapshot. Saves follow the lone engine's rules on the slot's live caches: marks (and a
+ piece end that is one) right after the piece that took them, the prompt snapshot after the last piece (exact: at the
+-prompt's end; fast: its last grid point), the reply snapshot when a drafted exact request ends. Rank 0 ships each
++prompt's end; fast: its last grid point; patches/0540, both: its last grid point strictly before the end), the reply
++snapshot when a drafted exact request ends. Rank 0 ships each
+ admission's session plan (entry, marks, its store digest) right after the admission's prompt, and each save's
+ decision (stored / skipped / duplicate, evictions) when it happens, both inside the round both ranks run; rank 1
+ checks the digest and applies the decisions. The store's budget is set aside at load (slots are added while the
+@@ -993,6 +994,7 @@ class Batcher:
+     resident = None                               # patches/0450 (GLM53_TF_GPU_ROUND ``resident``): a Resident
+     m_all = f_all = None                          # patches/0450: every slot's drafter backlog in one tensor each
+     _resident_go: list[int] | None = None         # patches/0450: the slots to run resident after this round
++    emit_first = True                             # patches/0540: GLM53_TF_EMIT_FIRST (a piece's first token at once)
+ 
+     def __init__(self, g, n: int) -> None:
+         from .engine import GRAPH_ROWS, MAX_ROWS
+@@ -1027,6 +1029,9 @@ class Batcher:
+         self.sightings = batchplan.Sightings(_env_int("GLM53_TF_BATCH_CAPTURE_AFTER", 1))
+         self.pad = batchplan.pad_mask(os.environ.get("GLM53_TF_BATCH_PAD", ""), MAX_ROWS)
+         self.short = max(0, _env_int("GLM53_TF_BATCH_SHORT", 0))
++        # patches/0540: a prompt's first token goes to its caller when its last piece ends, not after the round's
++        # other pieces and verify forward (rank 0 only; scheduling only)
++        self.emit_first = _env_int("GLM53_TF_EMIT_FIRST", 1) != 0
+         self.parity_key = _env_int("GLM53_TF_BATCH_PARITY_KEY", 0) == 1
+         # patches/0280: every window of a multi-slot round padded to one bucket; padded rows routed as real ones
+         self.buckets = batchplan.bucket_mask(os.environ.get("GLM53_TF_BATCH_BUCKETS", ""), MAX_ROWS)
+@@ -1888,7 +1893,7 @@ class Batcher:
+         """The next piece of the slot's prompt through ``decode.prefill`` (the request's knobs, resumed from the
+         previous piece's snapshot); after the last one, the first token and the first drafts."""
+ 
+-        from . import fastpf
++        from . import fastpf, pfgrid
+         from .decode import prefill, take_snapshot
+ 
+         g = self.g
+@@ -1903,6 +1908,10 @@ class Batcher:
+                 # patches/0180: pieces end on the chunk grid and on the snapshot grid (the snapshot the next resumes)
+                 grid = batchplan.piece_grid(fastpf.grid(e.prefill_rows), int(getattr(e, "snap_grid", 0) or 0)) \
+                     if e.fast_prefill else 0
++                # patches/0540: the piece that ends at the prompt's end keeps the prompt's snapshot strictly before
++                # it (a resend resumes all but its last grid step); earlier pieces keep theirs at their end, which the
++                # next piece resumes (``decode._prefill`` applies it to a prefill of exactly ``e.snap_before`` tokens)
++                e.snap_before = n if job.draft and pfgrid.before_end() else 0
+                 # patches/0335: alone in the batch -> the solo piece (fast prefills only; both ranks see the same slots)
+                 solo = batchplan.solo_piece(self.solo, self.piece, grid,
+                                             [i for i, q in enumerate(self.seqs) if q is not None and i != slot])
+@@ -1917,6 +1926,7 @@ class Batcher:
+                 finally:
+                     e.checkpoints = ()
+                 saves = list(getattr(e, "mark_snaps", ()) or ()) if job.draft else []
++                before, e.snap_before = job.draft and end == n and pfgrid.before_end(), 0     # patches/0540
+                 e.mark_snaps = []
+                 seq.pieces += 1
+                 if end < n:
+@@ -1935,8 +1945,8 @@ class Batcher:
+                 seq.done = n
+                 seq.resume = None
+                 tag = g._grid()                     # patches/0080: 0, or the fast chunk grid this prefill ran on
+-                if job.draft and tag:
+-                    if e.fast_snap is not None:     # the state at the prompt's last grid point, nothing later
++                if job.draft and (tag or before):
++                    if e.fast_snap is not None:     # the state at the prompt's last grid point (0540: before its end)
+                         self._remember(slot, e.fast_snap)
+                         saves.append(e.fast_snap)
+                 elif job.draft:
+@@ -1967,6 +1977,8 @@ class Batcher:
+             if tag % 64 // pfgrid.B12X:
+                 job.stats["b12x"] = tag % 64 // pfgrid.B12X
+         self._emit(seq, [first])
++        if self.emit_first and self._held:          # patches/0540: not held behind the round's other pieces
++            self._flush()
+         seq.stepper = Stepper(self, slot, job, first, last_hidden)
+         if seq.stepper.done(self.eos):
+             self._finish(slot)
+diff --git i/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index 9cfb8fe..2c816c0 100644
+--- i/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -176,6 +176,9 @@ class Engine:
+         # patches/0085: where fast snapshots sit (``pfgrid``; both ranks agree, ``fastpf.settings``) and the chunk
+         # size the last fast prefill ran (``prefill_rows`` may be ``pfgrid.AUTO``: chosen per prefill)
+         self.snap_grid, self.snap_tail = pfgrid.snapshot_grid(), pfgrid.snapshot_tail()
++        # patches/0540 (``pfgrid.before_end``): the callers' whole prompt length; its prefill keeps its snapshot
++        # strictly before its end (0: none; a piece that ends earlier keeps its snapshot at its end)
++        self.snap_before = 0
+         self.fast_rows = 0
+         self.mark_snaps: list = []
+         w.meta["fast_gather16"] = fastpf.gather16()
+@@ -456,7 +459,11 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     snapshot at the prompt's last multiple of ``e.snap_grid`` (or the last chunk's start, ``pfgrid``'s tail rule;
+     None when that is 0), tagged by mode only, and ``resume`` must be a fast snapshot of the same mode at a multiple
+     of 64 (``pfgrid``: why that keeps resumed == fresh whatever C either prefill used). ``e.fast_rows``: the C this
+-    prefill ran (0: exact)."""
++    prefill ran (0: exact).
++
++    patches/0540, ``e.snap_before`` == len(prompt) (the caller's whole prompt ends here): the snapshot point is the last
++    grid point strictly BEFORE n (``pfgrid.plan(before=True)``), so ``e.fast_snap`` is a strict prefix a resend of the
++    same prompt resumes from; exact prefills then leave theirs in ``e.fast_snap`` too (None: none worth keeping)."""
+ 
+     if not prompt:
+         raise ValueError("prefill requires at least one token")
+@@ -506,9 +513,15 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     # patches/0085: the chunk size (a speed choice: the bits do not depend on it), the chunks and the snapshot point
+     step = pfgrid.chunk_rows(e.prefill_rows, n - begin, cap, fast)
+     e.fast_rows = step if fast else 0
++    # patches/0540 (``pfgrid.before_end``): the caller's whole-prompt prefill keeps its snapshot strictly before n
++    # (``e.fast_snap``, exact prefills too), so the same prompt sent again resumes all but its last grid step
++    before = bool(getattr(e, "snap_before", 0)) and int(e.snap_before) == len(prompt)
++    if before:
++        e.snap_before = 0                           # one prefill's (a stale value could only move a snapshot)
+     pl = pfgrid.plan(begin, n, step, fast=fast, marks=getattr(e, "checkpoints", ()) or (), grid=grid,
+-                     tail=getattr(e, "snap_tail", None))
+-    if fast and pl.snap == begin and resume is not None:
++                     tail=getattr(e, "snap_tail", None), before=before)
++    snaps = fast or before
++    if snaps and pl.snap == begin and resume is not None:
+         e.fast_snap = resume                        # nothing new to keep: the resume point stays the prompt's state
+     for start, stop in pl.spans:
+         chunk = list(prompt[start:stop])
+@@ -516,7 +529,7 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+         if start in pl.marks:                       # patches/0085: extra snapshots asked for (patches/0110's marks)
+             e.mark_snaps.append(take_snapshot(e, prompt[:start], e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                               drafter=drafter, grid=tag, mtp_len=start - 1))
+-        if fast and start == pl.snap and start > begin:     # the state at the snapshot point, before [snap, ...)
++        if snaps and start == pl.snap and start > begin:    # the state at the snapshot point, before [snap, ...)
+             e.fast_snap = take_snapshot(e, prompt[:start], e.last_hidden if use_mtp else None, mtp=use_mtp,
+                                         drafter=drafter, grid=tag, mtp_len=start - 1)
+         if lean is not None:                        # patches/0082: the same bits in less memory
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index 7376de4..c941662 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -325,6 +325,12 @@ class GlmEngine:
+             raise RuntimeError("the two ranks were started with different fast-prefill settings "
+                                "(GLM53_TF_FAST_PREFILL, GLM53_TF_FAST_GATHER, fast_kda / fast_qmm present): "
+                                f"{fp_both[0]}, {fp_both[1]}")
++        from . import pfgrid as _pfgrid
++
++        be_both = self._gather_ints([int(_pfgrid.before_end())])      # patches/0540: it moves a cut (collectives)
++        if be_both[0] != be_both[1]:
++            raise RuntimeError(f"the two ranks were started with different {_pfgrid.BEFORE_ENV}: "
++                               f"{be_both[0]}, {be_both[1]}")
+         if fastpf.enabled() and rank == 0:
+             gone = "; ".join(f"{k}: {v}" for k, v in fastpf.MISSING.items())
+             from . import pfgrid
+@@ -982,6 +988,12 @@ class GlmEngine:
+         # a request writes the attention caches from its resume point on: every longer snapshot is overwritten
+         cut = len(hit.ids) if hit is not None else 0
+         self.cache = [c for c in self.cache if len(c.ids) <= cut]
++        from . import pfgrid
++
++        # patches/0540: the prompt's snapshot strictly before its end (``decode._prefill``: ``e.snap_before`` = the
++        # length of the prompt it applies to, 0: none)
++        before = draft and pfgrid.before_end()
++        self.e.snap_before = len(prompt) if before else 0
+         if store is not None:                       # patches/0110
+             store.begin(hit, cut)
+             self.e.checkpoints = sess.marks if sess is not None and draft else ()
+@@ -993,10 +1005,11 @@ class GlmEngine:
+         finally:
+             self.e.checkpoints = ()
+         prefill_s = time.perf_counter() - t0
++        self.e.snap_before = 0
+         grid = self._grid()                 # patches/0080: 0, or the fast chunk grid this prefill ran on
+         saves = list(getattr(self.e, "mark_snaps", ())) if draft else []       # patches/0110
+-        if draft and grid:
+-            if self.e.fast_snap is not None:        # the state at the prompt's last grid point, nothing later
++        if draft and (grid or before):
++            if self.e.fast_snap is not None:        # the state at the prompt's last grid point (0540: before its end)
+                 self._remember(self.e.fast_snap)
+                 saves.append(self.e.fast_snap)
+         elif draft:
+diff --git i/src/tensorfold/families/glm5_next/cuda/pfgrid.py w/src/tensorfold/families/glm5_next/cuda/pfgrid.py
+index 8ca0683..adc8c37 100644
+--- i/src/tensorfold/families/glm5_next/cuda/pfgrid.py
++++ w/src/tensorfold/families/glm5_next/cuda/pfgrid.py
+@@ -53,6 +53,23 @@ from its resume point on) this gives resumed == fresh; drafted == serial holds b
+ 
+ With GLM53_TF_SNAPSHOT_GRID = C and a fixed C the snapshots, tags and chunks are exactly patches/0080's grid rule.
+ 
++patches/0540: the snapshot strictly before the prompt's end (GLM53_TF_SNAPSHOT_BEFORE_END, default 1)
++-----------------------------------------------------------------------------------------------------
++A resume needs a snapshot of a STRICT prefix (``decode._prefill``: the first token is sampled from the prompt's last
++row, which a snapshot does not hold). Rule 2 put a prompt that ends on the grid (n = kG) at S = n, so an identical
++prompt sent again (a regenerate / retry, an agent resending its context, RigMark's "immediate replay") could not
++resume from it and fell back to the next session mark down (every 16,384 tokens): W13 replays resumed 0 / 16,384 /
++49,152 of 8,192 / 32,768 / 65,536 tokens. With ``before`` (the caller asks for it on the prefill that ends at the
++prompt's end: ``engine._run``, the batcher's last piece), S is the last grid point STRICTLY before n,
++(n - 1) // G * G, for every n, with rule 2's tail exception unchanged; so an on-grid prompt is treated exactly as
++the other G - 1 of every G lengths already were (one cut, snapshot at n - G), and a resend re-prefills at most G rows
++(or tail + G). The snapshot REPLACES the one at n (one per prompt, as before: no extra memory); a next turn that
++extends the prompt resumes G rows earlier than before, on 1 prompt length in G. Exact prefills (grid 0: a snapshot may
++sit anywhere) take theirs at the same S (a cut; exact chunks never depend on their cuts) instead of after the prompt.
++A cut and a snapshot at a multiple of 64 are what every other prompt length already gets: no new arithmetic, resumed
++== fresh as for every snapshot. Cost: one more chunk (one more read of the weights) on a prompt that ends on the grid
++and whose last chunk starts more than ``tail`` rows before S. Both ranks must agree (checked at load, ``engine``).
++
+ Nothing here imports torch (the session store and host tests use it).
+ """
+ 
+@@ -95,6 +112,19 @@ def snapshot_tail() -> int:
+     return v
+ 
+ 
++BEFORE_ENV = "GLM53_TF_SNAPSHOT_BEFORE_END"
++
++
++def before_end() -> bool:
++    """patches/0540, GLM53_TF_SNAPSHOT_BEFORE_END (default 1): a whole prompt's snapshot sits at its last grid point
++    strictly before its end (0: at the end when it ends on the grid, as patches/0085)."""
++
++    raw = os.environ.get(BEFORE_ENV, "").strip()
++    if raw not in ("", "0", "1"):
++        raise ValueError(f"{BEFORE_ENV}={raw}: expected 0 or 1")
++    return raw != "0"
++
++
+ def settings() -> list[int]:
+     """What both ranks must agree on (they decide the chunks, hence the collectives)."""
+ 
+@@ -199,24 +229,35 @@ def spans(begin: int, n: int, step: int, cuts: Sequence[int] = ()) -> list[tuple
+ 
+ 
+ def plan(begin: int, n: int, step: int, *, fast: bool, marks: Sequence[int] = (), grid: int | None = None,
+-         tail: int | None = None) -> Plan:
++         tail: int | None = None, before: bool = False) -> Plan:
+     """The chunks and snapshot of a prefill of positions [begin, n) in chunks of ``step`` rows (``chunk_rows``),
+-    also snapshotting at ``marks`` (the session store's: exact anywhere, fast on multiples of 64)."""
++    also snapshotting at ``marks`` (the session store's: exact anywhere, fast on multiples of 64). ``before``
++    (patches/0540): the prefill ends at the prompt's end and its snapshot must be of a strict prefix: S = the last
++    grid point strictly before n (exact prefills too, on the 64-grid; -1 when that is position 0 of a fresh one)."""
+ 
+     if not 0 <= begin < n or step < 1:
+         raise ValueError(f"prefill plan: positions {begin}..{n}, {step}-row chunks")
++    t = snapshot_tail() if tail is None else int(tail)
+     if not fast:
+         m = sorted({q for q in marks if begin < q < n})
+-        return Plan(spans(begin, n, step, m), -1, m)
++        if not before:
++            return Plan(spans(begin, n, step, m), -1, m)
++        # patches/0540: exact snapshots may sit anywhere; on the 64-grid as fast ones, always cut there (exact chunks
++        # are small by default, and the cut changes no bit); at or below the resume point the resume snapshot stays
++        s = (n - 1) // ALIGN * ALIGN
++        if s <= begin:
++            return Plan(spans(begin, n, step, m), begin if begin else -1, m)
++        base = spans(begin, n, step, m)
++        return Plan(spans(begin, n, step, m + [s]), s, [q for q in m if q != s],
++                    cut=all(a != s for a, _ in base))
+     if begin % ALIGN or step % ALIGN:
+         raise ValueError(f"fast prefill plan: resume point {begin} and chunk size {step} must be multiples of {ALIGN}")
+     g = snapshot_grid() if grid is None else int(grid)
+-    t = snapshot_tail() if tail is None else int(tail)
+     m = sorted({q for q in marks if begin < q < n and q % ALIGN == 0})
+     base = spans(begin, n, step, m)
+-    if n % g == 0:
++    if n % g == 0 and not before:
+         return Plan(base, n, m)
+-    s = n // g * g
++    s = (n - 1) // g * g                            # = n // g * g off the grid; n - g on it (patches/0540)
+     last = base[-1][0]
+     if last >= s or s - last <= t:
+         return Plan(base, last, [q for q in m if q != last])
+diff --git i/tests/cuda/test_glm_engine.py w/tests/cuda/test_glm_engine.py
+--- i/tests/cuda/test_glm_engine.py
++++ w/tests/cuda/test_glm_engine.py
+@@ -313,7 +313,11 @@
+     _generate(engine, first, sampling)
+     after_prompt = first + [11, 12, 13]
+     warm, stats = _generate(engine, after_prompt, sampling, policy="2")
+-    assert stats["cached"] == len(first)
++    # patches/0540: with GLM53_TF_SNAPSHOT_BEFORE_END on (default) the prompt's snapshot is its last 64-grid point
++    # strictly before the end (a chunk cut), also in exact mode; off: at the prompt's end
++    import os
++    before = os.environ.get("GLM53_TF_SNAPSHOT_BEFORE_END", "").strip() != "0"
++    assert stats["cached"] == ((len(first) - 1) // 64 * 64 if before else len(first))
+     _generate(engine, unrelated, sampling)
+     cold, stats = _generate(engine, after_prompt, sampling, policy="2")
+     assert stats["cached"] == 0 and warm == cold

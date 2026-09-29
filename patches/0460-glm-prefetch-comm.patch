@@ -1,0 +1,1487 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/batch.py b/src/tensorfold/families/glm5_next/cuda/batch.py
+index c83d3f2..342b624 100644
+--- a/src/tensorfold/families/glm5_next/cuda/batch.py
++++ b/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -134,7 +134,8 @@ from . import cpupin, decode_overlap as dover                              # pat
+ from . import draftvocab                                                   # patches/0420
+ from . import batchplan, comm as comm_mod, decode_v2 as dv2, glue, kda as kda_mod, kvpool, latent, qmm, sparse
+ from .attention import attention, kv_write
+-from .forward import State, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
++from . import l2pf                                                           # patches/0460
++from .forward import State, _join, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+ 
+ BACKLOG = 32                     # committed rows a drafter may lag behind before they are taken early
+ 
+@@ -165,6 +166,7 @@ def _kda(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+     if not dv2.kda_gates(p, k, b, T):                  # patches/0130, as in ``forward.kda_block``
+         qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:T]), out=b.ka[:T], part=b.sk)
+         qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:T]), out=b.kg[:T], part=b.sk)
++    l2pf.mark(w, layer, "o", T)         # patches/0460: o_proj into L2 while the slots' chains run
+     for st, R, o in zip(sts, Rs, offs):
+         sp = st.proj[li, :R]                 # the slot's window rows: its chain reads them, its commit shifts them
+         sp.copy_(p[o:o + R])
+@@ -197,6 +199,7 @@ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+         latent._project(layer, w, b, T)
+         if indexed:
+             latent._index_proj(layer, w, b, T)
++        l2pf.mark(w, layer, "o", T)     # patches/0460: kv_v + o_proj into L2 while the slots attend
+         for i, (st, R, o) in enumerate(zip(sts, Rs, offs)):
+             kc, _, pos_dev, index = cache(i, st)
+             latent._attend(layer, w, kc, pos_dev, b, o, R, nchs[i] if nchs is not None else None,
+@@ -217,6 +220,7 @@ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+     if indexed:
+         qmm.matmul(b.normed[:T], ix.kw, b.xs[:T], out=b.ikr[:T], part=b.sk)
+         glue.router(b.normed[:T], ix.gate, b.igr[:T])
++    l2pf.mark(w, layer, "o", T)         # patches/0460
+     scale = c.qk_dim ** -0.5
+     for i, (st, R, o) in enumerate(zip(sts, Rs, offs)):
+         kc, vc, pos_dev, index = cache(i, st)
+@@ -268,6 +272,7 @@ def compute_multi(w, sts: Sequence[State], b, Rs: Sequence[int], *, logits: bool
+         h = layer.attn_hc
+         glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:T], b.xs[:T], b.post[:T], b.comb[:T],
+                     b.hcpart[:T], c.eps, c.hc_eps, c.hc_iters)
++        b.site = (layer.index, "a")      # patches/0460: the all-gather sites, as ``forward.layer_forward`` tags them
+         if layer.kind == "kda":
+             g = _kda(layer, w, sts, b, Rs, offs, T)
+         else:
+@@ -276,15 +281,19 @@ def compute_multi(w, sts: Sequence[State], b, Rs: Sequence[int], *, logits: bool
+         h = layer.ffn_hc
+         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:T], b.xs[:T], b.post[:T], b.comb[:T],
+                     b.hcpart[:T], c.eps, c.hc_eps, c.hc_iters)
++        b.site = (layer.index, "f")
+         g = mlp_block(layer, w, b, T) if layer.mlp is not None else moe_block(layer, w, b, T)
+         glue.hc_post(x, x, g, b.post[:T], b.comb[:T])
+         for slot in b.tap_at.get(layer.index, ()):
+             glue.stream_mean(b.x[:T], b.taps[slot][:T])
+     glue.stream_mean(b.x[:T], b.hidden[:T])
+     if not logits:
++        _join(w)                         # patches/0460: no open prefetch fork past a forward (graphs)
+         return None
+     glue.rmsnorm(b.hidden[:T], w.norm, c.eps, b.fnormed[:T], b.fxs[:T])
+-    return qmm.matmul(b.fnormed[:T], w.head, b.fxs[:T], out=b.logits[:T], part=b.sk)
++    out = qmm.matmul(b.fnormed[:T], w.head, b.fxs[:T], out=b.logits[:T], part=b.sk)
++    _join(w)
++    return out
+ 
+ 
+ def stage_multi(w, sts: Sequence[State], b, windows: Sequence[Sequence[int]]) -> int:
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 94e1d03..e5c7c8f 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -170,6 +170,9 @@ class Engine:
+         from .overlap import install
+ 
+         install(w)                       # GLM53_TF_COMM (default: nothing); before any graph is captured
++        from . import l2pf
++
++        l2pf.install(w)                  # patches/0460: GLM53_TF_L2PF (default: nothing); replaces 0040's prefetcher
+         if graphs:
+             from .graphs import Graphs
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index c6d9fc5..ac5bc53 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -29,6 +29,7 @@ import triton.language as tl
+ 
+ from . import decode_v2 as dv2, fastpf, glue, kda as kda_mod, latent, profile, qmm, sparse
+ from . import decode_stream  # noqa: F401  (patches/0440: installs its hooks in exl3_mm / qmm when its knobs are on)
++from . import l2pf                                                            # patches/0460
+ from .attention import AttnScratch, attention, kv_write
+ from .comm import fast_gather
+ from .weights import LayerW, Weights
+@@ -369,7 +370,7 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+         return b.part[:R].view(1, R, d)
+     pf = w.meta.get("prefetch")
+     if pf is not None and site is not None:
+-        pf.launch(site)                  # the next kernels' weights into L2 while the exchange waits on the link
++        pf.launch(site, R)               # the next kernels' weights into L2 while the exchange waits on the link
+     out = b.gath[:b.world * R * d]
+     if b.fast and w.meta.get("fast_gather16"):
+         # patches/0080: a fast chunk gathers its partials as bf16 (half the bytes); both ranks then add the same
+@@ -412,6 +413,7 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int) -> torch
+         qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), out=b.kg[:R], part=b.sk)
+     if profile.ON:
+         profile.lap("kda.proj")
++    l2pf.mark(w, layer, "o", R)         # patches/0460: o_proj into L2 during the chain (off: a lookup)
+     cur = st.cur[li]
+     chain = kda_mod.chain
+     if b.fast:                           # patches/0080: a fast prefill chunk from absolute position st.pos
+@@ -448,6 +450,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
+     kv_write(b.kn[:R], b.vn[:R], kc, vc, pos_dev)
+     if profile.ON:
+         profile.lap("dsa.proj")
++    l2pf.mark(w, layer, "o", R)         # patches/0460: o_proj into L2 during the attention core
+     sparse_rows = index is not None and host_pos is not None and host_pos + R - 1 >= c.dense_limit
+     if npb is not None and index is None:
+         raise ValueError("dsa_block: a long-context step needs the indexer caches")
+@@ -510,6 +513,7 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+                     c.routed_scale, c.norm_topk)
+     if profile.ON:
+         profile.lap("moe.router")
++    l2pf.experts(w, layer, grp, R)      # patches/0460: the picked experts' first tiles into L2 (device-indexed)
+     if m.shared is not None:
+         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
+         from . import exl3_mm
+diff --git a/src/tensorfold/families/glm5_next/cuda/l2pf.cpp b/src/tensorfold/families/glm5_next/cuda/l2pf.cpp
+new file mode 100644
+index 0000000..4f7d832
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/l2pf.cpp
+@@ -0,0 +1,66 @@
++// Bindings of the L2 prefetch kernels (patches/0460, GLM53_TF_L2PF; l2pf.cu). Launches go on the CURRENT stream
++// (l2pf.py switches to its side stream first), so they are captured in CUDA graphs like any kernel.
++
++#include <stdint.h>
++
++#include <stdexcept>
++#include <string>
++
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include <torch/extension.h>
++
++namespace tfl2pf {
++
++cudaError_t launch_segments(const int64_t *table, int n, int grid, int threads, uint32_t chunk, bool bulk,
++                            cudaStream_t stream);
++cudaError_t launch_experts(const int32_t *ids, const int32_t *count, int maxu, const int64_t *bases, int nmat,
++                           int64_t stride_bytes, int64_t bytes, int64_t experts, int grid, int threads, uint32_t chunk,
++                           bool bulk, cudaStream_t stream);
++
++static void check(cudaError_t e, const char *what) {
++    if (e != cudaSuccess) {
++        throw std::runtime_error(std::string("l2pf: ") + what + ": " + cudaGetErrorString(e));
++    }
++}
++
++static void chunk_ok(int64_t chunk) {
++    if (chunk < 16 || chunk % 16 != 0 || chunk > (int64_t(1) << 24)) {
++        throw std::invalid_argument("l2pf: chunk must be a multiple of 16 bytes in [16, 16 MiB]");
++    }
++}
++
++// table: int64 [n, 2] on the device, (address, bytes) rows; addresses 16-byte aligned, bytes multiples of 16
++void segments(torch::Tensor table, int64_t grid, int64_t threads, int64_t chunk, bool bulk) {
++    TORCH_CHECK(table.is_cuda() && table.scalar_type() == torch::kInt64 && table.dim() == 2 && table.size(1) == 2 &&
++                    table.is_contiguous(),
++                "l2pf.segments: an int64 [n, 2] contiguous CUDA table");
++    chunk_ok(chunk);
++    if (table.size(0) == 0) {
++        return;
++    }
++    check(launch_segments(table.data_ptr<int64_t>(), int(table.size(0)), int(grid), int(threads), uint32_t(chunk), bulk,
++                          c10::cuda::getCurrentCUDAStream().stream()),
++          "segments launch");
++}
++
++// ids int32 [MAXU], count int32 [1]: qmm.Group; bases int64 [nmat] (device addresses of expert 0 of each matrix)
++void experts(torch::Tensor ids, torch::Tensor count, torch::Tensor bases, int64_t stride_bytes, int64_t bytes,
++             int64_t n_experts, int64_t grid, int64_t threads, int64_t chunk, bool bulk) {
++    TORCH_CHECK(ids.is_cuda() && ids.scalar_type() == torch::kInt32 && ids.is_contiguous(), "l2pf.experts: ids");
++    TORCH_CHECK(count.is_cuda() && count.scalar_type() == torch::kInt32 && count.numel() >= 1, "l2pf.experts: count");
++    TORCH_CHECK(bases.is_cuda() && bases.scalar_type() == torch::kInt64 && bases.is_contiguous(), "l2pf.experts: bases");
++    TORCH_CHECK(bytes > 0 && bytes % 16 == 0 && bytes <= stride_bytes, "l2pf.experts: bytes a multiple of 16, <= stride");
++    chunk_ok(chunk);
++    check(launch_experts(ids.data_ptr<int32_t>(), count.data_ptr<int32_t>(), int(ids.numel()),
++                         bases.data_ptr<int64_t>(), int(bases.numel()), stride_bytes, bytes, n_experts, int(grid),
++                         int(threads), uint32_t(chunk), bulk, c10::cuda::getCurrentCUDAStream().stream()),
++          "experts launch");
++}
++
++}  // namespace tfl2pf
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("segments", &tfl2pf::segments);
++    m.def("experts", &tfl2pf::experts);
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/l2pf.cu b/src/tensorfold/families/glm5_next/cuda/l2pf.cu
+new file mode 100644
+index 0000000..e315b8a
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/l2pf.cu
+@@ -0,0 +1,114 @@
++// L2 prefetch kernels for the decode rounds' idle windows (patches/0460, GLM53_TF_L2PF).
++//
++// Every kernel here only READS weight memory into the GPU's L2 and writes nothing the model reads, so it cannot change
++// a bit of any result; it only changes where the next kernels find their weights (L2 instead of DRAM).
++//
++//   bulk   one cp.async.bulk.prefetch.L2.global per CHUNK bytes (sm_90+ PTX; GB10 is sm_121): the SM's bulk-copy
++//          unit streams the range into L2 with no registers, no shared memory and no data returned to the SM, so
++//          the kernel is a handful of instructions per thread and the side stream holds no SM for the transfer
++//   lines  one prefetch.global.L2 per 128-byte line (any sm_70+ GPU): the fallback if the bulk form is slower here
++//
++// Two entry points:
++//   prefetch_segments  a static per-site table of (address, bytes) (the plans of l2pf.py: the next kernels' weights)
++//   prefetch_experts   device-indexed: the first ``bytes`` of every distinct routed expert the router picked this
++//                      window (qmm.Group ids[0 .. count)), in each listed matrix (EXL3 trellis [E, ...] per expert),
++//                      without a host round trip, so it is captured in the round's CUDA graph like the rest
++
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++namespace tfl2pf {
++
++constexpr uint32_t LINE = 128;
++
++__device__ __forceinline__ void bulk_prefetch(const void *p, uint32_t bytes) {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
++#else   // the pre-sm_90 targets of TORCH_CUDA_ARCH_LIST (never run on GB10): a line prefetch per 128 bytes
++    for (uint32_t o = 0; o < bytes; o += LINE) asm volatile("prefetch.global.L2 [%0];" ::"l"((const char *)p + o));
++#endif
++}
++
++__device__ __forceinline__ void line_prefetch(const void *p) {
++    asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
++}
++
++// ``bytes`` of [p, p + bytes) in pieces of ``chunk`` bytes (a multiple of 16), piece i by thread i of ``stride``.
++// Bulk prefetches need a 16-byte aligned address and a size that is a multiple of 16: the host rounds every segment
++// to that (l2pf.py), and the last piece is the remainder (also a multiple of 16).
++template <bool Bulk>
++__device__ __forceinline__ void range(const uint8_t *p, uint64_t bytes, uint32_t chunk, uint64_t index,
++                                      uint64_t stride) {
++    if (Bulk) {
++        const uint64_t pieces = (bytes + chunk - 1) / chunk;
++        for (uint64_t i = index; i < pieces; i += stride) {
++            const uint64_t off = i * chunk;
++            const uint64_t left = bytes - off;
++            bulk_prefetch(p + off, static_cast<uint32_t>(left < chunk ? left : chunk));
++        }
++    } else {
++        const uint64_t lines = (bytes + LINE - 1) / LINE;
++        for (uint64_t i = index; i < lines; i += stride) {
++            line_prefetch(p + i * LINE);
++        }
++    }
++}
++
++// table: n pairs of int64 (device address, bytes)
++template <bool Bulk>
++__global__ void __launch_bounds__(256) segments_kernel(const int64_t *table, int n, uint32_t chunk) {
++    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
++    for (int s = 0; s < n; s++) {
++        const uint8_t *p = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(table[2 * s]));
++        const uint64_t bytes = static_cast<uint64_t>(table[2 * s + 1]);
++        // segment s's first piece goes to thread s (mod the grid): a table of many one-piece heads (the chunk heads of
++        // a 4-bit matrix) is spread over the threads instead of all landing on thread 0
++        const uint64_t first = (index + stride - static_cast<uint64_t>(s) % stride) % stride;
++        range<Bulk>(p, bytes, chunk, first, stride);
++    }
++}
++
++// Block u (grid-stride over maxu) prefetches the first ``bytes`` of expert ids[u] in each of the ``nmat`` matrices
++// (bases[m] + ids[u] * stride_bytes) when u < count[0]. ids / count are the router's device output (qmm.Group).
++template <bool Bulk>
++__global__ void __launch_bounds__(256) experts_kernel(const int32_t *ids, const int32_t *count, int maxu,
++                                                      const int64_t *bases, int nmat, int64_t stride_bytes,
++                                                      int64_t bytes, int64_t experts, uint32_t chunk) {
++    const int n = min(static_cast<int>(*count), maxu);
++    for (int u = blockIdx.x; u < n; u += gridDim.x) {
++        const int64_t e = static_cast<int64_t>(ids[u]);
++        if (e < 0 || e >= experts) {
++            continue;                    // never read outside the expert tensors
++        }
++        for (int m = 0; m < nmat; m++) {
++            const uint8_t *p = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(bases[m])) + e * stride_bytes;
++            range<Bulk>(p, static_cast<uint64_t>(bytes), chunk, threadIdx.x, blockDim.x);
++        }
++    }
++}
++
++cudaError_t launch_segments(const int64_t *table, int n, int grid, int threads, uint32_t chunk, bool bulk,
++                            cudaStream_t stream) {
++    if (bulk) {
++        segments_kernel<true><<<grid, threads, 0, stream>>>(table, n, chunk);
++    } else {
++        segments_kernel<false><<<grid, threads, 0, stream>>>(table, n, chunk);
++    }
++    return cudaGetLastError();
++}
++
++cudaError_t launch_experts(const int32_t *ids, const int32_t *count, int maxu, const int64_t *bases, int nmat,
++                           int64_t stride_bytes, int64_t bytes, int64_t experts, int grid, int threads, uint32_t chunk,
++                           bool bulk, cudaStream_t stream) {
++    if (bulk) {
++        experts_kernel<true><<<grid, threads, 0, stream>>>(ids, count, maxu, bases, nmat, stride_bytes, bytes, experts,
++                                                           chunk);
++    } else {
++        experts_kernel<false><<<grid, threads, 0, stream>>>(ids, count, maxu, bases, nmat, stride_bytes, bytes, experts,
++                                                            chunk);
++    }
++    return cudaGetLastError();
++}
++
++}  // namespace tfl2pf
+diff --git a/src/tensorfold/families/glm5_next/cuda/l2pf.py b/src/tensorfold/families/glm5_next/cuda/l2pf.py
+new file mode 100644
+index 0000000..65418c9
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/l2pf.py
+@@ -0,0 +1,482 @@
++"""GLM53_TF_L2PF (patches/0460): the next kernels' weights into L2 during a decode round's latency-bound windows, on
++every forward path (lone ``forward.compute``, the Batcher's ``batch.compute_multi``, the MTP head alone and batched).
++Default off; off, every hook below is one dict lookup that finds nothing.
++
++Why
++---
++A decode round is DRAM-bound except for its latency-bound stretches: each block's all-gather (RoCE, 11-20 us),
++hc_post + the next hc_pre, the router, the KDA chains and the attention core. In those windows the memory system
++idles (docs/PROFILE.md section 5, docs/ROOFLINE.md section 2). patches/0040 (``GLM53_TF_COMM=prefetch``) used the
++all-gather windows, but only in ``forward.compute``: ``batch.compute_multi`` never tagged a site, so production's
++multi-slot rounds (``GLM53_TF_BATCH=4``) never prefetched, and its Triton loads held half the SMs while they ran.
++
++What
++----
++Sites (``GLM53_TF_L2PF_SITES``, default ``a,f,o``), each a static list of (address, bytes) built at load
++(``plans``), capped at ``GLM53_TF_L2PF_MB`` a site:
++
++- ``a``  at a layer's attention all-gather: its FFN's first reads (the mix ``ffn_hc.fn``, post norm, the router and
++         its bias, the shared expert's gate/up; or a dense MLP's gate/up) -- 0040's plan;
++- ``f``  at a layer's FFN all-gather: the next layer's ``attn_hc.fn``, input norm and attention input projection
++         (after the last layer: the final norm and the head) -- 0040's plan;
++- ``o``  NEW, after a layer's attention projections, before its attention core (the KDA chains, or the DSA
++         cache write + attention; per slot in a batched round, so this window grows with the slots): the attention
++         output projection (and on the latent path the value expansion ``kv_v`` first, which runs before it);
++- ``e``  NEW, device-indexed, right after the router: the first ``GLM53_TF_L2PF_EXPERT_KB`` of every distinct routed
++         expert the window picked (EXL3 gate and up trellis), from ``qmm.Group`` on the device (no host round trip,
++         captured in the graph). It overlaps the shared expert (computed first while a prefetcher is installed, as in
++         0040) and the routed kernels' input rotation; the routed kernels then start on L2 hits.
++The MTP head's own sites are ``("mtp", "a" | "f" | "o")``. A 4-bit matrix whose ``qmm`` launch is one wave (at most
++192 programs: the shared expert's gate/up, DSA's input projection, KDA's output projection, ``kv_v``) is prefetched as
++the head of every (64-column tile, K slice) chunk, so every program starts on L2 hits; larger launches by their first
++bytes (the first wave's programs).
++
++Mechanism (``GLM53_TF_L2PF``): ``bulk`` (= ``1``) a tiny kernel issues ``cp.async.bulk.prefetch.L2.global`` per
++``GLM53_TF_L2PF_CHUNK_KB`` (the SM's bulk-copy unit streams the bytes into L2; no registers, no shared memory, no data
++back to the SM); ``lines`` one ``prefetch.global.L2`` per 128-byte line; ``touch`` 0040's Triton loads into a sink.
++Every launch goes on a side stream forked from the current stream at the site (so it runs beside the main stream's
++next kernels, never in front of them), and every forward joins it before it returns (captured graphs hold no open
++fork). Windows wider than ``GLM53_TF_L2PF_ROWS`` rows (prefill chunks) skip every site.
++
++Exactness: the kernels only read weights into L2 and write nothing the model reads; every model kernel runs with the
++same arguments in the same stream order, except the EXL3 shared expert, which runs before the routed experts while a
++prefetcher is installed (0040's order: disjoint inputs and outputs, so the same bits). L2 residency changes timing,
++never values. Both ranks may even differ in these knobs (nothing crosses the link), though A/Bs set both.
++
++Knobs
++-----
++``GLM53_TF_L2PF``            ``0`` (default) | ``1`` / ``bulk`` | ``lines`` | ``touch``
++``GLM53_TF_L2PF_MB``         bytes a site (depth), MiB. 4 (capped at half the L2: 12 MiB on GB10)
++``GLM53_TF_L2PF_SITES``      comma list of a, f, o, e. ``a,f,o``
++``GLM53_TF_L2PF_EXPERT_KB``  per picked expert and matrix (site ``e``). 64
++``GLM53_TF_L2PF_ROWS``       largest window (rows of the forward) that prefetches. 64
++``GLM53_TF_L2PF_CHUNK_KB``   bytes a bulk prefetch instruction. 32
++``GLM53_TF_COMM=prefetch`` (0040) and ``GLM53_TF_L2PF`` exclude each other (the load refuses both).
++"""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import NamedTuple
++
++import torch
++
++ENV = "GLM53_TF_L2PF"
++MODES = ("bulk", "lines", "touch")
++SITES = ("a", "f", "o", "e")
++DEFAULT_SITES = ("a", "f", "o")
++L2_FALLBACK = 24 * 2**20                  # GB10 (results/W11/probe-head.log: 24.0 MB)
++ALIGN = 16                                # cp.async.bulk: 16-byte aligned address, size a multiple of 16
++
++
++@dataclass(frozen=True)
++class Settings:
++    mode: str | None = None               # None: off
++    mb: float = 4.0
++    sites: tuple = DEFAULT_SITES
++    expert_kb: int = 64
++    rows: int = 64
++    chunk_kb: int = 32
++
++    @property
++    def on(self) -> bool:
++        return self.mode is not None
++
++
++def _num(env: dict, name: str, default, lo, hi, kind=float):
++    raw = str(env.get(name, "")).strip()
++    if not raw:
++        return default
++    try:
++        v = kind(raw)
++    except ValueError:
++        raise ValueError(f"{name}={raw!r}: expected a number") from None
++    if not lo <= v <= hi:
++        raise ValueError(f"{name}={v}: expected {lo}..{hi}")
++    return v
++
++
++def settings(env: dict | None = None) -> Settings:
++    env = os.environ if env is None else env
++    raw = str(env.get(ENV, "")).strip().lower()
++    if raw in ("", "0", "off", "none"):
++        return Settings()
++    mode = "bulk" if raw == "1" else raw
++    if mode not in MODES:
++        raise ValueError(f"{ENV}={raw!r}: expected 0, 1, bulk, lines or touch")
++    mb = _num(env, ENV + "_MB", 4.0, 0.0625, 12.0)
++    sites_raw = str(env.get(ENV + "_SITES", "")).strip().lower()
++    sites = DEFAULT_SITES
++    if sites_raw:
++        sites = tuple(s.strip() for s in sites_raw.split(",") if s.strip())
++        bad = [s for s in sites if s not in SITES]
++        if bad or not sites:
++            raise ValueError(f"{ENV}_SITES={sites_raw!r}: expected a comma list of a, f, o, e")
++    return Settings(mode, float(mb), tuple(dict.fromkeys(sites)),
++                    int(_num(env, ENV + "_EXPERT_KB", 64, 1, 2048, int)),
++                    int(_num(env, ENV + "_ROWS", 64, 1, 1 << 16, int)),
++                    int(_num(env, ENV + "_CHUNK_KB", 32, 1, 1024, int)))
++
++
++# -- plans ------------------------------------------------------------------------------------------------------------
++class Span(NamedTuple):
++    tensor: torch.Tensor                  # the weight (kept for touch mode's views)
++    addr: int
++    nbytes: int
++
++
++def _span(t, left: int) -> Span | None:
++    """The first ``left`` bytes of tensor t, rounded for the bulk form (16-byte aligned start, a multiple of 16
++    bytes), or None."""
++
++    if not isinstance(t, torch.Tensor) or not t.is_contiguous() or t.numel() == 0:
++        return None
++    start = t.data_ptr()
++    end = start + t.numel() * t.element_size()
++    a = -(-start // ALIGN) * ALIGN
++    n = min(left, end - a) // ALIGN * ALIGN
++    if n <= 0:
++        return None
++    return Span(t, a, n)
++
++
++ONE_WAVE = 192                            # qmm programs resident at once on GB10 (4 CTAs an SM x 48 SMs; W11 ncu)
++
++
++def _is_q4(q) -> bool:
++    return all(hasattr(q, a) for a in ("weight", "scales", "biases", "n", "k"))
++
++
++def _q4_heads(q, left: int) -> list[Span]:
++    """A 4-bit matrix (``qmm.Q4``: words [N/64, K/64, 64, 8], one contiguous chunk of K * 32 / SK bytes per (64-column
++    tile, K slice), which is what one program of ``qmm.matmul`` streams): the first ``left / chunks`` bytes of EVERY
++    chunk, so every program of a single-wave launch starts on L2 hits (the first bytes of the tensor would only help
++    the first programs, and the launch lasts as long as its slowest one). [] if the launch is more than one wave (the
++    heads of later waves would be evicted by the earlier waves' stream) or the heads would be under 512 bytes."""
++
++    from . import qmm
++
++    w = q.weight
++    tiles = -(-int(q.n) // qmm.BN)
++    sk = qmm.split_k(int(q.n), int(q.k))
++    total = w.numel() * w.element_size()
++    chunks = tiles * sk
++    if chunks <= 0 or chunks > ONE_WAVE or total % chunks:
++        return []
++    size = total // chunks
++    per = min(size, left // chunks) // ALIGN * ALIGN
++    if per < 512 or w.data_ptr() % ALIGN or size % ALIGN:
++        return []
++    base = w.data_ptr()
++    return [Span(w, base + c * size, per) for c in range(chunks)]
++
++
++def take(items: list, budget: int) -> list[Span]:
++    """The spans of ``items`` in order, up to ``budget`` bytes in all. A tensor: its first bytes. A 4-bit matrix: its
++    scales and biases (small, read by every program), then its words -- the head of every (tile, K slice) chunk when
++    its launch is one wave (``_q4_heads``), else its first bytes (the first wave's programs). A BF16 matrix
++    (``qmm.B16``): its first bytes."""
++
++    out, left = [], int(budget)
++
++    def add(t) -> None:
++        nonlocal left
++        if left < ALIGN:
++            return
++        s = _span(t, left)
++        if s is not None:
++            out.append(s)
++            left -= s.nbytes
++
++    for it in items:
++        if left < ALIGN:
++            break
++        if isinstance(it, torch.Tensor):
++            add(it)
++        elif _is_q4(it):
++            add(it.scales)
++            add(it.biases)
++            heads = _q4_heads(it, left)
++            if heads:
++                out += heads
++                left -= sum(h.nbytes for h in heads)
++            else:
++                add(it.weight)
++        elif hasattr(it, "weight"):
++            add(it.weight)
++    return out
++
++
++def _ffn_items(layer, with_hc: bool) -> list:
++    """What the kernels after a layer's attention all-gather read first (0040's ``_ffn_reads``, matrices whole)."""
++
++    items = [layer.ffn_hc.fn] if with_hc and layer.ffn_hc is not None else []
++    items.append(layer.post_norm)
++    if layer.mlp is not None:
++        items.append(layer.mlp.gu)
++    elif layer.moe is not None:
++        items += [layer.moe.router, layer.moe.bias]
++        if layer.moe.shared is not None:
++            items.append(layer.moe.shared.gu)
++    return items
++
++
++def _attn_items(layer) -> list:
++    """... after the previous layer's FFN all-gather (0040's ``_attn_reads``)."""
++
++    items = [layer.attn_hc.fn] if layer.attn_hc is not None else []
++    items.append(layer.in_norm)
++    items.append(layer.kda.proj if layer.kind == "kda" else layer.dsa.proj)
++    return items
++
++
++def _out_items(layer, latent_kv: bool) -> list:
++    """... after a layer's attention core: the value expansion (latent DSA: it runs before the output projection),
++    then the output projection."""
++
++    if layer.kind == "kda":
++        return [layer.kda.o]
++    a = layer.dsa
++    return ([a.kv_v] if latent_kv else []) + [a.o]
++
++
++def plans(w, budget: int, sites=DEFAULT_SITES, latent_kv: bool | None = None) -> dict:
++    """Per site key ((layer index, kind) or ("mtp", kind)): the spans to prefetch, at most ``budget`` bytes: 0040's
++    ``a`` / ``f`` reads, plus ``o``."""
++
++    if latent_kv is None:
++        from . import latent
++
++        latent_kv = bool(latent.on(w))
++    out = {}
++    layers = w.layers
++    for i, layer in enumerate(layers):
++        if "a" in sites:
++            out[(layer.index, "a")] = take(_ffn_items(layer, True), budget)
++        if "f" in sites:
++            nxt = _attn_items(layers[i + 1]) if i + 1 < len(layers) else [w.norm, w.head]
++            out[(layer.index, "f")] = take(nxt, budget)
++        if "o" in sites:
++            out[(layer.index, "o")] = take(_out_items(layer, latent_kv), budget)
++    if w.mtp is not None:
++        if "a" in sites:
++            out[("mtp", "a")] = take(_ffn_items(w.mtp.layer, False), budget)
++        if "f" in sites:
++            from . import draftvocab
++
++            out[("mtp", "f")] = take([w.mtp.norm, draftvocab.head_for(w, "mtp")], budget)
++        if "o" in sites:
++            out[("mtp", "o")] = take(_out_items(w.mtp.layer, latent_kv), budget)
++    return {k: v for k, v in out.items() if v}
++
++
++def expert_plans(w, nbytes: int) -> dict:
++    """Per MoE layer with EXL3 experts (key: the ``Exl3Experts`` object's id): (bases [gate, up] addresses, bytes an
++    expert apart, bytes to prefetch an expert and matrix, expert count)."""
++
++    out = {}
++    layers = list(w.layers) + ([w.mtp.layer] if w.mtp is not None else [])
++    for layer in layers:
++        m = getattr(layer, "moe", None)
++        ex = getattr(m, "experts", None) if m is not None else None
++        if ex is None or not hasattr(ex, "gt") or not hasattr(ex, "ut"):
++            continue
++        gt, ut = ex.gt, ex.ut
++        if not (gt.is_contiguous() and ut.is_contiguous()) or gt.shape[0] != ut.shape[0] or gt.shape != ut.shape:
++            continue
++        stride = gt[0].numel() * gt.element_size()
++        n = min(int(nbytes), stride) // ALIGN * ALIGN
++        if n <= 0 or gt.data_ptr() % ALIGN or ut.data_ptr() % ALIGN or stride % ALIGN:
++            continue
++        out[id(ex)] = ([gt.data_ptr(), ut.data_ptr()], stride, n, int(gt.shape[0]))
++    return out
++
++
++def key(w, layer, kind: str):
++    """The site key of ``layer`` (the MTP head's layer is keyed ("mtp", kind): its index may equal a main layer's)."""
++
++    mtp = getattr(w, "mtp", None)
++    if mtp is not None and layer is mtp.layer:
++        return ("mtp", kind)
++    return (layer.index, kind)
++
++
++# -- hooks (called by forward / batch / latent; no-ops unless a 0460 prefetcher is installed) ------------------------
++def mark(w, layer, kind: str, R: int) -> None:
++    """Site ``kind`` of ``layer`` reached with R rows (``o``: after the attention projections)."""
++
++    pf = w.meta.get("prefetch")
++    if pf is not None and getattr(pf, "L2PF", False):
++        pf.launch(key(w, layer, kind), R)
++
++
++def experts(w, layer, grp, R: int) -> None:
++    """Site ``e``: right after the router wrote ``grp`` (ids / count on the device)."""
++
++    pf = w.meta.get("prefetch")
++    if pf is not None and getattr(pf, "L2PF", False):
++        pf.experts(layer, grp, R)
++
++
++# -- the prefetcher ---------------------------------------------------------------------------------------------------
++_EXT = None
++
++
++def _ext():
++    global _EXT
++    if _EXT is None:
++        from torch.utils.cpp_extension import load
++
++        here = Path(__file__).parent
++        _EXT = load(name="tensorfold_glm_l2pf_v1", sources=[str(here / "l2pf.cpp"), str(here / "l2pf.cu")],
++                    extra_cflags=["-O2"], extra_cuda_cflags=["-O3"], verbose=False)
++    return _EXT
++
++
++@dataclass
++class Stats:
++    launches: int = 0                     # site launches (eager calls + captures)
++    skipped_rows: int = 0                 # sites skipped: window wider than GLM53_TF_L2PF_ROWS
++    expert_launches: int = 0
++    bytes_planned: int = 0                # sum over sites of their plan's bytes (once, at load)
++    by_kind: dict = field(default_factory=dict)
++
++
++class Prefetcher:
++    """0040's interface (``launch(site)``, ``join()``, ``pending``) plus rows, the ``o`` / ``e`` sites and the bulk /
++    lines mechanisms. ``L2PF`` tells the 0460 hooks apart from 0040's ``overlap.Prefetcher`` (which has no ``o`` / ``e``
++    sites)."""
++
++    L2PF = True
++    THREADS = 128
++
++    def __init__(self, w, s: Settings) -> None:
++        dev = w.device
++        props = torch.cuda.get_device_properties(dev)
++        l2 = int(getattr(props, "L2_cache_size", 0) or 0) or L2_FALLBACK
++        self.s = s
++        self.budget = min(int(s.mb * 2**20), l2 // 2)
++        self.sms = int(props.multi_processor_count)
++        self.chunk = s.chunk_kb * 1024
++        self.plans = plans(w, self.budget, s.sites)
++        self.stats = Stats(bytes_planned=sum(sp.nbytes for v in self.plans.values() for sp in v))
++        for (_, kind), v in self.plans.items():
++            self.stats.by_kind[kind] = self.stats.by_kind.get(kind, 0) + sum(sp.nbytes for sp in v)
++        self.side = torch.cuda.Stream(device=dev)
++        self.pending = False
++        self._cap = False
++        self.tables: dict = {}
++        self.views: dict = {}
++        if s.mode in ("bulk", "lines"):
++            ext = _ext()
++            self.ext = ext
++            for k, spans in self.plans.items():
++                self.tables[k] = torch.tensor([[sp.addr, sp.nbytes] for sp in spans], dtype=torch.int64,
++                                              device=dev).view(-1, 2)
++        else:                                             # touch: 0040's loads, over int32 views of the same spans
++            from .overlap import Prefetcher as Touch
++
++            self.progs = max(1, self.sms // 2)
++            self.sink = torch.zeros((self.progs,), dtype=torch.int32, device=dev)
++            self._touch = Touch
++            for k, spans in self.plans.items():
++                self.views[k] = [_view(sp) for sp in spans]
++        self.eplans = {}
++        if "e" in s.sites and s.mode in ("bulk", "lines"):
++            for k, (bases, stride, n, count) in expert_plans(w, s.expert_kb * 1024).items():
++                self.eplans[k] = (torch.tensor(bases, dtype=torch.int64, device=dev), stride, n, count)
++
++    @property
++    def launches(self) -> int:                            # 0040's counter
++        return self.stats.launches
++
++    def _fork(self) -> None:
++        cur = torch.cuda.current_stream()
++        cap = torch.cuda.is_current_stream_capturing()
++        if self.pending and cap != self._cap:
++            self.pending = False                          # an eager fork never joins a capture (and vice versa)
++        self.side.wait_stream(cur)                        # after the main stream's work so far, beside what follows
++        self._cap = cap
++        self.pending = True
++
++    def _grid(self, nbytes: int) -> int:
++        per = self.chunk if self.s.mode == "bulk" else 128
++        pieces = -(-nbytes // per)
++        return max(1, min(self.sms, -(-pieces // self.THREADS)))
++
++    def launch(self, site, R: int | None = None) -> None:
++        if R is not None and R > self.s.rows:
++            self.stats.skipped_rows += 1
++            return
++        if self.s.mode == "touch":
++            segs = self.views.get(site)
++            if not segs:
++                return
++            self._fork()
++            with torch.cuda.stream(self.side):
++                for v in segs:
++                    self._touch_kernel(v)
++        else:
++            table = self.tables.get(site)
++            if table is None:
++                return
++            self._fork()
++            nbytes = sum(sp.nbytes for sp in self.plans[site])
++            with torch.cuda.stream(self.side):
++                self.ext.segments(table, self._grid(nbytes), self.THREADS, self.chunk, self.s.mode == "bulk")
++        self.stats.launches += 1
++
++    def _touch_kernel(self, v: torch.Tensor) -> None:
++        from .overlap import _touch
++
++        _touch[(self.progs,)](v, self.sink, v.numel(), BLOCK=self._touch.BLOCK, PROGS=self.progs, num_warps=4)
++
++    def experts(self, layer, grp, R: int) -> None:
++        if R > self.s.rows or not self.eplans:
++            return
++        ex = getattr(getattr(layer, "moe", None), "experts", None)
++        plan = self.eplans.get(id(ex))
++        if plan is None:
++            return
++        bases, stride, n, count = plan
++        self._fork()
++        with torch.cuda.stream(self.side):
++            self.ext.experts(grp.ids, grp.count, bases, stride, n, count, min(self.sms, int(grp.ids.numel())),
++                             self.THREADS, self.chunk, self.s.mode == "bulk")
++        self.stats.expert_launches += 1
++
++    def join(self) -> None:
++        if self.pending:
++            if torch.cuda.is_current_stream_capturing() == self._cap:
++                torch.cuda.current_stream().wait_stream(self.side)
++            self.pending = False
++
++
++def _view(sp: Span) -> torch.Tensor:
++    """touch mode: the span as an int32 view of its weight (the same memory; spans are multiples of 16 bytes)."""
++
++    t = sp.tensor
++    off = sp.addr - t.data_ptr()
++    return t.reshape(-1).view(torch.uint8)[off:off + sp.nbytes].view(torch.int32)
++
++
++def install(w):
++    """At engine build, after 0040's ``overlap.install`` (before any graph is captured): a 0460 prefetcher on
++    ``w.meta["prefetch"]`` when ``GLM53_TF_L2PF`` is on. Unlike 0040 it also runs with one rank (nothing it does
++    involves the link; the windows it fills are also the small kernels')."""
++
++    s = settings()
++    if not s.on:
++        return None
++    if w.meta.get("prefetch") is not None:
++        raise ValueError(f"{ENV} and GLM53_TF_COMM=prefetch (patches/0040) exclude each other: set one")
++    if not torch.cuda.is_available():
++        return None
++    pf = Prefetcher(w, s)
++    w.meta["prefetch"] = pf
++    kinds = ", ".join(f"{k} {v / 2**20:.1f} MiB" for k, v in sorted(pf.stats.by_kind.items()))
++    print(f"[tensorfold] l2pf: {s.mode}, {pf.budget / 2**20:g} MiB a site, sites {','.join(s.sites)} ({kinds}); "
++          f"experts {len(pf.eplans)} layers x {s.expert_kb} KiB; windows <= {s.rows} rows", flush=True)
++    return pf
+diff --git a/src/tensorfold/families/glm5_next/cuda/latent.py b/src/tensorfold/families/glm5_next/cuda/latent.py
+index 12a1d59..a83699d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/latent.py
++++ b/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -63,6 +63,7 @@ import triton.language as tl
+ 
+ from . import deep as _deep                                     # patches/0380
+ from . import fp8pf, glue, kvpool, profile, qmm, sparse
++from . import l2pf                                                  # patches/0460
+ from .qmm import B16, Q4
+ 
+ CHUNK = 512              # keys a program visits (the expanded kernel's chunk: the same chunk counts serve both)
+@@ -967,6 +968,7 @@ def dsa_block_latent(layer, w, lc: torch.Tensor, pos_dev: torch.Tensor, b, R: in
+     _project(layer, w, b, R)
+     if index is not None:
+         _index_proj(layer, w, b, R)
++    l2pf.mark(w, layer, "o", R)         # patches/0460: kv_v + o_proj into L2 during the attention core
+     _attend(layer, w, lc, pos_dev, b, 0, R, nch, index, host_pos, npb)
+     return _output(layer, w, b, R)
+ 
+@@ -979,6 +981,7 @@ def dsa_multi(layer, w, sts, b, Rs, offs, T: int, nchs, host_pos) -> torch.Tenso
+     indexed = sts[0].index is not None
+     if indexed:
+         _index_proj(layer, w, b, T)
++    l2pf.mark(w, layer, "o", T)         # patches/0460
+     for i, (st, R, o) in enumerate(zip(sts, Rs, offs)):
+         di = st.dsa_index[layer.index]
+         _attend(layer, w, st.kc[di], st.pos_dev, b, o, R, nchs[i] if nchs is not None else None,
+diff --git a/src/tensorfold/families/glm5_next/cuda/overlap.py b/src/tensorfold/families/glm5_next/cuda/overlap.py
+index c3dde89..38b863e 100644
+--- a/src/tensorfold/families/glm5_next/cuda/overlap.py
++++ b/src/tensorfold/families/glm5_next/cuda/overlap.py
+@@ -175,7 +175,7 @@ class Prefetcher:
+         self.pending = False
+         self.launches = 0
+ 
+-    def launch(self, site) -> None:
++    def launch(self, site, R: int | None = None) -> None:     # R: patches/0460's row limit (unused here)
+         segs = self.plans.get(site)
+         if not segs:
+             return
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce.cpp b/src/tensorfold/families/glm5_next/cuda/roce.cpp
+index fb21500..6654e3a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/roce.cpp
++++ b/src/tensorfold/families/glm5_next/cuda/roce.cpp
+@@ -22,6 +22,12 @@
+ //
+ // patches/0350: the proxy thread (and the tests' Loop) also polls ``FailWatch`` (roce_watch.h) every iteration: the
+ // host's view of a failed wait's flag at the moment of the failure, and whether it arrives later.
++//
++// patches/0460 (each off by default: 0350's behaviour): ``stripe_min`` -- a shard below it travels on one HCA
++// (seq % HCAs; one post, one flag to wait for) instead of being striped; ``inline_max`` -- a stripe of at most that
++// many bytes is posted inline (the CPU copies the staged bytes into the work request: no NIC DMA read of the send
++// slot); ``lazy_cq`` -- completions are reaped in the idle loop, not right after each post; ``trace`` -- the proxy
++// stamps when it saw each doorbell and when its posts returned (CLOCK_REALTIME ns, a ring the size of the kernel's).
+ 
+ #include <errno.h>
+ #include <infiniband/verbs.h>
+@@ -68,6 +74,7 @@ struct Blob {
+ };
+ 
+ struct Hca {
++    uint32_t inline_cap = 0;         // patches/0460: the queue pairs' max_inline_data as created
+     ibv_context *ctx = nullptr;
+     ibv_pd *pd = nullptr;
+     ibv_mr *mr = nullptr;
+@@ -104,9 +111,18 @@ bool layout(int world, uint64_t slot_bytes, uint64_t out[7]) {
+ class Proxy {
+   public:
+     Proxy(int world, int rank, std::vector<std::string> names, std::vector<int> gid_index, int traffic_class,
+-          uint64_t region, uint64_t region_bytes, uint64_t slot_bytes)
++          uint64_t region, uint64_t region_bytes, uint64_t slot_bytes, uint32_t stripe_min, uint32_t inline_max,
++          bool lazy_cq, uint32_t trace_entries)
+         : world_(world), rank_(rank), n_hca_(int(names.size())), tc_(traffic_class),
+-          region_(reinterpret_cast<uint8_t *>(region)), region_bytes_(region_bytes), slot_bytes_(slot_bytes) {
++          region_(reinterpret_cast<uint8_t *>(region)), region_bytes_(region_bytes), slot_bytes_(slot_bytes),
++          stripe_min_(stripe_min), inline_max_(inline_max), lazy_cq_(lazy_cq) {
++        if (trace_entries != 0) {                     // patches/0460
++            if ((trace_entries & (trace_entries - 1)) != 0) {
++                throw std::runtime_error("roce: trace entries must be a power of two");
++            }
++            trace_mask_ = trace_entries - 1;
++            ptrace_.assign(size_t(trace_entries) * 2, 0);
++        }
+         uint64_t lay[7];
+         if (!layout(world, slot_bytes, lay) || lay[4] > region_bytes || rank < 0 || rank >= world || n_hca_ < 1 ||
+             n_hca_ > MAX_HCAS || gid_index.size() != names.size() || tc_ < 0 || tc_ > 255) {
+@@ -214,6 +230,24 @@ class Proxy {
+         return out;
+     }
+ 
++    // patches/0460: per HCA the inline capacity the queue pairs got, then the posts sent inline and single-HCA ops
++    std::vector<uint64_t> stats2() const {
++        std::vector<uint64_t> out = {inline_posts_, single_ops_};
++        for (int h = 0; h < n_hca_; h++) {
++            out.push_back(hca_[h].inline_cap);
++        }
++        return out;
++    }
++
++    // patches/0460: (seen ns, posted ns) of the op whose sequence is ``seq`` (0, 0 without a trace or if overwritten)
++    std::vector<uint64_t> trace(uint32_t seq) const {
++        if (ptrace_.empty()) {
++            return {0, 0};
++        }
++        const size_t i = size_t(seq & trace_mask_) * 2;
++        return {ptrace_[i], ptrace_[i + 1]};
++    }
++
+     void destroy() {
+         stop();
+         for (int h = 0; h < MAX_HCAS; h++) {
+@@ -326,12 +360,20 @@ class Proxy {
+             attr.cap.max_recv_wr = 1;
+             attr.cap.max_send_sge = 1;
+             attr.cap.max_recv_sge = 1;
+-            attr.cap.max_inline_data = 16;
++            attr.cap.max_inline_data = inline_max_ > 16 ? inline_max_ : 16;
+             x.qp[p] = ibv_create_qp(x.pd, &attr);
++            if (x.qp[p] == nullptr && attr.cap.max_inline_data > 16) {
++                // patches/0460: the device refused the inline size: 0350's queue pair, no inline payloads
++                attr.cap.max_inline_data = 16;
++                x.qp[p] = ibv_create_qp(x.pd, &attr);
++            }
+             if (x.qp[p] == nullptr) {
+                 set_err("ibv_create_qp", errno);
+                 return false;
+             }
++            // ibv_create_qp writes the capacities it granted back into attr.cap (patches/0460)
++            const uint32_t cap = attr.cap.max_inline_data;
++            x.inline_cap = (inline_max_ == 0 || cap < 16) ? 0 : (cap < inline_max_ ? cap : inline_max_);
+             ibv_qp_attr init;
+             memset(&init, 0, sizeof(init));
+             init.qp_state = IBV_QPS_INIT;
+@@ -424,12 +466,18 @@ class Proxy {
+         uint8_t *send = region_ + send_off_ + size_t(slot) * slot_bytes_;
+         uint32_t seq_copy = seq;
+         const uint32_t total_packs = nbytes / 16;
++        const bool one = one_hca(nbytes, stripe_min_, n_hca_);          // patches/0460 (the kernel's rule)
++        const int used = one ? single_hca(seq, n_hca_) : -1;
++        single_ops_ += one ? 1 : 0;
+         for (int p = 0; p < world_; p++) {
+             if (p == rank_) {
+                 continue;
+             }
+             uint32_t pack_offset = 0;
+             for (int h = 0; h < n_hca_; h++) {
++                if (used >= 0 && h != used) {
++                    continue;
++                }
+                 Hca &x = hca_[h];
+                 // two work requests per stripe; keep the queue at most a quarter full
+                 while (x.outstanding[p] >= SEND_DEPTH / 4) {
+@@ -447,6 +495,9 @@ class Proxy {
+                 if (uint32_t(h) < total_packs % uint32_t(n_hca_)) {
+                     stripe_packs += 1;
+                 }
++                if (used >= 0) {
++                    stripe_packs = total_packs;          // patches/0460: the whole shard on this HCA
++                }
+                 const uint32_t stripe_bytes = stripe_packs * 16;
+                 const uint64_t byte_offset = uint64_t(pack_offset) * 16;
+                 const uint64_t remote = peer_addr_[p];
+@@ -482,6 +533,12 @@ class Proxy {
+                     data_wr.wr.rdma.remote_addr =
+                         remote + recv_off_ + (uint64_t(rank_) * SLOTS + slot) * slot_bytes_ + byte_offset;
+                     data_wr.wr.rdma.rkey = peer_rkey_[h][p];
++                    if (x.inline_cap != 0 && stripe_bytes <= x.inline_cap) {
++                        // patches/0460: the CPU copies the staged bytes into the work request at post time. The
++                        // doorbell's acquire load (main_loop) ordered the GPU's staging before this read.
++                        data_wr.send_flags = IBV_SEND_INLINE;
++                        inline_posts_ += 1;
++                    }
+                     first = &data_wr;
+                 }
+                 ibv_send_wr *bad = nullptr;
+@@ -496,6 +553,9 @@ class Proxy {
+             }
+         }
+         ops_posted_ += 1;
++        if (lazy_cq_) {
++            return true;                                 // patches/0460: reaped by the idle loop (and the depth bound)
++        }
+         for (int h = 0; h < n_hca_; h++) {
+             if (!drain_cq(h)) {
+                 return false;
+@@ -504,6 +564,12 @@ class Proxy {
+         return true;
+     }
+ 
++    static uint64_t now_ns() {
++        timespec t;
++        clock_gettime(CLOCK_REALTIME, &t);
++        return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
++    }
++
+     static void *main_tramp(void *self) {
+         static_cast<Proxy *>(self)->main_loop();
+         return nullptr;
+@@ -551,6 +617,7 @@ class Proxy {
+                 failed_.store(1);
+                 return;
+             }
++            const uint64_t seen = ptrace_.empty() ? 0 : now_ns();          // patches/0460
+             for (uint32_t s = last_seq_ + 1; pending > 0; s++, pending--) {
+                 const uint32_t nbytes = c[CTRL_SLOT_NBYTES + (s & 1u)];
+                 if (!post_op(s, nbytes)) {
+@@ -558,6 +625,11 @@ class Proxy {
+                     return;
+                 }
+                 last_seq_ = s;
++                if (!ptrace_.empty()) {
++                    const size_t i = size_t(s & trace_mask_) * 2;
++                    ptrace_[i] = seen;
++                    ptrace_[i + 1] = now_ns();
++                }
+             }
+         }
+     }
+@@ -579,6 +651,11 @@ class Proxy {
+     uint64_t writes_completed_ = 0;
+     std::string err_;
+     FailWatch watch_;                             // patches/0350
++    uint32_t stripe_min_ = 0, inline_max_ = 0;    // patches/0460
++    bool lazy_cq_ = false;
++    uint64_t inline_posts_ = 0, single_ops_ = 0;
++    uint32_t trace_mask_ = 0;
++    std::vector<uint64_t> ptrace_;
+ };
+ 
+ // -- pinned region -------------------------------------------------------------------------------------------------
+@@ -616,7 +693,8 @@ std::vector<uint64_t> py_layout(int world, uint64_t slot_bytes) {
+ class Launcher {
+   public:
+     Launcher(uint64_t recv_base, uint64_t flag_base, uint64_t send_base, uint64_t ctrl_base, uint64_t slot_bytes,
+-             uint64_t epoch, uint64_t poison, int world, int rank, int n_hca, int flag_stride, int slots, int threads)
++             uint64_t epoch, uint64_t poison, int world, int rank, int n_hca, int flag_stride, int slots, int threads,
++             uint32_t stripe_min, bool lean, uint64_t trace, uint32_t trace_entries)
+         : threads_(threads) {
+         memset(&a_, 0, sizeof(a_));
+         a_.recv_base = recv_base;
+@@ -631,6 +709,13 @@ class Launcher {
+         a_.n_hca = n_hca;
+         a_.flag_stride = flag_stride;
+         a_.slots = slots;
++        a_.stripe_min = stripe_min;                  // patches/0460
++        a_.lean = lean ? 1u : 0u;
++        a_.trace = reinterpret_cast<uint64_t *>(trace);
++        a_.trace_mask = trace_entries == 0 ? 0u : trace_entries - 1;
++        if (trace != 0 && (trace_entries == 0 || (trace_entries & (trace_entries - 1)) != 0)) {
++            throw std::invalid_argument("roce: trace entries must be a power of two");
++        }
+         if (threads < world * n_hca || threads % 32 != 0 || threads > 1024) {
+             throw std::invalid_argument("roce: threads must be a multiple of 32, <= 1024 and >= world x HCAs");
+         }
+@@ -667,10 +752,12 @@ class Launcher {
+ class Loop {
+   public:
+     Loop(uint64_t host, uint64_t recv_off, uint64_t flag_off, uint64_t send_off, uint64_t ctrl_off, uint64_t slot_bytes,
+-         int world, int rank, int n_hca, int flag_stride, int slots, int xor_key, int64_t stall_after, bool late)
++         int world, int rank, int n_hca, int flag_stride, int slots, int xor_key, int64_t stall_after, bool late,
++         uint32_t stripe_min)
+         : region_(reinterpret_cast<uint8_t *>(host)), recv_off_(recv_off), flag_off_(flag_off), send_off_(send_off),
+           ctrl_off_(ctrl_off), slot_bytes_(slot_bytes), world_(world), rank_(rank), n_hca_(n_hca),
+-          flag_stride_(flag_stride), slots_(slots), xor_(uint8_t(xor_key)), stall_after_(stall_after), late_(late) {
++          flag_stride_(flag_stride), slots_(slots), xor_(uint8_t(xor_key)), stall_after_(stall_after), late_(late),
++          stripe_min_(stripe_min) {
+         last_ = ctrl()[CTRL_SEQ];
+         running_.store(1);
+         int rc = pthread_create(&thread_, nullptr, &Loop::tramp, this);
+@@ -738,7 +825,13 @@ class Loop {
+                         dst[i] = uint8_t(send[i] ^ xor_);
+                     }
+                     std::atomic_thread_fence(std::memory_order_seq_cst);
++                    // patches/0460: a single-HCA op sets only that HCA's flag (a kernel that waited for another
++                    // HCA's would time out: the GPU tests' check of the kernel's rule)
++                    const int used = one_hca(nbytes, stripe_min_, n_hca_) ? single_hca(s, n_hca_) : -1;
+                     for (int h = 0; h < n_hca_; h++) {
++                        if (used >= 0 && h != used) {
++                            continue;
++                        }
+                         uint32_t *flag = reinterpret_cast<uint32_t *>(
+                             region_ + flag_off_ + ((uint64_t(p) * slots_ + slot) * n_hca_ + h) * flag_stride_);
+                         __atomic_store_n(flag, s, __ATOMIC_RELEASE);
+@@ -756,6 +849,7 @@ class Loop {
+     uint8_t xor_;
+     int64_t stall_after_;
+     bool late_;
++    uint32_t stripe_min_;                         // patches/0460
+     uint32_t last_ = 0;
+     FailWatch watch_;                             // patches/0350
+     pthread_t thread_{};
+@@ -782,7 +876,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.attr("CTRL_WORDS") = int(CTRL_WORDS);
+     m.attr("MAX_HCAS") = MAX_HCAS;
+     py::class_<Proxy>(m, "Proxy")
+-        .def(py::init<int, int, std::vector<std::string>, std::vector<int>, int, uint64_t, uint64_t, uint64_t>())
++        .def(py::init<int, int, std::vector<std::string>, std::vector<int>, int, uint64_t, uint64_t, uint64_t, uint32_t,
++                      uint32_t, bool, uint32_t>())
+         .def("local_blob", &Proxy::local_blob)
+         .def("connect", &Proxy::connect)
+         .def("start", &Proxy::start, py::call_guard<py::gil_scoped_release>())
+@@ -791,14 +886,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def("error", &Proxy::error)
+         .def("watch", &Proxy::watch)
+         .def("stats", &Proxy::stats)
++        .def("stats2", &Proxy::stats2)
++        .def("trace", &Proxy::trace)
+         .def("destroy", &Proxy::destroy, py::call_guard<py::gil_scoped_release>());
+     py::class_<Launcher>(m, "Launcher")
+         .def(py::init<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, int, int, int, int, int,
+-                      int>())
++                      int, uint32_t, bool, uint64_t, uint32_t>())
+         .def("run", &Launcher::run);
+     py::class_<Loop>(m, "Loop")
+         .def(py::init<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, int, int, int, int, int, int,
+-                      int64_t, bool>())
++                      int64_t, bool, uint32_t>())
+         .def("delivered", &Loop::delivered)
+         .def("watch", &Loop::watch)
+         .def("destroy", &Loop::destroy, py::call_guard<py::gil_scoped_release>());
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce.cu b/src/tensorfold/families/glm5_next/cuda/roce.cu
+index 988e610..44f675a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/roce.cu
++++ b/src/tensorfold/families/glm5_next/cuda/roce.cu
+@@ -83,6 +83,29 @@ __device__ __forceinline__ uint32_t atom_add_relaxed_gpu(uint32_t *p, uint32_t v
+ 
+ __device__ __forceinline__ void fence_sc_sys() { asm volatile("fence.sc.sys;" ::: "memory"); }
+ 
++// patches/0460 (``lean``): the release / acquire forms of the same orderings
++__device__ __forceinline__ void st_release_sys(uint32_t *p, uint32_t v) {
++    asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
++}
++
++__device__ __forceinline__ uint32_t atom_add_acq_rel_sys(uint32_t *p, uint32_t v) {
++    uint32_t old;
++    asm volatile("atom.acq_rel.sys.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
++    return old;
++}
++
++__device__ __forceinline__ uint32_t atom_add_acq_rel_gpu(uint32_t *p, uint32_t v) {
++    uint32_t old;
++    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
++    return old;
++}
++
++__device__ __forceinline__ void trace_at(const GatherArgs &a, uint32_t seq, int k, uint64_t t) {
++    if (a.trace != nullptr) {
++        a.trace[static_cast<uint64_t>(seq & a.trace_mask) * 4u + static_cast<uint32_t>(k)] = t;
++    }
++}
++
+ __device__ __forceinline__ void fence_sc_gpu() { asm volatile("fence.sc.gpu;" ::: "memory"); }
+ 
+ __device__ __forceinline__ uint64_t globaltimer() {
+@@ -176,6 +199,10 @@ __global__ void __launch_bounds__(1024) gather_kernel(GatherArgs a) {
+     const uint32_t seq = ld_relaxed_gpu(a.epoch) + 1u;
+     const uint64_t slot = seq & 1u;
+     uint8_t *send = reinterpret_cast<uint8_t *>(a.send_base + slot * a.slot_bytes);
++    const uint32_t padded = static_cast<uint32_t>((a.nbytes + 15u) & ~static_cast<uint64_t>(15u));
++    if (blockIdx.x == 0 && tid == 0) {
++        trace_at(a, seq, 0, globaltimer());               // patches/0460 (no-op without a trace ring)
++    }
+ 
+     // 1. stage this rank's shard into the pinned send slot
+     copy_bytes<false>(send, a.in, a.nbytes, index, stride);
+@@ -184,22 +211,39 @@ __global__ void __launch_bounds__(1024) gather_kernel(GatherArgs a) {
+     // 2. the last block to finish staging rings the proxy's doorbell (one system fence per block after the
+     //    barrier orders the block's staging stores before its arrival)
+     if (tid == 0) {
+-        fence_sc_sys();
+-        const uint32_t prior = atom_add_relaxed_gpu(a.stage_ctr, 1u);
+-        if (((prior + 1u) & (gdim - 1u)) == 0u) {
+-            const uint32_t padded = static_cast<uint32_t>((a.nbytes + 15u) & ~static_cast<uint64_t>(15u));
+-            st_relaxed_sys(ctrl + CTRL_NBYTES, padded);
+-            st_relaxed_sys(ctrl + CTRL_SLOT_NBYTES + slot, padded);
++        if (a.lean) {
++            // patches/0460: the same message-passing order with release / acquire instead of two sequentially
++            // consistent system fences: a block's arrival is a release RMW (the barrier made the block's staging
++            // stores precede it); the last arrival also acquires every earlier block's; the doorbell is a release
++            // store, so the byte counts and every staged byte are visible to the proxy's acquire load of it. One
++            // block (a 16 KiB shard): no arrival at all, one release store.
++            const bool last = gdim == 1u || ((atom_add_acq_rel_sys(a.stage_ctr, 1u) + 1u) & (gdim - 1u)) == 0u;
++            if (last) {
++                st_relaxed_sys(ctrl + CTRL_NBYTES, padded);
++                st_relaxed_sys(ctrl + CTRL_SLOT_NBYTES + slot, padded);
++                st_release_sys(ctrl + CTRL_SEQ, seq);
++                trace_at(a, seq, 1, globaltimer());
++            }
++        } else {
+             fence_sc_sys();
+-            st_relaxed_sys(ctrl + CTRL_SEQ, seq);
++            const uint32_t prior = atom_add_relaxed_gpu(a.stage_ctr, 1u);
++            if (((prior + 1u) & (gdim - 1u)) == 0u) {
++                st_relaxed_sys(ctrl + CTRL_NBYTES, padded);
++                st_relaxed_sys(ctrl + CTRL_SLOT_NBYTES + slot, padded);
++                fence_sc_sys();
++                st_relaxed_sys(ctrl + CTRL_SEQ, seq);
++                trace_at(a, seq, 1, globaltimer());
++            }
+         }
+     }
+ 
+-    // 3. wait for every peer's per-HCA flag of this sequence
++    // 3. wait for every peer's per-HCA flag of this sequence (patches/0460: only the one HCA a small op used)
++    const bool one = one_hca(padded, a.stripe_min, a.n_hca);
++    const int used = one ? single_hca(seq, a.n_hca) : -1;
+     if (tid < static_cast<uint32_t>(a.world * a.n_hca)) {
+         const int peer = static_cast<int>(tid) / a.n_hca;
+         const int hca = static_cast<int>(tid) - peer * a.n_hca;
+-        if (peer != a.rank) {
++        if (peer != a.rank && (used < 0 || hca == used)) {
+             const uint32_t *flag = reinterpret_cast<const uint32_t *>(
+                 a.flag_base + ((static_cast<uint64_t>(peer) * a.slots + slot) * a.n_hca + hca) * a.flag_stride);
+             uint32_t seen = 0u;
+@@ -214,6 +258,10 @@ __global__ void __launch_bounds__(1024) gather_kernel(GatherArgs a) {
+                 st_relaxed_sys(ctrl + CTRL_FAILED, 1u);
+                 fence_sc_sys();
+             }
++            if (a.trace != nullptr && blockIdx.x == 0) {
++                atomicMax(reinterpret_cast<unsigned long long *>(a.trace + static_cast<uint64_t>(seq & a.trace_mask) * 4u + 2u),
++                          static_cast<unsigned long long>(globaltimer()));
++            }
+         }
+     }
+     __syncthreads();
+@@ -237,6 +285,22 @@ __global__ void __launch_bounds__(1024) gather_kernel(GatherArgs a) {
+     }
+ 
+     // 5. the last block to finish publishes the next epoch (not after a failure: later launches stay no-ops)
++    if (a.lean) {
++        // patches/0460: the next launch reads the epoch after this kernel ended (stream order), so the copy-out needs
++        // no fence before it; the arrival is an acq_rel RMW so the last block sees every block's poison CAS
++        __syncthreads();
++        if (tid == 0) {
++            const bool last = gdim == 1u || ((atom_add_acq_rel_gpu(a.tail_ctr, 1u) + 1u) & (gdim - 1u)) == 0u;
++            if (last && ld_relaxed_gpu(a.poison) == 0u && ld_relaxed_sys(ctrl + CTRL_FAILED) == 0u) {
++                st_release_gpu(a.epoch, seq);
++                st_relaxed_sys(ctrl + CTRL_COMPLETED, seq);
++            }
++            if (last) {
++                trace_at(a, seq, 3, globaltimer());
++            }
++        }
++        return;
++    }
+     fence_sc_gpu();
+     __syncthreads();
+     if (tid == 0) {
+@@ -247,6 +311,7 @@ __global__ void __launch_bounds__(1024) gather_kernel(GatherArgs a) {
+                 st_release_gpu(a.epoch, seq);
+                 st_relaxed_sys(ctrl + CTRL_COMPLETED, seq);
+             }
++            trace_at(a, seq, 3, globaltimer());
+         }
+     }
+ }
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce.py b/src/tensorfold/families/glm5_next/cuda/roce.py
+index d373848..ac975ae 100644
+--- a/src/tensorfold/families/glm5_next/cuda/roce.py
++++ b/src/tensorfold/families/glm5_next/cuda/roce.py
+@@ -43,6 +43,19 @@ Knobs (both ranks must agree on all but the CPU; checked at load)
+                             both ranks start on NCCL. Default ``/cache/roce-failed`` when ``/cache`` exists; empty:
+                             none. Delete it to try RoCE again.
+ 
++patches/0460 (latency of one exchange; every one off by default = 0350's path, docs/PREFETCH-COMM.md):
++``GLM53_TF_ROCE_STRIPE_KB`` shards (16-byte padded) below this many KiB travel on ONE HCA (sequence % HCAs: one post,
++                            one flag, no max over two paths) instead of striped over both. 0 = always striped.
++                            Both ranks must agree (checked at load)
++``GLM53_TF_ROCE_INLINE``    stripes of at most this many bytes are posted inline (the proxy copies the staged bytes
++                            into the work request; no NIC read of the send slot). Capped by what the queue pairs
++                            grant (mlx5: ~200-900 B); 0 = off
++``GLM53_TF_ROCE_LAZY_CQ``   1: the proxy reaps completions in its idle loop, not right after every post
++``GLM53_TF_ROCE_LEAN``      1: the kernel's doorbell and tail use release / acquire operations instead of
++                            sequentially consistent fences (the same happens-before edges; one fewer system fence)
++``GLM53_TF_ROCE_TRACE``     N (a power of two): a ring of the last N ops' timestamps (kernel: start, doorbell, flags
++                            seen, end; proxy: doorbell seen, posted) for ``Runtime.trace_rows`` / bench_roce ``--trace``
++
+ GIDs: RoCE v2 GID indices move on reboot and differ per port, so they are never hard-coded: for each ACTIVE port
+ the lowest index whose type is ``RoCE v2`` and whose GID is IPv4-mapped (``::ffff:a.b.c.d``) is used (the same rule
+ as the vLLM kit's ``detect-gids.sh``). The ranks' HCAs are paired by IPv4 subnet (e.g. rocep1s0f1 <-> a.b.100.x,
+@@ -131,12 +144,17 @@ class Settings:
+     fallback: str = "nccl"
+     cpu: int = -1
+     hca_spec: str = ""
++    stripe_kb: int = 0                    # patches/0460 (agreed): shards below this travel on one HCA
++    inline_bytes: int = 0                 # patches/0460 (local): inline posts up to this many bytes
++    lazy_cq: bool = False                 # patches/0460 (local)
++    lean: bool = False                    # patches/0460 (local): release / acquire kernel ordering
++    trace: int = 0                        # patches/0460 (local): timestamp ring entries (0: off)
+ 
+     def agreed(self) -> list[int]:
+         """The integers both ranks must share (everything but the proxy's CPU and the device names)."""
+ 
+         return [self.max_bytes, int(round(self.timeout_s * 1000)), self.hcas, self.blocks, self.threads,
+-                self.traffic_class, int(self.fallback == "error")]
++                self.traffic_class, int(self.fallback == "error"), self.stripe_kb]
+ 
+ 
+ def _int(name: str, default: int, lo: int, hi: int) -> int:
+@@ -171,9 +189,16 @@ def settings() -> Settings:
+     fallback = os.environ.get("GLM53_TF_ROCE_FALLBACK", "").strip().lower() or "nccl"
+     if fallback not in ("nccl", "error"):
+         raise ValueError(f"GLM53_TF_ROCE_FALLBACK={fallback!r}: expected nccl or error")
++    trace = _int("GLM53_TF_ROCE_TRACE", 0, 0, 1 << 20)
++    if trace & (trace - 1):
++        raise ValueError(f"GLM53_TF_ROCE_TRACE={trace}: expected 0 or a power of two")
+     return Settings(max_bytes=kb * 1024, timeout_s=timeout, hcas=_int("GLM53_TF_ROCE_HCAS", 2, 1, MAX_HCAS),
+                     blocks=blocks, threads=threads, traffic_class=_int(tc_name, 0, 0, 255), fallback=fallback,
+-                    cpu=_int("GLM53_TF_ROCE_CPU", -1, -1, 4095), hca_spec=os.environ.get("GLM53_TF_ROCE_HCA", ""))
++                    cpu=_int("GLM53_TF_ROCE_CPU", -1, -1, 4095), hca_spec=os.environ.get("GLM53_TF_ROCE_HCA", ""),
++                    stripe_kb=_int("GLM53_TF_ROCE_STRIPE_KB", 0, 0, 65536),
++                    inline_bytes=_int("GLM53_TF_ROCE_INLINE", 0, 0, 4096),
++                    lazy_cq=bool(_int("GLM53_TF_ROCE_LAZY_CQ", 0, 0, 1)), lean=bool(_int("GLM53_TF_ROCE_LEAN", 0, 0, 1)),
++                    trace=trace)
+ 
+ 
+ def marker() -> Path | None:
+@@ -323,7 +348,7 @@ def _ext():
+         from torch.utils.cpp_extension import load
+ 
+         here = Path(__file__).parent
+-        _EXT = load(name="tensorfold_glm_roce_v2", sources=[str(here / "roce.cpp"), str(here / "roce.cu")],
++        _EXT = load(name="tensorfold_glm_roce_v3", sources=[str(here / "roce.cpp"), str(here / "roce.cu")],  # 0460: v3
+                     extra_cflags=["-O2"], extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
+     return _EXT
+ 
+@@ -369,9 +394,12 @@ class Runtime:
+         nflag = world * self.slots * MAX_HCAS * self.flag_stride // 4
+         self.flags = np.frombuffer((ctypes.c_uint32 * nflag).from_address(self.host + self.flag_off), dtype=np.uint32)
+         d = self.dev
++        self.stripe_min = stripe_min(s)                   # patches/0460
++        self.trace_buf = torch.zeros(4 * s.trace, dtype=torch.int64, device="cuda") if s.trace else None
+         self.launcher = ext.Launcher(d + self.recv_off, d + self.flag_off, d + self.send_off, d + self.ctrl_off,
+                                      self.slot_bytes, self._epoch_addr, self._poison_addr, world, rank, self.n_hca,
+-                                     self.flag_stride, self.slots, s.threads)
++                                     self.flag_stride, self.slots, s.threads, self.stripe_min, bool(s.lean),
++                                     self.trace_buf.data_ptr() if self.trace_buf is not None else 0, int(s.trace))
+         self.timeout_ns = int(s.timeout_s * 1e9)
+         self.lock = threading.Lock()
+         self.event = torch.cuda.Event()
+@@ -383,10 +411,11 @@ class Runtime:
+             if loop_xor is not None:
+                 self.loop = ext.Loop(self.host, self.recv_off, self.flag_off, self.send_off, self.ctrl_off,
+                                      self.slot_bytes, world, rank, self.n_hca, self.flag_stride, self.slots,
+-                                     int(loop_xor) & 0xFF, int(loop_stall_after), bool(loop_late))
++                                     int(loop_xor) & 0xFF, int(loop_stall_after), bool(loop_late), self.stripe_min)
+             else:
+                 self.proxy = ext.Proxy(world, rank, [h.name for h in self.hcas], [h.gid_index for h in self.hcas],
+-                                       s.traffic_class, self.host, self.total, self.slot_bytes)
++                                       s.traffic_class, self.host, self.total, self.slot_bytes, self.stripe_min,
++                                       int(s.inline_bytes), bool(s.lazy_cq), int(s.trace))
+         except Exception:
+             self._free()
+             raise
+@@ -486,6 +515,9 @@ class Runtime:
+             out.update(ops_posted=st[0], writes_completed=st[1], proxy_last_seq=st[2],
+                        per_hca=[{"writes": st[3 + 2 * h], "bytes": st[4 + 2 * h]} for h in range(self.n_hca)],
+                        proxy_error=self.proxy.error())
++            if hasattr(self.proxy, "stats2"):             # patches/0460
++                s2 = [int(v) for v in self.proxy.stats2()]
++                out.update(inline_posts=s2[0], single_hca_ops=s2[1], inline_cap=s2[2:])
+         return out
+ 
+     def _flag_word(self, peer: int, slot: int, hca: int) -> int:
+@@ -507,6 +539,26 @@ class Runtime:
+                 f"data are not trusted: restart both ranks (GLM53_TF_COMM_BACKEND=nccl avoids RoCE; "
+                 f"{marker() or 'GLM53_TF_ROCE_MARK'} makes the next start use NCCL)")
+ 
++    # -- patches/0460: timestamps
++    def trace_rows(self, seqs=None) -> list[dict]:
++        """The trace ring after a synchronize: per op still in it, the kernel's globaltimer stamps (ns) and the proxy's
++        CLOCK_REALTIME stamps (``trace_summary`` turns them into components)."""
++
++        if self.trace_buf is None:
++            return []
++        ring = self.s.trace
++        k = self.trace_buf.view(ring, 4).cpu().tolist()
++        last = int(self.ctrl[CTRL_COMPLETED])
++        seqs = range(max(1, last - ring + 1), last + 1) if seqs is None else seqs
++        out = []
++        for q in seqs:
++            t0, bell, flag, end = k[q & (ring - 1)]
++            row = {"seq": int(q), "start": t0, "bell": bell, "flag": flag, "end": end}
++            if self.proxy is not None and hasattr(self.proxy, "trace"):
++                row["seen"], row["posted"] = (int(v) for v in self.proxy.trace(int(q)))
++            out.append(row)
++        return out
++
+     # -- teardown
+     def _free(self) -> None:
+         if not self._freed:
+@@ -525,6 +577,62 @@ class Runtime:
+             self._free()
+ 
+ 
++def stripe_min(s: Settings) -> int:
++    """patches/0460: the kernel's / proxy's ``stripe_min`` in (16-byte padded) bytes; 0 = always striped."""
++
++    return int(s.stripe_kb) * 1024
++
++
++def one_hca(padded: int, stripe_min_bytes: int, n_hca: int) -> bool:
++    """roce_common.h's rule, for tests and the protocol model: does an op of ``padded`` bytes use one HCA?"""
++
++    return stripe_min_bytes != 0 and padded < stripe_min_bytes and n_hca > 1
++
++
++def _pct(v: list, q: float) -> float:
++    if not v:
++        return 0.0
++    v = sorted(v)
++    return float(v[min(len(v) - 1, int(q * (len(v) - 1) + 0.5))])
++
++
++def trace_summary(rows: list[dict], peer_rows: list[dict] | None = None) -> dict:
++    """patches/0460: per component, median / p90 in microseconds over the traced ops of one rank:
++
++    - ``stage``  kernel start -> doorbell (staging copy + fences);
++    - ``wait``   doorbell -> the peer's flags seen (the peer's lateness + proxy + wire + NIC write + visibility);
++    - ``copy``   flags seen -> kernel end (copy-out + tail);
++    - ``total``  start -> end;
++    - ``notice`` doorbell (GPU globaltimer) -> the proxy saw it (CPU CLOCK_REALTIME): meaningful only if the two
++      clocks agree (on GB10 the driver keeps globaltimer on the host's clock; check that ``notice`` is small and
++      positive), ``post`` the proxy's ibv_post_send calls.
++    With ``peer_rows`` (the other rank's rows, same seqs): per op the smaller of the two ranks' waits is the
++    transport (neither rank was waiting for a late peer), the difference is the skew (``transport`` / ``skew``)."""
++
++    comp: dict[str, list] = {k: [] for k in ("stage", "wait", "copy", "total", "notice", "post")}
++    by_seq = {}
++    for r in rows:
++        if not (r["start"] and r["bell"] and r["flag"] and r["end"]):
++            continue
++        comp["stage"].append((r["bell"] - r["start"]) / 1e3)
++        comp["wait"].append((r["flag"] - r["bell"]) / 1e3)
++        comp["copy"].append((r["end"] - r["flag"]) / 1e3)
++        comp["total"].append((r["end"] - r["start"]) / 1e3)
++        by_seq[r["seq"]] = (r["flag"] - r["bell"]) / 1e3
++        if r.get("seen") and r.get("posted"):
++            comp["notice"].append((r["seen"] - r["bell"]) / 1e3)
++            comp["post"].append((r["posted"] - r["seen"]) / 1e3)
++    if peer_rows is not None:
++        comp["transport"], comp["skew"] = [], []
++        for r in peer_rows:
++            if r["seq"] in by_seq and r["bell"] and r["flag"]:
++                a, b = by_seq[r["seq"]], (r["flag"] - r["bell"]) / 1e3
++                comp["transport"].append(min(a, b))
++                comp["skew"].append(abs(a - b))
++    return {k: {"n": len(v), "p50_us": round(_pct(v, 0.5), 2), "p90_us": round(_pct(v, 0.9), 2)}
++            for k, v in comp.items() if v}
++
++
+ def classify(seq: int, gpu_seen: int, host_now: int, watch: dict | None) -> tuple[str, str]:
+     """patches/0350: (kind, sentence) for a wait that timed out at ``seq``: ``gpu_seen`` the kernel's last read of the
+     flag, ``host_now`` the flag in host memory at the check, ``watch`` the proxy's record (``roce_watch.h``; None or
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce_common.h b/src/tensorfold/families/glm5_next/cuda/roce_common.h
+index 5773692..604b4d6 100644
+--- a/src/tensorfold/families/glm5_next/cuda/roce_common.h
++++ b/src/tensorfold/families/glm5_next/cuda/roce_common.h
+@@ -41,8 +41,21 @@ struct GatherArgs {
+     int n_hca;
+     int flag_stride;
+     int slots;
++    // patches/0460 (all 0: 0230 / 0350's behaviour)
++    uint32_t stripe_min;   // padded shards below this many bytes travel on ONE HCA (seq % n_hca), else striped
++    uint32_t lean;         // 1: release / acquire ordering instead of the sequentially consistent fences (same order)
++    uint64_t *trace;       // optional ring of 4 x u64 per op (globaltimer ns): start, doorbell, flags seen, end
++    uint32_t trace_mask;   // ring entries - 1 (a power of two minus one)
+ };
+ 
++// patches/0460: the HCAs an op of ``padded`` bytes uses -- ALL when striped, else only ``single_hca``. The kernel
++// (which flags to wait for), the proxy (which queue pairs to post on) and the test loop evaluate the same function of
++// (padded bytes, seq), so both ranks agree without exchanging anything.
++__host__ __device__ inline bool one_hca(uint32_t padded, uint32_t stripe_min, int n_hca) {
++    return stripe_min != 0u && padded < stripe_min && n_hca > 1;
++}
++__host__ __device__ inline int single_hca(uint32_t seq, int n_hca) { return static_cast<int>(seq % uint32_t(n_hca)); }
++
+ cudaError_t launch_gather(const GatherArgs &args, int grid, int threads, cudaStream_t stream);
+ 
+ }  // namespace tfroce

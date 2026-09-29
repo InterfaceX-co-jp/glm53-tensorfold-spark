@@ -1,0 +1,10 @@
+cap-r0.sqlite ('_qmm', 1, 192, 1): n 5708 median 149.6 us  p5 141.8  p25 145.2  p75 153.4  p95 159.9  p99 192.1  (p95-p5)/median 12.1%
+cap-r0.sqlite ('_qmm', 1, 197, 4): n 34374 median 147.1 us  p5 142.0  p25 144.9  p75 149.9  p95 157.8  p99 200.7  (p95-p5)/median 10.7%
+cap-r0.sqlite ('_qmm', 1, 1210, 1): n 2697 median 835.7 us  p5 821.7  p25 828.0  p75 844.6  p95 892.5  p99 991.3  (p95-p5)/median 8.5%
+cap-r0.sqlite ('grouped_kernel', 9, 8, 8): n 745 median 157.1 us  p5 152.0  p25 154.9  p75 159.9  p95 168.2  p99 228.6  (p95-p5)/median 10.3%
+cap-r0.sqlite ('grouped_kernel', 9, 32, 1): n 745 median 83.8 us  p5 80.1  p25 82.0  p75 86.7  p95 94.8  p99 125.4  (p95-p5)/median 17.4%
+cap-r1.sqlite ('_qmm', 1, 192, 1): n 5708 median 149.9 us  p5 139.2  p25 146.6  p75 152.9  p95 159.3  p99 198.3  (p95-p5)/median 13.4%
+cap-r1.sqlite ('_qmm', 1, 197, 4): n 34374 median 146.7 us  p5 140.7  p25 144.2  p75 149.5  p95 157.2  p99 201.6  (p95-p5)/median 11.2%
+cap-r1.sqlite ('_qmm', 1, 1210, 1): n 2697 median 814.9 us  p5 802.5  p25 808.9  p75 821.6  p95 851.8  p99 972.1  (p95-p5)/median 6.1%
+cap-r1.sqlite ('grouped_kernel', 9, 8, 8): n 745 median 157.7 us  p5 152.7  p25 155.8  p75 160.4  p95 166.8  p99 208.5  (p95-p5)/median 8.9%
+cap-r1.sqlite ('grouped_kernel', 9, 32, 1): n 745 median 83.6 us  p5 79.9  p25 81.7  p75 86.2  p95 91.8  p99 115.5  (p95-p5)/median 14.3%

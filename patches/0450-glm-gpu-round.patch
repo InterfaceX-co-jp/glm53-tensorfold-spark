@@ -1,0 +1,3066 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py i/src/tensorfold/families/glm5_next/cuda/batch.py
+index c83d3f2..7e14721 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ i/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -143,6 +143,10 @@ def _env_int(name: str, default: int) -> int:
+     return int(os.environ.get(name, "") or default)
+ 
+ 
++from . import gpuround, gpusample                                          # noqa: E402  (patches/0450)
++from .kda import SlotTables as _SlotTables                                 # noqa: E402  (patches/0450)
++
++
+ # -- the batched forward ------------------------------------------------------------------------------------------
+ def _starts(Rs: Sequence[int]) -> list[int]:
+     offs, o = [], 0
+@@ -155,6 +159,8 @@ def _starts(Rs: Sequence[int]) -> list[int]:
+ def _kda(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[int], T: int) -> torch.Tensor:
+     """``forward.kda_block`` over T rows of several sequences: the projections once, the chain per sequence."""
+ 
++    if isinstance(getattr(b, "kda_slots", None), _SlotTables):     # patches/0450 (GLM53_TF_GPU_ROUND ``kda``)
++        return _kda_slots(layer, w, sts, b, T)
+     c = w.cfg
+     k = layer.kda
+     li = sts[0].kda_index[layer.index]
+@@ -176,6 +182,26 @@ def _kda(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[in
+     return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:T]), T)
+ 
+ 
++def _kda_slots(layer, w, sts: Sequence[State], b, T: int) -> torch.Tensor:
++    """patches/0450 (GLM53_TF_GPU_ROUND ``kda``, resident rounds): ``_kda`` with every slot's chain in one launch
++    (``kda.chain_slots``: the slot's previous window's kept rows replayed in its prologue, its real rows only, its
++    window rows' conv channels stored for the conv shift); the projections and the output as ``_kda``'s."""
++
++    c = w.cfg
++    k = layer.kda
++    li = sts[0].kda_index[layer.index]
++    p = b.bproj[:T]
++    qmm.matmul(b.normed[:T], k.proj, b.xs[:T], out=p, part=b.sk)
++    fa = p[:, k.fa_off:k.fa_off + 128]
++    ga = p[:, k.ga_off:k.ga_off + 128]
++    if not dv2.kda_gates(p, k, b, T):
++        qmm.matmul(fa, k.fb, qmm.group_sums(fa, b.xs_fa[:T]), out=b.ka[:T], part=b.sk)
++        qmm.matmul(ga, k.gb, qmm.group_sums(ga, b.xs_ga[:T]), out=b.kg[:T], part=b.sk)
++    b.kda_slots.chain(li, k, k.a_log.numel(), c.eps, c.lower)
++    out = b.bkout[:T]
++    return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:T]), T)
++
++
+ def _dsa(layer, w, sts: Sequence[State], b, Rs: Sequence[int], offs: Sequence[int], T: int,
+          nchs: Sequence[int] | None, host_pos: Sequence[int] | None, npbs: Sequence[int] | None,
+          caches: Sequence[tuple] | None = None) -> torch.Tensor:
+@@ -323,11 +349,12 @@ def sample_multi(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Sequen
+     if rider is not None:                               # patches/0370: bits, moved as they are
+         parts.append(rider.view(torch.float32))
+     flat = torch.cat(parts).contiguous()
++    world = 1 if w.comm is None else w.world
++    if gpuround.sample_on(w) and all(gpusample.fits(k, world, sp[3]) for sp, k in zip(specs, ks)):
++        return _sample_multi_device(w, flat, specs, ks, world, rider)       # patches/0450
+     if w.comm is None:
+-        world = 1
+         got = flat.view(1, -1).cpu()
+     else:
+-        world = w.world
+         buf = torch.empty((world * flat.numel(),), dtype=torch.float32, device=logits.device)
+         comm_mod.fast_gather(w.comm, flat, buf)            # patches/0230
+         got = buf.view(world, -1).cpu()
+@@ -349,6 +376,55 @@ def sample_multi(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Sequen
+     return out
+ 
+ 
++def _sample_multi_device(w, flat: torch.Tensor, specs, ks: Sequence[int], world: int, rider: torch.Tensor | None):
++    """patches/0450 (GLM53_TF_GPU_ROUND ``sample``): ``sample_multi``'s draws on the GPU with the host's bits
++    (``gpusample``); one readback of the tokens (and rank 0's rider words)."""
++
++    if w.comm is None:
++        buf = flat
++    else:
++        buf = torch.empty((world * flat.numel(),), dtype=torch.float32, device=flat.device)
++        comm_mod.fast_gather(w.comm, flat, buf)            # patches/0230
++    rows, at = [], 0
++    for (off, R, positions, sampling), k in zip(specs, ks):
++        rows += [(at + r * 2 * k, k, int(positions[r]), sampling, False) for r in range(R)]
++        at += R * 2 * k
++    tok, _ = gpusample.choose(buf, flat.numel(), world, rows)
++    parts = [tok]
++    if rider is not None:                               # rank 0's words: right after the candidates in its part
++        parts.append(buf[at:at + rider.numel()].view(torch.int32))
++    host = torch.cat(parts).cpu().tolist()
++    comm_mod.check(w.comm)
++    out, i = [], 0
++    for _, R, _, _ in specs:
++        out.append([int(t) for t in host[i:i + R]])
++        i += R
++    if rider is not None:
++        return out, [int(v) for v in host[i:i + rider.numel()]]
++    return out
++
++
++def _sample_drafts_device(w, parts: list, specs, ks: Sequence[int], world: int) -> list[tuple[int, float | None]]:
++    """patches/0450: ``sample_drafts``' draws and probabilities on the GPU."""
++
++    flat = torch.cat(parts).contiguous()
++    if w.comm is None:
++        buf = flat
++    else:
++        buf = torch.empty((world * flat.numel(),), dtype=torch.float32, device=flat.device)
++        comm_mod.fast_gather(w.comm, flat, buf)            # patches/0230
++    rows, at = [], 0
++    for (_, pos, sampling, want), k in zip(specs, ks):
++        rows.append((at, k, int(pos), sampling, bool(want)))
++        at += 2 * k
++    want_any = any(r[4] for r in rows)
++    tok, prob = gpusample.choose(buf, flat.numel(), world, rows, want=want_any)
++    n = len(rows)
++    host = (torch.cat([tok.to(torch.float64), prob]) if want_any else tok).cpu().tolist()
++    comm_mod.check(w.comm)
++    return [(int(host[i]), float(host[n + i]) if rows[i][4] else None) for i in range(n)]
++
++
+ # -- patches/0200: MTP drafts of several slots in one pass --------------------------------------------------------------
+ def sample_drafts(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Any, bool]]) -> list[tuple[int, float | None]]:
+     """``decode.sample_rows`` for one row each of several sequences' draft logits (specs: (row, position, sampling,
+@@ -368,6 +444,9 @@ def sample_drafts(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Any,
+         ids = draftvocab.ids_of(w, ids, V)             # patches/0420: listed rows' columns -> token ids
+         parts.append(torch.cat([vals, ids.view(torch.float32)], dim=1).reshape(-1))
+         ks.append(k)
++    world = 1 if w.comm is None else w.world
++    if gpuround.sample_on(w) and all(gpusample.fits(k, world, sp[2], sp[3]) for sp, k in zip(specs, ks)):
++        return _sample_drafts_device(w, parts, specs, ks, world)            # patches/0450
+     flat = torch.cat(parts).contiguous()
+     if w.comm is None:
+         world = 1
+@@ -888,6 +967,9 @@ class Batcher:
+     _held: list | None = None                     # patches/0370: rank 0's tokens not handed to the HTTP threads yet
+     rider_n = 0
+     rider_host = rider_dev = None
++    resident = None                               # patches/0450 (GLM53_TF_GPU_ROUND ``resident``): a Resident
++    m_all = f_all = None                          # patches/0450: every slot's drafter backlog in one tensor each
++    _resident_go: list[int] | None = None         # patches/0450: the slots to run resident after this round
+ 
+     def __init__(self, g, n: int) -> None:
+         from .engine import GRAPH_ROWS, MAX_ROWS
+@@ -1007,9 +1089,17 @@ class Batcher:
+             b.bproj = torch.empty((rows, kda_layers[0].kda.proj.n), dtype=torch.bfloat16, device=w.device)
+             b.bkout = torch.empty((rows, e.st.scratch_set.out.shape[2]), dtype=torch.bfloat16, device=w.device)
+         # drafter backlogs per slot (auto_decode's m_rows / f_taps, BACKLOG rows)
+-        self.m_rows = [torch.zeros((BACKLOG, w.cfg.hidden), dtype=torch.bfloat16, device=w.device) for _ in range(n)]
+-        self.f_taps = [torch.zeros((BACKLOG, len(b.taps) * w.cfg.hidden), dtype=torch.bfloat16, device=w.device)
+-                       if b.taps else None for _ in range(n)]
++        if gpuround.env().resident:                 # patches/0450: one tensor each (+ a row the device may discard)
++            self.m_all = torch.zeros((n, BACKLOG + 1, w.cfg.hidden), dtype=torch.bfloat16, device=w.device)
++            self.m_rows = [self.m_all[i, :BACKLOG] for i in range(n)]
++            self.f_all = (torch.zeros((n, BACKLOG + 1, len(b.taps) * w.cfg.hidden), dtype=torch.bfloat16,
++                                      device=w.device) if b.taps else None)
++            self.f_taps = [self.f_all[i, :BACKLOG] if self.f_all is not None else None for i in range(n)]
++        else:
++            self.m_rows = [torch.zeros((BACKLOG, w.cfg.hidden), dtype=torch.bfloat16, device=w.device)
++                           for _ in range(n)]
++            self.f_taps = [torch.zeros((BACKLOG, len(b.taps) * w.cfg.hidden), dtype=torch.bfloat16, device=w.device)
++                           if b.taps else None for _ in range(n)]
+         self.pool = torch.cuda.graph_pool_handle() if self.use_graphs else None
+         if self.overlap.plan:                          # patches/0370: the plan rider's staging (same size both ranks)
+             self.rider_n = dover.rider_size(n)
+@@ -1060,6 +1150,19 @@ class Batcher:
+         self.queue: collections.deque[Job] = collections.deque()
+         self.error: BaseException | None = None
+         self.thread = None
++        # patches/0450 (GLM53_TF_GPU_ROUND ``resident``): steady decode as GPU-resident rounds; its drain flag rides on
++        # the sampler exchange as 0370's plan does, so it needs the ``plan`` part (both ranks agree on both knobs)
++        if gpuround.env().resident:
++            if not self.overlap.plan:
++                if g.rank == 0:
++                    print("[tensorfold] GLM53_TF_GPU_ROUND 'resident' needs GLM53_TF_DECODE_OVERLAP's 'plan' part: "
++                          "resident rounds are off", flush=True)
++            else:
++                from .resident import Resident
++
++                self.resident = Resident(self)
++                if g.rank == 0:
++                    print(f"[tensorfold] GPU-resident rounds (patches/0450): {gpuround.env().describe()}", flush=True)
+         if g.rank == 0:
+             self.thread = threading.Thread(target=self._serve, name="glm-batch", daemon=True)
+             self.thread.start()
+@@ -1385,6 +1488,7 @@ class Batcher:
+                     t0 = time.perf_counter()
+                     self.last_piece_s = 0.0
+                     self._execute(cancels, admits, pieces)
++                    self._go_resident()         # patches/0450
+                     decode_s = max(time.perf_counter() - t0 - self.last_piece_s, 0.0) if self.last_verify else 0.0
+                     prefilling = any(s is not None and s.stepper is None for s in self.seqs)
+                     self.fair.after(self.last_piece_s, decode_s, prefilling)
+@@ -1410,6 +1514,7 @@ class Batcher:
+                 ahead = self._take_ahead()      # patches/0370: rank 0's plan came with the last round's sampler
+                 if ahead is not None:
+                     self._execute(*ahead)       # cancels only: no spills, no admissions, no pieces
++                    self._go_resident()         # patches/0450
+                     continue
+                 cancels, admits, pieces = batchplan.parse_plan(self.g._share(None))
+                 if self.kvp is not None:                # patches/0290: the slots rank 0 spills this round
+@@ -1424,6 +1529,7 @@ class Batcher:
+                             self._prefetch(slot, job.sess)
+                     jobs.append((slot, cached, job))
+                 self._execute(cancels, jobs, pieces)
++                self._go_resident()             # patches/0450
+ 
+     def _plan(self) -> tuple[list[int], list[tuple[int, int, Job]], list[int]] | None:
+         """Rank 0: this round's cancels, admissions and prefill piece, shared with rank 1 (None: ``stop``)."""
+@@ -1839,6 +1945,25 @@ class Batcher:
+             st.rec[0].copy_(st.rec[1])
+             st.cur = [0] * len(st.cur)
+ 
++    def _go_resident(self) -> None:
++        """patches/0450: run resident rounds when the round just run said so (both ranks, the same point)."""
++
++        go, self._resident_go = self._resident_go, None
++        if go and self.resident is not None:
++            self._ahead = None                  # the plan that rode was empty: resident rounds take its place
++            self.resident.run(go)
++            self.counts["resident_runs"] += 1
++
++    def _mode_at(self, st: State, pos: int, R: int) -> int | None:
++        """``_mode`` of a window starting at ``pos`` (patches/0450: a position the host knows a bound of)."""
++
++        saved = st.pos
++        st.pos = pos
++        try:
++            return self._mode(st, R)
++        finally:
++            st.pos = saved
++
+     def _mode(self, st: State, R: int) -> int | None:
+         """A window's context mode for the graph key: 0 (every row dense), patches/0050's pool bucket (every row
+         past 2,050, long-context graphs on), or None (eager: a window crossing 2,051, or no long graphs)."""
+@@ -2041,6 +2166,17 @@ class Batcher:
+                 if q.stepper in mine:
+                     q.kinds["draft_ms"] += share
+                     q.kinds["mtp_batched"] += int(together)
++        # patches/0450: resident rounds follow when the next round's plan rode empty (rank 0: nothing waits, no cancel)
++        # and every slot can run them; both ranks decide from the same shared values
++        self._resident_go = None
++        if self.resident is not None and ov.plan and self._ahead is not None and going:
++            if batchplan.parse_plan(self._ahead) == ([], [], []):
++                slots = [s for s, _ in going]
++                why = self.resident.eligible(slots)
++                if why is None:
++                    self._resident_go = slots
++                else:
++                    self.counts[f"resident_no_{why}"] += 1
+ 
+     def _finish(self, slot: int, *, cancelled: bool = False) -> None:
+         from .decode import take_snapshot
+diff --git c/src/tensorfold/families/glm5_next/cuda/decode.py i/src/tensorfold/families/glm5_next/cuda/decode.py
+index 94e1d03..5d0a6a5 100644
+--- c/src/tensorfold/families/glm5_next/cuda/decode.py
++++ i/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -22,6 +22,7 @@ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+ from . import comm as comm_mod, draftvocab, fastpf, fp8pf, lean as lean_mod, pfglue, pfgrid, profile
+ from . import decode_overlap as dover                                       # patches/0370
++from . import gpuround, gpusample                                            # patches/0450
+ from . import dump as dump_mod                                               # patches/0430
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+@@ -44,6 +45,9 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
+         ids = draftvocab.ids_of(w, ids, logits.shape[1])
+     else:
+         ids = (ids + (w.vocab_offset if offset is None else offset)).to(torch.int32)
++    world = 1 if w.comm is None else w.world
++    if gpuround.sample_on(w) and gpusample.fits(k, world, sampling, probs is not None):
++        return _sample_device(w, vals, ids, positions, sampling, k, world, probs)      # patches/0450
+     if w.comm is None:
+         values = vals.cpu().numpy().astype(np.float32)
+         tokens = ids.cpu().numpy().astype(np.int64)
+@@ -66,6 +70,29 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
+     return chosen
+ 
+ 
++def _sample_device(w: Weights, vals: torch.Tensor, ids: torch.Tensor, positions: Sequence[int], sampling,
++                   k: int, world: int, probs: list[float] | None) -> list[int]:
++    """patches/0450 (GLM53_TF_GPU_ROUND ``sample``): ``sample_rows``' draw on the GPU (``gpusample``: the host's bits);
++    the host reads the tokens (and the probabilities) only."""
++
++    R = vals.shape[0]
++    packed = torch.cat([vals, ids.view(torch.float32)], dim=1).contiguous().view(-1)
++    if w.comm is None:
++        got = packed
++    else:
++        got = torch.empty((world * packed.numel(),), dtype=torch.float32, device=vals.device)
++        comm_mod.fast_gather(w.comm, packed, got)           # patches/0230
++    want = probs is not None
++    tok, prob = gpusample.choose(got, packed.numel(), world,
++                                 [(r * 2 * k, k, int(positions[r]), sampling, want) for r in range(R)], want=want)
++    host = (torch.cat([tok.to(torch.float64), prob]) if want else tok).cpu()
++    comm_mod.check(w.comm)                   # a failed RoCE exchange of this step raises before any token
++    if want:
++        probs.extend(float(p) for p in host[R:].tolist())
++        return [int(t) for t in host[:R].tolist()]
++    return [int(t) for t in host.tolist()]
++
++
+ def _probability(values: np.ndarray, tokens: np.ndarray, chosen: list[int], sampling: Sampling | None) -> list[float]:
+     """Each row's probability of its chosen token under the top-k / top-p distribution the sampler draws from
+     (the draft's own confidence; greedy uses temperature 1 over the candidates)."""
+diff --git c/src/tensorfold/families/glm5_next/cuda/dflash2.py i/src/tensorfold/families/glm5_next/cuda/dflash2.py
+index d74a358..181f348 100644
+--- c/src/tensorfold/families/glm5_next/cuda/dflash2.py
++++ i/src/tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -32,6 +32,7 @@ from safetensors import safe_open
+ from tensorfold.engine.exact_sampling import Sampling, uniform_rows
+ 
+ from . import comm as comm_mod, draftvocab, glue, qmm
++from .gpusample import _exp, _log, _uniform                  # patches/0450: the device chain's noise and probabilities
+ from .weights import Weights
+ 
+ EDGE = 0.6        # the selector's edge score weight in a chain pick
+@@ -422,7 +423,10 @@ class Drafter:
+         return _dconv(self._row(act, L.down, axs), dyn, L.m_base, 1, self.gs, x)
+ 
+     # -- the context --------------------------------------------------------------------------------------------
+-    def _taps_compute(self, n: int) -> None:
++    def _taps_compute(self, n: int, count: torch.Tensor | None = None) -> None:
++        """``count`` (patches/0450): the rows that count, a device int32 [1] (n is then a bound: the rows past it
++        write keys past the context, which the next pass overwrites)."""
++
+         ctx, _ = self._norm(_mm(self.tap_in[:n], self.fc), self.hidden_norm)
+         cos, sin = self._rotary(n)
+         idx = (self.pos_dev + self.ar[:n]) % self.cap          # patches/0065: slots (a ring or the positions)
+@@ -430,7 +434,10 @@ class Drafter:
+             _, k, v = self._prep(_mm(ctx, L.kv), L, cos, sin, 0)
+             self.kc[i].index_copy_(1, idx, k)
+             self.vc[i].index_copy_(1, idx, v)
+-        self.pos_dev += n
++        if count is None:
++            self.pos_dev += n
++        else:
++            self.pos_dev += count.to(torch.int64)
+ 
+     @torch.no_grad()
+     def add_taps(self, taps: torch.Tensor) -> None:
+@@ -449,6 +456,28 @@ class Drafter:
+                 self._taps_compute(n)
+             self.context_end += n
+ 
++    @torch.no_grad()
++    def add_taps_dev(self, taps: torch.Tensor, count: torch.Tensor, n: int, end_hi: int) -> None:
++        """patches/0450 (resident rounds): ``add_taps`` of the first ``count`` rows (a device int32 [1]) of ``taps``
++        [n, taps * D] (n: a bound of the count, at most the tap buffer's rows); ``end_hi``: a bound of the context's end
++        before them. The host's ``context_end`` catches up at ``resident_end``."""
++
++        if n <= 0:
++            return
++        if n > self.tap_in.shape[0]:
++            raise ValueError(f"resident taps: {n} rows, the tap buffer holds {self.tap_in.shape[0]}")
++        if not self.ring and end_hi + n > self.cap - self.block:
++            raise ValueError("drafter context past its capacity")
++        self.tap_in[:n].copy_(taps[:n])
++        self._taps_compute(n, count)
++        self._hi = max(self._hi, end_hi + n + self.block)
++
++    def resident_end(self, end: int) -> None:
++        """patches/0450: the context's end after resident rounds (the device's ``pos_dev`` already is)."""
++
++        self._end = int(end)
++        self._hi = max(self._hi, self._end + self.block)
++
+     # -- drafts -------------------------------------------------------------------------------------------------
+     def _block_compute(self) -> None:
+         """One pass over [pending, mask x (block - 1)] at the committed length: every row's top candidates
+@@ -575,3 +604,88 @@ class Drafter:
+             return []
+         tokens, values, proj = self.candidates(pending, depth)
+         return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence, probs)
++
++
++# -- patches/0450 (GLM53_TF_GPU_ROUND ``resident``): the chain on the device -------------------------------------------
++@triton.jit
++def _chain_kernel(PACKED, PACKED_I, pw, PROJ, pr, PRED, SUCC, cb, I, NEXT, NPROB, slot, seed, sampled, depth, DC,
++                  CONST, LOGT, EXPT, K: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr, RSEL: tl.constexpr,
++                  RB: tl.constexpr, NI_: tl.constexpr, MAXD_: tl.constexpr):
++    """``Drafter.chain`` for one slot after its block pass: per position the candidates' best K by (value desc, id
++    asc), the selector's edge from the previous pick, the target's keyed noise when sampling (the same uniform at
++    the same position), the pick and its probability; up to min(depth, CAP) picks into NEXT / NPROB, their count into
++    NNEXT. Drafts only: the edge sums run in the kernel's order, not BLAS's, so a near-tie can pick otherwise than the
++    host's chain; replies are unchanged either way."""
++
++    b = I + slot * NI_
++    cap = tl.minimum(depth, tl.load(b + 17))
++    prev = tl.load(b + 0)
++    first = tl.load(b + 9) + 1
++    temp = tl.load(DC + 2)
++    edge_w = tl.load(DC + 0)
++    noise_w = tl.load(DC + 1)
++    j = tl.arange(0, BLOCK)
++    ok = j < WORLD * K
++    rk = j // K
++    cc = j - rk * K
++    r = tl.arange(0, RB)
++    okr = r < RSEL
++    for d in range(0, cap):
++        a = rk * pw + d * 2 * K + cc
++        v = tl.load(PACKED + a, mask=ok, other=float("-inf"))
++        ids = tl.load(PACKED_I + a + K, mask=ok, other=0)
++        rank = tl.zeros([BLOCK], dtype=tl.int32)
++        for c0 in tl.static_range(0, BLOCK, 32):
++            i = c0 + tl.arange(0, 32)
++            oki = i < WORLD * K
++            rki = i // K
++            ai = rki * pw + d * 2 * K + (i - rki * K)
++            vi = tl.load(PACKED + ai, mask=oki, other=float("-inf"))
++            di = tl.load(PACKED_I + ai + K, mask=oki, other=0)
++            bef = (vi[None, :] > v[:, None]) | ((vi[None, :] == v[:, None]) & (di[None, :] < ids[:, None]))
++            rank += tl.sum((bef & oki[None, :]).to(tl.int32), axis=1)
++        keep = ok & (rank < K)
++        pv = tl.load(PRED + prev.to(tl.int64) * cb + r, mask=okr, other=0.0).to(tl.float64) * \
++            tl.load(PROJ + d * pr + r, mask=okr, other=0.0).to(tl.float64)
++        sv = tl.load(SUCC + ids.to(tl.int64)[:, None] * cb + r[None, :], mask=keep[:, None] & okr[None, :],
++                     other=0.0)
++        edge = tl.sum(sv.to(tl.float64) * pv[None, :], axis=1)
++        score = (v.to(tl.float64) + edge_w * edge) / temp
++        pick = score
++        if sampled != 0:
++            u = _uniform(seed, (first + d).to(tl.int64), ids, CONST)
++            pick = score + noise_w * (-_log(-_log(u, CONST, LOGT), CONST, LOGT))
++        pick = tl.where(keep, pick, float("-inf"))
++        best = tl.max(pick)
++        rmin = tl.min(tl.where(pick == best, rank, BLOCK + 1))
++        tok = tl.sum(tl.where(rank == rmin, ids, 0))
++        sm = tl.max(tl.where(keep, score, float("-inf")))
++        e = tl.where(keep, _exp(score - sm, CONST, EXPT), 0.0)
++        p = tl.sum(tl.where(rank == rmin, e, 0.0)) / tl.sum(e)
++        tl.store(NEXT + slot * MAXD_ + d, tok)
++        tl.store(NPROB + slot * MAXD_ + d, p)
++        prev = tok
++    tl.store(b + 14, tl.maximum(cap, 0))
++
++
++def chain_dev(d, pred: torch.Tensor, succ: torch.Tensor, I: torch.Tensor, NEXT: torch.Tensor, NPROB: torch.Tensor,
++              slot: int, sampling, depth: int, ni: int, maxd: int) -> None:
++    """patches/0450: ``_chain_kernel`` for ``d``'s last block pass (``packed`` / ``proj`` on the device)."""
++
++    from . import gpusample
++
++    sampled = sampling is not None and sampling.temperature > 0
++    temp = float(sampling.temperature) if sampled else 1.0
++    const, logt, expt = gpusample.tables(str(d.dev))
++    dc = getattr(d, "_dc", None)
++    if dc is None or getattr(d, "_dc_temp", None) != temp:     # EDGE, NOISE, the temperature (float64 on the device)
++        dc = torch.tensor([EDGE, NOISE, temp], dtype=torch.float64, device=d.dev)
++        d._dc, d._dc_temp = dc, temp
++    world = d.packed.shape[0]
++    K = d.top_k
++    seed = gpusample._i64(int(sampling.seed) & 0xFFFFFFFFFFFFFFFF) if sampled else 0
++    rsel = int(pred.shape[1])
++    _chain_kernel[(1,)](d.packed, d.packed.view(torch.int32), d.packed.stride(0), d.proj, d.proj.stride(0), pred, succ,
++                        pred.stride(0), I, NEXT, NPROB, int(slot), seed, int(sampled), int(depth), dc, const, logt,
++                        expt, K=K, WORLD=world, BLOCK=max(32, triton.next_power_of_2(world * K)), RSEL=rsel,
++                        RB=triton.next_power_of_2(rsel), NI_=ni, MAXD_=maxd, num_warps=4, enable_fp_fusion=False)
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py i/src/tensorfold/families/glm5_next/cuda/engine.py
+index cd6e5fb..1237961 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ i/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -474,6 +474,27 @@ class GlmEngine:
+             print(f"[tensorfold] prefill glue (patches/0190): MoE glue {pfglue.moe_glue(glue)}, "
+                   f"MTP prefill window {pfglue.MTP_WINDOW or 'off'}, fused hc {glue.HC_FUSED}, 32-query attention "
+                   f"tiles {int(latent.BF16_BM32)}", flush=True)
++        # patches/0450 (GLM53_TF_GPU_ROUND): both ranks run the same parts; the device sampler is first checked
++        # against this host's numpy (libm and draws); a difference on either rank turns the device draw off on both
++        from . import gpuround
++
++        gr = gpuround.env()
++        gr_both = self._gather_ints([gr.code(), int(gpuround.peek())])
++        if gr_both[0] != gr_both[1]:
++            raise RuntimeError("the two ranks were started with different GLM53_TF_GPU_ROUND / "
++                               f"GLM53_TF_GPU_ROUND_PEEK: rank 0 {gr_both[0]}, rank 1 {gr_both[1]}")
++        if gr.sample:
++            from . import gpusample
++
++            why = gpusample.self_check(w.device)
++            ok = self._gather_ints([int(why is None)])
++            w.meta["gpu_sample"] = bool(ok[0][0] and ok[1][0])
++            if why is not None:
++                print(f"[tensorfold] rank {rank}: the GPU sampler differs from numpy here ({why}); GLM53_TF_GPU_ROUND "
++                      "draws on the host", flush=True)
++            elif rank == 0:
++                off = "" if w.meta["gpu_sample"] else " (the device draw is off: rank 1's check failed)"
++                print(f"[tensorfold] GPU round (patches/0450): {gr.describe()}{off}", flush=True)
+         if n > 1:                           # patches/0120: per-request knobs, fast / lean prefill and every drafter
+             from .batch import Batcher
+ 
+diff --git c/src/tensorfold/families/glm5_next/cuda/gpuround.py i/src/tensorfold/families/glm5_next/cuda/gpuround.py
+new file mode 100644
+index 0000000..0dcd9b1
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/gpuround.py
+@@ -0,0 +1,382 @@
++"""patches/0450: a GPU-resident decode round (GLM53_TF_GPU_ROUND, off by default; docs/GPU-ROUND.md).
++
++Parts (``1`` = all; a comma list picks some):
++
++- ``sample``: the keyed sampler, the greedy pick and the drafts' probabilities run on the GPU (``gpusample``) with
++  the host's bits, in ``decode.sample_rows``, ``batch.sample_multi`` and ``batch.sample_drafts``. The host reads the
++  tokens (and probabilities) instead of every row's gathered candidates, and runs no numpy draw. Rows the kernel does
++  not take (``gpusample.fits``: more than 128 kept candidates) are drawn on the host as before.
++- ``resident``: steady batched decode runs as GPU-resident rounds (``Resident``): the verify window is staged, sampled,
++  accepted and committed on the device, the drafters' backlogs advance on the device, and the next window's drafts are
++  drafted on the device (MTP chains and DFlash2 blocks, depths decided there from the host's calibration one round
++  stale); the host launches round k + 1 before it reads round k's tokens (a pinned ring), so no host readback sits on
++  the round's critical path. Anything else (an arrival, a cancel, a finished request, a prefill piece, a lookup match,
++  a window crossing the 2,051-token dense limit) drains the rounds and the normal path (``Batcher._plan`` /
++  ``_execute``) takes over with the same state. Needs ``sample`` and GLM53_TF_DECODE_OVERLAP's ``plan`` part (the
++  drain flag rides the sampler exchange as 0370's plan does).
++- ``kda``: inside resident rounds, KDA commits are folded into the next window's chain (``kda.chain_slots``: the
++  previous window's kept rows are replayed in the chain's prologue, all slots in one launch per layer) instead of a
++  separate replay pass per slot.
++
++Exactness: the device draw is the host's float64 arithmetic op for op (``gpusample``), the accept rule is
++``Stepper.accept``'s, commits keep the chain / replay update routine and row order, and drafts only propose; so every
++token, every committed state and every reply equals today's (drafted == serial, batched == alone, resumed == fresh).
++Both ranks run the same kernels on the same gathered data, the same host decisions from the same read-back data one
++round late, and the same collectives in the same order.
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++from dataclasses import dataclass
++
++import triton
++import triton.language as tl
++
++PARTS = ("sample", "resident", "kda")
++
++
++@dataclass(frozen=True)
++class Settings:
++    sample: bool = False
++    resident: bool = False
++    kda: bool = False
++
++    @property
++    def on(self) -> bool:
++        return self.sample or self.resident or self.kda
++
++    def code(self) -> int:
++        return sum(1 << i for i, p in enumerate(PARTS) if getattr(self, p))
++
++    def describe(self) -> str:
++        return ",".join(p for p in PARTS if getattr(self, p)) or "off"
++
++
++def parse(spec: str | None) -> Settings:
++    """GLM53_TF_GPU_ROUND: ``0`` / empty (off), ``1`` (every part), or a comma list of ``sample``, ``resident``,
++    ``kda``. ``resident`` implies ``sample``; ``kda`` needs ``resident``."""
++
++    s = str(spec or "").strip().lower()
++    if s in ("", "0", "off", "false", "no"):
++        return Settings()
++    if s in ("1", "on", "true", "yes", "all"):
++        parts = set(PARTS)
++    else:
++        parts = {p.strip() for p in s.replace(";", ",").split(",") if p.strip()}
++        bad = parts - set(PARTS)
++        if bad:
++            raise ValueError(f"GLM53_TF_GPU_ROUND={spec!r}: unknown part(s) {sorted(bad)}; expected 0, 1 or a comma "
++                             f"list of {', '.join(PARTS)}")
++    if "kda" in parts and "resident" not in parts:
++        raise ValueError(f"GLM53_TF_GPU_ROUND={spec!r}: 'kda' folds commits into resident rounds; add 'resident'")
++    if "resident" in parts:
++        parts.add("sample")
++    return Settings(**{p: p in parts for p in PARTS})
++
++
++@functools.lru_cache(maxsize=1)
++def env() -> Settings:
++    """The process's setting (read once)."""
++
++    return parse(os.environ.get("GLM53_TF_GPU_ROUND"))
++
++
++@functools.lru_cache(maxsize=1)
++def peek() -> bool:
++    """GLM53_TF_GPU_ROUND_PEEK (default 1): resident rounds wait for the device's draft decisions (an MTP chain's next
++    step, the next window's rows) on a small pinned record and an event, so chains run exactly the steps they need and
++    windows carry no padding; the host processes round k - 1 while round k's forward runs. 0: the host stays a whole
++    round ahead (the drafts' bounds one round stale: MTP steps past a chain's end run for nothing, windows are padded
++    to the bound). Both ranks must agree (checked at load with the knob)."""
++
++    v = os.environ.get("GLM53_TF_GPU_ROUND_PEEK", "1").strip().lower()
++    if v not in ("0", "1"):
++        raise ValueError(f"GLM53_TF_GPU_ROUND_PEEK={v!r}: expected 0 or 1")
++    return v == "1"
++
++
++def sample_on(w) -> bool:
++    """Whether the samplers of this engine draw on the GPU (the knob, and the load check passed: ``w.meta``)."""
++
++    meta = getattr(w, "meta", None)
++    if isinstance(meta, dict) and "gpu_sample" in meta:
++        return bool(meta["gpu_sample"])
++    return env().sample
++
++
++# -- resident rounds: per-slot device state ----------------------------------------------------------------------------
++# ResidentState.I (int32 [slots, NI]): device-owned (the host writes it once, when resident rounds start)
++PEND, COUNT, MAXTOK, STOPEOS, DONE, NREAL, KEEP, MCOUNT, FCOUNT, POS, MBASE, MOFF, FOFF, PREKEEP, NNEXT, LIVE, \
++    CHAINED, CAP = range(18)
++NI = 20
++# ResidentState.H (int32 [slots, NH]): what the host decides for the round it launches (uploaded with the round)
++RUN, OFF, BOUND, ARMN = range(4)
++NH = 8
++ARM_S, ARM_M, ARM_F = 0, 1, 2
++# ResidentState.F (float64 [slots, NF]): device-owned floats (the running product of a chain)
++CHAIN = 0
++NF = 4
++# ResidentState.P (float64 [slots, NP]): the next window's depth parameters (the host's calibration one round stale):
++# MTP factors / DFlash2 factors / MTP look-ahead per draft position (16 each), the rate, verify[0..16], the marginal
++# verify ms of draft j (``_dv``, j = 0..16), mtp_step, the confidence, the mode
++P_FM, P_FF, P_AHEAD, P_RATE, P_VERIFY, P_DV, P_STEP, P_CONF, P_MODE = 0, 16, 32, 48, 49, 66, 83, 84, 85
++NP = 88
++MODE_OPT, MODE_CONF = 1, 2               # cost-derived depths (patches/0071) / a confidence threshold (c3:0.35, ...)
++Q_MAX = 0.995                            # depth.Q_MAX
++MAXD = 16                                # drafts a window holds at most (patches/0380: 15)
++REC_HEAD = 16                            # a slot's record: 16 ints, then the run rows' samples, then the next drafts
++
++
++@triton.jit
++def _stage_kernel(I, H, DRAFT, ROWSLOT, ROWIDX, IDS, SRC, INT, NI_: tl.constexpr, NH_: tl.constexpr,
++                  MAXD_: tl.constexpr):
++    """Row t of the round (slot ROWSLOT[t], row ROWIDX[t] of its window): its token (the pending token, then the
++    drafts; a padded row repeats the last real one), the row it routes as (patches/0280's tie: the last real row), and
++    its position in the sampler's row table (INT[t, 3]: the committed length + 1 + r)."""
++
++    t = tl.program_id(0)
++    s = tl.load(ROWSLOT + t)
++    r = tl.load(ROWIDX + t)
++    n = tl.load(I + s * NI_ + 5)
++    src = tl.minimum(r, n)
++    pend = tl.load(I + s * NI_ + 0)
++    d = tl.load(DRAFT + s * MAXD_ + tl.maximum(src - 1, 0))
++    tl.store(IDS + t, tl.where(src == 0, pend, d))
++    off = tl.load(H + s * NH_ + 1)
++    tl.store(SRC + t, (off + src).to(tl.int64))
++    pos = tl.load(I + s * NI_ + 9)
++    tl.store(INT + t * 8 + 3, (pos + 1 + r).to(tl.int64))
++
++
++@triton.jit
++def _accept_kernel(I, H, F, DRAFT, TOK, EOS, n_eos, KEEPV, MTOK, REC, SLOTS, BACKLOG_: tl.constexpr,
++                   NI_: tl.constexpr, NH_: tl.constexpr, NF_: tl.constexpr, MAXD_: tl.constexpr,
++                   REC_W: tl.constexpr, MAXR: tl.constexpr):
++    """Program i: slot SLOTS[i] of the round. ``Stepper.accept``'s rule on the device: keep the pending token's row and
++    the drafts up to the first whose row sampled another token (or an end token, with stop-at-EOS); a finished slot
++    keeps nothing. Advances the slot's counters, appends the kept tokens to its MTP token backlog, writes the round's
++    record (keep, count, done, position, rows run, drafts, the run rows' samples) and readies the next window's
++    drafting (CAP: its length bound within the room; an empty chain)."""
++
++    i = tl.program_id(0)
++    s = tl.load(SLOTS + i)
++    b = I + s * NI_
++    h = H + s * NH_
++    o = tl.load(h + 1)
++    R = tl.load(h + 0)
++    n = tl.load(b + 5)
++    done = tl.load(b + 4)
++    stop = tl.load(b + 3)
++    count = tl.load(b + 1)
++    going = done == 0
++    keep = going.to(tl.int32)
++    for j in range(0, n):
++        t = tl.load(TOK + o + j)
++        d = tl.load(DRAFT + s * MAXD_ + j)
++        eos = t < 0
++        for e in range(0, n_eos):
++            eos = eos | (t == tl.load(EOS + e))
++        going = going & (t == d) & ((stop == 0) | (eos == 0))
++        keep += going.to(tl.int32)
++    last = tl.load(TOK + o + tl.maximum(keep - 1, 0))
++    leos = last < 0
++    for e in range(0, n_eos):
++        leos = leos | (last == tl.load(EOS + e))
++    count2 = count + keep
++    pend = tl.where(keep > 0, last, tl.load(b + 0))
++    maxtok = tl.load(b + 2)
++    done2 = (done != 0) | (count2 >= maxtok) | ((stop != 0) & (keep > 0) & leos)
++    mcount = tl.load(b + 7)
++    fcount = tl.load(b + 8)
++    for j in range(0, keep):
++        tl.store(MTOK + s * (BACKLOG_ + 1) + tl.minimum(mcount + j, BACKLOG_), tl.load(TOK + o + j))
++    pos = tl.load(b + 9)
++    tl.store(b + 11, mcount)                            # MOFF / FOFF: where this round's kept rows go
++    tl.store(b + 12, fcount)
++    tl.store(b + 7, tl.minimum(mcount + keep, BACKLOG_))
++    tl.store(b + 8, tl.minimum(fcount + keep, BACKLOG_))
++    tl.store(b + 6, keep)
++    tl.store(b + 1, count2)
++    tl.store(b + 4, done2.to(tl.int32))
++    tl.store(b + 0, pend)
++    tl.store(b + 9, pos + keep)
++    tl.store(b + 13, keep)                              # PREKEEP: the next chain's prologue (``kda``)
++    tl.store(KEEPV + i, keep)
++    # the next window: its drafts' bound within the room (``max(1, min(depth, room))``), none for a finished slot
++    bound = tl.load(h + 2)
++    cap = tl.maximum(tl.minimum(bound, maxtok - count2), 1)
++    arm = tl.load(h + 3)
++    cap = tl.where(done2 | (arm == 0), 0, cap)
++    tl.store(b + 17, cap)
++    tl.store(b + 14, 0)                                 # NNEXT
++    tl.store(b + 15, (cap > 0).to(tl.int32))            # LIVE
++    tl.store(b + 16, 0)                                 # CHAINED
++    tl.store(F + s * NF_ + 0, tl.load(F + s * NF_ + 0) * 0.0 + 1.0)
++    rec = REC + i * REC_W
++    tl.store(rec + 0, keep)
++    tl.store(rec + 1, count2)
++    tl.store(rec + 2, done2.to(tl.int32))
++    tl.store(rec + 3, pos + keep)
++    tl.store(rec + 4, R)
++    tl.store(rec + 5, n)
++    tl.store(rec + 6, mcount)
++    tl.store(rec + 7, fcount)
++    for j in range(0, R):
++        tl.store(rec + 16 + j, tl.load(TOK + o + j))
++
++
++@triton.jit
++def _finish_kernel(I, NEXT, NPROB, DRAFT, DPROB, REC, RECF, SLOTS, NI_: tl.constexpr, MAXD_: tl.constexpr,
++                   REC_W: tl.constexpr, RECF_W: tl.constexpr, MAXR: tl.constexpr):
++    """After the drafting: the next window's drafts become the window's (NEXT -> DRAFT, NNEXT -> NREAL) and go to the
++    round's record with their probabilities and the drafters' counters."""
++
++    i = tl.program_id(0)
++    s = tl.load(SLOTS + i)
++    b = I + s * NI_
++    n = tl.load(b + 14)
++    tl.store(b + 5, n)
++    rec = REC + i * REC_W
++    recf = RECF + i * RECF_W
++    for j in range(0, n):
++        d = tl.load(NEXT + s * MAXD_ + j)
++        p = tl.load(NPROB + s * MAXD_ + j)
++        tl.store(DRAFT + s * MAXD_ + j, d)
++        tl.store(DPROB + s * MAXD_ + j, p)
++        tl.store(rec + 16 + MAXR + j, d)
++        tl.store(recf + j, p)
++    tl.store(rec + 8, n)
++    tl.store(rec + 9, tl.load(b + 7))                   # MCOUNT, FCOUNT after the drafting took its backlog
++    tl.store(rec + 10, tl.load(b + 8))
++    tl.store(rec + 11, tl.load(b + 10))                 # MBASE
++    tl.store(rec + 12, tl.load(b + 16))                 # CHAINED
++
++
++@triton.jit
++def _backlog_kernel(SRC, src_row, DST, dst_slot, dst_row, I, H, SLOTS, width, col, backlog, NI_: tl.constexpr,
++                    NH_: tl.constexpr, WHICH: tl.constexpr, BLOCK: tl.constexpr):
++    """Program (i, r, column block): row r of slot SLOTS[i]'s window, when kept, into its backlog row MOFF + r (WHICH
++    0: the MTP rows) or FOFF + r (1: the DFlash2 taps), from column ``col`` (a tap's place in the row). A row past the
++    backlog goes to its last row (``backlog``: kept free; the host never lets a backlog get there)."""
++
++    i = tl.program_id(0)
++    r = tl.program_id(1)
++    cb = tl.program_id(2)
++    s = tl.load(SLOTS + i)
++    keep = tl.load(I + s * NI_ + 6)
++    base = tl.load(I + s * NI_ + 11 + WHICH)
++    o = tl.load(H + s * NH_ + 1)
++    c = cb * BLOCK + tl.arange(0, BLOCK)
++    m = (c < width) & (r < keep)
++    v = tl.load(SRC + (o + r).to(tl.int64) * src_row + c, mask=m)
++    tl.store(DST + s.to(tl.int64) * dst_slot + tl.minimum(base + r, backlog).to(tl.int64) * dst_row + col + c, v,
++             mask=m)
++
++
++@triton.jit
++def _row_dev(CONV, PROJ, l, src, c, conv_layer, proj_layer, proj_row, C: tl.constexpr, TAPS: tl.constexpr):
++    old = tl.load(CONV + l * conv_layer + src * C + c, mask=(src < TAPS) & (c < C), other=0.0)
++    new = tl.load(PROJ + l * proj_layer + (src - TAPS) * proj_row + c, mask=(src >= TAPS) & (c < C), other=0.0)
++    return tl.where(src < TAPS, old, new)
++
++
++@triton.jit
++def _conv_shift_dev(CONV, PROJ, I, slot, conv_layer, proj_layer, proj_row, C: tl.constexpr, TAPS: tl.constexpr,
++                    NI_: tl.constexpr, BLOCK: tl.constexpr):
++    """``forward._conv_shift`` with the slot's keep read on the device (0: the windows stay)."""
++
++    keep = tl.load(I + slot * NI_ + 6)
++    l = tl.program_id(0).to(tl.int64)
++    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    v0 = _row_dev(CONV, PROJ, l, keep, c, conv_layer, proj_layer, proj_row, C, TAPS)
++    v1 = _row_dev(CONV, PROJ, l, keep + 1, c, conv_layer, proj_layer, proj_row, C, TAPS)
++    v2 = _row_dev(CONV, PROJ, l, keep + 2, c, conv_layer, proj_layer, proj_row, C, TAPS)
++    tl.store(CONV + l * conv_layer + c, v0, mask=c < C)
++    tl.store(CONV + l * conv_layer + C + c, v1, mask=c < C)
++    tl.store(CONV + l * conv_layer + 2 * C + c, v2, mask=c < C)
++
++
++# -- the drafts' depth on the device (patches/0071's rules with the host's calibration, one round stale) ---------------
++@triton.jit
++def _mtp_next_kernel(I, F, P, NEXT, NPROB, TOKS, PROBS, SLOTS, j, NI_: tl.constexpr, NF_: tl.constexpr,
++                     NP_: tl.constexpr, MAXD_: tl.constexpr, QMAX: tl.constexpr):
++    """MTP draft j of slot SLOTS[i] (``decode.draft``), sampled as TOKS[i] with probability PROBS[i]:
++    ``DepthOptimizer.mtp_next`` (P_MODE 1) or the confidence chain (2) decides whether it joins the window and whether
++    the chain goes on (LIVE); once a chain stops, its later steps' drafts are ignored (the host launched them: a
++    stale bound). CHAINED counts the head steps whose drafts the chain went on to."""
++
++    i = tl.program_id(0)
++    s = tl.load(SLOTS + i)
++    b = I + s * NI_
++    live = tl.load(b + 15) != 0
++    d = tl.load(TOKS + i)
++    p = tl.load(PROBS + i)
++    par = P + s * NP_
++    mode = tl.load(par + 85).to(tl.int32)
++    count = tl.load(b + 17)
++    chain = tl.load(F + s * NF_ + 0)
++    f = tl.load(par + 0 + tl.minimum(j, 15))
++    q = tl.minimum(tl.maximum(p, 0.0) * f, QMAX)
++    lam = tl.load(par + 48)
++    c2 = chain * q
++    take_opt = (j == 0) | (c2 >= lam * tl.load(par + 66 + tl.minimum(j + 1, 16)))
++    conf = tl.load(par + 84)
++    take_conf = (j == 0) | (conf <= 0.0) | (chain * p >= conf)
++    take = tl.where(mode == 1, take_opt, take_conf) & live & (j < count)
++    gain = c2 * 0.5 * (tl.load(par + 32 + tl.minimum(j + 1, 15)) + q)
++    more_opt = (gain >= lam * (tl.load(par + 83) + tl.load(par + 66 + tl.minimum(j + 2, 16)))) & \
++        (j + 2 <= tl.load(par + 86).to(tl.int32))
++    c3 = tl.where(mode == 1, c2, tl.where(conf > 0.0, chain * p, chain))
++    more_conf = (conf <= 0.0) | (c3 >= conf)
++    more = tl.where(mode == 1, more_opt, more_conf) & (j + 1 < count) & take
++    n = tl.load(b + 14)
++    tl.store(NEXT + s * MAXD_ + tl.minimum(n, MAXD_ - 1), d, mask=take)
++    tl.store(NPROB + s * MAXD_ + tl.minimum(n, MAXD_ - 1), p, mask=take)
++    tl.store(b + 14, n + take.to(tl.int32))
++    tl.store(F + s * NF_ + 0, tl.where(take, c3, chain))
++    tl.store(b + 15, more.to(tl.int32))
++    tl.store(b + 16, tl.load(b + 16) + more.to(tl.int32))
++
++
++@triton.jit
++def _f_depth_kernel(I, P, NPROB, SLOTS, NI_: tl.constexpr, NP_: tl.constexpr, MAXD_: tl.constexpr,
++                    QMAX: tl.constexpr):
++    """A DFlash2 block's picks (NNEXT of them, with their probabilities) cut to the window's depth:
++    ``DepthOptimizer.f_depth`` (P_MODE 1: argmax over k of E(k) - rate x verify[k], ties to the smaller k, at least 1)
++    or the confidence chain (2: stop once the product falls below it, the first pick always kept), within CAP."""
++
++    i = tl.program_id(0)
++    s = tl.load(SLOTS + i)
++    b = I + s * NI_
++    par = P + s * NP_
++    n = tl.load(b + 14)
++    cap = tl.minimum(n, tl.load(b + 17))
++    mode = tl.load(par + 85).to(tl.int32)
++    lam = tl.load(par + 48)
++    conf = tl.load(par + 84)
++    top = tl.load(par + 86).to(tl.int32)                # len(verify) - 1
++    e = tl.load(par + 48) * 0.0 + 1.0
++    run = e
++    best = n * 0
++    best_s = e * 0.0 - float("inf")
++    chain = e
++    k_conf = n * 0
++    alive = cap > 0
++    for k in range(0, 16):
++        ok = (k < cap) & (k < top)
++        p = tl.load(NPROB + s * MAXD_ + k)
++        q = tl.minimum(tl.maximum(p, 0.0) * tl.load(par + 16 + k), QMAX)
++        run = tl.where(ok, run * q, run)
++        e = tl.where(ok, e + run, e)
++        sur = e - lam * tl.load(par + 49 + k + 1)
++        better = ok & (sur > best_s + 1e-12)
++        best = tl.where(better, k + 1, best)
++        best_s = tl.where(better, sur, best_s)
++        chain = tl.where(ok, chain * p, chain)
++        alive = alive & (k < cap) & ((k == 0) | (conf <= 0.0) | (chain >= conf))
++        k_conf += alive.to(tl.int32)
++    k_opt = tl.minimum(tl.maximum(best, 1), cap)
++    k = tl.where(mode == 1, k_opt, k_conf)
++    tl.store(b + 14, tl.where(cap > 0, k, 0))
+diff --git c/src/tensorfold/families/glm5_next/cuda/gpusample.py i/src/tensorfold/families/glm5_next/cuda/gpusample.py
+new file mode 100644
+index 0000000..a297890
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/gpusample.py
+@@ -0,0 +1,669 @@
++"""patches/0450: the keyed sampler (``exact_sampling.choose_rows``), the greedy pick and the drafts' probability
++(``decode._probability``) on the GPU, with the host's bits.
++
++The host draws a token from a row's gathered candidates (every rank's top k + MARGIN values and token ids) with
++numpy in float64:
++
++    order candidates by (value desc, id asc); keep the first k (top_k, else all);
++    scaled = float64(value) / max(T, 1e-6)
++    top_p cut: probs = exp(scaled - max); probs /= probs.sum(); keep = #(cumsum(probs) < top_p) + 1
++    token  = argmax (first) of  scaled - log(-log(u(seed, position, id)))   over the kept candidates
++
++and greedy is the first candidate of the order. ``_choose_kernel`` computes the same float64 operations in the same
++order, so the token is the same, bit for bit:
++
++- ``u``: splitmix64 on uint64 (wrapping), ``(x >> 11) * 2^-53 + 2^-54`` (the product is exact, one rounded add).
++- ``log`` and ``exp``: numpy calls libm for float64 on aarch64 (glibc 2.39 in the image, Ubuntu 24.04). ``_log`` /
++  ``_exp`` are that build's instruction sequences (``__log`` / ``__exp``, GLIBC_2.29 symbols, disassembled from
++  Ubuntu's arm64 libm.so.6 2.39-0ubuntu8.9): the same table lookups, the same fused multiply-adds (``fmadd`` /
++  ``fmsub``, where GCC contracted glibc's C) and the same separate multiplies and adds elsewhere, with glibc's own
++  tables (``_LOG_*``, ``_EXP_*``, read from that binary and equal to e_log_data.c / e_exp_data.c). Every operation is
++  an IEEE-754 double operation with round-to-nearest, so the GPU gives the same bits. The kernels are compiled with
++  ``enable_fp_fusion=False`` (no contraction the host does not do).
++- ``probs.sum()``: numpy's pairwise summation (8 accumulators from the first 8 elements, strided adds, the ((0+1) +
++  (2+3)) + ((4+5) + (6+7)) combine, the rest added in order; fewer than 8: in order from -0.0), over the candidates
++  in their order. ``cumsum``: in order. Division: IEEE.
++- The order: a candidate's rank is the number of candidates before it in (value desc, id asc); ids are distinct
++  (the ranks hold disjoint vocabulary halves), so ranks are a permutation. float32 compares (-0.0 == 0.0), as numpy's.
++- ``argmax``: the lowest rank among the maximal scores (numpy's first maximum).
++
++Limits (``fits``): at most 128 candidates kept a row (top_k, or every gathered candidate when top_k is 0) and 256
++gathered (world x (top_k + MARGIN)); a row outside them is drawn on the host (the caller's fallback). ``_log`` reads
++the uniforms (2^-54 .. 1: 1 - 2^-54 rounds to 1.0) and their -log (0, or 1.1e-16 .. 37.5): positive normal numbers
++and zero (-inf, as glibc). ``_exp`` covers every input (-inf .. 0 here; overflow, underflow and subnormal results as
++glibc's ``specialcase``).
++
++Tests: tests/test_gpu_sampler_interpreter.py (the kernel in Triton's interpreter against ``choose_rows``, the greedy
++lexsort and ``_probability``, and ``_log`` / ``_exp`` against numpy, bit for bit), tests/test_gpu_round_compile.py
++(sm_121 PTX: ``fma.rn.f64`` / ``div.rn.f64`` only where written, no contraction), tests/libm_a64.py (the port against
++the aarch64 libm itself, run in unicorn).
++"""
++
++from __future__ import annotations
++
++import struct
++from functools import lru_cache
++from typing import Any, Sequence
++
++import numpy as np
++import torch
++import triton
++import triton.language as tl
++
++
++MAX_KEEP = 128           # candidates a row may keep (numpy's pairwise sum has one level up to 128)
++MAX_GATHERED = 256       # candidates a row may gather (world x k)
++GOLDEN = 0x9E3779B97F4A7C15
++POS_MUL = 0xD1B54A32D192ED03
++
++# glibc 2.39 __log_data (aarch64 libm.so.6 2.39-0ubuntu8.9, == e_log_data.c): ln2hi, ln2lo, poly[5] (A), poly1[11]
++# (B); then tab[128] = (invc, logc)
++_LOG_HEAD = (
++    0x3fe62e42fefa3800, 0x3d2ef35793c76730, 0xbfe0000000000001, 0x3fd555555551305b,
++    0xbfcfffffffeb4590, 0x3fc999b324f10111, 0xbfc55575e506c89f, 0xbfe0000000000000,
++    0x3fd5555555555577, 0xbfcffffffffffdcb, 0x3fc999999995dd0c, 0xbfc55555556745a7,
++    0x3fc24924a344de30, 0xbfbfffffa4423d65, 0x3fbc7184282ad6ca, 0xbfb999eb43b068ff,
++    0x3fb78182f7afd085, 0xbfb5521375d145cd,
++)
++_LOG_TAB = (
++    0x3ff734f0c3e0de9f, 0xbfd7cc7f79e69000, 0x3ff713786a2ce91f, 0xbfd76feec20d0000,
++    0x3ff6f26008fab5a0, 0xbfd713e31351e000, 0x3ff6d1a61f138c7d, 0xbfd6b85b38287800,
++    0x3ff6b1490bc5b4d1, 0xbfd65d5590807800, 0x3ff69147332f0cba, 0xbfd602d076180000,
++    0x3ff6719f18224223, 0xbfd5a8ca86909000, 0x3ff6524f99a51ed9, 0xbfd54f4356035000,
++    0x3ff63356aa8f24c4, 0xbfd4f637c36b4000, 0x3ff614b36b9ddc14, 0xbfd49da7fda85000,
++    0x3ff5f66452c65c4c, 0xbfd445923989a800, 0x3ff5d867b5912c4f, 0xbfd3edf439b0b800,
++    0x3ff5babccb5b90de, 0xbfd396ce448f7000, 0x3ff59d61f2d91a78, 0xbfd3401e17bda000,
++    0x3ff5805612465687, 0xbfd2e9e2ef468000, 0x3ff56397cee76bd3, 0xbfd2941b3830e000,
++    0x3ff54725e2a77f93, 0xbfd23ec58cda8800, 0x3ff52aff42064583, 0xbfd1e9e129279000,
++    0x3ff50f22dbb2bddf, 0xbfd1956d2b48f800, 0x3ff4f38f4734ded7, 0xbfd141679ab9f800,
++    0x3ff4d843cfde2840, 0xbfd0edd094ef9800, 0x3ff4bd3ec078a3c8, 0xbfd09aa518db1000,
++    0x3ff4a27fc3e0258a, 0xbfd047e65263b800, 0x3ff4880524d48434, 0xbfcfeb224586f000,
++    0x3ff46dce1b192d0b, 0xbfcf474a7517b000, 0x3ff453d9d3391854, 0xbfcea4443d103000,
++    0x3ff43a2744b4845a, 0xbfce020d44e9b000, 0x3ff420b54115f8fb, 0xbfcd60a22977f000,
++    0x3ff40782da3ef4b1, 0xbfccc00104959000, 0x3ff3ee8f5d57fe8f, 0xbfcc202956891000,
++    0x3ff3d5d9a00b4ce9, 0xbfcb81178d811000, 0x3ff3bd60c010c12b, 0xbfcae2c9ccd3d000,
++    0x3ff3a5242b75dab8, 0xbfca45402e129000, 0x3ff38d22cd9fd002, 0xbfc9a877681df000,
++    0x3ff3755bc5847a1c, 0xbfc90c6d69483000, 0x3ff35dce49ad36e2, 0xbfc87120a645c000,
++    0x3ff34679984dd440, 0xbfc7d68fb4143000, 0x3ff32f5cceffcb24, 0xbfc73cb83c627000,
++    0x3ff3187775a10d49, 0xbfc6a39a9b376000, 0x3ff301c8373e3990, 0xbfc60b3154b7a000,
++    0x3ff2eb4ebb95f841, 0xbfc5737d76243000, 0x3ff2d50a0219a9d1, 0xbfc4dc7b8fc23000,
++    0x3ff2bef9a8b7fd2a, 0xbfc4462c51d20000, 0x3ff2a91c7a0c1bab, 0xbfc3b08abc830000,
++    0x3ff293726014b530, 0xbfc31b996b490000, 0x3ff27dfa5757a1f5, 0xbfc2875490a44000,
++    0x3ff268b39b1d3bbf, 0xbfc1f3b9f879a000, 0x3ff2539d838ff5bd, 0xbfc160c8252ca000,
++    0x3ff23eb7aac9083b, 0xbfc0ce7f57f72000, 0x3ff22a012ba940b6, 0xbfc03cdc49fea000,
++    0x3ff2157996cc4132, 0xbfbf57bdbc4b8000, 0x3ff201201dd2fc9b, 0xbfbe370896404000,
++    0x3ff1ecf4494d480b, 0xbfbd17983ef94000, 0x3ff1d8f5528f6569, 0xbfbbf9674ed8a000,
++    0x3ff1c52311577e7c, 0xbfbadc79202f6000, 0x3ff1b17c74cb26e9, 0xbfb9c0c3e7288000,
++    0x3ff19e010c2c1ab6, 0xbfb8a646b372c000, 0x3ff18ab07bb670bd, 0xbfb78d01b3ac0000,
++    0x3ff1778a25efbcb6, 0xbfb674f145380000, 0x3ff1648d354c31da, 0xbfb55e0e6d878000,
++    0x3ff151b990275fdd, 0xbfb4485cdea1e000, 0x3ff13f0ea432d24c, 0xbfb333d94d6aa000,
++    0x3ff12c8b7210f9da, 0xbfb22079f8c56000, 0x3ff11a3028ecb531, 0xbfb10e4698622000,
++    0x3ff107fbda8434af, 0xbfaffa6c6ad20000, 0x3ff0f5ee0f4e6bb3, 0xbfadda8d4a774000,
++    0x3ff0e4065d2a9fce, 0xbfabbcece4850000, 0x3ff0d244632ca521, 0xbfa9a1894012c000,
++    0x3ff0c0a77ce2981a, 0xbfa788583302c000, 0x3ff0af2f83c636d1, 0xbfa5715e67d68000,
++    0x3ff09ddb98a01339, 0xbfa35c8a49658000, 0x3ff08cabaf52e7df, 0xbfa149e364154000,
++    0x3ff07b9f2f4e28fb, 0xbf9e72c082eb8000, 0x3ff06ab58c358f19, 0xbf9a55f152528000,
++    0x3ff059eea5ecf92c, 0xbf963d62cf818000, 0x3ff04949cdd12c90, 0xbf9228fb8caa0000,
++    0x3ff038c6c6f0ada9, 0xbf8c317b20f90000, 0x3ff02865137932a9, 0xbf8419355daa0000,
++    0x3ff0182427ea7348, 0xbf781203c2ec0000, 0x3ff008040614b195, 0xbf60040979240000,
++    0x3fefe01ff726fa1a, 0x3f6feff384900000, 0x3fefa11cc261ea74, 0x3f87dc41353d0000,
++    0x3fef6310b081992e, 0x3f93cea3c4c28000, 0x3fef25f63ceeadcd, 0x3f9b9fc114890000,
++    0x3feee9c8039113e7, 0x3fa1b0d8ce110000, 0x3feeae8078cbb1ab, 0x3fa58a5bd001c000,
++    0x3fee741aa29d0c9b, 0x3fa95c8340d88000, 0x3fee3a91830a99b5, 0x3fad276aef578000,
++    0x3fee01e009609a56, 0x3fb07598e598c000, 0x3fedca01e577bb98, 0x3fb253f5e30d2000,
++    0x3fed92f20b7c9103, 0x3fb42edd8b380000, 0x3fed5cac66fb5cce, 0x3fb606598757c000,
++    0x3fed272caa5ede9d, 0x3fb7da76356a0000, 0x3fecf26e3e6b2ccd, 0x3fb9ab434e1c6000,
++    0x3fecbe6da2a77902, 0x3fbb78c7bb0d6000, 0x3fec8b266d37086d, 0x3fbd431332e72000,
++    0x3fec5894bd5d5804, 0x3fbf0a3171de6000, 0x3fec26b533bb9f8c, 0x3fc067152b914000,
++    0x3febf583eeece73f, 0x3fc147858292b000, 0x3febc4fd75db96c1, 0x3fc2266ecdca3000,
++    0x3feb951e0c864a28, 0x3fc303d7a6c55000, 0x3feb65e2c5ef3e2c, 0x3fc3dfc33c331000,
++    0x3feb374867c9888b, 0x3fc4ba366b7a8000, 0x3feb094b211d304a, 0x3fc5933928d1f000,
++    0x3feadbe885f2ef7e, 0x3fc66acd2418f000, 0x3feaaf1d31603da2, 0x3fc740f8ec669000,
++    0x3fea82e63fd358a7, 0x3fc815c0f51af000, 0x3fea5740ef09738b, 0x3fc8e92954f68000,
++    0x3fea2c2a90ab4b27, 0x3fc9bb3602f84000, 0x3fea01a01393f2d1, 0x3fca8bed1c2c0000,
++    0x3fe9d79f24db3c1b, 0x3fcb5b515c01d000, 0x3fe9ae2505c7b190, 0x3fcc2967ccbcc000,
++    0x3fe9852ef297ce2f, 0x3fccf635d5486000, 0x3fe95cbaeea44b75, 0x3fcdc1bd3446c000,
++    0x3fe934c69de74838, 0x3fce8c01b8cfe000, 0x3fe90d4f2f6752e6, 0x3fcf5509c0179000,
++    0x3fe8e6528effd79d, 0x3fd00e6c121fb800, 0x3fe8bfce9fcc007c, 0x3fd071b80e93d000,
++    0x3fe899c0dabec30e, 0x3fd0d46b9e867000, 0x3fe87427aa2317fb, 0x3fd13687334bd000,
++    0x3fe84f00acb39a08, 0x3fd1980d67234800, 0x3fe82a49e8653e55, 0x3fd1f8ffe0cc8000,
++    0x3fe8060195f40260, 0x3fd2595fd7636800, 0x3fe7e22563e0a329, 0x3fd2b9300914a800,
++    0x3fe7beb377dcb5ad, 0x3fd3187210436000, 0x3fe79baa679725c2, 0x3fd377266dec1800,
++    0x3fe77907f2170657, 0x3fd3d54ffbaf3000, 0x3fe756cadbd6130c, 0x3fd432eee32fe000,
++)
++# glibc 2.39 __exp_data (the same binary, == e_exp_data.c): invln2N, shift, negln2hiN, negln2loN, poly[4] (C2..C5);
++# then tab[256]
++_EXP_HEAD = (
++    0x40671547652b82fe, 0x4338000000000000, 0xbf762e42fefa0000, 0xbd0cf79abc9e3b3a,
++    0x3fdffffffffffdbd, 0x3fc555555555543c, 0x3fa55555cf172b91, 0x3f81111167a4d017,
++)
++_EXP_TAB = (
++    0x0000000000000000, 0x3ff0000000000000, 0x3c9b3b4f1a88bf6e, 0x3feff63da9fb3335,
++    0xbc7160139cd8dc5d, 0x3fefec9a3e778061, 0xbc905e7a108766d1, 0x3fefe315e86e7f85,
++    0x3c8cd2523567f613, 0x3fefd9b0d3158574, 0xbc8bce8023f98efa, 0x3fefd06b29ddf6de,
++    0x3c60f74e61e6c861, 0x3fefc74518759bc8, 0x3c90a3e45b33d399, 0x3fefbe3ecac6f383,
++    0x3c979aa65d837b6d, 0x3fefb5586cf9890f, 0x3c8eb51a92fdeffc, 0x3fefac922b7247f7,
++    0x3c3ebe3d702f9cd1, 0x3fefa3ec32d3d1a2, 0xbc6a033489906e0b, 0x3fef9b66affed31b,
++    0xbc9556522a2fbd0e, 0x3fef9301d0125b51, 0xbc5080ef8c4eea55, 0x3fef8abdc06c31cc,
++    0xbc91c923b9d5f416, 0x3fef829aaea92de0, 0x3c80d3e3e95c55af, 0x3fef7a98c8a58e51,
++    0xbc801b15eaa59348, 0x3fef72b83c7d517b, 0xbc8f1ff055de323d, 0x3fef6af9388c8dea,
++    0x3c8b898c3f1353bf, 0x3fef635beb6fcb75, 0xbc96d99c7611eb26, 0x3fef5be084045cd4,
++    0x3c9aecf73e3a2f60, 0x3fef54873168b9aa, 0xbc8fe782cb86389d, 0x3fef4d5022fcd91d,
++    0x3c8a6f4144a6c38d, 0x3fef463b88628cd6, 0x3c807a05b0e4047d, 0x3fef3f49917ddc96,
++    0x3c968efde3a8a894, 0x3fef387a6e756238, 0x3c875e18f274487d, 0x3fef31ce4fb2a63f,
++    0x3c80472b981fe7f2, 0x3fef2b4565e27cdd, 0xbc96b87b3f71085e, 0x3fef24dfe1f56381,
++    0x3c82f7e16d09ab31, 0x3fef1e9df51fdee1, 0xbc3d219b1a6fbffa, 0x3fef187fd0dad990,
++    0x3c8b3782720c0ab4, 0x3fef1285a6e4030b, 0x3c6e149289cecb8f, 0x3fef0cafa93e2f56,
++    0x3c834d754db0abb6, 0x3fef06fe0a31b715, 0x3c864201e2ac744c, 0x3fef0170fc4cd831,
++    0x3c8fdd395dd3f84a, 0x3feefc08b26416ff, 0xbc86a3803b8e5b04, 0x3feef6c55f929ff1,
++    0xbc924aedcc4b5068, 0x3feef1a7373aa9cb, 0xbc9907f81b512d8e, 0x3feeecae6d05d866,
++    0xbc71d1e83e9436d2, 0x3feee7db34e59ff7, 0xbc991919b3ce1b15, 0x3feee32dc313a8e5,
++    0x3c859f48a72a4c6d, 0x3feedea64c123422, 0xbc9312607a28698a, 0x3feeda4504ac801c,
++    0xbc58a78f4817895b, 0x3feed60a21f72e2a, 0xbc7c2c9b67499a1b, 0x3feed1f5d950a897,
++    0x3c4363ed60c2ac11, 0x3feece086061892d, 0x3c9666093b0664ef, 0x3feeca41ed1d0057,
++    0x3c6ecce1daa10379, 0x3feec6a2b5c13cd0, 0x3c93ff8e3f0f1230, 0x3feec32af0d7d3de,
++    0x3c7690cebb7aafb0, 0x3feebfdad5362a27, 0x3c931dbdeb54e077, 0x3feebcb299fddd0d,
++    0xbc8f94340071a38e, 0x3feeb9b2769d2ca7, 0xbc87deccdc93a349, 0x3feeb6daa2cf6642,
++    0xbc78dec6bd0f385f, 0x3feeb42b569d4f82, 0xbc861246ec7b5cf6, 0x3feeb1a4ca5d920f,
++    0x3c93350518fdd78e, 0x3feeaf4736b527da, 0x3c7b98b72f8a9b05, 0x3feead12d497c7fd,
++    0x3c9063e1e21c5409, 0x3feeab07dd485429, 0x3c34c7855019c6ea, 0x3feea9268a5946b7,
++    0x3c9432e62b64c035, 0x3feea76f15ad2148, 0xbc8ce44a6199769f, 0x3feea5e1b976dc09,
++    0xbc8c33c53bef4da8, 0x3feea47eb03a5585, 0xbc845378892be9ae, 0x3feea34634ccc320,
++    0xbc93cedd78565858, 0x3feea23882552225, 0x3c5710aa807e1964, 0x3feea155d44ca973,
++    0xbc93b3efbf5e2228, 0x3feea09e667f3bcd, 0xbc6a12ad8734b982, 0x3feea012750bdabf,
++    0xbc6367efb86da9ee, 0x3fee9fb23c651a2f, 0xbc80dc3d54e08851, 0x3fee9f7df9519484,
++    0xbc781f647e5a3ecf, 0x3fee9f75e8ec5f74, 0xbc86ee4ac08b7db0, 0x3fee9f9a48a58174,
++    0xbc8619321e55e68a, 0x3fee9feb564267c9, 0x3c909ccb5e09d4d3, 0x3feea0694fde5d3f,
++    0xbc7b32dcb94da51d, 0x3feea11473eb0187, 0x3c94ecfd5467c06b, 0x3feea1ed0130c132,
++    0x3c65ebe1abd66c55, 0x3feea2f336cf4e62, 0xbc88a1c52fb3cf42, 0x3feea427543e1a12,
++    0xbc9369b6f13b3734, 0x3feea589994cce13, 0xbc805e843a19ff1e, 0x3feea71a4623c7ad,
++    0xbc94d450d872576e, 0x3feea8d99b4492ed, 0x3c90ad675b0e8a00, 0x3feeaac7d98a6699,
++    0x3c8db72fc1f0eab4, 0x3feeace5422aa0db, 0xbc65b6609cc5e7ff, 0x3feeaf3216b5448c,
++    0x3c7bf68359f35f44, 0x3feeb1ae99157736, 0xbc93091fa71e3d83, 0x3feeb45b0b91ffc6,
++    0xbc5da9b88b6c1e29, 0x3feeb737b0cdc5e5, 0xbc6c23f97c90b959, 0x3feeba44cbc8520f,
++    0xbc92434322f4f9aa, 0x3feebd829fde4e50, 0xbc85ca6cd7668e4b, 0x3feec0f170ca07ba,
++    0x3c71affc2b91ce27, 0x3feec49182a3f090, 0x3c6dd235e10a73bb, 0x3feec86319e32323,
++    0xbc87c50422622263, 0x3feecc667b5de565, 0x3c8b1c86e3e231d5, 0x3feed09bec4a2d33,
++    0xbc91bbd1d3bcbb15, 0x3feed503b23e255d, 0x3c90cc319cee31d2, 0x3feed99e1330b358,
++    0x3c8469846e735ab3, 0x3feede6b5579fdbf, 0xbc82dfcd978e9db4, 0x3feee36bbfd3f37a,
++    0x3c8c1a7792cb3387, 0x3feee89f995ad3ad, 0xbc907b8f4ad1d9fa, 0x3feeee07298db666,
++    0xbc55c3d956dcaeba, 0x3feef3a2b84f15fb, 0xbc90a40e3da6f640, 0x3feef9728de5593a,
++    0xbc68d6f438ad9334, 0x3feeff76f2fb5e47, 0xbc91eee26b588a35, 0x3fef05b030a1064a,
++    0x3c74ffd70a5fddcd, 0x3fef0c1e904bc1d2, 0xbc91bdfbfa9298ac, 0x3fef12c25bd71e09,
++    0x3c736eae30af0cb3, 0x3fef199bdd85529c, 0x3c8ee3325c9ffd94, 0x3fef20ab5fffd07a,
++    0x3c84e08fd10959ac, 0x3fef27f12e57d14b, 0x3c63cdaf384e1a67, 0x3fef2f6d9406e7b5,
++    0x3c676b2c6c921968, 0x3fef3720dcef9069, 0xbc808a1883ccb5d2, 0x3fef3f0b555dc3fa,
++    0xbc8fad5d3ffffa6f, 0x3fef472d4a07897c, 0xbc900dae3875a949, 0x3fef4f87080d89f2,
++    0x3c74a385a63d07a7, 0x3fef5818dcfba487, 0xbc82919e2040220f, 0x3fef60e316c98398,
++    0x3c8e5a50d5c192ac, 0x3fef69e603db3285, 0x3c843a59ac016b4b, 0x3fef7321f301b460,
++    0xbc82d52107b43e1f, 0x3fef7c97337b9b5f, 0xbc892ab93b470dc9, 0x3fef864614f5a129,
++    0x3c74b604603a88d3, 0x3fef902ee78b3ff6, 0x3c83c5ec519d7271, 0x3fef9a51fbc74c83,
++    0xbc8ff7128fd391f0, 0x3fefa4afa2a490da, 0xbc8dae98e223747d, 0x3fefaf482d8e67f1,
++    0x3c8ec3bc41aa2008, 0x3fefba1bee615a27, 0x3c842b94c3a9eb32, 0x3fefc52b376bba97,
++    0x3c8a64a931d185ee, 0x3fefd0765b6e4540, 0xbc8e37bae43be3ed, 0x3fefdbfdad9cbe14,
++    0x3c77893b4d91cd9d, 0x3fefe7c1819e90d8, 0x3c5305c14160cc89, 0x3feff3c22b8f71f1,
++)
++
++
++def _f64(u: int) -> float:
++    return struct.unpack("<d", struct.pack("<Q", u))[0]
++
++
++def _i64(u: int) -> int:
++    return u - (1 << 64) if u >> 63 else u
++
++
++# CONST (float64): 0 ln2hi, 1 ln2lo, 2..6 A[0..4], 7..17 B[0..10], 18 invln2N, 19 negln2hiN, 20 negln2loN,
++# 21..24 C2..C5, 25 2^27, 26 1.0, 27 -1.0, 28 2^1009, 29 2^-1022, 30 2^-53, 31 2^-54. (A float literal in a Triton
++# kernel is a float32 constant: every float64 constant comes from this table.)
++_CONST = tuple(_f64(u) for u in _LOG_HEAD) + (_f64(_EXP_HEAD[0]),) + tuple(_f64(u) for u in _EXP_HEAD[2:8]) + (
++    2.0 ** 27, 1.0, -1.0, 2.0 ** 1009, 2.0 ** -1022, 2.0 ** -53, 2.0 ** -54)
++
++
++@lru_cache(maxsize=8)
++def tables(device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """(CONST f64 [32], LOGT f64 [256]: (invc, logc) pairs, EXPT int64 [256]) on ``device``."""
++
++    const = torch.tensor(_CONST, dtype=torch.float64)
++    logt = torch.tensor([_f64(u) for u in _LOG_TAB], dtype=torch.float64)
++    expt = torch.tensor([_i64(u) for u in _EXP_TAB], dtype=torch.int64)
++    return const.to(device), logt.to(device), expt.to(device)
++
++
++# -- the libm port (float64, elementwise; tensors of any shape) -----------------------------------------------------
++@triton.jit
++def _c(CONST, i: tl.constexpr):
++    return tl.load(CONST + i)
++
++
++@triton.jit
++def _log(x, CONST, LOGT):
++    """glibc 2.39 aarch64 ``__log`` for positive normal x and +-0 (-inf): both paths computed, the one glibc takes
++    selected."""
++
++    ix = x.to(tl.uint64, bitcast=True)
++    near = (ix - 0x3FEE000000000000) <= 0x308FFFFFFFFFF          # 1 - 2^-4 <= x < 1 + 0x1.09p-4
++    one = ix == 0x3FF0000000000000
++    # -- close to 1 (poly1, B) --
++    r = x - _c(CONST, 26)
++    d1 = tl.fma(r, _c(CONST, 25), r)
++    r2 = r * r
++    d4 = tl.fma(_c(CONST, 15), r, _c(CONST, 14))
++    rhi = tl.fma(-r, _c(CONST, 25), d1)
++    r3 = r * r2
++    d4 = tl.fma(_c(CONST, 16), r2, d4)
++    d3 = tl.fma(_c(CONST, 12), r, _c(CONST, 11))
++    d4 = tl.fma(_c(CONST, 17), r3, d4)
++    hh = rhi * rhi
++    d3 = tl.fma(_c(CONST, 13), r2, d3)
++    hi = tl.fma(hh, _c(CONST, 7), r)
++    d2 = tl.fma(_c(CONST, 9), r, _c(CONST, 8))
++    d3 = tl.fma(d4, r3, d3)
++    rlo = r - rhi
++    rs = r + rhi
++    d2 = tl.fma(_c(CONST, 10), r2, d2)
++    b0rlo = _c(CONST, 7) * rlo
++    lo = r - hi
++    lo = tl.fma(hh, _c(CONST, 7), lo)
++    d2 = tl.fma(d3, r3, d2)
++    lo = tl.fma(b0rlo, rs, lo)
++    lo = tl.fma(d2, r3, lo)
++    y_near = hi + lo
++    # -- the table path (poly, A) --
++    tmp = ix - 0x3FE6000000000000
++    i = ((tmp >> 45) & 127).to(tl.int32)
++    k = tmp.to(tl.int64, bitcast=True) >> 52
++    iz = ix - (tmp & 0xFFF0000000000000)
++    kd = k.to(tl.int32).to(tl.float64)
++    invc = tl.load(LOGT + 2 * i)
++    logc = tl.load(LOGT + 2 * i + 1)
++    z = iz.to(tl.float64, bitcast=True)
++    w = tl.fma(_c(CONST, 0), kd, logc)
++    r = tl.fma(invc, z, _c(CONST, 27))
++    hi = r + w
++    p34 = tl.fma(_c(CONST, 6), r, _c(CONST, 5))
++    p12 = tl.fma(_c(CONST, 4), r, _c(CONST, 3))
++    r2 = r * r
++    t = w - hi
++    r3 = r * r2
++    t = t + r
++    p = tl.fma(p34, r2, p12)
++    t = tl.fma(_c(CONST, 1), kd, t)
++    t = tl.fma(_c(CONST, 2), r2, t)
++    t = tl.fma(r3, p, t)
++    y_main = t + hi
++    y = tl.where(near, y_near, y_main)
++    y = tl.where(one, 0.0, y)
++    # log(+-0) = -inf (glibc's __math_divzero): -log(u) is -0.0 when u rounds to 1.0 (x >> 11 == 2^53 - 1)
++    return tl.where((ix << 1) == 0, float("-inf"), y)
++
++
++@triton.jit
++def _round_away(z):
++    """round(z) half away from zero (``frinta`` / ``fcvtas``), as int64; |z| < 2^52."""
++
++    t = z.to(tl.int64)
++    f = z - t.to(tl.float64)
++    return t + (f >= 0.5).to(tl.int64) - (f <= -0.5).to(tl.int64)
++
++
++@triton.jit
++def _exp(x, CONST, EXPT):
++    """glibc 2.39 aarch64 ``__exp`` (every input but NaN payloads), branch-free."""
++
++    ix = x.to(tl.uint64, bitcast=True)
++    abstop = ((ix >> 52) & 0x7FF).to(tl.int32)
++    tiny = abstop < 0x3C9
++    huge = abstop >= 0x409
++    special = abstop == 0x408
++    xc = tl.where(huge | tiny, 0.0, x)
++    z = xc * _c(CONST, 18)
++    ki = _round_away(z)
++    kd = ki.to(tl.float64)
++    d0 = tl.fma(_c(CONST, 19), kd, xc)
++    r = tl.fma(_c(CONST, 20), kd, d0)
++    idx = 2 * (ki & 127)
++    tail = tl.load(EXPT + idx).to(tl.float64, bitcast=True)
++    tbits = tl.load(EXPT + idx + 1).to(tl.uint64, bitcast=True)
++    p23 = tl.fma(_c(CONST, 22), r, _c(CONST, 21))
++    p45 = tl.fma(_c(CONST, 24), r, _c(CONST, 23))
++    r2 = r * r
++    d1 = r + tail
++    sbits = tbits + (ki.to(tl.uint64, bitcast=True) << 45)
++    r4 = r2 * r2
++    d1 = tl.fma(p23, r2, d1)
++    tmp = tl.fma(r4, p45, d1)
++    s = sbits.to(tl.float64, bitcast=True)
++    y_main = tl.fma(tmp, s, s)
++    # specialcase, k > 0 (overflowing scale)
++    sp = (sbits - 0x3F10000000000000).to(tl.float64, bitcast=True)
++    y_pos = tl.fma(tmp, sp, sp) * _c(CONST, 28)                      # * 2^1009
++    # specialcase, k < 0 (subnormal range)
++    sn = (sbits + 0x3FE0000000000000).to(tl.float64, bitcast=True)
++    st = tmp * sn
++    yn = sn + st
++    one = _c(CONST, 26)
++    hi = yn + one
++    a = sn - yn
++    b = one - hi
++    lo = a + st
++    a = b + yn
++    lo = a + lo
++    ysub = (lo + hi) - one
++    ysub = tl.where(ysub == 0.0, 0.0, ysub)
++    yn = tl.where(yn < one, ysub, yn)
++    y_neg = yn * _c(CONST, 29)                                        # * 2^-1022
++    neg_k = (ki & 0x80000000) != 0
++    y_sp = tl.where(neg_k, y_neg, y_pos)
++    y = tl.where(special, y_sp, y_main)
++    # the inputs glibc answers before the reduction
++    y = tl.where(tiny, one + x, y)
++    isinf_neg = ix == 0xFFF0000000000000
++    nanin = abstop == 0x7FF
++    sign = (ix >> 63) != 0
++    y_huge = tl.where(nanin, one + x, tl.where(sign, 0.0, float("inf")))
++    y_huge = tl.where(isinf_neg, 0.0, y_huge)
++    return tl.where(huge, y_huge, y)
++
++
++# -- the keyed uniform ------------------------------------------------------------------------------------------------
++@triton.jit
++def _mix(x):
++    x = x ^ (x >> 30)
++    x = x * 0xBF58476D1CE4E5B9
++    x = x ^ (x >> 27)
++    x = x * 0x94D049BB133111EB
++    return x ^ (x >> 31)
++
++
++@triton.jit
++def _uniform(seed, pos, ids, CONST):
++    """``exact_sampling.uniform``: (0, 1) doubles from splitmix64 of (seed, position, token id)."""
++
++    x = _mix(seed.to(tl.int64).to(tl.uint64, bitcast=True) + 0x9E3779B97F4A7C15)
++    x = _mix(x ^ (pos.to(tl.int64).to(tl.uint64, bitcast=True) * 0xD1B54A32D192ED03))
++    x = _mix(x ^ ids.to(tl.int64).to(tl.uint64, bitcast=True))
++    return (x >> 11).to(tl.float64) * _c(CONST, 30) + _c(CONST, 31)
++
++
++@triton.jit
++def _pw_sum(S, n, div):
++    """numpy's pairwise sum of S[0:n] / div (n <= 128; ``div`` 1.0: the elements as they are)."""
++
++    res = tl.load(S) * 0.0 - 0.0                     # -0.0 (float64)
++    if n < 8:
++        for i in range(0, n):
++            res = res + tl.load(S + i) / div
++    else:
++        r0 = tl.load(S + 0) / div
++        r1 = tl.load(S + 1) / div
++        r2 = tl.load(S + 2) / div
++        r3 = tl.load(S + 3) / div
++        r4 = tl.load(S + 4) / div
++        r5 = tl.load(S + 5) / div
++        r6 = tl.load(S + 6) / div
++        r7 = tl.load(S + 7) / div
++        n8 = n - n % 8
++        for i in range(8, n8, 8):
++            r0 = r0 + tl.load(S + i + 0) / div
++            r1 = r1 + tl.load(S + i + 1) / div
++            r2 = r2 + tl.load(S + i + 2) / div
++            r3 = r3 + tl.load(S + i + 3) / div
++            r4 = r4 + tl.load(S + i + 4) / div
++            r5 = r5 + tl.load(S + i + 5) / div
++            r6 = r6 + tl.load(S + i + 6) / div
++            r7 = r7 + tl.load(S + i + 7) / div
++        res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
++        for i in range(n8, n):
++            res = res + tl.load(S + i) / div
++    return res
++
++
++@triton.jit
++def _below(S, n, div, top):
++    """#(cumsum(S[0:n] / div) < top), the cumulative sum in order (numpy's ``cumsum``)."""
++
++    cs = tl.load(S) * 0.0
++    cnt = n * 0
++    for i in range(0, n):
++        cs = cs + tl.load(S + i) / div
++        cnt += (cs < top).to(cnt.dtype)
++    return cnt
++
++
++# -- the draw ---------------------------------------------------------------------------------------------------------
++@triton.jit
++def _choose_kernel(G, GI, P, INT, FLT, TOK, PROB, SCR, CONST, LOGT, EXPT,
++                   WORLD: tl.constexpr, BLOCK: tl.constexpr, CH: tl.constexpr, WANT: tl.constexpr):
++    """One row: its WORLD x k gathered candidates (rank r's values at G[r * P + off .. + k], ids as int32 bits right
++    after) -> TOK[row] (and PROB[row] with WANT). INT[row] = (off, k, seed, position, kept for the draw, mode: bit 0
++    sampled / bit 1 probability, kept for the probability, -), FLT[row] = (max(T, 1e-6), top_p, T or 1, top_p or 1)."""
++
++    row = tl.program_id(0)
++    ib = INT + row * 8
++    off = tl.load(ib + 0)
++    k = tl.load(ib + 1)
++    seed = tl.load(ib + 2)
++    pos = tl.load(ib + 3)
++    kk = tl.load(ib + 4)
++    mode = tl.load(ib + 5)
++    kkp = tl.load(ib + 6)
++    W = WORLD * k
++    j = tl.arange(0, BLOCK).to(tl.int64)
++    ok = j < W
++    rk = j // k
++    addr = rk * P + off + (j - rk * k)
++    v = tl.load(G + addr, mask=ok, other=float("-inf"))
++    ids = tl.load(GI + addr + k, mask=ok, other=0)
++    # the order (value desc, id asc) as ranks
++    rank = tl.zeros([BLOCK], dtype=tl.int32)
++    for c0 in tl.static_range(0, BLOCK, CH):
++        i = c0 + tl.arange(0, CH).to(tl.int64)
++        oki = i < W
++        rki = i // k
++        ai = rki * P + off + (i - rki * k)
++        vi = tl.load(G + ai, mask=oki, other=float("-inf"))
++        di = tl.load(GI + ai + k, mask=oki, other=0)
++        before = (vi[None, :] > v[:, None]) | ((vi[None, :] == v[:, None]) & (di[None, :] < ids[:, None]))
++        rank += tl.sum((before & oki[None, :]).to(tl.int32), axis=1)
++    rank = tl.where(ok, rank, BLOCK + 1)
++    tok = tl.sum(tl.where(rank == 0, ids, 0))                   # greedy: the first of the order
++    chosen = rank * 0                                            # the chosen candidate's rank (greedy: 0)
++    base = SCR + row * (2 * BLOCK)
++    if (mode & 1) != 0:
++        tm = tl.load(FLT + row * 4 + 0)
++        tp = tl.load(FLT + row * 4 + 1)
++        keep = rank < kk
++        sc = v.to(tl.float64) / tm
++        u = _uniform(seed, pos, ids, CONST)
++        score = sc - _log(-_log(u, CONST, LOGT), CONST, LOGT)
++        n_keep = kk
++        if (tp > 0.0) & (tp < 1.0):
++            m = tl.max(tl.where(keep, sc, float("-inf")))
++            e = _exp(sc - m, CONST, EXPT)
++            tl.store(base + rank, e, mask=keep)
++            tl.debug_barrier()
++            s1 = _pw_sum(base, kk, tl.load(CONST + 26))
++            n_keep = _below(base, kk, s1, tp) + 1
++            tl.debug_barrier()
++        score = tl.where(keep & (rank < n_keep), score, float("-inf"))
++        best = tl.max(score)
++        rmin = tl.min(tl.where(score == best, rank, BLOCK + 1))
++        tok = tl.sum(tl.where(rank == rmin, ids, 0))
++        chosen = rank * 0 + rmin
++    tl.store(TOK + row, tok)
++    if WANT:
++        prob = tl.load(CONST + 26) * 0.0
++        if (mode & 2) != 0:
++            pt = tl.load(FLT + row * 4 + 2)
++            pp = tl.load(FLT + row * 4 + 3)
++            keepp = rank < kkp
++            vv = v.to(tl.float64) / pt
++            m2 = tl.max(tl.where(keepp, vv, float("-inf")))
++            e2 = _exp(vv - m2, CONST, EXPT)
++            b2 = base + BLOCK
++            tl.store(b2 + rank, e2, mask=keepp)
++            tl.debug_barrier()
++            s = _pw_sum(b2, kkp, tl.load(CONST + 26))
++            rc = tl.max(chosen)
++            if (pp > 0.0) & (pp < 1.0):
++                keep2 = tl.minimum(_below(b2, kkp, s, pp) + 1, kkp)
++                s2 = _pw_sum(b2, keep2, s)
++                hit = tl.load(b2 + tl.minimum(rc, keep2 - 1)) / s / s2
++                prob = tl.where(rc < keep2, hit, prob)
++            else:
++                hit = tl.load(b2 + tl.minimum(rc, kkp - 1)) / s
++                prob = tl.where(rc < kkp, hit, prob)
++        tl.store(PROB + row, prob)
++
++
++# -- host side --------------------------------------------------------------------------------------------------------
++def kept(sampling: Any, width: int) -> int:
++    """The candidates the draw keeps (``choose_rows``' k)."""
++
++    return max(1, min(int(sampling.top_k) if sampling.top_k else width, width))
++
++
++def fits(k: int, world: int, sampling: Any, want: bool = False) -> bool:
++    """Whether a row of ``k`` candidates a rank can be drawn by the kernel (else the host draws it)."""
++
++    width = world * k
++    if width > MAX_GATHERED:
++        return False
++    if sampling is not None and sampling.temperature > 0 and kept(sampling, width) > MAX_KEEP:
++        return False
++    if want:
++        tk = sampling.top_k if sampling is not None and sampling.top_k else width
++        if min(int(tk), width) > MAX_KEEP:
++            return False
++    return True
++
++
++def row_entry(off: int, k: int, world: int, position: int, sampling: Any, want: bool = False) -> tuple[list, list]:
++    """(INT row, FLT row) for one row: the host sampler's parameters, as ``_choose_kernel`` reads them."""
++
++    width = world * k
++    greedy = sampling is None or sampling.temperature <= 0
++    mode = 0 if greedy else 1
++    seed = kk = 0
++    tm = tp = 1.0
++    if not greedy:
++        seed = _i64(int(sampling.seed) & 0xFFFFFFFFFFFFFFFF)
++        kk = kept(sampling, width)
++        tm = max(float(sampling.temperature), 1e-6)
++        tp = float(sampling.top_p)
++    kkp, pt, pp = 0, 1.0, 1.0
++    if want:
++        mode |= 2
++        pt = float(sampling.temperature) if sampling is not None and sampling.temperature > 0 else 1.0
++        pp = float(sampling.top_p) if sampling is not None else 1.0
++        tk = sampling.top_k if sampling is not None and sampling.top_k else width
++        kkp = min(int(tk), width)
++    return [int(off), int(k), seed, int(position), kk, mode, kkp, 0], [tm, tp, pt, pp]
++
++
++def block_for(width: int) -> int:
++    return max(16, triton.next_power_of_2(int(width)))
++
++
++def launch(got: torch.Tensor, P: int, world: int, ints: torch.Tensor, flts: torch.Tensor, tok: torch.Tensor,
++           prob: torch.Tensor | None, scratch: torch.Tensor, width: int) -> None:
++    """``_choose_kernel`` over ``ints.shape[0]`` rows (capturable: every argument a device tensor or a constant).
++    ``got``: float32 [world * P] (the all-gather's output); ``width``: the largest world x k of the rows; ``scratch``:
++    float64 of at least rows x 2 x ``block_for(width)``."""
++
++    const, logt, expt = tables(str(got.device))
++    B = block_for(width)
++    n = ints.shape[0]
++    want = prob is not None
++    _choose_kernel[(n,)](got, got.view(torch.int32), int(P), ints, flts, tok, prob if want else tok, scratch,
++                         const, logt, expt, WORLD=int(world), BLOCK=B, CH=min(32, B), WANT=want, num_warps=4,
++                         enable_fp_fusion=False)
++
++
++def choose(got: torch.Tensor, P: int, world: int, rows: Sequence[tuple[int, int, int, Any, bool]],
++           want: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
++    """Rows (off, k, position, sampling, want probability) of ``got`` (see ``launch``) -> (tokens int32 [n], the
++    probabilities float64 [n] or None), on ``got``'s device, without a host sync."""
++
++    ints, flts = [], []
++    width = 1
++    for off, k, position, sampling, w_ in rows:
++        a, b = row_entry(off, k, world, position, sampling, w_)
++        ints.append(a)
++        flts.append(b)
++        width = max(width, world * k)
++    dev = got.device
++    pin = dev.type == "cuda"
++    it = torch.tensor(ints, dtype=torch.int64, pin_memory=pin).to(dev, non_blocking=True)
++    ft = torch.tensor(flts, dtype=torch.float64, pin_memory=pin).to(dev, non_blocking=True)
++    n = len(rows)
++    tok = torch.empty((n,), dtype=torch.int32, device=dev)
++    prob = torch.empty((n,), dtype=torch.float64, device=dev) if want else None
++    scratch = torch.empty((n, 2 * block_for(width)), dtype=torch.float64, device=dev)
++    launch(got, P, world, it, ft, tok, prob, scratch, width)
++    return tok, prob
++
++
++# -- elementwise entry points (tests, the load check) ------------------------------------------------------------------
++@triton.jit
++def _libm_kernel(X, Y, n, CONST, LOGT, EXPT, WHICH: tl.constexpr, BLOCK: tl.constexpr):
++    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    m = i < n
++    x = tl.load(X + i, mask=m, other=1.0)
++    if WHICH == 0:
++        y = _log(x, CONST, LOGT)
++    elif WHICH == 1:
++        y = _exp(x, CONST, EXPT)
++    else:
++        y = _log(-_log(x, CONST, LOGT), CONST, LOGT)
++    tl.store(Y + i, y, mask=m)
++
++
++def libm(x: torch.Tensor, which: str) -> torch.Tensor:
++    """float64 ``log`` / ``exp`` / ``gumbel`` (log(-log(x))) of every element through the kernels' port."""
++
++    const, logt, expt = tables(str(x.device))
++    x = x.contiguous().to(torch.float64)
++    y = torch.empty_like(x)
++    n = x.numel()
++    _libm_kernel[(triton.cdiv(n, 256),)](x, y, n, const, logt, expt, WHICH={"log": 0, "exp": 1, "gumbel": 2}[which],
++                                         BLOCK=256, num_warps=4, enable_fp_fusion=False)
++    return y
++
++
++def self_check(device, rows: int = 4096, seed: int = 450) -> str | None:
++    """The kernels against the host's own numpy on this machine (``GLM53_TF_GPU_ROUND``'s load check): libm on
++    uniforms, their -log and exp's range, then draws of random rows. -> None, or what differed."""
++
++    rng = np.random.default_rng(seed)
++    u = (rng.integers(0, 1 << 53, size=rows * 8, dtype=np.int64).astype(np.float64) * 2.0 ** -53 + 2.0 ** -54)
++    e = -np.abs(rng.standard_normal(rows * 8) * rng.choice([0.01, 1.0, 30.0, 800.0], size=rows * 8))
++    checks = (("log", u, np.log(u)), ("log", -np.log(u), np.log(-np.log(u))), ("exp", e, np.exp(e)))
++    for which, x, want in checks:
++        got = libm(torch.from_numpy(x).to(device), which).cpu().numpy()
++        bad = np.nonzero(got.view(np.int64) != want.view(np.int64))[0]
++        if len(bad):
++            i = int(bad[0])
++            return f"{which}({x[i]!r}) = {got[i]!r} on the GPU, {want[i]!r} in numpy ({len(bad)} of {len(x)} differ)"
++    from tensorfold.engine.exact_sampling import Sampling, choose_rows
++
++    world, k = 2, 28
++    vals = (rng.standard_normal((rows, world * k)) * 3).astype(np.float32)
++    vals[:, 1::7] = vals[:, ::7][:, :vals[:, 1::7].shape[1]]         # ties
++    ids = np.stack([rng.permutation(1000)[:world * k] for _ in range(rows)]).astype(np.int64)
++    got = np.zeros((world, rows * 2 * k), dtype=np.float32)
++    for r in range(world):
++        seg = np.concatenate([vals[:, r * k:(r + 1) * k], ids[:, r * k:(r + 1) * k].astype(np.int32).view(np.float32)],
++                             axis=1)
++        got[r] = seg.reshape(-1)
++    gt = torch.from_numpy(got.reshape(-1)).to(device)
++    s = Sampling(seed=int(rng.integers(1 << 62)), temperature=0.7, top_k=20, top_p=0.9)
++    pos = [int(p) for p in rng.integers(0, 1 << 20, size=rows)]
++    tok, _ = choose(gt, rows * 2 * k, world, [(r * 2 * k, k, pos[r], s, False) for r in range(rows)])
++    host = choose_rows(vals.astype(np.float32), ids, pos, s)
++    dev = tok.cpu().tolist()
++    if dev != host:
++        i = next(i for i, (a, b) in enumerate(zip(dev, host)) if a != b)
++        return f"row {i}: the GPU drew {dev[i]}, the host {host[i]}"
++    return None
+diff --git c/src/tensorfold/families/glm5_next/cuda/kda.cpp i/src/tensorfold/families/glm5_next/cuda/kda.cpp
+index a0d338b..33e5930 100644
+--- c/src/tensorfold/families/glm5_next/cuda/kda.cpp
++++ i/src/tensorfold/families/glm5_next/cuda/kda.cpp
+@@ -9,6 +9,11 @@ void kda_replay_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, co
+                      int64_t, at::Tensor&);
+ void kda_replay_layers_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, at::Tensor&);
++void kda_replay_slots_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, int64_t, int64_t, int64_t,
++                           int64_t);
++void kda_chain_slots_cuda(const at::Tensor&, const at::Tensor&, int64_t, const at::Tensor&, int64_t, int64_t,
++                          int64_t, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                          double, double);
+ 
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t, name, ": expected a CUDA tensor of the right dtype");
+@@ -60,8 +65,42 @@ void replay_layers(const at::Tensor& state_in, int64_t state_stride, const at::T
+                            rows, state_out);
+ }
+ 
++// patches/0450: every slot's replay in one launch (keeps on the device); a KDA layer's chains of several slots in one
++// launch with the previous window's commit folded in (``kda.chain_slots``)
++void replay_slots(const at::Tensor& tab, const at::Tensor& keep, const at::Tensor& run, int64_t layers, int64_t heads,
++                  int64_t state_stride, int64_t skip_full) {
++    check(tab, at::kLong, "slot table");
++    check(keep, at::kInt, "keeps");
++    check(run, at::kInt, "rows run");
++    TORCH_CHECK(tab.is_contiguous() && tab.numel() == keep.numel() * 8 && run.numel() == keep.numel(),
++                "replay_slots: a table of 8 int64 a slot, a keep and a row count a slot");
++    c10::cuda::CUDAGuard guard(tab.device());
++    kda_replay_slots_cuda(tab, keep, run, layers, heads, state_stride, skip_full);
++}
++
++void chain_slots(const at::Tensor& tab, const at::Tensor& state, int64_t ni, const at::Tensor& slot_ids,
++                 int64_t col_pre, int64_t col_real, int64_t heads, int64_t b_off, const at::Tensor& cw,
++                 const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w, double eps,
++                 double lower) {
++    check(tab, at::kLong, "slot table");
++    check(state, at::kInt, "slot counters");
++    check(slot_ids, at::kInt, "slot ids");
++    check(cw, at::kBFloat16, "conv weight");
++    check(a_log, at::kFloat, "A_log");
++    check(dt_bias, at::kFloat, "dt_bias");
++    check(norm_w, at::kBFloat16, "norm");
++    TORCH_CHECK(tab.is_contiguous() && tab.numel() == slot_ids.numel() * 24 && state.is_contiguous(),
++                "chain_slots: a table of 24 int64 a slot, contiguous counters");
++    TORCH_CHECK(a_log.numel() == heads && cw.is_contiguous(), "chain_slots: heads / conv weight");
++    c10::cuda::CUDAGuard guard(tab.device());
++    kda_chain_slots_cuda(tab, state, ni, slot_ids, col_pre, col_real, heads, b_off, cw, a_log, dt_bias, norm_w, eps,
++                         lower);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("chain", &chain);
+     m.def("replay", &replay);
+     m.def("replay_layers", &replay_layers);
++    m.def("replay_slots", &replay_slots);        // patches/0450
++    m.def("chain_slots", &chain_slots);          // patches/0450
+ }
+diff --git c/src/tensorfold/families/glm5_next/cuda/kda.cu i/src/tensorfold/families/glm5_next/cuda/kda.cu
+index bd90938..a91d2a2 100644
+--- c/src/tensorfold/families/glm5_next/cuda/kda.cu
++++ i/src/tensorfold/families/glm5_next/cuda/kda.cu
+@@ -215,6 +215,201 @@ __global__ void __launch_bounds__(1024) replay_layers_kernel(
+         for (int i = 0; i < 4; ++i) sout[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
+ }
+ 
++
++// patches/0450 (GLM53_TF_GPU_ROUND): several slots in one launch, rows read on the device.
++//
++// replay_slots_kernel: block (layer * H + head, slot). A slot's row of ``tab`` (int64 x 8): state in, state out, k, v,
++// g, b saves (addresses), the saves' per-layer strides (k / v / g, b). keep[slot] rows are replayed; a slot whose keep
++// equals run[slot] is skipped when ``skip_full`` (the chain already wrote the state after its whole window). keep 0
++// copies the state (a finished slot's round that commits nothing). The update routine and row order are
++// ``replay_layers_kernel``'s, so the bits are.
++__global__ void __launch_bounds__(1024) replay_slots_kernel(
++        int H, const long long* __restrict__ tab, const int* __restrict__ keep, const int* __restrict__ run,
++        size_t state_stride, int skip_full) {
++    const int slot = blockIdx.y;
++    const int layer = blockIdx.x / H, h = blockIdx.x % H;
++    const int rows = keep[slot];
++    if (skip_full && rows == run[slot]) return;
++    const long long* e = tab + (size_t)slot * 8;
++    const size_t kv_stride = (size_t)e[6], b_stride = (size_t)e[7];
++    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++    __shared__ float vs[DV];
++    float s[4][4];
++    const float* sin = reinterpret_cast<const float*>(e[0]) + layer * state_stride;
++    float* sout = reinterpret_cast<float*>(e[1]) + layer * state_stride;
++    const float* ks = reinterpret_cast<const float*>(e[2]) + layer * kv_stride;
++    const __nv_bfloat16* vsv = reinterpret_cast<const __nv_bfloat16*>(e[3]) + layer * kv_stride;
++    const float* gsv = reinterpret_cast<const float*>(e[4]) + layer * kv_stride;
++    const float* bsv = reinterpret_cast<const float*>(e[5]) + layer * b_stride;
++    const size_t sbase = (size_t)h * DV * DK;
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s[j][i] = sin[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
++    for (int r = 0; r < rows; ++r) {
++        const size_t base = ((size_t)r * H + h) * DK;
++        if (t < DV) vs[t] = __bfloat162float(vsv[base + t]);
++        __syncthreads();
++        float kk[4], gg[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { kk[i] = ks[base + lane * 4 + i]; gg[i] = gsv[base + lane * 4 + i]; }
++        update(s, kk, gg, vs, warp, bsv[r * H + h]);
++        __syncthreads();
++    }
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) sout[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
++}
++
++// chain_slots_kernel: ``chain_kernel`` for one KDA layer of several slots (block (head, slot)) with the previous
++// window's commit folded in. A slot's row of ``tab`` (int64 x 24):
++//   0 P rows, 1 p_stride, 2 A rows, 3 a_stride, 4 G rows, 5 g_stride, 6 conv state, 7 state in, 8 state out,
++//   9 out rows, 10 k save, 11 v save, 12 g save, 13 b save, 14 rows, 15 prev k save, 16 prev v save, 17 prev g save,
++//   18 prev b save, 19 proj rows (the window rows the conv shift reads), 20 proj row stride, 21-23 unused.
++// The slot's counters are read on the device (``state`` int32 [slots, ni], row ``slot_ids[slot]``): the first
++// state[col_pre] rows of the previous window are replayed from its saves (``replay_kernel``'s loop: the committed
++// state), which is written to ``state out``; then the window's first min(rows, 1 + state[col_real]) rows (its real
++// rows: padded rows are not run) as ``chain_kernel`` runs them (the same statements), saving what the next window's
++// prologue (or a replay) needs, and each row's conv channels are stored to the proj rows. The state after the window
++// is not written: the next window's prologue makes it.
++__global__ void __launch_bounds__(1024) chain_slots_kernel(
++        int H, int b_off, const long long* __restrict__ tab, const int* __restrict__ state, int ni,
++        const int* __restrict__ slot_ids, int col_pre, int col_real,
++        const __nv_bfloat16* __restrict__ cw, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
++        const __nv_bfloat16* __restrict__ norm_w, float eps, float lower) {
++    const int slot = blockIdx.y;
++    const long long* e = tab + (size_t)slot * 24;
++    const int* __restrict__ sc = state + (size_t)slot_ids[slot] * ni;
++    const __nv_bfloat16* __restrict__ P = reinterpret_cast<const __nv_bfloat16*>(e[0]);
++    const int p_stride = (int)e[1];
++    const __nv_bfloat16* __restrict__ A = reinterpret_cast<const __nv_bfloat16*>(e[2]);
++    const int a_stride = (int)e[3];
++    const __nv_bfloat16* __restrict__ G = reinterpret_cast<const __nv_bfloat16*>(e[4]);
++    const int g_stride = (int)e[5];
++    const __nv_bfloat16* __restrict__ cs = reinterpret_cast<const __nv_bfloat16*>(e[6]);
++    const float* __restrict__ state_in = reinterpret_cast<const float*>(e[7]);
++    float* __restrict__ state_out = reinterpret_cast<float*>(e[8]);
++    __nv_bfloat16* __restrict__ out = reinterpret_cast<__nv_bfloat16*>(e[9]);
++    float* __restrict__ k_save = reinterpret_cast<float*>(e[10]);
++    __nv_bfloat16* __restrict__ v_save = reinterpret_cast<__nv_bfloat16*>(e[11]);
++    float* __restrict__ g_save = reinterpret_cast<float*>(e[12]);
++    float* __restrict__ b_save = reinterpret_cast<float*>(e[13]);
++    const int rows = min((int)e[14], 1 + sc[col_real]);
++    const float* __restrict__ pk = reinterpret_cast<const float*>(e[15]);
++    const __nv_bfloat16* __restrict__ pv = reinterpret_cast<const __nv_bfloat16*>(e[16]);
++    const float* __restrict__ pg = reinterpret_cast<const float*>(e[17]);
++    const float* __restrict__ pb = reinterpret_cast<const float*>(e[18]);
++    __nv_bfloat16* __restrict__ proj = reinterpret_cast<__nv_bfloat16*>(e[19]);
++    const size_t proj_stride = (size_t)e[20];
++    const int C = 3 * H * DK;                         // conv channels: q | k | v
++    const int h = blockIdx.x;
++    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++    __shared__ float qs[DK], ks[DK], vs[DV], ys[DV], gs[DK];
++    __shared__ float beta_s, rinv;
++    int c = -1;
++    if (t < 3 * DK) c = (t / DK) * H * DK + h * DK + (t % DK);
++    float s[4][4];
++    const size_t sbase = (size_t)h * DV * DK;
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
++    // the previous window's kept rows (``replay_kernel``)
++    const int npre = sc[col_pre];
++    for (int r = 0; r < npre; ++r) {
++        const size_t base = ((size_t)r * H + h) * DK;
++        if (t < DV) vs[t] = __bfloat162float(pv[base + t]);
++        __syncthreads();
++        float kk[4], gg[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { kk[i] = pk[base + lane * 4 + i]; gg[i] = pg[base + lane * 4 + i]; }
++        update(s, kk, gg, vs, warp, pb[r * H + h]);
++        __syncthreads();
++    }
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
++    // the window (``chain_kernel``)
++    const float decay_rate = expf(a_log[h]);
++    for (int r = 0; r < rows; ++r) {
++        if (c >= 0) {
++            float acc = 0.0f;
++#pragma unroll
++            for (int tap = 0; tap < TAPS; ++tap) {
++                const int at = r + tap;
++                const float x = at < TAPS - 1 ? __bfloat162float(cs[(size_t)at * C + c])
++                                              : __bfloat162float(P[(size_t)(at - (TAPS - 1)) * p_stride + c]);
++                acc = acc + __bfloat162float(cw[(size_t)c * TAPS + tap]) * x;
++            }
++            const float act = bf(acc / (1.0f + expf(-acc)));
++            if (t < DK) qs[t] = act;
++            else if (t < 2 * DK) ks[t - DK] = act;
++            else vs[t - 2 * DK] = act;
++            proj[(size_t)r * proj_stride + c] = P[(size_t)r * p_stride + c];
++        } else if (t >= 512 && t < 512 + DK) {
++            const int i = t - 512;
++            const float a = __bfloat162float(A[(size_t)r * a_stride + h * DK + i]) + dt_bias[h * DK + i];
++            gs[i] = expf(lower * sigmoidf_(decay_rate * a));
++        } else if (t == 1023) {
++            beta_s = bf(sigmoidf_(__bfloat162float(P[(size_t)r * p_stride + b_off + h])));
++        }
++        __syncthreads();
++        if (warp < 2) {
++            float* x = warp == 0 ? qs : ks;
++            float v4[4], ss = 0.0f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) { v4[i] = x[lane * 4 + i]; ss = ss + v4[i] * v4[i]; }
++            ss = warp_sum(ss);
++            float inv = 1.0f / sqrtf(ss + 1e-6f);
++            __syncwarp();
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                float y = v4[i] * inv;
++                if (warp == 0) y = y * (1.0f / sqrtf((float)DK));
++                x[lane * 4 + i] = y;
++            }
++        }
++        __syncthreads();
++        const float beta = beta_s;
++        float kk[4], qq[4], gg[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { kk[i] = ks[lane * 4 + i]; qq[i] = qs[lane * 4 + i]; gg[i] = gs[lane * 4 + i]; }
++        update(s, kk, gg, vs, warp, beta);
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = 0.0f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) o = o + s[j][i] * qq[i];
++            o = warp_sum(o);
++            if (lane == 0) ys[warp * 4 + j] = bf(o);
++        }
++        {
++            const size_t base = ((size_t)r * H + h) * DK;
++            if (t < DK) { k_save[base + t] = ks[t]; g_save[base + t] = gs[t]; }
++            if (t >= DK && t < DK + DV) v_save[base + t - DK] = __float2bfloat16_rn(vs[t - DK]);
++            if (t == 0) b_save[r * H + h] = beta;
++        }
++        __syncthreads();
++        if (warp == 0) {
++            float ss = 0.0f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) { const float y = ys[lane * 4 + i]; ss = ss + y * y; }
++            ss = warp_sum(ss);
++            if (lane == 0) rinv = 1.0f / sqrtf(ss / (float)DV + eps);
++        }
++        __syncthreads();
++        if (t < DV) {
++            const float yn = ys[t] * rinv;
++            const float yw = __bfloat162float(norm_w[t]) * yn;
++            const float gate = __bfloat162float(G[(size_t)r * g_stride + h * DV + t]);
++            out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
++        }
++        __syncthreads();
++    }
++}
++
+ }  // namespace
+ 
+ template <typename T>
+@@ -256,3 +451,25 @@ void kda_replay_layers_cuda(const at::Tensor& state_in, int64_t state_stride, co
+         ptr<float>(g_save), ptr<float>(b_save), (size_t)kv_stride, (size_t)b_stride, (int)rows, ptr<float>(state_out));
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
++
++void kda_replay_slots_cuda(const at::Tensor& tab, const at::Tensor& keep, const at::Tensor& run, int64_t layers,
++                           int64_t heads, int64_t state_stride, int64_t skip_full) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int slots = (int)keep.numel();
++    replay_slots_kernel<<<dim3((unsigned)(layers * heads), (unsigned)slots), 1024, 0, stream>>>(
++        (int)heads, ptr<long long>(tab), ptr<int>(keep), ptr<int>(run), (size_t)state_stride, (int)skip_full);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void kda_chain_slots_cuda(const at::Tensor& tab, const at::Tensor& state, int64_t ni, const at::Tensor& slot_ids,
++                          int64_t col_pre, int64_t col_real, int64_t heads, int64_t b_off, const at::Tensor& cw,
++                          const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w, double eps,
++                          double lower) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int slots = (int)slot_ids.numel();
++    chain_slots_kernel<<<dim3((unsigned)heads, (unsigned)slots), 1024, 0, stream>>>(
++        (int)heads, (int)b_off, ptr<long long>(tab), ptr<int>(state), (int)ni, ptr<int>(slot_ids), (int)col_pre,
++        (int)col_real, ptr<__nv_bfloat16>(cw), ptr<float>(a_log), ptr<float>(dt_bias), ptr<__nv_bfloat16>(norm_w),
++        (float)eps, (float)lower);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git c/src/tensorfold/families/glm5_next/cuda/kda.py i/src/tensorfold/families/glm5_next/cuda/kda.py
+index 60eb8cd..2499739 100644
+--- c/src/tensorfold/families/glm5_next/cuda/kda.py
++++ i/src/tensorfold/families/glm5_next/cuda/kda.py
+@@ -78,3 +78,35 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
+ 
+ def replay(state_in: torch.Tensor, scratch: KDAScratch, rows: int, state_out: torch.Tensor) -> None:
+     _ext().replay(state_in, scratch.k, scratch.v, scratch.g, scratch.b, int(rows), state_out)
++
++
++# -- patches/0450 (GLM53_TF_GPU_ROUND ``kda``): several slots a launch, commits folded into the next chain -------------
++class SlotTables:
++    """``chain_slots``' per-layer tables for one round key (slots, their rows in the round, their KDA parities): per
++    slot the window's projection / gate rows in the batch buffers, its conv window, state in (``rec[cur]``, the state
++    before the previous window's kept rows) / out (``rec[1 - cur]``: the committed state it writes), its output rows,
++    this parity's saves and the previous window's, and its proj rows (the conv shift reads them). Built once; a CUDA
++    graph of the round holds these addresses."""
++
++    def __init__(self, sts, saves, prev, b, offs, Rs, state, slot_ids, ni: int, col_pre: int, col_real: int = 5):
++        self.state, self.slot_ids, self.ni, self.col_pre, self.col_real = state, slot_ids, ni, col_pre, col_real
++        n_layers = len(sts[0].cur)
++        dev = sts[0].rec.device
++        rows = []
++        for li in range(n_layers):
++            layer_rows = []
++            for st, sv, pv, o, R in zip(sts, saves, prev, offs, Rs):
++                cur = st.cur[li]
++                a, pa = sv.views[li], pv.views[li]
++                layer_rows.append([b.bproj[o].data_ptr(), b.bproj.stride(0), b.ka[o].data_ptr(), b.ka.stride(0),
++                                   b.kg[o].data_ptr(), b.kg.stride(0), st.conv[li].data_ptr(),
++                                   st.rec[cur, li].data_ptr(), st.rec[1 - cur, li].data_ptr(),
++                                   b.bkout[o].data_ptr(), a.k.data_ptr(), a.v.data_ptr(), a.g.data_ptr(),
++                                   a.b.data_ptr(), int(R), pa.k.data_ptr(), pa.v.data_ptr(), pa.g.data_ptr(),
++                                   pa.b.data_ptr(), st.proj[li].data_ptr(), st.proj.stride(1), 0, 0, 0])
++            rows.append(layer_rows)
++        self.tab = torch.tensor(rows, dtype=torch.int64, device=dev)       # [layers, slots, 24]
++
++    def chain(self, li: int, k, heads: int, eps: float, lower: float) -> None:
++        _ext().chain_slots(self.tab[li], self.state, self.ni, self.slot_ids, self.col_pre, self.col_real, heads,
++                           int(k.b_off), k.conv, k.a_log, k.dt_bias, k.norm, float(eps), float(lower))
+diff --git c/src/tensorfold/families/glm5_next/cuda/resident.py i/src/tensorfold/families/glm5_next/cuda/resident.py
+new file mode 100644
+index 0000000..2f6f959
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/resident.py
+@@ -0,0 +1,1177 @@
++"""patches/0450 (GLM53_TF_GPU_ROUND ``resident``): GPU-resident decode rounds inside ``Batcher`` (docs/GPU-ROUND.md).
++
++A resident round is the batch round (``Batcher._verify`` + ``Stepper.propose``) with every step that read the device
++from the host moved onto the device, and the host one round behind:
++
++    stage   the window's ids from the device state (pending token, drafts; padded rows repeat the last real token and
++            route as it, patches/0280's tie, so they read no experts of their own), the sampler rows' positions
++    forward ``compute_multi`` (capturable code; CUDA graphs per key under the batcher's graph policy)
++    sample  every slot's top-k, one all-gather (rank 0's drain flag rides on it), ``gpusample``: the host's bits
++    accept  ``Stepper.accept``'s rule, counters, the MTP token backlog, the round's record (``gpuround._accept_kernel``)
++    commit  KDA replay of every slot in one launch (keeps on the device; the ``kda`` part folds it into the next
++            chain), conv windows, positions
++    backlog the kept rows' MTP input rows and DFlash2 taps into the slots' backlogs
++    draft   the next window: MTP chains (every m-slot's backlog in one head pass, then one pass a chained step,
++            device-sampled drafts fed to the next step, ``DepthOptimizer.mtp_next`` on the device) and DFlash2 blocks
++            (taps with a device count, the block pass, the chain and ``f_depth`` on the device)
++    record  one pinned copy of the round's record; an event
++
++The host launches round k, then waits for round k - 1's event and does that round's bookkeeping (``Stepper`` records,
++emits, depth calibration). Its decisions for a window (drafter, depth bound, rows) are one round stale; the device
++decides the drafts themselves. Exactness does not depend on any of that: the accept rule, the sampler bits and the
++commit are the serial ones, and drafts only propose.
++
++Rounds run while the batch is steady. Anything else drains them (the round in flight is processed, the host state is
++materialized: positions, KDA state, index tails, the steppers' next drafts and backlogs) and the normal path takes over
++with the same state: a finished request, rank 0's drain flag (a queued request, a cancel, stopping), a lookup match, a
++window whose context mode is not certain (crossing 2,051 or a pool bucket), the cache's end. Every such check is made
++before a round is launched, so a round is never cut half-way.
++"""
++
++from __future__ import annotations
++
++import time
++from dataclasses import dataclass, field
++from typing import Any, Sequence
++
++import numpy as np
++import torch
++import triton
++
++from tensorfold.engine.exact_sampling import MARGIN
++
++from . import gpuround as gr, gpusample
++
++RING = 4                                # pinned staging / record slots (at most 2 rounds in flight)
++
++
++def _tracks_m(stp) -> bool:
++    """Whether the request keeps an MTP backlog (``Stepper.accept``: drafting requests with the MTP head)."""
++
++    return stp.policy is not None and stp.use_mtp
++
++
++def _tracks_f(stp) -> bool:
++    return stp.policy is not None and stp.drafter is not None
++
++
++@dataclass
++class Window:
++    """One slot's window: drafted in round k - 1, verified in round k."""
++
++    arm: str = "s"                      # "s" serial, "m" MTP, "f" DFlash2
++    rows: int = 1                       # rows run (1 + the drafts' bound)
++    steps: int = 0                      # MTP head passes (absorb + chained)
++    backlog: int = 0                    # rows the drafter took before drafting it (the cost model's catch-up)
++
++
++@dataclass
++class Plan:
++    """What the host decided for the round it launches."""
++
++    nxt: dict[int, Window]              # the next windows (drafted in this round)
++    modes: list                         # the verified windows' context modes
++    flush_m: list[int]                  # slots whose MTP backlog is taken although they draft otherwise
++    flush_f: list[int]
++    n_hi_m: dict[int, int]              # head rows an absorb runs (a bound of the backlog; the device counts)
++    n_hi_f: dict[int, int]
++    m_modes: dict[int, list]            # per m-slot: the absorb's mode, then each chained step's
++
++
++@dataclass
++class Launched:
++    k: int
++    active: list[int]
++    windows: dict[int, Window]
++    nxt: dict[int, Window]
++    ring: int
++    event: Any = None
++    t0: float = 0.0
++
++
++@dataclass
++class SlotHost:
++    """The host's view of a slot during resident rounds (one round late)."""
++
++    pos: int = 0                        # committed length after the last processed round
++    count: int = 0
++    mcount: int = 0                     # MTP backlog after the last processed round's drafting
++    fcount: int = 0
++    mbase: int = 0                      # the MTP head's committed length after it
++    probs: list = field(default_factory=list)   # the pending window's drafts' probabilities
++    m_depths: list = field(default_factory=list)
++    f_depths: list = field(default_factory=list)
++
++
++class ResidentState:
++    """The device side: counters, drafts, backlogs, staging and the record ring (both ranks alike)."""
++
++    def __init__(self, n: int, rows: int, backlog: int, device, eos: Sequence[int]) -> None:
++        dev = torch.device(device)
++        pin = dev.type == "cuda"
++        self.n, self.rows, self.backlog = n, rows, backlog
++        self.I = torch.zeros((n, gr.NI), dtype=torch.int32, device=dev)
++        self.H = torch.zeros((n, gr.NH), dtype=torch.int32, device=dev)
++        self.F = torch.ones((n, gr.NF), dtype=torch.float64, device=dev)
++        self.P = torch.zeros((n, gr.NP), dtype=torch.float64, device=dev)
++        self.DRAFT = torch.zeros((n, gr.MAXD), dtype=torch.int32, device=dev)
++        self.DPROB = torch.zeros((n, gr.MAXD), dtype=torch.float64, device=dev)
++        self.NEXT = torch.zeros((n, gr.MAXD), dtype=torch.int32, device=dev)
++        self.NPROB = torch.zeros((n, gr.MAXD), dtype=torch.float64, device=dev)
++        self.MTOK = torch.zeros((n, backlog + 1), dtype=torch.int32, device=dev)
++        self.EOS = torch.tensor(list(eos) or [-1], dtype=torch.int32, device=dev)
++        self.n_eos = len(eos)
++        self.KEEPV = torch.zeros((n,), dtype=torch.int32, device=dev)
++        self.RUNV = torch.zeros((n,), dtype=torch.int32, device=dev)
++        self.TOK = torch.zeros((rows,), dtype=torch.int32, device=dev)
++        self.SRC = torch.arange(rows, dtype=torch.int64, device=dev)
++        self.ROWS = torch.zeros((2, rows), dtype=torch.int32, device=dev)     # each round row's slot and window row
++        self.MAXR = rows
++        self.rec_w = gr.REC_HEAD + rows + gr.MAXD
++        self.REC = torch.zeros((n + 1, self.rec_w), dtype=torch.int32, device=dev)     # + rank 0's rider row
++        self.RECF = torch.zeros((n, gr.MAXD), dtype=torch.float64, device=dev)
++
++        def host(t: torch.Tensor) -> torch.Tensor:
++            h = torch.zeros(t.shape, dtype=t.dtype)
++            return h.pin_memory() if pin else h
++
++        self.h_rec = [host(self.REC) for _ in range(RING)]
++        self.h_recf = [host(self.RECF) for _ in range(RING)]
++        self.h_H = [host(self.H) for _ in range(RING)]
++        self.h_P = [host(self.P) for _ in range(RING)]
++        self.h_rows = [host(self.ROWS) for _ in range(RING)]
++        self.h_I = host(self.I)
++        self.h_draft = host(self.DRAFT)
++        self.h_mtok = host(self.MTOK)
++        self.h_rider: list[torch.Tensor] = []          # the rider's staging, a slot per round in flight
++        self.SEL = torch.zeros((rows,), dtype=torch.int64, device=dev)   # the head passes' selected rows
++        self.h_peek = host(self.I)                     # GLM53_TF_GPU_ROUND_PEEK: the counters, read at a decision
++
++
++class Resident:
++    """A batcher's resident rounds (both ranks). ``ops``: a factory of the model side, called with this object
++    (``RealOps``; the tests' fake)."""
++
++    def __init__(self, bat, ops=None) -> None:
++        from .batch import BACKLOG
++
++        self.bat = bat
++        self.settings = gr.env()
++        self.kda = self.settings.kda
++        self.peek = gr.peek()
++        self.steps_run: dict[int, int] = {}      # peek: the MTP head passes this round's chains ran, per slot
++        self.peeks = 0                           # peek: device records read at a decision
++        self.ops = (ops or RealOps)(self)
++        n = bat.n
++        rows = min(self.ops.max_rows(), n * gr.MAXD)
++        self.st = ResidentState(n, rows, BACKLOG, self.ops.device(), bat.eos)
++        if bat.rider_n:                         # the rider's staging, a pinned slot per round in flight
++            pin = torch.device(self.ops.device()).type == "cuda"
++            self.st.h_rider = [torch.zeros((bat.rider_n,), dtype=torch.int32) for _ in range(RING)]
++            if pin:
++                self.st.h_rider = [t.pin_memory() for t in self.st.h_rider]
++        self.k = 0
++        self.rounds = 0
++        self.entries = 0
++        self.drains: dict[str, int] = {}
++        self.host: dict[int, SlotHost] = {}
++        self.flight: dict[int, int] = {}    # rows of each slot's window in the launched, unprocessed round
++        self.took: dict[int, tuple[bool, bool]] = {}    # did that round's drafting take the MTP / taps backlog
++        self.windows: dict[int, Window] = {}
++
++    # -- when -------------------------------------------------------------------------------------------------------
++    def eligible(self, active: list[int]) -> str | None:
++        """Why the batch cannot go resident after this round (None: it can). Deterministic on both ranks."""
++
++        bat = self.bat
++        if not active:
++            return "idle"
++        if not gr.sample_on(bat.g.w):
++            return "sampler"
++        from . import dump as dump_mod
++
++        if dump_mod.DUMP is not None:
++            return "dump"
++        world = 1 if bat.g.w.comm is None else bat.g.w.world
++        for s in active:
++            q = bat.seqs[s]
++            if q is None or q.stepper is None:
++                return "prefill"
++            stp = q.stepper
++            if stp.done(bat.eos):
++                return "done"
++            if stp.arm not in ("s", "m", "f"):
++                return f"arm {stp.arm}"
++            sp = stp.job.sampling
++            k = int(sp.top_k) + MARGIN if sp is not None and sp.temperature > 0 else 20 + MARGIN
++            if not gpusample.fits(k, world, sp, True):
++                return "top_k"
++            st = bat.states[s]
++            if _tracks_m(stp) and st.mtp_len - st.mtp_drafted <= 0:
++                return "mtp start"
++            if len(stp.drafts) >= gr.MAXD:
++                return "window"
++            rows = 1 + len(stp.drafts)          # the first round's commit appends up to its rows to the backlogs
++            if (_tracks_m(stp) and len(stp.m_next) + rows > self.st.backlog) or \
++                    (_tracks_f(stp) and stp.n_f + rows > self.st.backlog):
++                return "backlog"
++            if self.ops.mode(s, st.pos, st.pos, 1 + len(stp.drafts)) is None:
++                return "context mode"
++        return None
++
++    # -- the loop ----------------------------------------------------------------------------------------------------
++    def run(self, active: list[int]) -> str:
++        """Resident rounds over ``active`` until something drains them; then the batcher's state is the normal path's
++        and every finished request is finished. Both ranks call this at the same point with the same slots. -> why it
++        drained."""
++
++        bat = self.bat
++        self.entries += 1
++        self._enter(active)
++        inflight: Launched | None = None
++        reason = None
++        try:
++            while True:
++                plan = self._decide(active)
++                if isinstance(plan, str):
++                    reason = plan
++                    break
++                h, reason = self._launch(active, plan, inflight)      # processes the round in flight on the way
++                inflight = h
++                if reason is not None:
++                    break
++        finally:
++            if inflight is not None:
++                reason = self._process(inflight) or reason
++            self._exit(active)
++        reason = reason or "?"
++        self.drains[reason] = self.drains.get(reason, 0) + 1
++        for s in active:
++            q = bat.seqs[s]
++            if q is not None and q.stepper is not None and q.stepper.done(bat.eos):
++                bat._finish(s)
++        return reason
++
++    # -- entering: the normal path's state onto the device -------------------------------------------------------------
++    def _enter(self, active: list[int]) -> None:
++        bat, S = self.bat, self.st
++        I = S.h_I.numpy()
++        I[:] = 0
++        dr = S.h_draft.numpy()
++        dr[:] = 0
++        mt = S.h_mtok.numpy()
++        mt[:] = 0
++        self.host = {}
++        self.windows = {}
++        for s in active:
++            stp = bat.seqs[s].stepper
++            st = bat.states[s]
++            I[s, gr.PEND] = stp.out[-1]
++            I[s, gr.COUNT] = len(stp.out)
++            I[s, gr.MAXTOK] = stp.job.max_tokens
++            I[s, gr.STOPEOS] = int(stp.job.stop_eos)
++            I[s, gr.NREAL] = len(stp.drafts)
++            mc = len(stp.m_next) if _tracks_m(stp) else 0
++            fc = stp.n_f if _tracks_f(stp) else 0
++            I[s, gr.MCOUNT] = mc
++            I[s, gr.FCOUNT] = fc
++            I[s, gr.POS] = st.pos
++            mbase = st.mtp_len - st.mtp_drafted
++            I[s, gr.MBASE] = mbase
++            dr[s, :len(stp.drafts)] = stp.drafts
++            if mc:
++                mt[s, :mc] = stp.m_next         # (the device appends to every slot's; only these are read)
++            used = list(getattr(stp.opt, "used", []) or []) if stp.opt is not None else []
++            self.host[s] = SlotHost(pos=st.pos, count=len(stp.out), mcount=mc, fcount=fc, mbase=mbase, probs=used)
++            self.windows[s] = Window(arm=stp.arm, rows=1 + len(stp.drafts), steps=stp.steps, backlog=stp.backlog)
++            if st.mtp_drafted:               # ``decode.absorb``: the chained entries go at the next absorb
++                st.set_mtp_len(mbase)
++                st.mtp_drafted = 0
++        S.I.copy_(S.h_I, non_blocking=True)
++        S.DRAFT.copy_(S.h_draft, non_blocking=True)
++        S.MTOK.copy_(S.h_mtok, non_blocking=True)
++        S.F.fill_(1.0)
++        self.ops.enter(active)
++        self.k = 0
++        self.flight = {}
++        self.took = {}
++
++    # -- the host's decisions for the round it launches (one round stale) --------------------------------------------
++    def _decide(self, active: list[int]) -> Plan | str:
++        """This round verifies ``self.windows`` and drafts the next ones: per slot the drafter, its bound and rows,
++        every context mode the round meets, the backlog flushes. -> the plan, or why the rounds must drain."""
++
++        bat, S = self.bat, self.st
++        nxt: dict[int, Window] = {}
++        modes = []
++        for s in active:
++            stp = bat.seqs[s].stepper
++            hs = self.host[s]
++            st = bat.states[s]
++            win = self.windows[s]
++            lo, hi = hs.pos, hs.pos + self._inflight_rows(s)   # the window starts somewhere in [lo, hi]
++            m = self.ops.mode(s, lo, hi, win.rows)
++            if m is None:
++                return "context mode"
++            modes.append(m)
++            if hi + win.rows + 2 * gr.MAXD + 2 > st.capacity:
++                return "capacity"
++            try:                                # patches/0290: map the pages the window may write (host only)
++                self.ops.room(s, hi + win.rows)
++            except Exception:  # noqa: BLE001 - short of pool pages: the normal path decides
++                return "pool"
++            room = stp.job.max_tokens - (hs.count + self._inflight_rows(s))
++            arm, bound = self._arm(s, stp, hs, room)
++            if arm is None:
++                return "lookup"
++            rows = 1 + bound if arm in ("m", "f") else 1
++            nxt[s] = Window(arm=arm, rows=rows, steps=bound if arm == "m" else 0)
++        # backlogs: the absorb / taps pass takes at most this many rows; one that could overflow at the next commit is
++        # taken now (``Stepper.accept``'s early absorb)
++        flush_m, flush_f, n_hi_m, n_hi_f, m_modes = [], [], {}, {}, {}
++        for s in active:
++            stp = bat.seqs[s].stepper
++            win, w2 = self.windows[s], nxt[s]
++            m_hi = self._m_hi(s) + win.rows
++            f_hi = self._f_hi(s) + win.rows
++            if _tracks_m(stp) and (w2.arm == "m" or m_hi + w2.rows > S.backlog):
++                if w2.arm != "m":
++                    flush_m.append(s)
++                n = min(S.backlog, m_hi)
++                n_hi_m[s] = n
++                w2.backlog = n if w2.arm == "m" else w2.backlog
++                hs = self.host[s]
++                mm = [self.ops.mode_mtp(s, hs.mbase, hs.mbase + self._m_hi(s) + win.rows, n)]
++                if w2.arm == "m":
++                    mm += [self.ops.mode_mtp(s, hs.mbase + j, hs.mbase + m_hi + j, 1) for j in range(w2.steps - 1)]
++                if any(x is None for x in mm):
++                    return "MTP context mode"
++                m_modes[s] = mm
++            if _tracks_f(stp) and (w2.arm == "f" or f_hi + w2.rows > S.backlog):
++                if w2.arm != "f":
++                    flush_f.append(s)
++                n_hi_f[s] = min(S.backlog, f_hi)
++                if w2.arm == "f":
++                    w2.backlog = n_hi_f[s]
++        return Plan(nxt, modes, flush_m, flush_f, n_hi_m, n_hi_f, m_modes)
++
++    def _inflight_rows(self, s: int) -> int:
++        """Rows a slot may still commit in the round launched but not processed (0 before the first)."""
++
++        return self.flight.get(s, 0)
++
++    def _m_hi(self, s: int) -> int:
++        """A bound of the slot's MTP backlog at the end of the launched, unprocessed round: 0 when its drafting took
++        the backlog (the head absorbed it), else the last processed count plus the rows that round may have kept."""
++
++        if self.took.get(s, (False, False))[0]:
++            return 0
++        return self.host[s].mcount + self._inflight_rows(s)
++
++    def _f_hi(self, s: int) -> int:
++        if self.took.get(s, (False, False))[1]:
++            return 0
++        return self.host[s].fcount + self._inflight_rows(s)
++
++    def _arm(self, s: int, stp, hs: SlotHost, room: int) -> tuple[str | None, int]:
++        """``Stepper.propose``'s choices with the host's (stale) records: the drafter and the window's bound.
++        (None, 0): a lookup match (the normal path drafts it)."""
++
++        from . import adapt as adapt_mod
++
++        if stp.policy is None or room <= 1:
++            return "s", 0
++        if stp.lookup is not None:
++            stp.lookup.sync(stp.out)
++            most = min(stp.lookup.most, room)
++            drafts = stp.lookup.index.propose(most, stp.lookup.min_match)[0] if most > 0 else []
++            if drafts:
++                return None, 0
++        if stp.adapt is not None:
++            arm = stp.adapt.pick(self.bat.round_costs.rate())
++        else:
++            arm = stp.choice.pick() if stp.choice is not None else "m"
++        if arm == adapt_mod.SERIAL or (arm == "f" and stp.drafter is None):
++            return "s", 0
++        if arm == "m":
++            depth = max(1, min(stp.m_policy.next(*stp.last["m"]) if stp.opt is None else stp.opt.most_m, room))
++            if self.peek:                       # the device stops the chain; the host runs exactly its steps
++                return "m", max(1, min(depth, gr.MAXD - 1))
++            recent = hs.m_depths[-4:]
++            guess = (max(recent) + 1) if recent else 2           # the chain the device ran lately, one more
++            return "m", max(1, min(depth, guess, gr.MAXD - 1))
++        most = stp.opt.most_f if stp.opt is not None else stp.f_policy.next(*stp.last["f"])
++        depth = max(1, min(most, room, stp.drafter.block - 1))
++        if self.peek:                           # the next window's rows are read after the block
++            return "f", max(1, min(depth, gr.MAXD - 1))
++        recent = hs.f_depths[-4:]
++        guess = (max(recent) + 2) if recent else depth
++        return "f", max(1, min(depth, guess, gr.MAXD - 1))
++
++    # -- launching a round ---------------------------------------------------------------------------------------------
++    def peek_state(self) -> np.ndarray:
++        """GLM53_TF_GPU_ROUND_PEEK: the device counters as the stream has them now (a small pinned copy and its event:
++        no stream synchronization, nothing else waited for)."""
++
++        S = self.st
++        self.peeks += 1
++        S.h_peek.copy_(S.I, non_blocking=True)
++        self.ops.wait(self.ops.event())
++        return S.h_peek.numpy()
++
++    def _launch(self, active: list[int], plan: Plan, prev: Launched | None) -> tuple[Launched, str | None]:
++        """Round k: its front (the verify window through the commit and backlogs), then (peek) the previous round's
++        bookkeeping while the front runs, then the draft stage. -> (the round, a drain reason from the previous one)."""
++
++        bat, S, ops = self.bat, self.st, self.ops
++        reason = None
++        ring = self.k % RING
++        wins, nxt = self.windows, plan.nxt
++        Rs = [wins[s].rows for s in active]
++        T = sum(Rs)
++        H = S.h_H[ring].numpy()
++        H[:] = 0
++        P = S.h_P[ring].numpy()
++        P[:] = 0.0
++        rows = S.h_rows[ring].numpy()
++        o = 0
++        for s, R in zip(active, Rs):
++            H[s, gr.RUN] = R
++            H[s, gr.OFF] = o
++            w = nxt[s]
++            H[s, gr.BOUND] = w.rows - 1 if w.arm in ("m", "f") else 0
++            H[s, gr.ARMN] = {"s": gr.ARM_S, "m": gr.ARM_M, "f": gr.ARM_F}[w.arm]
++            stp = bat.seqs[s].stepper
++            if stp.opt is not None:         # batch-aware depths: this request's rows come after the others'
++                stp.opt.verify = bat.round_costs.table(sum(nxt[x].rows for x in active if x != s))
++            self._params(P[s], stp, w.arm)
++            rows[0, o:o + R] = s
++            rows[1, o:o + R] = np.arange(R)
++            o += R
++        S.H.copy_(S.h_H[ring], non_blocking=True)
++        S.P.copy_(S.h_P[ring], non_blocking=True)
++        S.ROWS[:, :T].copy_(S.h_rows[ring][:, :T], non_blocking=True)
++        ints, flts, width = self._sampler_rows(active, Rs)
++        ops.stage(T, ints)
++        logits = ops.forward(active, Rs, plan.modes)
++        if bat.overlap.emit:                    # patches/0370: the GPU is busy; the HTTP threads may run
++            bat._flush()
++        rider = self._rider(ring)
++        buf, P_len, at = ops.gather_candidates(logits, active, Rs, rider)
++        gpusample.launch(buf, P_len, ops.world(), ints, flts, S.TOK, None, ops.scratch(T, width), width)
++        n = len(active)
++        slots_t = ops.slots_tensor(active)
++        gr._accept_kernel[(n,)](S.I, S.H, S.F, S.DRAFT, S.TOK, S.EOS, S.n_eos, S.KEEPV, S.MTOK, S.REC, slots_t,
++                                BACKLOG_=S.backlog, NI_=gr.NI, NH_=gr.NH, NF_=gr.NF, MAXD_=gr.MAXD, REC_W=S.rec_w,
++                                MAXR=S.MAXR, num_warps=1)
++        ops.commit(active, Rs)
++        ops.backlogs(active, slots_t, max(Rs))
++        if self.peek and prev is not None:      # the host's work for round k - 1 while this round's forward runs
++            reason = self._process(prev)
++            prev = None
++        self.steps_run = {}
++        ms = [s for s in active if nxt[s].arm == "m"]
++        fs = [s for s in active if nxt[s].arm == "f"]
++        if ms or plan.flush_m:
++            ops.mtp(ms, plan.flush_m, nxt, plan.n_hi_m, plan.m_modes)
++        if fs or plan.flush_f:
++            ops.dflash(fs, plan.flush_f, nxt, plan.n_hi_f)
++        gr._finish_kernel[(n,)](S.I, S.NEXT, S.NPROB, S.DRAFT, S.DPROB, S.REC, S.RECF, slots_t, NI_=gr.NI,
++                                MAXD_=gr.MAXD, REC_W=S.rec_w, RECF_W=gr.MAXD, MAXR=S.MAXR, num_warps=1)
++        if rider is not None:
++            S.REC[n, :rider.numel()].copy_(buf[at:at + rider.numel()].view(torch.int32))
++        S.h_rec[ring][:n + 1].copy_(S.REC[:n + 1], non_blocking=True)
++        S.h_recf[ring][:n].copy_(S.RECF[:n], non_blocking=True)
++        ev = ops.event()
++        if self.peek:                           # the next windows' rows and the MTP passes, as the device decided them
++            I = self.peek_state()
++            for s in active:
++                w = nxt[s]
++                if w.arm in ("m", "f"):
++                    w.rows = 1 + int(I[s, gr.NREAL])
++                if w.arm == "m":
++                    w.steps = self.steps_run.get(s, w.steps)
++        h = Launched(self.k, list(active), dict(wins), dict(nxt), ring, ev, time.perf_counter())
++        ops.after_launch(active)
++        self.flight = {s: wins[s].rows for s in active}
++        self.took = {s: (s in plan.n_hi_m, s in plan.n_hi_f) for s in active}
++        self.windows = nxt
++        self.k += 1
++        self.rounds += 1
++        bat.round += 1
++        if prev is not None:                    # the host a whole round ahead: round k - 1 now
++            reason = self._process(prev)
++        return h, reason
++
++    def _params(self, P: np.ndarray, stp, arm: str) -> None:
++        pol = stp.m_policy if arm == "m" else stp.f_policy
++        depth_params(P, stp.opt, float(getattr(pol, "confidence", 0.0) or 0.0))
++
++    def _sampler_rows(self, active: list[int], Rs: list[int]):
++        """The verify rows' sampler table (the stage fills the positions on the device)."""
++
++        bat = self.bat
++        world = self.ops.world()
++        ints, flts, at, width = [], [], 0, 1
++        for s, R in zip(active, Rs):
++            sampling = bat.seqs[s].stepper.job.sampling
++            greedy = sampling is None or sampling.temperature <= 0
++            k = min(1 if greedy else int(sampling.top_k) + MARGIN, self.ops.vocab_part())
++            for r in range(R):
++                a, b = gpusample.row_entry(at + r * 2 * k, k, world, 0, sampling)
++                ints.append(a)
++                flts.append(b)
++            at += R * 2 * k
++            width = max(width, world * k)
++        return self.ops.upload(ints, torch.int64), self.ops.upload(flts, torch.float64), width
++
++    def _rider(self, ring: int):
++        """Rank 0's drain flag (a queued request, a cancel, stopping) on the round's exchange: [1] drain, [2] go on
++        (rank 1 sends zeros); both ranks read rank 0's words with the round's record. Staged in the round's own
++        pinned slot: the host is a round ahead of the copy."""
++
++        bat, S = self.bat, self.st
++        if bat.rider_n == 0:
++            return None
++        words = [0] * bat.rider_n
++        if not bat.following:
++            with bat.cv:
++                drain = bool(bat.queue) or bat.stopping or any(q is not None and q.job.cancel for q in bat.seqs)
++            words[0] = 1 if drain else 2
++        S.h_rider[ring].numpy()[:] = words
++        bat.rider_dev.copy_(S.h_rider[ring], non_blocking=True)
++        return bat.rider_dev
++
++    # -- a processed round: the host catches up ------------------------------------------------------------------------
++    def _process(self, h: Launched) -> str | None:
++        """Round ``h``'s record: every slot's tokens and counters into its ``Stepper`` (records, emits), the next
++        window's drafts' probabilities into the host's view. -> a drain reason, or None."""
++
++        from . import comm as comm_mod
++
++        bat, S = self.bat, self.st
++        self.ops.wait(h.event)
++        comm_mod.check(bat.g.w.comm)           # a failed RoCE exchange raises before any of its tokens is used
++        rec = S.h_rec[h.ring].numpy()
++        recf = S.h_recf[h.ring].numpy()
++        reason = None
++        n = len(h.active)
++        if bat.rider_n and int(rec[n, 0]) == 1:
++            reason = "rank 0"
++        parts, tokens = [], 0
++        shared = n > 1
++        for i, s in enumerate(h.active):
++            r = rec[i]
++            keep, count, done, pos, R, nd = (int(x) for x in r[:6])
++            toks = [int(t) for t in r[gr.REC_HEAD:gr.REC_HEAD + max(keep, 0)]]
++            win = h.windows[s]
++            hs = self.host[s]
++            q = bat.seqs[s]
++            stp = q.stepper
++            pad = max(0, R - 1 - nd)            # rows run past the drafts (a stale bound: lag mode only)
++            q.kinds["pad_rows"] += pad
++            bat.counts["pad_rows"] += pad
++            if keep > 0:
++                self._accepted(s, stp, win, hs, nd, keep, toks, shared)
++                tokens += keep
++                parts.append((win.arm, 1 + nd, win.steps, win.backlog))
++                bat._emit(q, toks[:max(0, stp.job.max_tokens - (len(stp.out) - keep))])
++            hs.pos, hs.count = pos, count
++            nn = int(r[8])
++            hs.probs = [float(p) for p in recf[i, :nn]]
++            hs.mcount, hs.fcount, hs.mbase = int(r[9]), int(r[10]), int(r[11])
++            nw = h.nxt[s]
++            if nw.arm == "m":
++                hs.m_depths.append(nn)
++            elif nw.arm == "f":
++                hs.f_depths.append(nn)
++            bat.states[s].pos = pos             # the host's mirror (the device's is authoritative)
++            q.kinds["resident"] += 1
++            q.kinds["verify_ms"] += (time.perf_counter() - h.t0) * 1e3
++            if done:
++                reason = reason or "done"
++        if parts:
++            bat.round_costs.record(parts, tokens)
++        return reason
++
++    def _accepted(self, s: int, stp, win: Window, hs: SlotHost, nd: int, keep: int, toks: list[int],
++                  shared: bool) -> None:
++        """``Stepper.accept``'s bookkeeping for a window the device committed."""
++
++        from . import adapt as adapt_mod, draftvocab
++
++        arm = win.arm
++        R = 1 + nd
++        if stp.policy is not None:
++            if stp.use_mtp:                     # patches/0420: the fallback rule's window (a round late)
++                draftvocab.track(self.bat.g.w, self.bat.states[s], toks)
++            a = arm if arm in ("m", "f") else adapt_mod.SERIAL
++            if stp.opt is not None:
++                stp.opt.used = list(hs.probs[:nd]) if a in ("m", "f") else []
++            if stp.adapt is not None:
++                stp.adapt.record(a, R, win.steps, win.backlog, keep, stp.opt.verify, shared)
++            elif stp.choice is not None and a in ("m", "f"):
++                stp.choice.record(a, R, win.steps, win.backlog, keep)
++            if stp.lookup is not None and a != adapt_mod.SERIAL:
++                stp.lookup.record(a, R, win.steps, win.backlog, keep)
++            if stp.opt is not None:
++                stp.opt.record(a, R, win.steps, win.backlog, keep)
++            if a in stp.last:
++                stp.last[a] = (nd, keep - 1)
++        stp.rounds += 1
++        stp.shared += int(shared)
++        stp.drafted += nd
++        stp.accepted += keep - 1
++        stp.depths.append(nd)
++        stp.keeps.append(keep)
++        stp.arms.append(arm)
++        stp.out.extend(toks)
++
++    # -- leaving: the device state back into the normal path's ---------------------------------------------------------
++    def _exit(self, active: list[int]) -> None:
++        bat, S = self.bat, self.st
++        self.ops.exit(active)
++        I = S.I.cpu().numpy()
++        mtok = S.MTOK.cpu().numpy()
++        drafts = S.DRAFT.cpu().numpy()
++        dprob = S.DPROB.cpu().numpy()
++        for s in active:
++            stp = bat.seqs[s].stepper
++            st = bat.states[s]
++            st.set_pos(int(I[s, gr.POS]), committed=True)
++            if getattr(st, "index_ring", 0):
++                st.save_index_tail()           # patches/0065: resident commits skip it; the tail of this position
++            win = self.windows[s]
++            nd = int(I[s, gr.NREAL])
++            stp.drafts = [int(t) for t in drafts[s, :nd]]
++            stp.arm = win.arm
++            stp.steps, stp.backlog = win.steps, win.backlog
++            if stp.opt is not None:
++                stp.opt.used = [float(p) for p in dprob[s, :nd]]
++            if _tracks_m(stp):
++                mc = int(I[s, gr.MCOUNT])
++                stp.m_next = [int(t) for t in mtok[s, :mc]]
++                chained = win.steps - 1 if win.arm == "m" else 0     # the head steps the device ran after the absorb
++                st.set_mtp_len(int(I[s, gr.MBASE]) + chained)
++                st.mtp_drafted = chained
++            if _tracks_f(stp):
++                stp.n_f = int(I[s, gr.FCOUNT])
++                self.ops.drafter_end(s, int(I[s, gr.POS]) - stp.n_f)
++
++
++def depth_params(P: np.ndarray, opt, confidence: float) -> None:
++    """A window's depth parameters for the device (``gpuround.P_*``): a ``DepthOptimizer``'s calibration factors,
++    look-ahead, rate and verify table as it would use them now (cost-derived depths), or the confidence threshold."""
++
++    if opt is not None:
++        from .depth import MAX_DRAFTS
++
++        cal = opt.cal
++        for j in range(16):
++            jj = min(j, MAX_DRAFTS - 1)
++            P[gr.P_FM + j] = cal.factor("m", jj)
++            P[gr.P_FF + j] = cal.factor("f", jj)
++            P[gr.P_AHEAD + j] = cal.ahead("m", jj)
++        P[gr.P_RATE] = opt.rate()
++        v = list(opt.verify)
++        for j in range(17):
++            P[gr.P_VERIFY + j] = v[min(j, len(v) - 1)]
++            P[gr.P_DV + j] = opt._dv(j) if j >= 1 else 0.0
++        P[gr.P_STEP] = opt.costs.get("mtp_step", 0.0)
++        P[gr.P_MODE] = gr.MODE_OPT
++        P[gr.P_MODE + 1] = len(v) - 1
++    else:
++        P[gr.P_CONF] = confidence
++        P[gr.P_MODE] = gr.MODE_CONF
++        P[gr.P_MODE + 1] = 16
++
++
++# -- the model side ----------------------------------------------------------------------------------------------------
++class RealOps:
++    """The engine's kernels for resident rounds (GPU)."""
++
++    def __init__(self, res: Resident) -> None:
++        self.res = res
++        self.bat = res.bat
++        g = self.bat.g
++        self.w = g.w
++        self.e = g.e
++        self._scratch = None
++        self._slots: dict[tuple, torch.Tensor] = {}
++        self._tabs: dict[tuple, Any] = {}
++        self._alt: dict[int, Any] = {}      # ``kda``: each slot's second scratch set
++        self.pred = self.succ = None
++
++    # -- small things
++    def device(self):
++        return self.w.device
++
++    def max_rows(self) -> int:
++        return self.e.buf.rows
++
++    def world(self) -> int:
++        return 1 if self.w.comm is None else self.w.world
++
++    def vocab_part(self) -> int:
++        return self.w.head.n
++
++    def upload(self, values: list, dtype) -> torch.Tensor:
++        return torch.tensor(values, dtype=dtype, pin_memory=True).to(self.w.device, non_blocking=True)
++
++    def event(self):
++        ev = torch.cuda.Event()
++        ev.record()
++        return ev
++
++    @staticmethod
++    def wait(ev) -> None:
++        ev.synchronize()
++
++    def slots_tensor(self, active: list[int]) -> torch.Tensor:
++        key = tuple(active)
++        t = self._slots.get(key)
++        if t is None:
++            t = torch.tensor(active, dtype=torch.int32, device=self.w.device)
++            self._slots[key] = t
++        return t
++
++    def scratch(self, rows: int, width: int) -> torch.Tensor:
++        need = max(1, rows) * 2 * gpusample.block_for(width)
++        if self._scratch is None or self._scratch.numel() < need:
++            self._scratch = torch.empty((max(need, 1 << 14),), dtype=torch.float64, device=self.w.device)
++        return self._scratch
++
++    def mode(self, s: int, lo: int, hi: int, R: int):
++        """The window's context mode if it is the same wherever in [lo, hi] it starts (0 dense, else patches/0050's
++        pool bucket), else None."""
++
++        st = self.bat.states[s]
++        a, b = self.bat._mode_at(st, lo, R), self.bat._mode_at(st, hi, R)
++        return a if a is not None and a == b else None
++
++    def mode_mtp(self, s: int, lo: int, hi: int, n: int):
++        return self.mode(s, lo, hi, n)
++
++    def room(self, s: int, end: int) -> None:
++        st = self.bat.states[s]
++        if getattr(st, "pages", None) is not None:      # patches/0290: map every page a window may write
++            st.pages.ensure(min(st.capacity, end))
++
++    def enter(self, active: list[int]) -> None:
++        d0 = self.bat.g.drafter
++        if d0 is not None and self.pred is None:
++            self.pred = torch.from_numpy(np.ascontiguousarray(d0.pred, dtype=np.float32)).to(self.w.device)
++            self.succ = torch.from_numpy(np.ascontiguousarray(d0.succ, dtype=np.float32)).to(self.w.device)
++
++    def after_launch(self, active: list[int]) -> None:
++        for s in active:                    # the KDA state parity flips every round (``forward.commit``)
++            st = self.bat.states[s]
++            if st.cur:
++                st.cur = [1 - st.cur[0]] * len(st.cur)
++
++    def drafter_end(self, s: int, end: int) -> None:
++        d = self.bat.drafters[s]
++        if d is not None:
++            d.resident_end(end)
++
++    # -- stage / forward
++    def stage(self, T: int, ints: torch.Tensor) -> None:
++        S = self.res.st
++        gr._stage_kernel[(T,)](S.I, S.H, S.DRAFT, S.ROWS[0], S.ROWS[1], self.e.buf.ids, S.SRC, ints, NI_=gr.NI,
++                               NH_=gr.NH, MAXD_=gr.MAXD, num_warps=1)
++
++    def forward(self, active: list[int], Rs: list[int], modes: list) -> torch.Tensor:
++        """``compute_multi`` over the windows (resident keys under the batcher's graph policy; padded rows route as
++        their window's last real row)."""
++
++        from .batch import compute_multi
++
++        bat = self.bat
++        w, e, b = self.w, self.e, self.e.buf
++        e.rows_from = None
++        sts = [bat.states[s] for s in active]
++        T = sum(Rs)
++        bat.last_rows = list(Rs)
++        key = ("resident", tuple(active), tuple(Rs), tuple(modes), tuple(st.cur[0] if st.cur else 0 for st in sts),
++               self.res.kda)
++        tables = self._kda_tables(active, Rs) if self.res.kda else None
++
++        def run() -> None:
++            b.route_src = self.res.st.SRC
++            b.kda_slots = tables
++            try:
++                compute_multi(w, sts, b, Rs, npbs=modes)
++            finally:
++                b.route_src = None
++                b.kda_slots = None
++
++        g = bat.multi.get(key)
++        if g is not None:
++            bat.counts["graph"] += 1
++            g.replay()
++            return b.logits[:T]
++        run()
++        bat.counts["eager"] += 1
++        if bat.use_graphs and len(bat.multi) < bat.max_graphs and bat.sightings.capture(key):
++            torch.cuda.synchronize()
++            graph = torch.cuda.CUDAGraph()
++            try:
++                with torch.cuda.graph(graph, pool=bat.pool, capture_error_mode="thread_local"):
++                    run()
++            except Exception as exc:  # noqa: BLE001 - eager from here on
++                bat.use_graphs = False
++                print(f"[tensorfold] resident round CUDA graph capture failed ({type(exc).__name__}: {exc}); eager",
++                      flush=True)
++                torch.cuda.synchronize()
++            else:
++                bat.multi[key] = graph
++                bat.counts["capture"] += 1
++        return b.logits[:T]
++
++    def gather_candidates(self, logits: torch.Tensor, active: list[int], Rs: list[int], rider):
++        """Every row's top candidates (``sample_multi``'s) and the rider in one exchange. -> (the gathered buffer, a
++        rank's part, the rider's offset in rank 0's part)."""
++
++        from . import comm as comm_mod
++
++        bat = self.bat
++        parts, off = [], 0
++        for s, R in zip(active, Rs):
++            sampling = bat.seqs[s].stepper.job.sampling
++            greedy = sampling is None or sampling.temperature <= 0
++            k = 1 if greedy else min(logits.shape[1], int(sampling.top_k) + MARGIN)
++            vals, ids = torch.topk(logits[off:off + R].float(), k, dim=-1)
++            ids = (ids + self.w.vocab_offset).to(torch.int32)
++            parts.append(torch.cat([vals, ids.view(torch.float32)], dim=1).reshape(-1))
++            off += R
++        at = sum(p.numel() for p in parts)
++        if rider is not None:
++            parts.append(rider.view(torch.float32))
++        flat = torch.cat(parts).contiguous()
++        if self.w.comm is None:
++            return flat, flat.numel(), at
++        buf = torch.empty((self.w.world * flat.numel(),), dtype=torch.float32, device=flat.device)
++        comm_mod.fast_gather(self.w.comm, flat, buf)            # patches/0230
++        return buf, flat.numel(), at
++
++    # -- commit
++    def commit(self, active: list[int], Rs: list[int]) -> None:
++        """KDA: every slot's replay in one launch (``kda.replay_slots``: keeps on the device, a slot that kept every row
++        run skipped), or nothing with ``kda`` (the next chain folds it); conv windows; positions."""
++
++        from . import kda as kda_mod
++
++        bat, S = self.bat, self.res.st
++        n = len(active)
++        sts = [bat.states[s] for s in active]
++        if sts[0].cur and not self.res.kda:
++            S.RUNV[:n].copy_(self.upload(Rs, torch.int32))
++            tab = self._replay_table(active, sts, fold=False)
++            ss = sts[0].scratch_set
++            kda_mod._ext().replay_slots(tab, S.KEEPV[:n], S.RUNV[:n], ss.layers, ss.heads, sts[0].rec[0, 0].numel(), 1)
++        for s, st in zip(active, sts):
++            if st.cur:
++                C = st.conv.shape[2]
++                gr._conv_shift_dev[(len(st.cur), triton.cdiv(C, 1024))](
++                    st.conv, st.proj, S.I, s, st.conv.stride(0), st.proj.stride(0), st.proj.stride(1), C=C, TAPS=3,
++                    NI_=gr.NI, BLOCK=1024, num_warps=4)
++            st.pos_dev.copy_(S.I[s, gr.POS:gr.POS + 1])
++
++    def _replay_table(self, active: list[int], sts, *, fold: bool) -> torch.Tensor:
++        """Per slot: the state in / out of this parity and the saves the replay reads (``fold``: the last chain's)."""
++
++        key = ("replay", tuple(active), tuple(st.cur[0] for st in sts), fold)
++        t = self._tabs.get(key)
++        if t is None:
++            rows = []
++            for s, st in zip(active, sts):
++                cur = st.cur[0]
++                ss = self._saves(s, st, 1 - cur) if fold else st.scratch_set
++                rows.append([st.rec[cur].data_ptr(), st.rec[1 - cur].data_ptr(), ss.k.data_ptr(), ss.v.data_ptr(),
++                             ss.g.data_ptr(), ss.b.data_ptr(), ss.k.stride(0), ss.b.stride(0)])
++            t = torch.tensor(rows, dtype=torch.int64, device=self.w.device)
++            self._tabs[key] = t
++        return t
++
++    def _saves(self, s: int, st, parity: int):
++        """``kda``: the scratch set a chain run at KDA parity ``parity`` saves into (0: the State's, 1: the second)."""
++
++        if parity == 0:
++            return st.scratch_set
++        a = self._alt.get(s)
++        if a is None:
++            from . import kda as kda_mod
++            from .engine import MAX_ROWS
++
++            ss = st.scratch_set
++            a = kda_mod.KDAScratchSet(ss.layers, min(MAX_ROWS, ss.rows), ss.heads, st.rec.device)
++            self._alt[s] = a
++        return a
++
++    def _kda_tables(self, active: list[int], Rs: list[int]):
++        """``kda``: ``kda.chain_slots``' tables of this key's layers (built once; its graph holds their addresses)."""
++
++        from . import kda as kda_mod
++
++        bat, S, b = self.bat, self.res.st, self.e.buf
++        sts = [bat.states[s] for s in active]
++        key = ("chain", tuple(active), tuple(Rs), tuple(st.cur[0] for st in sts))
++        t = self._tabs.get(key)
++        if t is None:
++            offs, o = [], 0
++            for R in Rs:
++                offs.append(o)
++                o += R
++            saves = [self._saves(s, st, st.cur[0]) for s, st in zip(active, sts)]
++            prev = [self._saves(s, st, 1 - st.cur[0]) for s, st in zip(active, sts)]
++            t = kda_mod.SlotTables(sts, saves, prev, b, offs, Rs, S.I, self.slots_tensor(active), gr.NI, gr.PREKEEP)
++            self._tabs[key] = t
++        return t
++
++    def backlogs(self, active: list[int], slots_t: torch.Tensor, rmax: int) -> None:
++        """The kept rows' MTP input rows (final-normed) and DFlash2 taps into every slot's backlog."""
++
++        bat, S, b = self.bat, self.res.st, self.e.buf
++        n = len(active)
++        D = self.w.cfg.hidden
++        m_all = bat.m_all
++        if m_all is not None:
++            gr._backlog_kernel[(n, rmax, triton.cdiv(D, 1024))](
++                b.fnormed, b.fnormed.stride(0), m_all, m_all.stride(0), m_all.stride(1), S.I, S.H, slots_t, D, 0,
++                S.backlog, NI_=gr.NI, NH_=gr.NH, WHICH=0, BLOCK=1024, num_warps=4)
++        f_all = bat.f_all
++        if f_all is not None:
++            for ti, tap in enumerate(b.taps):
++                gr._backlog_kernel[(n, rmax, triton.cdiv(D, 1024))](
++                    tap, tap.stride(0), f_all, f_all.stride(0), f_all.stride(1), S.I, S.H, slots_t, D, ti * D,
++                    S.backlog, NI_=gr.NI, NH_=gr.NH, WHICH=1, BLOCK=1024, num_warps=4)
++
++    # -- drafting: MTP chains
++    def mtp(self, ms: list[int], flush: list[int], nxt: dict, n_hi: dict, m_modes: dict) -> None:
++        """Every m-slot's MTP chain, and the backlog of the slots that flush it: one head pass absorbs every backlog
++        (``batch.mtp_multi`` on device-staged rows, each slot's last real row selected on the device), then one pass
++        a chained step; drafts sampled and chosen on the device (``_mtp_next_kernel``)."""
++
++        from . import draftvocab
++
++        bat, S, w = self.bat, self.res.st, self.w
++        b = self.e.mbuf
++        items = ms + flush
++        sts = [bat.states[s] for s in items]
++        full = any(draftvocab.full(w, st, "mtp") for st in sts)
++        ns = [n_hi[s] for s in items]
++        offs, o = [], 0
++        for n in ns:
++            offs.append(o)
++            o += n
++        for s, st, off, n in zip(items, sts, offs, ns):
++            b.ids[off:off + n].copy_(S.MTOK[s, :n])
++            b.hin[off:off + n].copy_(bat.m_rows[s][:n])
++            st.mtp_pos_dev.copy_(S.I[s, gr.MBASE:gr.MBASE + 1])
++        sel = self._sel(items, offs, gr.MCOUNT)
++        logits = self._pass(items, sts, ns, offs, o, sel, full, [m_modes[s][0] for s in items])
++        for s, st in zip(items, sts):         # MBASE += MCOUNT, MCOUNT = 0; the head's length after the absorb
++            S.I[s, gr.MBASE].add_(S.I[s, gr.MCOUNT])
++            S.I[s, gr.MCOUNT].zero_()
++            st.mtp_pos_dev.copy_(S.I[s, gr.MBASE:gr.MBASE + 1])
++        if not ms:
++            return
++        slots_m = self.slots_tensor(ms)
++        m_sts = sts[:len(ms)]
++        D = max(nxt[s].steps for s in ms)
++        passes = 1
++        for j in range(D):
++            tok, prob = self._draw(logits[:len(ms)], ms, j)
++            gr._mtp_next_kernel[(len(ms),)](S.I, S.F, S.P, S.NEXT, S.NPROB, tok, prob, slots_m, j, NI_=gr.NI,
++                                            NF_=gr.NF, NP_=gr.NP, MAXD_=gr.MAXD, QMAX=gr.Q_MAX, num_warps=1)
++            if j + 1 >= D:
++                break
++            if self.res.peek and not any(int(self.res.peek_state()[s, gr.LIVE]) for s in ms):
++                break                           # every chain stopped here: no step runs for nothing
++            passes += 1
++            b.hin[:len(ms)].copy_(b.fnormed[:len(ms)])             # ``Engine.draft_hidden``: the head's output rows
++            b.ids[:len(ms)].copy_(tok)
++            idx = self._arange(len(ms))
++            modes = [m_modes[s][1 + j] if 1 + j < len(m_modes[s]) else m_modes[s][-1] for s in ms]
++            logits = self._pass(ms, m_sts, [1] * len(ms), list(range(len(ms))), len(ms), idx, full, modes)
++            for st in m_sts:
++                st.mtp_pos_dev.add_(1)
++        for s in ms:
++            self.res.steps_run[s] = passes
++
++    def _sel(self, items: list[int], offs: list[int], col: int) -> torch.Tensor:
++        """Each item's last real row in the pass: its offset + its count - 1 (the count read on the device), in the
++        persistent ``SEL`` (a captured head pass reads it there)."""
++
++        S = self.res.st
++        key = ("offs", tuple(offs))
++        base = self._tabs.get(key)
++        if base is None:
++            base = torch.tensor(offs, dtype=torch.int64, device=self.w.device)
++            self._tabs[key] = base
++        cnt = S.I.index_select(0, self.slots_tensor(items).long())[:, col].long()
++        n = len(items)
++        S.SEL[:n].copy_(base + (cnt - 1).clamp(min=0))
++        return S.SEL[:n]
++
++    def _arange(self, n: int) -> torch.Tensor:
++        key = ("arange", n)
++        t = self._tabs.get(key)
++        if t is None:
++            t = torch.arange(n, dtype=torch.int64, device=self.w.device)
++            self._tabs[key] = t
++        return t
++
++    def _pass(self, items, sts, ns, offs, T, sel, full, modes) -> torch.Tensor:
++        """A head pass, as a CUDA graph per (items, rows, modes, head) under the batcher's graph policy (its inputs
++        are the head's buffers, the slots' head positions and ``SEL``: the same addresses every time)."""
++
++        bat = self.bat
++        key = ("mtp", tuple(items), tuple(ns), tuple(modes), bool(full))
++        g = bat.multi.get(key)
++        if g is not None:
++            from . import draftvocab
++
++            g.replay()
++            return self.e.mbuf.logits[:len(sts), :draftvocab.head_for(self.w, "mtp", full).n]
++        out = self._head_pass(sts, ns, offs, T, sel, full, modes)
++        if bat.use_graphs and len(bat.multi) < bat.max_graphs and bat.sightings.capture(key):
++            torch.cuda.synchronize()
++            graph = torch.cuda.CUDAGraph()
++            try:
++                with torch.cuda.graph(graph, pool=bat.pool, capture_error_mode="thread_local"):
++                    self._head_pass(sts, ns, offs, T, sel, full, modes)
++            except Exception:  # noqa: BLE001 - eager from here on
++                bat.use_graphs = False
++                torch.cuda.synchronize()
++            else:
++                bat.multi[key] = graph
++        return out
++
++    def _head_pass(self, sts, ns, offs, T, sel, full, modes) -> torch.Tensor:
++        """``batch.mtp_multi`` on rows already in the head's buffers: the capturable attention (device positions),
++        each item's selected row through the final norm and the head. -> logits [items, draft columns]."""
++
++        from . import draftvocab, glue, qmm
++        from .batch import _dsa
++        from .forward import _join, moe_block
++
++        w, b = self.w, self.e.mbuf
++        c = w.cfg
++        m = w.mtp
++        D = c.hidden
++        N = len(sts)
++        glue.embed(b.ids[:T], w.embed, D, 1, b.me[:T])
++        glue.rmsnorm(b.me[:T], m.enorm, c.eps, b.mcat[:T, :D])
++        glue.rmsnorm(b.hin[:T], m.hnorm, c.eps, b.mcat[:T, D:])
++        qmm.matmul(b.mcat[:T], m.eh, qmm.group_sums(b.mcat[:T], b.mxs[:T]), out=b.mx[:T], part=b.sk)
++        layer = m.layer
++        glue.rmsnorm(b.mx[:T], layer.in_norm, c.eps, b.normed[:T], b.xs[:T])
++        b.site = ("mtp", "a")
++        caches = [(st.mtp_kc, st.mtp_vc, st.mtp_pos_dev, st.index[-1] if st.index is not None else None)
++                  for st in sts]
++        g = _dsa(layer, w, sts, b, ns, offs, T, None, None, modes, caches=caches)
++        glue.residual_add(b.mx[:T], b.mx[:T], g)
++        glue.rmsnorm(b.mx[:T], layer.post_norm, c.eps, b.normed[:T], b.xs[:T])
++        b.site = ("mtp", "f")
++        g = moe_block(layer, w, b, T)
++        glue.residual_add(b.mx[:T], b.mx[:T], g)
++        rows = b.mx[:T].index_select(0, sel)
++        glue.rmsnorm(rows, m.norm, c.eps, b.fnormed[:N], b.fxs[:N])
++        head = draftvocab.head_for(w, "mtp", full)
++        out = qmm.matmul(b.fnormed[:N], head, b.fxs[:N], out=b.logits[:N, :head.n], part=b.sk)
++        _join(w)
++        return out
++
++    def _draw(self, rows: torch.Tensor, items: list[int], j: int):
++        """Each item's draft j from its logits row (``sample_drafts``: the same candidates, draw and probability,
++        positions from the device)."""
++
++        from . import comm as comm_mod, draftvocab
++
++        bat, S, w = self.bat, self.res.st, self.w
++        V = rows.shape[1]
++        parts, ints, flts, at, width = [], [], [], 0, 1
++        world = self.world()
++        for i, s in enumerate(items):
++            sampling = bat.seqs[s].stepper.job.sampling
++            greedy = sampling is None or sampling.temperature <= 0
++            k = min(V, 20 + MARGIN) if greedy else min(V, int(sampling.top_k) + MARGIN)
++            vals, ids = torch.topk(rows[i:i + 1].float(), k, dim=-1)
++            ids = draftvocab.ids_of(w, ids, V)
++            parts.append(torch.cat([vals, ids.view(torch.float32)], dim=1).reshape(-1))
++            a, bb = gpusample.row_entry(at, k, world, 0, sampling, True)
++            ints.append(a)
++            flts.append(bb)
++            at += 2 * k
++            width = max(width, world * k)
++        flat = torch.cat(parts).contiguous()
++        if w.comm is None:
++            buf = flat
++        else:
++            buf = torch.empty((w.world * flat.numel(),), dtype=torch.float32, device=flat.device)
++            comm_mod.fast_gather(w.comm, flat, buf)
++        it = self.upload(ints, torch.int64)
++        ft = self.upload(flts, torch.float64)
++        draft_positions(S.I, self.slots_tensor(items), it, j)
++        tok = torch.empty((len(items),), dtype=torch.int32, device=w.device)
++        prob = torch.empty((len(items),), dtype=torch.float64, device=w.device)
++        gpusample.launch(buf, flat.numel(), world, it, ft, tok, prob, self.scratch(len(items), width), width)
++        return tok, prob
++
++    # -- drafting: DFlash2 blocks
++    def dflash(self, fs: list[int], flush: list[int], nxt: dict, n_hi: dict) -> None:
++        """Every f-slot's DFlash2 block: its taps backlog (a device count), the block pass, the chain and the depth on
++        the device; the slots that flush take their taps only."""
++
++        from . import dflash2, draftvocab
++
++        bat, S = self.bat, self.res.st
++        for s in fs + flush:
++            d = bat.drafters[s]
++            d.add_taps_dev(bat.f_taps[s][:n_hi[s]], S.I[s, gr.FCOUNT:gr.FCOUNT + 1], n_hi[s],
++                           self.res.host[s].pos + self.res._inflight_rows(s))
++            S.I[s, gr.FCOUNT].zero_()
++        for s in fs:
++            d = bat.drafters[s]
++            d.ids[:1].copy_(S.I[s, gr.PEND:gr.PEND + 1])
++            d.dv_full = draftvocab.full(self.w, d.dv_st, "dflash")
++            graph = d.block_graph_full if d.dv_full else d.block_graph
++            if graph is not None:
++                graph.replay()
++            else:
++                d._block_compute()
++            sampling = bat.seqs[s].stepper.job.sampling
++            dflash2.chain_dev(d, self.pred, self.succ, S.I, S.NEXT, S.NPROB, s, sampling,
++                              min(nxt[s].rows - 1, d.block - 1), gr.NI, gr.MAXD)
++        if fs:
++            gr._f_depth_kernel[(len(fs),)](S.I, S.P, S.NPROB, self.slots_tensor(fs), NI_=gr.NI, NP_=gr.NP,
++                                           MAXD_=gr.MAXD, QMAX=gr.Q_MAX, num_warps=1)
++
++    # -- leaving
++    def exit(self, active: list[int]) -> None:
++        """``kda``: the last window's commit, folded into a chain that never ran, is replayed now: the State's KDA state
++        is the committed one again (``replay_slots`` from the last chain's saves)."""
++
++        if not self.res.kda:
++            return
++        from . import kda as kda_mod
++
++        bat, S = self.bat, self.res.st
++        sts = [bat.states[s] for s in active]
++        if not sts or not sts[0].cur:
++            return
++        n = len(active)
++        tab = self._replay_table(active, sts, fold=True)
++        keep = S.I.index_select(0, self.slots_tensor(active).long())[:, gr.PREKEEP].contiguous()
++        S.RUNV[:n].fill_(-1)
++        ss = sts[0].scratch_set
++        kda_mod._ext().replay_slots(tab, keep, S.RUNV[:n], ss.layers, ss.heads, sts[0].rec[0, 0].numel(), 0)
++        for st in sts:
++            st.cur = [1 - st.cur[0]] * len(st.cur)
++
++
++def draft_positions(I: torch.Tensor, slots: torch.Tensor, ints: torch.Tensor, j: int) -> None:
++    """Draft j's sampler rows: the slot's committed length + 1 + j (``decode.draft``'s ``position + j``)."""
++
++    ints[:, 3].copy_(I.index_select(0, slots.long())[:, gr.POS].long() + 1 + j)

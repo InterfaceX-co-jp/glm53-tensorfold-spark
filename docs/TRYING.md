@@ -98,8 +98,12 @@ curl -s $B/v1/chat/completions -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-- Streaming (`"stream": true`), tools (`tools`, `tool_choice`) and reasoning (`reasoning_content`, also as
-  `reasoning`) follow the OpenAI API.
+- Streaming (`"stream": true`), tools (`tools`, `tool_choice`) and reasoning follow the OpenAI API. Reasoning comes
+  as `reasoning` in the production config (`GLM53_TF_REASONING_FIELDS=reasoning`, as the vLLM kit); the other
+  configs and `GLM53_TF_REASONING_FIELDS=both` also send `reasoning_content`.
+- Images (production config, `GLM53_TF_VISION=1`, patch 0500): `image_url` content parts with a `data:` or `http(s)`
+  URL, up to 8 a request; example in the README ([image input](../README.md#image-input)), limits and knobs in
+  [`VISION.md`](VISION.md).
 - The response has a `tensorfold` object (decode tok/s, TTFT, prefill seconds, the knobs used) and a `speculative`
   object (rounds, drafted and accepted tokens). `usage.prompt_tokens_details.cached_tokens` shows a session hit.
 - `/health` and `/metrics` (Prometheus) on the same port (patch 0150).
@@ -126,7 +130,8 @@ long tables that way against 5-6/6 with thinking off.
 Nothing to do: every request resumes from the longest stored prefix of the same conversation (the stored states
 are keyed by the token prefix). With the single-stream config the store holds `GLM53_TF_SESSION_GIB` of other
 sessions; in the batch configs each slot keeps its own conversation, the 2 GiB RAM store holds a few more, and in the
-production config the NVMe tier keeps every evicted session (up to 64 GiB a node) and survives restarts. Check `cached_tokens` in `usage`. `"priority": "background"` (and opencode's
+production config the NVMe tier keeps every evicted session (up to 64 GiB a node) and survives restarts. Check `cached_tokens` in `usage`. The same prompt sent again (a regenerate, a retry) resumes all
+but its last <= 64 tokens (patch 0540); the resumed state is bit-identical to a fresh prefill. `"priority": "background"` (and opencode's
 session-title requests, recognised automatically) waits behind foreground requests.
 
 ## 3. A/B a knob without a restart (`tf_knobs`)

@@ -1,0 +1,588 @@
+{
+ "all|all|m": {
+  "rounds": 4016,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.29,
+  "a_cond": [
+   0.847,
+   0.776,
+   0.732,
+   0.645
+  ],
+  "attempted": [
+   4016,
+   3394,
+   2630,
+   1920
+  ],
+  "p_cum": [
+   0.847,
+   0.657,
+   0.481,
+   0.31
+  ]
+ },
+ "all|greedy|m": {
+  "rounds": 1992,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.297,
+  "a_cond": [
+   0.84,
+   0.777,
+   0.753,
+   0.649
+  ],
+  "attempted": [
+   1992,
+   1671,
+   1294,
+   972
+  ],
+  "p_cum": [
+   0.84,
+   0.653,
+   0.491,
+   0.319
+  ]
+ },
+ "all|sampled|m": {
+  "rounds": 2024,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.284,
+  "a_cond": [
+   0.854,
+   0.776,
+   0.711,
+   0.64
+  ],
+  "attempted": [
+   2024,
+   1723,
+   1336,
+   948
+  ],
+  "p_cum": [
+   0.854,
+   0.662,
+   0.471,
+   0.302
+  ]
+ },
+ "agent|all|m": {
+  "rounds": 1580,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.992,
+  "a_cond": [
+   0.937,
+   0.901,
+   0.837,
+   0.726
+  ],
+  "attempted": [
+   1580,
+   1477,
+   1328,
+   1110
+  ],
+  "p_cum": [
+   0.937,
+   0.844,
+   0.707,
+   0.513
+  ]
+ },
+ "agent|greedy|m": {
+  "rounds": 771,
+  "mean_depth": 3.98,
+  "tokens_a_round": 4.04,
+  "a_cond": [
+   0.929,
+   0.916,
+   0.857,
+   0.741
+  ],
+  "attempted": [
+   771,
+   715,
+   652,
+   559
+  ],
+  "p_cum": [
+   0.929,
+   0.851,
+   0.73,
+   0.541
+  ]
+ },
+ "agent|sampled|m": {
+  "rounds": 809,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.947,
+  "a_cond": [
+   0.944,
+   0.887,
+   0.817,
+   0.711
+  ],
+  "attempted": [
+   809,
+   762,
+   676,
+   551
+  ],
+  "p_cum": [
+   0.944,
+   0.838,
+   0.685,
+   0.487
+  ]
+ },
+ "code|all|m": {
+  "rounds": 887,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.463,
+  "a_cond": [
+   0.9,
+   0.793,
+   0.749,
+   0.603
+  ],
+  "attempted": [
+   887,
+   797,
+   630,
+   469
+  ],
+  "p_cum": [
+   0.9,
+   0.713,
+   0.534,
+   0.321
+  ]
+ },
+ "code|greedy|m": {
+  "rounds": 444,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.459,
+  "a_cond": [
+   0.896,
+   0.776,
+   0.779,
+   0.609
+  ],
+  "attempted": [
+   444,
+   398,
+   308,
+   238
+  ],
+  "p_cum": [
+   0.896,
+   0.696,
+   0.542,
+   0.329
+  ]
+ },
+ "code|sampled|m": {
+  "rounds": 443,
+  "mean_depth": 3.99,
+  "tokens_a_round": 3.467,
+  "a_cond": [
+   0.903,
+   0.81,
+   0.72,
+   0.597
+  ],
+  "attempted": [
+   443,
+   399,
+   322,
+   231
+  ],
+  "p_cum": [
+   0.903,
+   0.731,
+   0.526,
+   0.314
+  ]
+ },
+ "prose|all|m": {
+  "rounds": 1549,
+  "mean_depth": 3.99,
+  "tokens_a_round": 2.475,
+  "a_cond": [
+   0.725,
+   0.6,
+   0.507,
+   0.437
+  ],
+  "attempted": [
+   1549,
+   1120,
+   672,
+   341
+  ],
+  "p_cum": [
+   0.725,
+   0.435,
+   0.221,
+   0.097
+  ]
+ },
+ "prose|greedy|m": {
+  "rounds": 777,
+  "mean_depth": 3.99,
+  "tokens_a_round": 2.467,
+  "a_cond": [
+   0.719,
+   0.599,
+   0.524,
+   0.411
+  ],
+  "attempted": [
+   777,
+   558,
+   334,
+   175
+  ],
+  "p_cum": [
+   0.719,
+   0.431,
+   0.226,
+   0.093
+  ]
+ },
+ "prose|sampled|m": {
+  "rounds": 772,
+  "mean_depth": 3.98,
+  "tokens_a_round": 2.483,
+  "a_cond": [
+   0.731,
+   0.601,
+   0.491,
+   0.464
+  ],
+  "attempted": [
+   772,
+   562,
+   338,
+   166
+  ],
+  "p_cum": [
+   0.731,
+   0.439,
+   0.216,
+   0.101
+  ]
+ },
+ "requests": [
+  {
+   "name": "chat",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 41.16,
+   "tpr": 2.716,
+   "mix": {
+    "MTP": 141
+   }
+  },
+  {
+   "name": "chat",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 40.62,
+   "tpr": 2.66,
+   "mix": {
+    "MTP": 144
+   }
+  },
+  {
+   "name": "essay",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 34.57,
+   "tpr": 2.28,
+   "mix": {
+    "MTP": 168
+   }
+  },
+  {
+   "name": "essay",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 33.14,
+   "tpr": 2.189,
+   "mix": {
+    "MTP": 175
+   }
+  },
+  {
+   "name": "hashmap",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 41.97,
+   "tpr": 2.736,
+   "mix": {
+    "MTP": 140
+   }
+  },
+  {
+   "name": "hashmap",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 43.31,
+   "tpr": 2.816,
+   "mix": {
+    "MTP": 136
+   }
+  },
+  {
+   "name": "tides",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 41.22,
+   "tpr": 2.678,
+   "mix": {
+    "MTP": 143
+   }
+  },
+  {
+   "name": "tides",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 42.86,
+   "tpr": 2.775,
+   "mix": {
+    "MTP": 138
+   }
+  },
+  {
+   "name": "letter",
+   "cat": "prose",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 32.04,
+   "tpr": 2.07,
+   "mix": {
+    "MTP": 185
+   }
+  },
+  {
+   "name": "letter",
+   "cat": "prose",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 33.1,
+   "tpr": 2.14,
+   "mix": {
+    "MTP": 179
+   }
+  },
+  {
+   "name": "code-lru",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 51.62,
+   "tpr": 3.389,
+   "mix": {
+    "MTP": 113
+   }
+  },
+  {
+   "name": "code-lru",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 51.87,
+   "tpr": 3.45,
+   "mix": {
+    "MTP": 111
+   }
+  },
+  {
+   "name": "code-fib",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 54.75,
+   "tpr": 3.648,
+   "mix": {
+    "MTP": 105
+   }
+  },
+  {
+   "name": "code-fib",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 55.24,
+   "tpr": 3.683,
+   "mix": {
+    "MTP": 104
+   }
+  },
+  {
+   "name": "code-go",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 48.05,
+   "tpr": 3.192,
+   "mix": {
+    "MTP": 120
+   }
+  },
+  {
+   "name": "code-go",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 46.18,
+   "tpr": 3.089,
+   "mix": {
+    "MTP": 124
+   }
+  },
+  {
+   "name": "code-ts",
+   "cat": "code",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 53.76,
+   "tpr": 3.613,
+   "mix": {
+    "MTP": 106
+   }
+  },
+  {
+   "name": "code-ts",
+   "cat": "code",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 54.32,
+   "tpr": 3.683,
+   "mix": {
+    "MTP": 104
+   }
+  },
+  {
+   "name": "agent-rename",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 768,
+   "tps": 64.95,
+   "tpr": 4.62,
+   "mix": {
+    "MTP": 166
+   }
+  },
+  {
+   "name": "agent-rename",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 768,
+   "tps": 64.73,
+   "tpr": 4.593,
+   "mix": {
+    "MTP": 167
+   }
+  },
+  {
+   "name": "agent-log",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 768,
+   "tps": 65.74,
+   "tpr": 4.648,
+   "mix": {
+    "MTP": 165
+   }
+  },
+  {
+   "name": "agent-log",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 768,
+   "tps": 60.45,
+   "tpr": 4.285,
+   "mix": {
+    "MTP": 179
+   }
+  },
+  {
+   "name": "agent-diff",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 428,
+   "tps": 56.49,
+   "tpr": 3.917,
+   "mix": {
+    "MTP": 109
+   }
+  },
+  {
+   "name": "agent-diff",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 507,
+   "tps": 53.55,
+   "tpr": 3.693,
+   "mix": {
+    "MTP": 137
+   }
+  },
+  {
+   "name": "agent-json",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 768,
+   "tps": 65.15,
+   "tpr": 4.168,
+   "mix": {
+    "MTP": 184
+   }
+  },
+  {
+   "name": "agent-json",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 768,
+   "tps": 64.1,
+   "tpr": 4.124,
+   "mix": {
+    "MTP": 186
+   }
+  },
+  {
+   "name": "agent-plan",
+   "cat": "agent",
+   "temp": 0.0,
+   "tokens": 384,
+   "tps": 39.42,
+   "tpr": 2.605,
+   "mix": {
+    "MTP": 147
+   }
+  },
+  {
+   "name": "agent-plan",
+   "cat": "agent",
+   "temp": 1.0,
+   "tokens": 384,
+   "tps": 41.24,
+   "tpr": 2.736,
+   "mix": {
+    "MTP": 140
+   }
+  }
+ ]
+}

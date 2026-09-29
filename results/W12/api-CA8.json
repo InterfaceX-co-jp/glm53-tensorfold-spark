@@ -1,0 +1,62 @@
+{
+ "models": {
+  "id": "GLM-5.3-Flash-EXL3",
+  "object": "model",
+  "owned_by": "tensorfold",
+  "created": 1790673009,
+  "root": "GLM-5.3-Flash-EXL3",
+  "max_model_len": 1048576,
+  "context_length": 1048576
+ },
+ "max_model_len_ok": true,
+ "tokenize": [
+  200,
+  {
+   "count": 13,
+   "max_model_len": 1048576,
+   "tokens": [
+    154822,
+    154824,
+    154827,
+    20795,
+    448,
+    279,
+    3175,
+    3409,
+    10397,
+    13,
+    154828,
+    154841,
+    154842
+   ],
+   "token_strs": null
+  }
+ ],
+ "over": [
+  400,
+  {
+   "error": {
+    "message": "This model's maximum context length is 1048576 tokens. However, you requested 1048589 tokens (13 in the messages, 1048576 in the completion). Please reduce the length of the messages or completion. (This TensorFold server was started with --context 1048576 (CONTEXT); restart both ranks with CONTEXT=1048589 or more to serve it.)",
+    "type": "invalid_request_error",
+    "code": "context_length_exceeded",
+    "param": "messages"
+   }
+  }
+ ],
+ "over_ok": true,
+ "edge": [
+  200,
+  {
+   "content": "OK",
+   "usage": {
+    "prompt_tokens": 13,
+    "completion_tokens": 2,
+    "total_tokens": 15,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   }
+  }
+ ],
+ "edge_ok": true
+}

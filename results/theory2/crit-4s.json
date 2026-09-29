@@ -1,0 +1,12578 @@
+{
+ "r0": [
+  {
+   "label": "r0",
+   "segment": 0,
+   "rounds": 178,
+   "wall_ms": 117.8553766011236,
+   "conc_ms": 0.005106786516853931,
+   "busy_ms": 111.98606066853931,
+   "dev_span_ms": 117.55671717415721,
+   "kernels": 2575.7134831460676,
+   "graph_kernels": 476.5,
+   "eager_kernels": 2099.2134831460676,
+   "eager_api_us": 31110.75871910112,
+   "graph_launches": 3.2865168539325844,
+   "k_3-10us_n": 569.2977528089888,
+   "k_3-10us_ms": 3.1240162134832636,
+   "fam_other": 0.6171264606741778,
+   "fam_hc": 1.7977697022472154,
+   "k_50-200us_n": 154.87640449438203,
+   "k_50-200us_ms": 15.071630584269748,
+   "fam_dense": 21.409886438205138,
+   "k_<3us_n": 1136.1629213483145,
+   "k_<3us_ms": 1.940710741573086,
+   "k_10-50us_n": 616.5280898876405,
+   "k_10-50us_ms": 14.814816314606622,
+   "fam_kda": 5.693464297752775,
+   "fam_xchg": 4.107499921348309,
+   "fam_attn": 4.587937056179781,
+   "fam_router": 1.5840143258427808,
+   "fam_experts": 72.09248484269739,
+   "k_>=200us_n": 98.84831460674157,
+   "k_>=200us_ms": 77.03999360112378,
+   "fam_nccl": 0.07439936516853932,
+   "fam_sample": 0.026585044943820284,
+   "gap_5-20us_ms": 0.3987911573033715,
+   "gap_5-20us_n": 40.60674157303371,
+   "gap_hostbound_ms": 3.8967151123595314,
+   "gapph_vfwd_ms": 1.100402865166868,
+   "gap_20-100us_ms": 0.3514401011235959,
+   "gap_20-100us_n": 10.98314606741573,
+   "gap_<1.5us_ms": 0.6348238033715229,
+   "gap_<1.5us_n": 2306.6853932584268,
+   "gap_1.5-5us_ms": 0.4945996348314844,
+   "gap_1.5-5us_n": 179.54494382022472,
+   "gapph_sample_multi_ms": 2.3582673314606217,
+   "gap_>100us_ms": 3.691001808988762,
+   "gap_>100us_n": 4.662921348314606,
+   "gapph_other_ms": 1.5990213539323024,
+   "gapph_propose_ms": 0.5129649550560812,
+   "streams": {
+    "7": {
+     "kernels": 2575.7134831460676,
+     "ms": 111.99116745506981
+    }
+   },
+   "phase_host_ms": {
+    "vfwd": 56.51809178651688,
+    "propose": 6.833494612359547,
+    "sample_multi": 46.67453061235954
+   },
+   "phase_busy_ms": {
+    "vfwd": 99.10821615728953,
+    "sample_multi": 0.25508087640449295,
+    "other": 7.187024095505777,
+    "propose": 5.440846325843165
+   },
+   "phase_hostbound_idle_ms": {
+    "vfwd": 0.07992623595505617,
+    "other": 1.4178415786516851,
+    "propose": 0.09529802247191013,
+    "sample_multi": 2.3036492752808946
+   },
+   "idle_ms": 5.869315932584286,
+   "idle_by_next_launch": {
+    "sample_multi|host|long(>20us)": 2.29,
+    "other|host|long(>20us)": 1.292,
+    "vfwd|device|short": 1.007,
+    "vfwd|host|long(>20us)": 0.347,
+    "propose|host|long(>20us)": 0.338,
+    "other|host|short": 0.199,
+    "other|device|short": 0.103,
+    "propose|device|short": 0.094,
+    "sample_multi|device|short": 0.052,
+    "propose|device|long(>20us)": 0.052,
+    "vfwd|host|short": 0.032,
+    "propose|host|short": 0.029,
+    "sample_multi|host|short": 0.013,
+    "vfwd|device|long(>20us)": 0.013,
+    "other|device|long(>20us)": 0.005,
+    "sample_multi|device|long(>20us)": 0.003
+   },
+   "template": {
+    "round_wall_ms": 114.478222,
+    "blocks": [
+     {
+      "kernels": 17,
+      "us": 624.9,
+      "gaps_us": 14.0,
+      "fam": {
+       "xchg": 262.6,
+       "dense": 225.5,
+       "kda": 119.0,
+       "hc": 14.1,
+       "other": 3.7
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 279.3,
+      "gaps_us": 0.8,
+      "fam": {
+       "dense": 246.2,
+       "hc": 17.3,
+       "xchg": 15.8
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 376.2,
+      "gaps_us": 13.2,
+      "fam": {
+       "dense": 218.1,
+       "kda": 110.8,
+       "xchg": 30.6,
+       "hc": 16.7
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 273.2,
+      "gaps_us": 0.7,
+      "fam": {
+       "dense": 240.5,
+       "hc": 19.2,
+       "xchg": 13.5
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 383.4,
+      "gaps_us": 13.4,
+      "fam": {
+       "dense": 221.8,
+       "kda": 111.7,
+       "xchg": 31.4,
+       "hc": 18.5
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 274.2,
+      "gaps_us": 0.8,
+      "fam": {
+       "dense": 244.8,
+       "hc": 19.1,
+       "xchg": 10.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 582.0,
+      "gaps_us": 4.9,
+      "fam": {
+       "attn": 332.9,
+       "dense": 187.3,
+       "xchg": 30.0,
+       "hc": 16.9,
+       "router": 11.8,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1887.1,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 1780.5,
+       "dense": 51.6,
+       "router": 27.3,
+       "hc": 15.5,
+       "xchg": 10.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 392.2,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 228.3,
+       "kda": 114.3,
+       "xchg": 30.9,
+       "hc": 18.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1907.3,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 1797.5,
+       "dense": 48.7,
+       "router": 31.4,
+       "hc": 17.5,
+       "xchg": 10.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 393.4,
+      "gaps_us": 13.0,
+      "fam": {
+       "dense": 231.7,
+       "kda": 113.7,
+       "xchg": 29.2,
+       "hc": 18.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1999.2,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1873.0,
+       "dense": 49.5,
+       "router": 29.7,
+       "xchg": 28.3,
+       "hc": 17.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 449.5,
+      "gaps_us": 13.2,
+      "fam": {
+       "dense": 227.0,
+       "kda": 116.1,
+       "xchg": 87.2,
+       "hc": 19.2
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 2329.5,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1859.3,
+       "xchg": 372.6,
+       "dense": 47.9,
+       "router": 28.8,
+       "hc": 19.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 564.5,
+      "gaps_us": 4.7,
+      "fam": {
+       "attn": 328.5,
+       "dense": 189.6,
+       "hc": 17.3,
+       "xchg": 16.6,
+       "router": 9.6,
+       "other": 2.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 2011.1,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1698.9,
+       "xchg": 218.4,
+       "dense": 48.8,
+       "router": 27.4,
+       "hc": 16.3,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 408.2,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 234.3,
+       "kda": 115.6,
+       "xchg": 42.4,
+       "hc": 15.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1911.4,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1741.7,
+       "xchg": 71.5,
+       "dense": 49.3,
+       "router": 29.3,
+       "hc": 18.3,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 374.1,
+      "gaps_us": 15.1,
+      "fam": {
+       "dense": 229.4,
+       "kda": 115.4,
+       "hc": 17.9,
+       "xchg": 11.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1947.5,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1841.4,
+       "dense": 49.4,
+       "router": 26.6,
+       "hc": 17.5,
+       "xchg": 11.3,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 384.3,
+      "gaps_us": 17.2,
+      "fam": {
+       "dense": 227.0,
+       "kda": 121.8,
+       "hc": 18.6,
+       "xchg": 16.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1877.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1763.7,
+       "dense": 50.4,
+       "router": 33.0,
+       "hc": 18.4,
+       "xchg": 10.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 590.0,
+      "gaps_us": 4.6,
+      "fam": {
+       "attn": 333.4,
+       "dense": 192.0,
+       "xchg": 31.7,
+       "hc": 18.4,
+       "router": 11.4,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1910.8,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1804.2,
+       "dense": 51.5,
+       "router": 27.6,
+       "hc": 15.6,
+       "xchg": 10.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 392.1,
+      "gaps_us": 15.1,
+      "fam": {
+       "dense": 229.5,
+       "kda": 122.8,
+       "xchg": 23.1,
+       "hc": 16.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1944.5,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1829.2,
+       "dense": 50.6,
+       "router": 31.2,
+       "hc": 21.2,
+       "xchg": 10.9,
+       "other": 1.4
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 385.1,
+      "gaps_us": 15.0,
+      "fam": {
+       "dense": 231.3,
+       "kda": 119.2,
+       "xchg": 19.0,
+       "hc": 15.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1693.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1559.6,
+       "dense": 49.2,
+       "xchg": 34.8,
+       "router": 30.4,
+       "hc": 18.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 390.2,
+      "gaps_us": 17.2,
+      "fam": {
+       "dense": 235.8,
+       "kda": 123.3,
+       "hc": 18.3,
+       "xchg": 12.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1812.7,
+      "gaps_us": 2.1,
+      "fam": {
+       "experts": 1594.3,
+       "xchg": 118.6,
+       "dense": 50.6,
+       "router": 30.3,
+       "hc": 17.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 40,
+      "us": 913.2,
+      "gaps_us": 5.0,
+      "fam": {
+       "xchg": 352.0,
+       "attn": 332.7,
+       "dense": 193.5,
+       "hc": 19.6,
+       "router": 12.3,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1745.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1614.0,
+       "dense": 50.7,
+       "xchg": 37.1,
+       "router": 26.7,
+       "hc": 16.0,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 514.4,
+      "gaps_us": 15.1,
+      "fam": {
+       "dense": 223.7,
+       "xchg": 148.1,
+       "kda": 124.8,
+       "hc": 17.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1770.4,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1522.4,
+       "xchg": 150.0,
+       "dense": 49.6,
+       "router": 28.6,
+       "hc": 18.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 442.9,
+      "gaps_us": 18.8,
+      "fam": {
+       "dense": 230.8,
+       "kda": 120.5,
+       "xchg": 74.2,
+       "hc": 17.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1576.0,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1462.8,
+       "dense": 51.2,
+       "router": 30.8,
+       "hc": 19.2,
+       "xchg": 10.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 395.6,
+      "gaps_us": 15.0,
+      "fam": {
+       "dense": 233.7,
+       "kda": 123.2,
+       "xchg": 22.6,
+       "hc": 16.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1427.6,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1313.8,
+       "dense": 49.7,
+       "router": 30.4,
+       "hc": 17.2,
+       "xchg": 15.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 580.5,
+      "gaps_us": 4.5,
+      "fam": {
+       "attn": 330.6,
+       "dense": 187.2,
+       "xchg": 30.3,
+       "hc": 18.0,
+       "router": 11.4,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1389.1,
+      "gaps_us": 4.0,
+      "fam": {
+       "experts": 1284.1,
+       "dense": 49.7,
+       "router": 27.2,
+       "hc": 16.1,
+       "xchg": 10.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 390.7,
+      "gaps_us": 15.2,
+      "fam": {
+       "dense": 232.9,
+       "kda": 118.5,
+       "xchg": 23.7,
+       "hc": 15.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1442.9,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1307.8,
+       "dense": 50.7,
+       "xchg": 34.8,
+       "router": 28.2,
+       "hc": 20.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 380.5,
+      "gaps_us": 19.1,
+      "fam": {
+       "dense": 229.9,
+       "kda": 120.9,
+       "hc": 17.9,
+       "xchg": 11.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1499.5,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1387.7,
+       "dense": 47.9,
+       "router": 32.1,
+       "hc": 17.4,
+       "xchg": 13.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 390.4,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 227.3,
+       "kda": 125.0,
+       "xchg": 20.7,
+       "hc": 17.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1575.3,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1461.7,
+       "dense": 50.8,
+       "router": 31.6,
+       "hc": 19.4,
+       "xchg": 10.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 583.3,
+      "gaps_us": 4.7,
+      "fam": {
+       "attn": 337.6,
+       "dense": 185.6,
+       "xchg": 30.4,
+       "hc": 15.7,
+       "router": 11.0,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1541.9,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1436.5,
+       "dense": 50.6,
+       "router": 26.9,
+       "hc": 15.9,
+       "xchg": 10.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 392.5,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 229.6,
+       "kda": 125.7,
+       "hc": 18.8,
+       "xchg": 18.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1530.1,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 1415.0,
+       "dense": 52.2,
+       "router": 31.8,
+       "hc": 18.8,
+       "xchg": 11.0,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 395.4,
+      "gaps_us": 19.7,
+      "fam": {
+       "dense": 229.1,
+       "kda": 124.0,
+       "xchg": 22.7,
+       "hc": 19.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1267.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1153.1,
+       "dense": 50.6,
+       "router": 31.3,
+       "hc": 19.7,
+       "xchg": 11.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 390.0,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 238.5,
+       "kda": 122.4,
+       "hc": 17.3,
+       "xchg": 11.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1322.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1212.6,
+       "dense": 47.9,
+       "router": 30.9,
+       "hc": 18.6,
+       "xchg": 10.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 581.7,
+      "gaps_us": 4.8,
+      "fam": {
+       "attn": 328.8,
+       "dense": 189.1,
+       "xchg": 32.5,
+       "hc": 17.5,
+       "router": 10.8,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1240.9,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1136.7,
+       "dense": 50.0,
+       "router": 26.8,
+       "hc": 15.7,
+       "xchg": 10.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 388.8,
+      "gaps_us": 19.3,
+      "fam": {
+       "dense": 230.0,
+       "kda": 123.0,
+       "xchg": 20.1,
+       "hc": 15.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1570.9,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1459.5,
+       "dense": 51.4,
+       "router": 28.5,
+       "hc": 19.1,
+       "xchg": 11.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 386.8,
+      "gaps_us": 14.7,
+      "fam": {
+       "dense": 230.3,
+       "kda": 122.1,
+       "hc": 18.8,
+       "xchg": 15.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1544.0,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1413.9,
+       "dense": 47.4,
+       "xchg": 32.3,
+       "router": 30.4,
+       "hc": 18.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 383.2,
+      "gaps_us": 13.0,
+      "fam": {
+       "dense": 233.7,
+       "kda": 119.0,
+       "hc": 17.5,
+       "xchg": 13.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1576.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1462.0,
+       "dense": 52.9,
+       "router": 30.7,
+       "hc": 19.1,
+       "xchg": 10.6,
+       "other": 1.4
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 701.7,
+      "gaps_us": 4.5,
+      "fam": {
+       "attn": 445.2,
+       "dense": 196.4,
+       "hc": 32.0,
+       "router": 14.2,
+       "xchg": 10.6,
+       "other": 3.3
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1648.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1517.3,
+       "dense": 74.3,
+       "router": 27.5,
+       "hc": 17.0,
+       "xchg": 10.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 426.0,
+      "gaps_us": 27.1,
+      "fam": {
+       "dense": 233.6,
+       "kda": 162.9,
+       "hc": 17.5,
+       "xchg": 12.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1365.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1254.8,
+       "dense": 50.5,
+       "router": 29.2,
+       "hc": 18.6,
+       "xchg": 10.8,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 393.1,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 221.3,
+       "kda": 124.8,
+       "xchg": 31.8,
+       "hc": 15.2
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1212.1,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1099.2,
+       "dense": 53.1,
+       "router": 29.3,
+       "hc": 18.6,
+       "xchg": 10.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 395.3,
+      "gaps_us": 19.0,
+      "fam": {
+       "dense": 229.3,
+       "kda": 121.6,
+       "xchg": 22.7,
+       "hc": 21.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1457.6,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1345.0,
+       "dense": 53.9,
+       "router": 29.3,
+       "hc": 17.4,
+       "xchg": 10.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 685.2,
+      "gaps_us": 4.7,
+      "fam": {
+       "attn": 394.2,
+       "dense": 246.8,
+       "hc": 18.8,
+       "router": 11.5,
+       "xchg": 10.8,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1741.1,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1617.2,
+       "dense": 51.7,
+       "router": 28.7,
+       "xchg": 26.2,
+       "hc": 16.0,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 499.7,
+      "gaps_us": 13.3,
+      "fam": {
+       "dense": 275.0,
+       "kda": 190.1,
+       "hc": 22.9,
+       "xchg": 11.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1739.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1587.6,
+       "dense": 62.6,
+       "xchg": 35.2,
+       "router": 33.2,
+       "hc": 20.0,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 552.5,
+      "gaps_us": 17.5,
+      "fam": {
+       "dense": 314.0,
+       "kda": 152.5,
+       "hc": 73.5,
+       "xchg": 12.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1752.0,
+      "gaps_us": 1.7,
+      "fam": {
+       "experts": 1632.4,
+       "dense": 54.6,
+       "router": 30.8,
+       "hc": 19.3,
+       "xchg": 12.9,
+       "other": 2.0
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 507.8,
+      "gaps_us": 20.7,
+      "fam": {
+       "dense": 289.5,
+       "kda": 132.4,
+       "hc": 73.7,
+       "xchg": 12.2
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1931.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1810.2,
+       "dense": 54.9,
+       "router": 30.6,
+       "hc": 23.5,
+       "xchg": 10.8,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 1026.1,
+      "gaps_us": 4.8,
+      "fam": {
+       "attn": 565.3,
+       "dense": 348.1,
+       "xchg": 53.3,
+       "router": 37.3,
+       "hc": 19.1,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1632.6,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1439.5,
+       "dense": 133.7,
+       "router": 30.8,
+       "hc": 16.1,
+       "xchg": 11.1,
+       "other": 1.4
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 525.8,
+      "gaps_us": 13.3,
+      "fam": {
+       "dense": 316.3,
+       "kda": 140.2,
+       "hc": 57.4,
+       "xchg": 11.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1533.7,
+      "gaps_us": 1.7,
+      "fam": {
+       "experts": 1420.5,
+       "dense": 52.0,
+       "router": 29.9,
+       "hc": 18.6,
+       "xchg": 11.0,
+       "other": 1.7
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 491.4,
+      "gaps_us": 21.3,
+      "fam": {
+       "dense": 313.3,
+       "kda": 131.0,
+       "xchg": 28.2,
+       "hc": 18.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1469.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1277.4,
+       "hc": 87.6,
+       "dense": 49.5,
+       "router": 42.8,
+       "xchg": 11.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 410.8,
+      "gaps_us": 24.1,
+      "fam": {
+       "dense": 255.8,
+       "kda": 125.4,
+       "hc": 17.1,
+       "xchg": 12.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1569.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1450.5,
+       "dense": 52.5,
+       "router": 31.5,
+       "hc": 22.4,
+       "xchg": 11.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 40,
+      "us": 713.6,
+      "gaps_us": 4.9,
+      "fam": {
+       "attn": 469.5,
+       "dense": 195.7,
+       "hc": 19.4,
+       "xchg": 13.2,
+       "router": 12.8,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1601.1,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1448.5,
+       "dense": 92.9,
+       "router": 27.2,
+       "hc": 20.0,
+       "xchg": 11.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 443.7,
+      "gaps_us": 13.2,
+      "fam": {
+       "dense": 285.8,
+       "kda": 126.4,
+       "hc": 20.4,
+       "xchg": 11.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1744.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1562.5,
+       "dense": 120.2,
+       "router": 30.5,
+       "hc": 19.0,
+       "xchg": 10.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 98,
+      "us": 1335.3,
+      "gaps_us": 69.2,
+      "fam": {
+       "dense": 953.0,
+       "attn": 295.6,
+       "other": 72.9,
+       "xchg": 8.2,
+       "hc": 5.6
+      }
+     },
+     {
+      "kernels": 82,
+      "us": 1383.6,
+      "gaps_us": 697.7,
+      "fam": {
+       "kda": 765.0,
+       "dense": 475.5,
+       "other": 133.0,
+       "xchg": 10.1
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 272.7,
+      "gaps_us": 3.1,
+      "fam": {
+       "dense": 242.5,
+       "xchg": 23.7,
+       "other": 3.9,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 127.9,
+      "gaps_us": 3.7,
+      "fam": {
+       "dense": 87.6,
+       "xchg": 20.7,
+       "other": 9.8,
+       "kda": 9.8
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 266.4,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 245.0,
+       "xchg": 15.0,
+       "other": 3.8,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 135.9,
+      "gaps_us": 3.7,
+      "fam": {
+       "dense": 88.0,
+       "xchg": 27.7,
+       "kda": 10.3,
+       "other": 9.9
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 264.3,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 244.3,
+       "xchg": 13.5,
+       "other": 3.9,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 135.6,
+      "gaps_us": 3.7,
+      "fam": {
+       "dense": 88.4,
+       "xchg": 26.7,
+       "kda": 10.6,
+       "other": 9.9
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 265.3,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 244.0,
+       "xchg": 14.9,
+       "other": 3.8,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 133.6,
+      "gaps_us": 3.6,
+      "fam": {
+       "dense": 86.0,
+       "xchg": 27.4,
+       "kda": 10.3,
+       "other": 9.9
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 267.3,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 238.2,
+       "xchg": 22.6,
+       "other": 3.9,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 30,
+      "us": 904.3,
+      "gaps_us": 10.8,
+      "fam": {
+       "dense": 827.6,
+       "attn": 45.2,
+       "other": 19.5,
+       "xchg": 6.7,
+       "sample": 3.8,
+       "kda": 1.5
+      }
+     },
+     {
+      "kernels": 68,
+      "us": 524.3,
+      "gaps_us": 528.3,
+      "fam": {
+       "dense": 425.6,
+       "other": 79.6,
+       "xchg": 9.7,
+       "kda": 8.2,
+       "sample": 1.2
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 263.6,
+      "gaps_us": 3.1,
+      "fam": {
+       "dense": 235.5,
+       "xchg": 21.7,
+       "other": 3.8,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 125.7,
+      "gaps_us": 3.8,
+      "fam": {
+       "dense": 83.7,
+       "xchg": 22.1,
+       "kda": 10.0,
+       "other": 9.9
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 259.9,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 243.4,
+       "xchg": 10.1,
+       "other": 3.8,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 137.4,
+      "gaps_us": 3.6,
+      "fam": {
+       "dense": 86.0,
+       "xchg": 31.1,
+       "kda": 10.3,
+       "other": 10.0
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 256.3,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 240.4,
+       "xchg": 9.4,
+       "other": 3.8,
+       "kda": 2.7
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 140.7,
+      "gaps_us": 3.7,
+      "fam": {
+       "dense": 88.6,
+       "xchg": 32.1,
+       "other": 10.0,
+       "kda": 10.0
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 258.4,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 242.6,
+       "xchg": 9.4,
+       "other": 3.8,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 136.1,
+      "gaps_us": 3.8,
+      "fam": {
+       "dense": 85.6,
+       "xchg": 30.4,
+       "kda": 10.1,
+       "other": 10.0
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 259.8,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 237.1,
+       "xchg": 16.3,
+       "other": 3.8,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 30,
+      "us": 908.4,
+      "gaps_us": 10.7,
+      "fam": {
+       "dense": 833.2,
+       "attn": 45.2,
+       "other": 18.3,
+       "xchg": 6.6,
+       "sample": 3.7,
+       "kda": 1.4
+      }
+     },
+     {
+      "kernels": 112,
+      "us": 5945.9,
+      "gaps_us": 891.9,
+      "fam": {
+       "experts": 4028.4,
+       "dense": 1282.7,
+       "attn": 342.1,
+       "nccl": 143.1,
+       "other": 76.4,
+       "router": 47.1,
+       "xchg": 16.7,
+       "sample": 9.4
+      }
+     },
+     {
+      "kernels": 28,
+      "us": 446.1,
+      "gaps_us": 473.4,
+      "fam": {
+       "dense": 267.4,
+       "attn": 152.1,
+       "other": 10.8,
+       "xchg": 8.1,
+       "router": 7.7
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 316.4,
+      "gaps_us": 39.0,
+      "fam": {
+       "experts": 237.4,
+       "dense": 46.8,
+       "router": 21.3,
+       "xchg": 8.0,
+       "other": 2.9
+      }
+     },
+     {
+      "kernels": 29,
+      "us": 883.6,
+      "gaps_us": 14.0,
+      "fam": {
+       "dense": 818.8,
+       "attn": 37.2,
+       "other": 16.5,
+       "xchg": 6.9,
+       "sample": 4.2
+      }
+     },
+     {
+      "kernels": 0,
+      "us": 0,
+      "gaps_us": 0,
+      "fam": {}
+     }
+    ],
+    "first_layers": [
+     [
+      [
+       "_embed_b16",
+       "other",
+       3.7,
+       0.0,
+       [
+        9,
+        64,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.6,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.5,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       150.1,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.0,
+       0.26,
+       [
+        111,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.1,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.8,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.9,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       27.6,
+       1.54,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       30.1,
+       3.33,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       31.7,
+       3.23,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.6,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       1.5,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       60.8,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.1,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       262.6,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       3.8,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.1,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       168.6,
+       0.13,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.4,
+       -0.13,
+       [
+        9,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       75.0,
+       -0.16,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       15.8,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.8,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       9.6,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       146.1,
+       0.1,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.0,
+       0.13,
+       [
+        111,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.6,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.0,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       26.5,
+       1.54,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       27.6,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       27.0,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.7,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       1.5,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       58.7,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       30.6,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       3.7,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       10.0,
+       0.1,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.5,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       161.2,
+       0.1,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.4,
+       -0.16,
+       [
+        9,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       76.7,
+       -0.13,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       13.5,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       2.4,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       10.7,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       146.0,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.0,
+       0.13,
+       [
+        111,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.8,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.6,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       26.6,
+       1.57,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       28.7,
+       2.94,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       27.0,
+       2.94,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.4,
+       2.94,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       1.5,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       62.6,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       31.4,
+       0.1,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       4.1,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       9.6,
+       0.1,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       163.2,
+       0.13,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.4,
+       -0.22,
+       [
+        9,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       79.0,
+       -0.13,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       10.3,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.5,
+       0.1,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       9.9,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.5,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       28.8,
+       0.13,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.13,
+       [
+        18,
+        1,
+        1
+       ]
+      ],
+      [
+       "_rmsnorm",
+       "other",
+       1.6,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_rmsnorm",
+       "other",
+       1.5,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       39.7,
+       0.13,
+       [
+        1,
+        128,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.5,
+       0.1,
+       [
+        72,
+        1,
+        1
+       ]
+      ],
+      [
+       "_absorb2",
+       "attn",
+       33.2,
+       0.13,
+       [
+        256,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       7.1,
+       0.13,
+       [
+        1,
+        3,
+        8
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.4,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       10.4,
+       0.1,
+       [
+        1,
+        4,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       3.5,
+       0.1,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       1.5,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       4.0,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       50.3,
+       0.13,
+       [
+        4,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       1.5,
+       0.1,
+       [
+        64,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       1.5,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       1.3,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       1.8,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       50.3,
+       0.13,
+       [
+        4,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       1.4,
+       0.13,
+       [
+        64,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       1.5,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       1.2,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       0.8,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       49.8,
+       0.13,
+       [
+        4,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       1.4,
+       0.13,
+       [
+        64,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       1.5,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       1.2,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       1.8,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       50.1,
+       0.13,
+       [
+        6,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       1.6,
+       0.13,
+       [
+        96,
+        1,
+        1
+       ]
+      ],
+      [
+       "_expand2",
+       "attn",
+       71.7,
+       0.13,
+       [
+        128,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.0,
+       0.13,
+       [
+        9,
+        8,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       105.1,
+       0.13,
+       [
+        1,
+        64,
+        8
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.6,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       30.0,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       2.0,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.2,
+       0.1,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       13.8,
+       0.13,
+       [
+        1,
+        9,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_topk",
+       "router",
+       4.1,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group",
+       "router",
+       6.0,
+       0.1,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "rot_in_kernel",
+       "experts",
+       13.6,
+       0.1,
+       [
+        81,
+        32,
+        2
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       1175.1,
+       0.13,
+       [
+        73,
+        8,
+        8
+       ]
+      ],
+      [
+       "gateup_epilogue_kernel",
+       "experts",
+       13.2,
+       -0.13,
+       [
+        81,
+        8,
+        1
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       568.8,
+       -0.13,
+       [
+        73,
+        32,
+        1
+       ]
+      ],
+      [
+       "down_epilogue_kernel",
+       "experts",
+       9.8,
+       -0.13,
+       [
+        81,
+        32,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       28.5,
+       -0.16,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.1,
+       [
+        18,
+        1,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.0,
+       0.13,
+       [
+        9,
+        2,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       18.0,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       3.0,
+       0.1,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "elementwise_kernel",
+       "other",
+       1.3,
+       0.1,
+       [
+        144,
+        1,
+        1
+       ]
+      ],
+      [
+       "_combine",
+       "router",
+       2.0,
+       0.1,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       10.9,
+       0.1,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       2.5,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       10.7,
+       0.1,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.5,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       153.4,
+       0.1,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.0,
+       0.13,
+       [
+        111,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.6,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.6,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       26.0,
+       1.54,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.4,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.1,
+       2.94,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.8,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       1.5,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       61.0,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.1,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       30.9,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       3.6,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.4,
+       0.1,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.5,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       18.0,
+       0.1,
+       [
+        1,
+        9,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_topk",
+       "router",
+       4.0,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group",
+       "router",
+       6.0,
+       0.1,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "rot_in_kernel",
+       "experts",
+       13.5,
+       0.13,
+       [
+        81,
+        32,
+        2
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       1177.7,
+       0.13,
+       [
+        73,
+        8,
+        8
+       ]
+      ],
+      [
+       "gateup_epilogue_kernel",
+       "experts",
+       13.4,
+       -0.13,
+       [
+        81,
+        8,
+        1
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       583.6,
+       -0.1,
+       [
+        73,
+        32,
+        1
+       ]
+      ],
+      [
+       "down_epilogue_kernel",
+       "experts",
+       9.3,
+       -0.16,
+       [
+        81,
+        32,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       29.6,
+       -0.16,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.1,
+       [
+        18,
+        1,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.0,
+       0.13,
+       [
+        9,
+        2,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       16.0,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.1,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "elementwise_kernel",
+       "other",
+       1.3,
+       0.1,
+       [
+        144,
+        1,
+        1
+       ]
+      ],
+      [
+       "_combine",
+       "router",
+       2.0,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       10.9,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "label": "r0",
+   "segment": 1,
+   "rounds": 99,
+   "wall_ms": 55.71188391919192,
+   "conc_ms": 0.035030555555555544,
+   "busy_ms": 53.72392487878786,
+   "dev_span_ms": 54.46659445454547,
+   "kernels": 1849.5252525252524,
+   "graph_kernels": 1713.030303030303,
+   "eager_kernels": 136.4949494949495,
+   "eager_api_us": 606.5513737373738,
+   "graph_launches": 3.3636363636363638,
+   "k_3-10us_n": 539.7474747474747,
+   "k_3-10us_ms": 3.1743873131312745,
+   "fam_other": 0.23913186868687633,
+   "fam_hc": 1.4518954949494782,
+   "k_50-200us_n": 136.35353535353536,
+   "k_50-200us_ms": 14.67210436363633,
+   "fam_dense": 16.204188707072014,
+   "k_<3us_n": 794.6868686868687,
+   "k_<3us_ms": 1.0992024949494983,
+   "k_10-50us_n": 308.6161616161616,
+   "k_10-50us_ms": 7.285349303030314,
+   "fam_kda": 1.598940959595958,
+   "fam_xchg": 2.340825050505046,
+   "fam_attn": 2.258572252525267,
+   "fam_router": 1.218219595959542,
+   "fam_experts": 28.431530121212138,
+   "k_>=200us_n": 70.12121212121212,
+   "k_>=200us_ms": 27.527911959595887,
+   "fam_sample": 0.010099282828282822,
+   "gap_5-20us_ms": 0.03581410101010102,
+   "gap_5-20us_n": 3.505050505050505,
+   "gap_hostbound_ms": 0.23242445454545443,
+   "gapph_vfwd_ms": 0.18236276767672205,
+   "gap_20-100us_ms": 0.12430562626262635,
+   "gap_20-100us_n": 2.414141414141414,
+   "gap_<1.5us_ms": 0.2159272121211364,
+   "gap_<1.5us_n": 1592.3737373737374,
+   "gapph_sample_multi_ms": 0.025896505050505118,
+   "gap_1.5-5us_ms": 0.02785686868686846,
+   "gap_1.5-5us_n": 11.06060606060606,
+   "gap_>100us_ms": 0.3387657676767678,
+   "gap_>100us_n": 1.7272727272727273,
+   "gapph_other_ms": 0.20676073737373749,
+   "gapph_propose_ms": 0.3276495656565283,
+   "fam_nccl": 0.005552101010101011,
+   "streams": {
+    "7": {
+     "kernels": 1849.5252525252524,
+     "ms": 53.758955434350035
+    }
+   },
+   "phase_host_ms": {
+    "vfwd": 2.1582270404040407,
+    "propose": 5.440576252525252,
+    "sample_multi": 47.8683708181818
+   },
+   "phase_busy_ms": {
+    "vfwd": 48.51047979798286,
+    "sample_multi": 0.08468424242424183,
+    "other": 0.4252546969696963,
+    "propose": 4.738536696969609
+   },
+   "phase_hostbound_idle_ms": {
+    "vfwd": 0.0023556868686868686,
+    "other": 0.20214662626262617,
+    "propose": 0.027922141414141413
+   },
+   "idle_ms": 1.987959040404057,
+   "idle_by_next_launch": {
+    "vfwd|host|long(>20us)": 1.249,
+    "propose|host|long(>20us)": 0.247,
+    "other|host|long(>20us)": 0.199,
+    "vfwd|device|short": 0.18,
+    "propose|device|short": 0.061,
+    "sample_multi|device|short": 0.022,
+    "propose|device|long(>20us)": 0.011,
+    "propose|host|short": 0.009,
+    "sample_multi|device|long(>20us)": 0.004,
+    "other|device|short": 0.004,
+    "other|host|short": 0.003,
+    "vfwd|host|short": 0.001
+   },
+   "template": {
+    "round_wall_ms": 53.83698,
+    "blocks": [
+     {
+      "kernels": 14,
+      "us": 277.4,
+      "gaps_us": 1.7,
+      "fam": {
+       "dense": 219.5,
+       "kda": 32.4,
+       "hc": 13.7,
+       "xchg": 8.2,
+       "other": 3.6
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 276.7,
+      "gaps_us": 0.7,
+      "fam": {
+       "dense": 236.8,
+       "xchg": 25.1,
+       "hc": 14.8
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 276.2,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 218.6,
+       "kda": 30.6,
+       "hc": 16.5,
+       "xchg": 10.5
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 267.7,
+      "gaps_us": 0.8,
+      "fam": {
+       "dense": 233.0,
+       "xchg": 20.7,
+       "hc": 14.0
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 321.0,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 234.3,
+       "kda": 61.2,
+       "hc": 17.2,
+       "xchg": 8.3
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 329.3,
+      "gaps_us": 0.8,
+      "fam": {
+       "dense": 301.6,
+       "hc": 15.3,
+       "xchg": 12.4
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 450.7,
+      "gaps_us": 3.0,
+      "fam": {
+       "dense": 225.1,
+       "attn": 177.6,
+       "hc": 18.3,
+       "router": 17.7,
+       "xchg": 8.1,
+       "other": 3.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 974.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 835.8,
+       "dense": 83.0,
+       "router": 31.0,
+       "hc": 15.2,
+       "xchg": 8.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 334.1,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 276.4,
+       "kda": 31.4,
+       "hc": 18.0,
+       "xchg": 8.3
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1020.8,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 891.0,
+       "dense": 66.8,
+       "router": 25.3,
+       "xchg": 22.7,
+       "hc": 13.8,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 309.9,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 247.5,
+       "kda": 32.6,
+       "hc": 22.0,
+       "xchg": 7.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 845.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 743.6,
+       "dense": 49.6,
+       "router": 24.5,
+       "hc": 15.1,
+       "xchg": 11.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 15,
+      "us": 288.3,
+      "gaps_us": 1.7,
+      "fam": {
+       "dense": 215.0,
+       "kda": 35.6,
+       "xchg": 20.3,
+       "hc": 17.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 822.1,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 729.2,
+       "dense": 47.2,
+       "router": 22.0,
+       "hc": 14.3,
+       "xchg": 8.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 399.4,
+      "gaps_us": 3.0,
+      "fam": {
+       "dense": 184.8,
+       "attn": 158.5,
+       "xchg": 26.5,
+       "hc": 16.6,
+       "router": 10.0,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 799.3,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 702.1,
+       "dense": 48.5,
+       "router": 24.6,
+       "hc": 14.7,
+       "xchg": 8.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 293.9,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 217.5,
+       "kda": 31.7,
+       "xchg": 29.9,
+       "hc": 14.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 801.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 702.7,
+       "dense": 47.9,
+       "router": 23.0,
+       "hc": 14.1,
+       "xchg": 12.4,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 285.4,
+      "gaps_us": 1.7,
+      "fam": {
+       "dense": 214.2,
+       "kda": 33.8,
+       "xchg": 20.9,
+       "hc": 16.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 939.2,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 832.5,
+       "dense": 59.3,
+       "router": 22.9,
+       "hc": 14.6,
+       "xchg": 8.4,
+       "other": 1.5
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 311.0,
+      "gaps_us": 1.3,
+      "fam": {
+       "dense": 238.2,
+       "kda": 32.7,
+       "xchg": 23.3,
+       "hc": 16.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1055.8,
+      "gaps_us": 2.2,
+      "fam": {
+       "experts": 874.7,
+       "dense": 104.6,
+       "router": 28.7,
+       "xchg": 24.8,
+       "hc": 21.8,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 512.7,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 265.4,
+       "attn": 199.7,
+       "hc": 25.3,
+       "router": 11.3,
+       "xchg": 8.0,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 991.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 823.4,
+       "dense": 91.3,
+       "router": 39.0,
+       "xchg": 21.8,
+       "hc": 14.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 283.1,
+      "gaps_us": 1.8,
+      "fam": {
+       "dense": 217.0,
+       "kda": 32.4,
+       "hc": 22.0,
+       "xchg": 11.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 933.0,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 835.9,
+       "dense": 47.8,
+       "router": 24.1,
+       "hc": 15.1,
+       "xchg": 8.6,
+       "other": 1.5
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 314.0,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 249.4,
+       "kda": 41.1,
+       "hc": 15.7,
+       "xchg": 7.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 951.3,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 762.5,
+       "dense": 71.8,
+       "hc": 55.6,
+       "xchg": 37.0,
+       "router": 23.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 310.7,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 225.4,
+       "hc": 43.5,
+       "kda": 32.7,
+       "xchg": 9.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 945.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 813.2,
+       "dense": 69.9,
+       "router": 23.9,
+       "xchg": 23.3,
+       "hc": 14.0,
+       "other": 1.5
+      }
+     },
+     {
+      "kernels": 25,
+      "us": 577.9,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 300.4,
+       "attn": 210.5,
+       "hc": 36.4,
+       "router": 19.9,
+       "xchg": 7.8,
+       "other": 2.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 800.5,
+      "gaps_us": 4.0,
+      "fam": {
+       "experts": 691.2,
+       "dense": 49.0,
+       "router": 25.6,
+       "xchg": 18.8,
+       "hc": 14.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 276.4,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 211.8,
+       "kda": 37.3,
+       "hc": 16.5,
+       "xchg": 10.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 773.6,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 680.6,
+       "dense": 47.3,
+       "router": 22.1,
+       "hc": 14.2,
+       "xchg": 8.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 282.8,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 208.1,
+       "kda": 34.4,
+       "xchg": 23.8,
+       "hc": 16.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 715.4,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 616.6,
+       "dense": 51.4,
+       "router": 23.5,
+       "hc": 14.5,
+       "xchg": 8.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 285.2,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 214.2,
+       "kda": 31.4,
+       "xchg": 24.7,
+       "hc": 14.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 699.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 601.4,
+       "dense": 47.9,
+       "router": 23.1,
+       "hc": 14.1,
+       "xchg": 11.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 389.5,
+      "gaps_us": 3.0,
+      "fam": {
+       "dense": 187.3,
+       "attn": 159.9,
+       "hc": 16.6,
+       "xchg": 11.6,
+       "router": 11.1,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 720.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 610.6,
+       "dense": 48.5,
+       "router": 25.6,
+       "xchg": 20.3,
+       "hc": 14.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 275.8,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 219.5,
+       "kda": 34.1,
+       "hc": 14.5,
+       "xchg": 7.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 704.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 600.3,
+       "dense": 48.6,
+       "router": 23.5,
+       "xchg": 16.4,
+       "hc": 14.7,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 276.1,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 213.2,
+       "kda": 31.7,
+       "hc": 17.3,
+       "xchg": 13.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 812.5,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 717.0,
+       "dense": 48.4,
+       "router": 23.6,
+       "hc": 14.2,
+       "xchg": 8.1,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 297.6,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 209.5,
+       "xchg": 40.1,
+       "kda": 32.3,
+       "hc": 15.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 770.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 671.7,
+       "dense": 51.9,
+       "router": 23.3,
+       "hc": 14.2,
+       "xchg": 8.0,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 400.1,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 179.5,
+       "attn": 163.0,
+       "xchg": 29.0,
+       "hc": 14.8,
+       "router": 10.7,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 663.9,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 554.8,
+       "dense": 57.7,
+       "router": 27.0,
+       "hc": 14.9,
+       "xchg": 8.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 441.3,
+      "gaps_us": 1.7,
+      "fam": {
+       "dense": 339.9,
+       "hc": 51.8,
+       "kda": 39.2,
+       "xchg": 10.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 790.1,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 561.0,
+       "hc": 116.3,
+       "router": 53.2,
+       "dense": 49.6,
+       "xchg": 8.6,
+       "other": 1.4
+      }
+     },
+     {
+      "kernels": 15,
+      "us": 319.4,
+      "gaps_us": 1.7,
+      "fam": {
+       "dense": 261.8,
+       "kda": 33.7,
+       "hc": 16.3,
+       "xchg": 7.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 769.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 652.1,
+       "dense": 48.8,
+       "xchg": 30.5,
+       "router": 22.7,
+       "hc": 14.5,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 279.6,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 220.9,
+       "kda": 34.6,
+       "hc": 16.4,
+       "xchg": 7.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 662.1,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 559.3,
+       "dense": 46.5,
+       "router": 22.4,
+       "xchg": 18.6,
+       "hc": 14.1,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 389.8,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 180.8,
+       "attn": 158.2,
+       "xchg": 23.0,
+       "hc": 15.8,
+       "router": 9.1,
+       "other": 2.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 604.5,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 483.8,
+       "dense": 49.6,
+       "xchg": 32.4,
+       "router": 23.0,
+       "hc": 14.5,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 278.4,
+      "gaps_us": 1.6,
+      "fam": {
+       "dense": 214.2,
+       "kda": 32.7,
+       "xchg": 17.0,
+       "hc": 14.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 783.1,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 687.7,
+       "dense": 50.4,
+       "router": 21.5,
+       "hc": 14.2,
+       "xchg": 8.1,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 291.2,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 217.5,
+       "kda": 34.3,
+       "xchg": 22.6,
+       "hc": 16.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 723.2,
+      "gaps_us": 3.7,
+      "fam": {
+       "experts": 615.3,
+       "dense": 47.8,
+       "router": 23.7,
+       "xchg": 20.7,
+       "hc": 14.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 280.2,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 216.2,
+       "kda": 33.1,
+       "hc": 16.5,
+       "xchg": 14.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 729.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 611.7,
+       "dense": 47.3,
+       "xchg": 32.9,
+       "router": 22.7,
+       "hc": 13.9,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 378.0,
+      "gaps_us": 2.7,
+      "fam": {
+       "dense": 180.9,
+       "attn": 159.2,
+       "hc": 16.4,
+       "router": 10.8,
+       "xchg": 7.7,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 727.1,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 610.6,
+       "dense": 50.5,
+       "xchg": 27.2,
+       "router": 22.9,
+       "hc": 14.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 274.0,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 212.4,
+       "kda": 33.6,
+       "hc": 15.9,
+       "xchg": 12.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 708.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 606.2,
+       "dense": 48.2,
+       "router": 22.5,
+       "xchg": 15.2,
+       "hc": 14.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 282.0,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 207.8,
+       "kda": 34.0,
+       "xchg": 25.5,
+       "hc": 14.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 596.9,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 498.9,
+       "dense": 51.0,
+       "router": 22.5,
+       "hc": 14.4,
+       "xchg": 8.8,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 15,
+      "us": 291.1,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 211.9,
+       "kda": 34.3,
+       "xchg": 27.2,
+       "hc": 17.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 736.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 629.8,
+       "dense": 52.6,
+       "router": 23.4,
+       "xchg": 15.5,
+       "hc": 14.3,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 391.0,
+      "gaps_us": 3.0,
+      "fam": {
+       "dense": 180.5,
+       "attn": 162.7,
+       "hc": 17.3,
+       "xchg": 15.7,
+       "router": 11.9,
+       "other": 2.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 719.2,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 619.8,
+       "dense": 50.6,
+       "router": 24.7,
+       "hc": 14.4,
+       "xchg": 8.5,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 292.3,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 214.6,
+       "kda": 34.8,
+       "xchg": 26.5,
+       "hc": 16.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 717.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 620.7,
+       "dense": 49.6,
+       "router": 23.6,
+       "hc": 14.5,
+       "xchg": 8.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 288.5,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 211.0,
+       "kda": 32.2,
+       "xchg": 28.8,
+       "hc": 16.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 719.8,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 622.8,
+       "dense": 47.2,
+       "router": 21.7,
+       "hc": 14.7,
+       "xchg": 12.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 273.6,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 216.4,
+       "kda": 31.6,
+       "hc": 14.8,
+       "xchg": 10.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 668.4,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 549.0,
+       "dense": 48.0,
+       "xchg": 31.6,
+       "router": 24.3,
+       "hc": 14.3,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 389.4,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 185.8,
+       "attn": 163.9,
+       "hc": 17.3,
+       "router": 11.5,
+       "xchg": 7.9,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 736.4,
+      "gaps_us": 2.1,
+      "fam": {
+       "experts": 626.6,
+       "dense": 49.6,
+       "router": 26.0,
+       "xchg": 18.8,
+       "hc": 14.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 278.1,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 222.0,
+       "kda": 33.7,
+       "hc": 14.7,
+       "xchg": 7.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 736.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 617.2,
+       "dense": 50.2,
+       "xchg": 31.3,
+       "router": 22.5,
+       "hc": 14.3,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 271.4,
+      "gaps_us": 1.6,
+      "fam": {
+       "dense": 213.3,
+       "kda": 32.3,
+       "hc": 16.8,
+       "xchg": 9.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 757.1,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 637.6,
+       "dense": 48.1,
+       "xchg": 33.3,
+       "router": 22.7,
+       "hc": 14.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 276.7,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 221.6,
+       "kda": 31.8,
+       "hc": 15.6,
+       "xchg": 7.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 817.5,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 708.5,
+       "dense": 49.3,
+       "router": 23.7,
+       "xchg": 20.7,
+       "hc": 14.1,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 25,
+      "us": 387.9,
+      "gaps_us": 3.1,
+      "fam": {
+       "dense": 185.5,
+       "attn": 162.1,
+       "hc": 18.1,
+       "router": 11.4,
+       "xchg": 7.7,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 761.6,
+      "gaps_us": 4.0,
+      "fam": {
+       "experts": 661.5,
+       "dense": 50.8,
+       "router": 25.5,
+       "hc": 14.2,
+       "xchg": 8.4,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 292.8,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 215.7,
+       "kda": 31.4,
+       "xchg": 29.5,
+       "hc": 16.2
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 757.0,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 653.2,
+       "dense": 55.3,
+       "router": 24.7,
+       "hc": 14.4,
+       "xchg": 8.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 29,
+      "us": 920.7,
+      "gaps_us": 24.5,
+      "fam": {
+       "dense": 846.1,
+       "attn": 42.7,
+       "other": 21.6,
+       "xchg": 7.3,
+       "hc": 3.0
+      }
+     },
+     {
+      "kernels": 34,
+      "us": 1175.0,
+      "gaps_us": 121.9,
+      "fam": {
+       "kda": 643.0,
+       "dense": 313.3,
+       "attn": 155.5,
+       "other": 29.3,
+       "xchg": 26.4,
+       "router": 7.5
+      }
+     },
+     {
+      "kernels": 19,
+      "us": 571.9,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 471.9,
+       "dense": 51.7,
+       "router": 23.7,
+       "xchg": 20.6,
+       "other": 4.0
+      }
+     },
+     {
+      "kernels": 29,
+      "us": 880.7,
+      "gaps_us": 13.9,
+      "fam": {
+       "dense": 814.6,
+       "attn": 37.2,
+       "other": 17.8,
+       "xchg": 6.9,
+       "sample": 4.2
+      }
+     },
+     {
+      "kernels": 0,
+      "us": 0,
+      "gaps_us": 0,
+      "fam": {}
+     }
+    ],
+    "first_layers": [
+     [
+      [
+       "_embed_b16",
+       "other",
+       3.6,
+       0.0,
+       [
+        3,
+        64,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.2,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.5,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       148.9,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.3,
+       0.22,
+       [
+        37,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.8,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.8,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       32.4,
+       0.1,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.16,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       58.0,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       8.2,
+       0.1,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.8,
+       0.1,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       7.7,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.1,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       157.1,
+       0.13,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.2,
+       -0.13,
+       [
+        3,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       77.4,
+       -0.13,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       25.1,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       7.7,
+       0.1,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       7.5,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       143.4,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       3.1,
+       -0.13,
+       [
+        37,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       8.4,
+       -0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.7,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.9,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       30.6,
+       0.13,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       53.3,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       10.5,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       7.4,
+       0.1,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       154.3,
+       0.13,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.2,
+       -0.13,
+       [
+        3,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       76.4,
+       -0.13,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       20.7,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.8,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       10.2,
+       0.1,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.2,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       159.2,
+       0.1,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.4,
+       -0.13,
+       [
+        37,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.0,
+       -0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.8,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.4,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       61.2,
+       0.13,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       60.7,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       8.3,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.6,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       151.9,
+       0.1,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.5,
+       -0.1,
+       [
+        3,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       138.8,
+       -0.35,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       9.4,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       12.4,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       11.6,
+       0.1,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       26.4,
+       0.1,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.3,
+       0.1,
+       [
+        6,
+        1,
+        1
+       ]
+      ],
+      [
+       "_rmsnorm",
+       "other",
+       1.6,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_rmsnorm",
+       "other",
+       2.3,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       38.8,
+       0.1,
+       [
+        1,
+        128,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        24,
+        1,
+        1
+       ]
+      ],
+      [
+       "_absorb2",
+       "attn",
+       41.0,
+       0.13,
+       [
+        256,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       7.6,
+       0.13,
+       [
+        1,
+        3,
+        8
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       16.5,
+       0.13,
+       [
+        1,
+        4,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.2,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       3.8,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       1.7,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       3.9,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       47.9,
+       0.13,
+       [
+        6,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       1.8,
+       0.13,
+       [
+        96,
+        1,
+        1
+       ]
+      ],
+      [
+       "_expand2",
+       "attn",
+       77.5,
+       0.13,
+       [
+        128,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        8,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       146.2,
+       0.13,
+       [
+        1,
+        64,
+        8
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.5,
+       0.16,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       8.1,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.5,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.1,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       20.4,
+       0.1,
+       [
+        1,
+        9,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "_topk",
+       "router",
+       4.0,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group",
+       "router",
+       3.2,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "rot_in_kernel",
+       "experts",
+       30.9,
+       0.13,
+       [
+        27,
+        32,
+        2
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       547.6,
+       0.13,
+       [
+        25,
+        8,
+        8
+       ]
+      ],
+      [
+       "gateup_epilogue_kernel",
+       "experts",
+       7.6,
+       -0.13,
+       [
+        27,
+        8,
+        1
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       242.0,
+       -0.13,
+       [
+        25,
+        32,
+        1
+       ]
+      ],
+      [
+       "down_epilogue_kernel",
+       "experts",
+       7.7,
+       -0.13,
+       [
+        27,
+        32,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       43.6,
+       -0.13,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       4.9,
+       0.13,
+       [
+        6,
+        1,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       4.5,
+       0.13,
+       [
+        3,
+        2,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       29.0,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "elementwise_kernel",
+       "other",
+       1.3,
+       0.1,
+       [
+        48,
+        1,
+        1
+       ]
+      ],
+      [
+       "_combine",
+       "router",
+       2.0,
+       0.1,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       8.4,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.9,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       10.7,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       205.9,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.4,
+       -0.13,
+       [
+        37,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       -0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.7,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       5.7,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       31.4,
+       0.13,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       56.0,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       8.3,
+       0.1,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.1,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       7.2,
+       0.1,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       15.2,
+       0.13,
+       [
+        1,
+        9,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "_topk",
+       "router",
+       4.0,
+       0.1,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group",
+       "router",
+       2.8,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "rot_in_kernel",
+       "experts",
+       9.0,
+       0.13,
+       [
+        27,
+        32,
+        2
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       554.4,
+       0.13,
+       [
+        25,
+        8,
+        8
+       ]
+      ],
+      [
+       "gateup_epilogue_kernel",
+       "experts",
+       18.5,
+       -0.13,
+       [
+        27,
+        8,
+        1
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       282.4,
+       -0.13,
+       [
+        25,
+        32,
+        1
+       ]
+      ],
+      [
+       "down_epilogue_kernel",
+       "experts",
+       26.7,
+       -0.13,
+       [
+        27,
+        32,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       31.1,
+       -0.13,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        6,
+        1,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.0,
+       0.1,
+       [
+        3,
+        2,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       32.5,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "elementwise_kernel",
+       "other",
+       1.2,
+       0.13,
+       [
+        48,
+        1,
+        1
+       ]
+      ],
+      [
+       "_combine",
+       "router",
+       1.9,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       22.7,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ]
+    ]
+   }
+  }
+ ],
+ "r1": [
+  {
+   "label": "r1",
+   "segment": 0,
+   "rounds": 178,
+   "wall_ms": 117.85692375842697,
+   "conc_ms": 0.0047477471910112356,
+   "busy_ms": 112.30381576966289,
+   "dev_span_ms": 117.5552306797754,
+   "kernels": 2575.7134831460676,
+   "graph_kernels": 476.5,
+   "eager_kernels": 2099.2134831460676,
+   "eager_api_us": 30973.29959550563,
+   "graph_launches": 3.2865168539325844,
+   "k_3-10us_n": 562.7865168539325,
+   "k_3-10us_ms": 3.086233837078766,
+   "fam_other": 0.6132374550561936,
+   "fam_hc": 1.7918079662920863,
+   "k_50-200us_n": 163.43258426966293,
+   "k_50-200us_ms": 15.653114842696594,
+   "fam_dense": 21.239206353934417,
+   "k_<3us_n": 1141.3651685393259,
+   "k_<3us_ms": 1.9521390842697586,
+   "k_10-50us_n": 608.6404494382023,
+   "k_10-50us_ms": 14.66512323033701,
+   "fam_kda": 5.478786404494366,
+   "fam_xchg": 5.0873442921348335,
+   "fam_attn": 4.575885101123664,
+   "fam_router": 1.5673628539327056,
+   "fam_experts": 71.65827273033676,
+   "k_>=200us_n": 99.48876404494382,
+   "k_>=200us_ms": 76.95195252247186,
+   "fam_nccl": 0.27003519662921344,
+   "fam_sample": 0.02662516292134826,
+   "gap_20-100us_ms": 0.33472550000000056,
+   "gap_20-100us_n": 10.808988764044944,
+   "gap_hostbound_ms": 3.611068174157286,
+   "gapph_vfwd_ms": 1.0876727303351161,
+   "gap_5-20us_ms": 0.3749842359550582,
+   "gap_5-20us_n": 36.41573033707865,
+   "gap_<1.5us_ms": 0.6375741966301467,
+   "gap_<1.5us_n": 2306.758426966292,
+   "gap_1.5-5us_ms": 0.49835305056182383,
+   "gap_1.5-5us_n": 183.65168539325842,
+   "gapph_sample_multi_ms": 2.3261599044943018,
+   "gap_>100us_ms": 3.405777926966294,
+   "gap_>100us_n": 4.578651685393258,
+   "gapph_other_ms": 1.347163938201924,
+   "gapph_propose_ms": 0.4904183370785259,
+   "streams": {
+    "7": {
+     "kernels": 2575.7134831460676,
+     "ms": 112.30856351686485
+    }
+   },
+   "phase_host_ms": {
+    "vfwd": 56.503639713483146,
+    "propose": 6.849387123595502,
+    "sample_multi": 46.716105134831515
+   },
+   "phase_busy_ms": {
+    "vfwd": 99.10183265729468,
+    "sample_multi": 0.30676012921348034,
+    "other": 7.390212258427062,
+    "propose": 5.509758471910733
+   },
+   "phase_hostbound_idle_ms": {
+    "vfwd": 0.09242226404494393,
+    "other": 1.1675403764044945,
+    "propose": 0.08040348876404504,
+    "sample_multi": 2.2707020449438113
+   },
+   "idle_ms": 5.553107988764083,
+   "idle_by_next_launch": {
+    "sample_multi|host|long(>20us)": 2.254,
+    "other|host|long(>20us)": 1.042,
+    "vfwd|device|short": 0.985,
+    "vfwd|host|long(>20us)": 0.36,
+    "propose|host|long(>20us)": 0.335,
+    "other|host|short": 0.197,
+    "other|device|short": 0.103,
+    "propose|device|short": 0.098,
+    "sample_multi|device|short": 0.051,
+    "vfwd|host|short": 0.036,
+    "propose|device|long(>20us)": 0.033,
+    "propose|host|short": 0.025,
+    "sample_multi|host|short": 0.017,
+    "vfwd|device|long(>20us)": 0.01,
+    "other|device|long(>20us)": 0.005,
+    "sample_multi|device|long(>20us)": 0.004
+   },
+   "template": {
+    "round_wall_ms": 114.469972,
+    "blocks": [
+     {
+      "kernels": 17,
+      "us": 370.8,
+      "gaps_us": 13.9,
+      "fam": {
+       "dense": 224.7,
+       "kda": 116.0,
+       "hc": 14.0,
+       "xchg": 12.5,
+       "other": 3.6
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 298.3,
+      "gaps_us": 0.8,
+      "fam": {
+       "dense": 245.6,
+       "xchg": 34.2,
+       "hc": 18.5
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 358.9,
+      "gaps_us": 13.0,
+      "fam": {
+       "dense": 222.0,
+       "kda": 107.4,
+       "hc": 16.0,
+       "xchg": 13.5
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 291.6,
+      "gaps_us": 0.7,
+      "fam": {
+       "dense": 242.8,
+       "xchg": 30.4,
+       "hc": 18.4
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 365.1,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 224.4,
+       "kda": 110.4,
+       "hc": 18.0,
+       "xchg": 12.3
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 294.5,
+      "gaps_us": 0.8,
+      "fam": {
+       "dense": 239.1,
+       "xchg": 36.4,
+       "hc": 19.0
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 563.9,
+      "gaps_us": 4.5,
+      "fam": {
+       "attn": 330.1,
+       "dense": 187.6,
+       "hc": 17.3,
+       "xchg": 14.5,
+       "router": 11.3,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1906.4,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1761.2,
+       "dense": 51.1,
+       "xchg": 49.1,
+       "router": 28.0,
+       "hc": 15.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 373.0,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 230.0,
+       "kda": 110.3,
+       "hc": 18.6,
+       "xchg": 14.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1926.3,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 1800.7,
+       "dense": 46.8,
+       "xchg": 32.3,
+       "router": 28.6,
+       "hc": 16.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 376.2,
+      "gaps_us": 13.3,
+      "fam": {
+       "dense": 228.5,
+       "kda": 112.1,
+       "hc": 19.1,
+       "xchg": 16.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 2000.0,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1882.6,
+       "dense": 51.2,
+       "router": 29.5,
+       "hc": 17.9,
+       "xchg": 17.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 445.6,
+      "gaps_us": 13.0,
+      "fam": {
+       "dense": 273.5,
+       "kda": 113.1,
+       "hc": 47.2,
+       "xchg": 11.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 2329.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 2224.1,
+       "dense": 46.4,
+       "router": 29.3,
+       "hc": 17.4,
+       "xchg": 10.8,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 579.1,
+      "gaps_us": 4.7,
+      "fam": {
+       "attn": 326.9,
+       "dense": 195.9,
+       "xchg": 26.8,
+       "hc": 16.8,
+       "router": 9.6,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1994.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1887.5,
+       "dense": 51.9,
+       "router": 27.2,
+       "hc": 16.6,
+       "xchg": 10.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 409.4,
+      "gaps_us": 14.0,
+      "fam": {
+       "dense": 266.3,
+       "kda": 114.1,
+       "hc": 17.2,
+       "xchg": 11.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1911.0,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1774.8,
+       "router": 54.9,
+       "dense": 48.9,
+       "hc": 20.6,
+       "xchg": 10.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 397.2,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 229.7,
+       "kda": 111.8,
+       "xchg": 37.3,
+       "hc": 18.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1946.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1808.8,
+       "dense": 46.7,
+       "xchg": 41.5,
+       "router": 29.5,
+       "hc": 18.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 386.1,
+      "gaps_us": 13.2,
+      "fam": {
+       "dense": 225.4,
+       "kda": 113.0,
+       "xchg": 29.3,
+       "hc": 18.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1880.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1745.8,
+       "dense": 47.6,
+       "xchg": 38.9,
+       "router": 30.0,
+       "hc": 17.2,
+       "other": 1.4
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 568.2,
+      "gaps_us": 4.8,
+      "fam": {
+       "attn": 330.7,
+       "dense": 194.3,
+       "hc": 17.1,
+       "router": 12.3,
+       "xchg": 10.8,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1933.0,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1781.0,
+       "xchg": 54.3,
+       "dense": 53.4,
+       "router": 27.6,
+       "hc": 15.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 382.0,
+      "gaps_us": 13.0,
+      "fam": {
+       "dense": 231.2,
+       "kda": 111.3,
+       "xchg": 22.4,
+       "hc": 17.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1954.6,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1805.0,
+       "dense": 52.8,
+       "xchg": 45.4,
+       "router": 30.9,
+       "hc": 19.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 380.3,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 228.0,
+       "kda": 111.8,
+       "xchg": 24.8,
+       "hc": 15.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1679.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1570.5,
+       "dense": 49.1,
+       "router": 29.4,
+       "hc": 18.6,
+       "xchg": 10.8,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 411.0,
+      "gaps_us": 17.7,
+      "fam": {
+       "dense": 226.8,
+       "kda": 111.1,
+       "xchg": 55.0,
+       "hc": 18.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1799.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1670.6,
+       "dense": 52.5,
+       "router": 30.3,
+       "xchg": 24.2,
+       "hc": 18.2,
+       "other": 3.9
+      }
+     },
+     {
+      "kernels": 40,
+      "us": 905.7,
+      "gaps_us": 5.0,
+      "fam": {
+       "attn": 497.9,
+       "dense": 317.1,
+       "hc": 48.1,
+       "other": 20.3,
+       "router": 12.0,
+       "xchg": 10.3
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1745.2,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1641.7,
+       "dense": 49.6,
+       "router": 25.9,
+       "hc": 16.1,
+       "xchg": 10.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 519.4,
+      "gaps_us": 17.6,
+      "fam": {
+       "dense": 339.8,
+       "kda": 139.0,
+       "xchg": 22.4,
+       "hc": 18.2
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1764.7,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 1566.1,
+       "router": 83.1,
+       "dense": 54.2,
+       "hc": 46.0,
+       "xchg": 11.0,
+       "other": 4.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 432.9,
+      "gaps_us": 28.8,
+      "fam": {
+       "dense": 239.7,
+       "kda": 126.5,
+       "hc": 55.2,
+       "xchg": 11.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1597.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1391.7,
+       "xchg": 107.6,
+       "dense": 47.4,
+       "router": 29.5,
+       "hc": 20.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 385.8,
+      "gaps_us": 13.0,
+      "fam": {
+       "dense": 233.6,
+       "kda": 112.7,
+       "xchg": 23.1,
+       "hc": 16.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1434.6,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1310.8,
+       "dense": 48.7,
+       "xchg": 27.9,
+       "router": 27.2,
+       "hc": 18.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 563.7,
+      "gaps_us": 4.7,
+      "fam": {
+       "attn": 334.1,
+       "dense": 188.2,
+       "hc": 18.1,
+       "xchg": 11.9,
+       "router": 8.3,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1409.6,
+      "gaps_us": 3.9,
+      "fam": {
+       "experts": 1271.0,
+       "dense": 51.3,
+       "xchg": 40.9,
+       "router": 27.7,
+       "hc": 17.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 381.5,
+      "gaps_us": 12.9,
+      "fam": {
+       "dense": 232.9,
+       "kda": 111.5,
+       "xchg": 21.4,
+       "hc": 15.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1432.6,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1322.2,
+       "dense": 50.0,
+       "router": 30.2,
+       "hc": 17.9,
+       "xchg": 11.0,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 401.7,
+      "gaps_us": 18.9,
+      "fam": {
+       "dense": 229.7,
+       "kda": 110.9,
+       "xchg": 44.4,
+       "hc": 16.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1497.1,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1372.2,
+       "dense": 46.6,
+       "xchg": 30.5,
+       "router": 28.9,
+       "hc": 17.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 382.5,
+      "gaps_us": 13.0,
+      "fam": {
+       "dense": 228.8,
+       "kda": 112.6,
+       "xchg": 23.6,
+       "hc": 17.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1586.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1446.6,
+       "dense": 47.9,
+       "xchg": 42.6,
+       "router": 29.4,
+       "hc": 18.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 562.0,
+      "gaps_us": 4.5,
+      "fam": {
+       "attn": 340.0,
+       "dense": 184.4,
+       "hc": 15.7,
+       "xchg": 11.0,
+       "router": 7.9,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1563.1,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1429.0,
+       "dense": 48.7,
+       "xchg": 41.1,
+       "router": 27.5,
+       "hc": 15.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 387.5,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 228.1,
+       "kda": 112.1,
+       "xchg": 27.8,
+       "hc": 19.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1534.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1401.5,
+       "dense": 47.1,
+       "xchg": 38.7,
+       "router": 29.1,
+       "hc": 17.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 386.9,
+      "gaps_us": 17.5,
+      "fam": {
+       "dense": 233.5,
+       "kda": 111.6,
+       "xchg": 22.7,
+       "hc": 19.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1276.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1141.3,
+       "dense": 51.0,
+       "xchg": 32.9,
+       "router": 30.3,
+       "hc": 20.0,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 390.6,
+      "gaps_us": 13.1,
+      "fam": {
+       "dense": 227.0,
+       "kda": 111.0,
+       "xchg": 35.1,
+       "hc": 17.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1322.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1192.1,
+       "dense": 47.9,
+       "xchg": 32.6,
+       "router": 29.7,
+       "hc": 18.4,
+       "other": 1.6
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 560.2,
+      "gaps_us": 4.8,
+      "fam": {
+       "attn": 331.3,
+       "dense": 188.2,
+       "hc": 16.6,
+       "xchg": 11.5,
+       "router": 9.5,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1263.5,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 1113.8,
+       "xchg": 53.6,
+       "dense": 49.7,
+       "router": 27.6,
+       "hc": 17.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 382.5,
+      "gaps_us": 17.2,
+      "fam": {
+       "dense": 227.7,
+       "kda": 112.6,
+       "xchg": 25.2,
+       "hc": 17.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1577.6,
+      "gaps_us": 2.1,
+      "fam": {
+       "experts": 1418.7,
+       "xchg": 63.0,
+       "dense": 47.7,
+       "router": 28.0,
+       "hc": 18.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 384.3,
+      "gaps_us": 14.8,
+      "fam": {
+       "dense": 226.2,
+       "kda": 109.6,
+       "xchg": 29.7,
+       "hc": 18.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1525.9,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 1416.0,
+       "dense": 50.0,
+       "router": 30.1,
+       "hc": 17.6,
+       "xchg": 10.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 405.0,
+      "gaps_us": 13.0,
+      "fam": {
+       "dense": 233.5,
+       "kda": 112.7,
+       "xchg": 41.0,
+       "hc": 17.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1576.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1309.0,
+       "xchg": 168.1,
+       "dense": 52.0,
+       "router": 27.6,
+       "hc": 18.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 702.1,
+      "gaps_us": 4.7,
+      "fam": {
+       "attn": 329.7,
+       "dense": 187.7,
+       "xchg": 152.3,
+       "hc": 18.2,
+       "router": 11.2,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1648.7,
+      "gaps_us": 2.1,
+      "fam": {
+       "experts": 1246.4,
+       "xchg": 308.4,
+       "dense": 50.2,
+       "router": 27.1,
+       "hc": 15.3,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 433.8,
+      "gaps_us": 17.4,
+      "fam": {
+       "dense": 232.6,
+       "kda": 112.4,
+       "xchg": 72.2,
+       "hc": 16.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1365.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1230.3,
+       "dense": 51.3,
+       "xchg": 36.3,
+       "router": 28.3,
+       "hc": 18.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 372.8,
+      "gaps_us": 13.2,
+      "fam": {
+       "dense": 230.8,
+       "kda": 112.4,
+       "hc": 15.6,
+       "xchg": 14.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1232.6,
+      "gaps_us": 2.1,
+      "fam": {
+       "experts": 1097.7,
+       "dense": 45.9,
+       "xchg": 38.6,
+       "router": 30.4,
+       "hc": 18.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 401.4,
+      "gaps_us": 16.6,
+      "fam": {
+       "dense": 228.7,
+       "kda": 112.1,
+       "xchg": 37.6,
+       "hc": 23.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1495.4,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1297.9,
+       "xchg": 94.5,
+       "dense": 52.4,
+       "router": 31.2,
+       "hc": 18.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 684.0,
+      "gaps_us": 4.9,
+      "fam": {
+       "attn": 338.7,
+       "dense": 187.6,
+       "xchg": 128.8,
+       "hc": 17.4,
+       "router": 8.5,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1737.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1383.3,
+       "xchg": 257.6,
+       "dense": 50.1,
+       "router": 28.2,
+       "hc": 17.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 499.8,
+      "gaps_us": 15.7,
+      "fam": {
+       "dense": 236.9,
+       "xchg": 130.5,
+       "kda": 113.8,
+       "hc": 18.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1731.0,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1367.8,
+       "xchg": 262.0,
+       "dense": 54.1,
+       "router": 29.3,
+       "hc": 16.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 562.4,
+      "gaps_us": 15.1,
+      "fam": {
+       "dense": 224.8,
+       "xchg": 205.1,
+       "kda": 114.8,
+       "hc": 17.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1745.0,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1382.8,
+       "xchg": 263.0,
+       "dense": 47.7,
+       "router": 29.6,
+       "hc": 20.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 500.2,
+      "gaps_us": 19.4,
+      "fam": {
+       "dense": 229.9,
+       "xchg": 141.9,
+       "kda": 112.7,
+       "hc": 15.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1930.3,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 1464.0,
+       "xchg": 368.7,
+       "dense": 50.0,
+       "router": 28.9,
+       "hc": 17.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 39,
+      "us": 1018.5,
+      "gaps_us": 4.5,
+      "fam": {
+       "xchg": 457.1,
+       "attn": 337.3,
+       "dense": 191.5,
+       "hc": 18.4,
+       "router": 11.2,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1633.9,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1216.2,
+       "xchg": 321.8,
+       "dense": 51.9,
+       "router": 26.6,
+       "hc": 16.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 520.3,
+      "gaps_us": 15.2,
+      "fam": {
+       "dense": 231.6,
+       "xchg": 156.9,
+       "kda": 115.9,
+       "hc": 15.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1532.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1168.7,
+       "xchg": 262.5,
+       "dense": 49.3,
+       "router": 32.4,
+       "hc": 18.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 497.7,
+      "gaps_us": 14.8,
+      "fam": {
+       "dense": 228.3,
+       "xchg": 135.6,
+       "kda": 115.6,
+       "hc": 18.2
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1466.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 1088.0,
+       "xchg": 276.2,
+       "dense": 52.6,
+       "router": 27.6,
+       "hc": 21.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 414.7,
+      "gaps_us": 19.4,
+      "fam": {
+       "dense": 227.6,
+       "kda": 112.6,
+       "xchg": 58.0,
+       "hc": 16.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1569.7,
+      "gaps_us": 2.1,
+      "fam": {
+       "experts": 1233.2,
+       "xchg": 237.9,
+       "dense": 50.8,
+       "router": 29.9,
+       "hc": 16.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 40,
+      "us": 709.6,
+      "gaps_us": 4.8,
+      "fam": {
+       "attn": 333.2,
+       "dense": 180.8,
+       "xchg": 163.9,
+       "hc": 19.9,
+       "router": 8.7,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1604.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1243.0,
+       "xchg": 269.7,
+       "dense": 48.3,
+       "router": 26.6,
+       "hc": 15.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 17,
+      "us": 441.0,
+      "gaps_us": 15.4,
+      "fam": {
+       "dense": 236.2,
+       "kda": 109.4,
+       "xchg": 78.0,
+       "hc": 17.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1742.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 1313.2,
+       "xchg": 328.1,
+       "dense": 52.2,
+       "router": 30.6,
+       "hc": 16.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 98,
+      "us": 1357.3,
+      "gaps_us": 64.5,
+      "fam": {
+       "dense": 830.3,
+       "xchg": 303.9,
+       "attn": 156.5,
+       "other": 60.6,
+       "hc": 6.0
+      }
+     },
+     {
+      "kernels": 82,
+      "us": 1715.6,
+      "gaps_us": 346.4,
+      "fam": {
+       "kda": 688.8,
+       "dense": 481.4,
+       "xchg": 436.8,
+       "other": 108.6
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 259.1,
+      "gaps_us": 3.1,
+      "fam": {
+       "dense": 230.8,
+       "xchg": 21.8,
+       "other": 3.9,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 129.7,
+      "gaps_us": 3.8,
+      "fam": {
+       "dense": 87.2,
+       "xchg": 22.1,
+       "kda": 10.4,
+       "other": 10.0
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 271.3,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 237.4,
+       "xchg": 27.3,
+       "other": 3.9,
+       "kda": 2.7
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 125.4,
+      "gaps_us": 3.6,
+      "fam": {
+       "dense": 88.3,
+       "xchg": 16.9,
+       "kda": 10.2,
+       "other": 10.0
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 269.3,
+      "gaps_us": 9.4,
+      "fam": {
+       "dense": 235.4,
+       "xchg": 27.4,
+       "other": 3.8,
+       "kda": 2.7
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 123.1,
+      "gaps_us": 3.7,
+      "fam": {
+       "dense": 86.6,
+       "xchg": 16.6,
+       "kda": 10.0,
+       "other": 9.9
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 276.8,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 244.0,
+       "xchg": 26.2,
+       "other": 3.9,
+       "kda": 2.7
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 121.5,
+      "gaps_us": 3.7,
+      "fam": {
+       "dense": 87.0,
+       "xchg": 14.4,
+       "kda": 10.1,
+       "other": 10.0
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 271.8,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 246.0,
+       "xchg": 19.3,
+       "other": 3.9,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 30,
+      "us": 909.1,
+      "gaps_us": 10.2,
+      "fam": {
+       "dense": 808.5,
+       "attn": 46.0,
+       "xchg": 31.0,
+       "other": 18.4,
+       "sample": 3.9,
+       "kda": 1.3
+      }
+     },
+     {
+      "kernels": 68,
+      "us": 730.8,
+      "gaps_us": 330.2,
+      "fam": {
+       "dense": 424.9,
+       "xchg": 215.7,
+       "other": 80.3,
+       "kda": 8.7,
+       "sample": 1.2
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 251.9,
+      "gaps_us": 3.1,
+      "fam": {
+       "dense": 224.9,
+       "xchg": 20.5,
+       "other": 3.8,
+       "kda": 2.7
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 124.7,
+      "gaps_us": 3.6,
+      "fam": {
+       "dense": 86.1,
+       "xchg": 18.3,
+       "kda": 10.3,
+       "other": 10.0
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 271.7,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 234.6,
+       "xchg": 30.6,
+       "other": 3.8,
+       "kda": 2.7
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 116.8,
+      "gaps_us": 3.8,
+      "fam": {
+       "dense": 87.4,
+       "kda": 10.2,
+       "other": 9.8,
+       "xchg": 9.4
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 281.2,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 236.3,
+       "xchg": 38.3,
+       "other": 3.8,
+       "kda": 2.8
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 115.5,
+      "gaps_us": 3.6,
+      "fam": {
+       "dense": 86.0,
+       "kda": 10.3,
+       "other": 9.9,
+       "xchg": 9.3
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 279.3,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 239.6,
+       "xchg": 33.0,
+       "other": 3.9,
+       "kda": 2.8
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 114.9,
+      "gaps_us": 3.7,
+      "fam": {
+       "dense": 85.2,
+       "kda": 10.4,
+       "other": 9.9,
+       "xchg": 9.4
+      }
+     },
+     {
+      "kernels": 13,
+      "us": 274.3,
+      "gaps_us": 2.8,
+      "fam": {
+       "dense": 237.4,
+       "xchg": 30.4,
+       "other": 3.9,
+       "kda": 2.6
+      }
+     },
+     {
+      "kernels": 30,
+      "us": 907.9,
+      "gaps_us": 10.5,
+      "fam": {
+       "dense": 806.4,
+       "attn": 45.9,
+       "xchg": 31.8,
+       "other": 18.7,
+       "sample": 3.8,
+       "kda": 1.3
+      }
+     },
+     {
+      "kernels": 112,
+      "us": 6286.5,
+      "gaps_us": 544.4,
+      "fam": {
+       "experts": 3279.7,
+       "nccl": 1284.4,
+       "dense": 1249.8,
+       "attn": 335.3,
+       "other": 73.1,
+       "router": 47.8,
+       "sample": 9.4,
+       "xchg": 7.0
+      }
+     },
+     {
+      "kernels": 28,
+      "us": 565.1,
+      "gaps_us": 362.0,
+      "fam": {
+       "dense": 270.5,
+       "attn": 152.5,
+       "xchg": 124.3,
+       "other": 10.3,
+       "router": 7.5
+      }
+     },
+     {
+      "kernels": 18,
+      "us": 348.1,
+      "gaps_us": 7.1,
+      "fam": {
+       "experts": 252.0,
+       "dense": 49.1,
+       "xchg": 22.5,
+       "router": 21.5,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 29,
+      "us": 881.8,
+      "gaps_us": 14.3,
+      "fam": {
+       "dense": 799.5,
+       "attn": 36.9,
+       "xchg": 24.4,
+       "other": 16.8,
+       "sample": 4.2
+      }
+     },
+     {
+      "kernels": 0,
+      "us": 0,
+      "gaps_us": 0,
+      "fam": {}
+     }
+    ],
+    "first_layers": [
+     [
+      [
+       "_embed_b16",
+       "other",
+       3.6,
+       0.0,
+       [
+        9,
+        64,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.3,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.7,
+       0.35,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       148.8,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       4.0,
+       0.26,
+       [
+        111,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.1,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.0,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.0,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.7,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       27.9,
+       1.57,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       26.4,
+       2.94,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       32.3,
+       3.07,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.4,
+       3.04,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       1.54,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       60.2,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.1,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       12.5,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       4.4,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.8,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       167.2,
+       0.13,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.4,
+       -0.13,
+       [
+        9,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       75.8,
+       -0.13,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       34.2,
+       0.1,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       2.1,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.6,
+       0.1,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       145.5,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.2,
+       -0.13,
+       [
+        111,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       -0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.7,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.0,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       26.2,
+       1.54,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       25.8,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       26.0,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.4,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       1.54,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       62.9,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       13.5,
+       0.1,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       4.4,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.6,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       162.4,
+       0.1,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.4,
+       -0.13,
+       [
+        9,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       77.8,
+       -0.13,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       30.4,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.7,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       10.9,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       148.7,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.4,
+       -0.13,
+       [
+        111,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       -0.19,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.7,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.6,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       26.6,
+       1.57,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       26.0,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       28.5,
+       2.94,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.3,
+       2.94,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       1.54,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       62.3,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       12.3,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       3.7,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       9.9,
+       0.1,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       160.2,
+       0.13,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.4,
+       -0.16,
+       [
+        9,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       76.3,
+       -0.13,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       36.4,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       2.7,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       9.3,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       29.1,
+       0.13,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.1,
+       [
+        18,
+        1,
+        1
+       ]
+      ],
+      [
+       "_rmsnorm",
+       "other",
+       1.6,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_rmsnorm",
+       "other",
+       1.5,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       39.5,
+       0.13,
+       [
+        1,
+        128,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.6,
+       0.13,
+       [
+        72,
+        1,
+        1
+       ]
+      ],
+      [
+       "_absorb2",
+       "attn",
+       33.2,
+       0.1,
+       [
+        256,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       7.1,
+       0.13,
+       [
+        1,
+        3,
+        8
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.4,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       9.9,
+       0.13,
+       [
+        1,
+        4,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       3.5,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       1.5,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       1.9,
+       0.1,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       50.4,
+       0.1,
+       [
+        4,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       1.5,
+       0.13,
+       [
+        64,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       1.5,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       1.3,
+       0.1,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       1.8,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       50.1,
+       0.1,
+       [
+        4,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       1.4,
+       0.13,
+       [
+        64,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       1.5,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       1.2,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       0.8,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       49.7,
+       0.1,
+       [
+        4,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       1.4,
+       0.13,
+       [
+        64,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       1.5,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       1.3,
+       0.1,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       1.9,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       49.9,
+       0.13,
+       [
+        6,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       1.6,
+       0.13,
+       [
+        96,
+        1,
+        1
+       ]
+      ],
+      [
+       "_expand2",
+       "attn",
+       71.2,
+       0.1,
+       [
+        128,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.0,
+       0.13,
+       [
+        9,
+        8,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       104.7,
+       0.13,
+       [
+        1,
+        64,
+        8
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.0,
+       -0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       14.5,
+       -0.26,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.5,
+       0.1,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.8,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       14.6,
+       0.13,
+       [
+        1,
+        9,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_topk",
+       "router",
+       4.0,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group",
+       "router",
+       6.0,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "rot_in_kernel",
+       "experts",
+       14.0,
+       0.13,
+       [
+        81,
+        32,
+        2
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       1149.3,
+       0.13,
+       [
+        73,
+        8,
+        8
+       ]
+      ],
+      [
+       "gateup_epilogue_kernel",
+       "experts",
+       17.0,
+       -0.1,
+       [
+        81,
+        8,
+        1
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       568.5,
+       -0.13,
+       [
+        73,
+        32,
+        1
+       ]
+      ],
+      [
+       "down_epilogue_kernel",
+       "experts",
+       12.4,
+       -0.13,
+       [
+        81,
+        32,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       27.4,
+       -0.13,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.13,
+       [
+        18,
+        1,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       3.2,
+       0.1,
+       [
+        9,
+        2,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       17.2,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.2,
+       0.13,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "elementwise_kernel",
+       "other",
+       1.3,
+       0.13,
+       [
+        144,
+        1,
+        1
+       ]
+      ],
+      [
+       "_combine",
+       "router",
+       2.0,
+       0.1,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       49.1,
+       0.1,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       2.5,
+       0.13,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       10.7,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       155.6,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.2,
+       -0.13,
+       [
+        111,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       -0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.6,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.0,
+       0.13,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.8,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       26.8,
+       1.54,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       25.8,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       28.4,
+       2.94,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       29.3,
+       2.91,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       1.54,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       59.9,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.1,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       14.1,
+       0.13,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       2.8,
+       0.1,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.4,
+       0.13,
+       [
+        9,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       15.2,
+       0.13,
+       [
+        1,
+        9,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_topk",
+       "router",
+       4.0,
+       0.1,
+       [
+        9,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group",
+       "router",
+       6.0,
+       0.1,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "rot_in_kernel",
+       "experts",
+       13.0,
+       0.13,
+       [
+        81,
+        32,
+        2
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       1168.4,
+       0.13,
+       [
+        73,
+        8,
+        8
+       ]
+      ],
+      [
+       "gateup_epilogue_kernel",
+       "experts",
+       14.2,
+       -0.13,
+       [
+        81,
+        8,
+        1
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       596.3,
+       -0.13,
+       [
+        73,
+        32,
+        1
+       ]
+      ],
+      [
+       "down_epilogue_kernel",
+       "experts",
+       8.8,
+       -0.13,
+       [
+        81,
+        32,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       27.6,
+       -0.13,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.13,
+       [
+        18,
+        1,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.0,
+       0.1,
+       [
+        9,
+        2,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       16.1,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.1,
+       [
+        36,
+        1,
+        1
+       ]
+      ],
+      [
+       "elementwise_kernel",
+       "other",
+       1.3,
+       0.1,
+       [
+        144,
+        1,
+        1
+       ]
+      ],
+      [
+       "_combine",
+       "router",
+       2.0,
+       0.1,
+       [
+        9,
+        4,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       32.3,
+       0.1,
+       [
+        8,
+        1,
+        1
+       ]
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "label": "r1",
+   "segment": 1,
+   "rounds": 99,
+   "wall_ms": 55.71359318181818,
+   "conc_ms": 0.03560622222222223,
+   "busy_ms": 53.56420066666666,
+   "dev_span_ms": 54.33406410101009,
+   "kernels": 1849.5252525252524,
+   "graph_kernels": 1713.030303030303,
+   "eager_kernels": 136.4949494949495,
+   "eager_api_us": 608.6800303030304,
+   "graph_launches": 3.3636363636363638,
+   "k_3-10us_n": 532.2424242424242,
+   "k_3-10us_ms": 3.0876617676767792,
+   "fam_other": 0.2433991515151554,
+   "fam_hc": 1.4570088989898802,
+   "k_50-200us_n": 139.43434343434345,
+   "k_50-200us_ms": 14.907611151515132,
+   "fam_dense": 16.05203643434432,
+   "k_<3us_n": 791.1919191919192,
+   "k_<3us_ms": 1.1047553232323093,
+   "k_10-50us_n": 317.5353535353535,
+   "k_10-50us_ms": 7.456619535353597,
+   "fam_kda": 1.5365707676767704,
+   "fam_xchg": 2.657306878787876,
+   "fam_attn": 2.2444779696969737,
+   "fam_router": 1.1905251919190816,
+   "fam_experts": 28.20247433333338,
+   "k_>=200us_n": 69.12121212121212,
+   "k_>=200us_ms": 27.043159111111212,
+   "fam_sample": 0.01000220202020202,
+   "gap_5-20us_ms": 0.038859666666666653,
+   "gap_5-20us_n": 3.909090909090909,
+   "gap_hostbound_ms": 0.24064458585858578,
+   "gapph_vfwd_ms": 0.18850714141409758,
+   "gap_20-100us_ms": 0.1222572323232324,
+   "gap_20-100us_n": 2.3434343434343434,
+   "gap_<1.5us_ms": 0.21680418181811464,
+   "gap_<1.5us_n": 1592.3939393939395,
+   "gapph_sample_multi_ms": 0.02608087878787863,
+   "gap_1.5-5us_ms": 0.02696271717171693,
+   "gap_1.5-5us_n": 10.646464646464647,
+   "gapph_other_ms": 0.21475572727272718,
+   "gapph_propose_ms": 0.340519686868623,
+   "gap_>100us_ms": 0.3649796363636363,
+   "gap_>100us_n": 1.8686868686868687,
+   "fam_nccl": 0.006005060606060607,
+   "streams": {
+    "7": {
+     "kernels": 1849.5252525252524,
+     "ms": 53.5998068888977
+    }
+   },
+   "phase_host_ms": {
+    "vfwd": 2.3418819090909095,
+    "propose": 5.42183495959596,
+    "sample_multi": 47.69968587878787
+   },
+   "phase_busy_ms": {
+    "vfwd": 48.35196033333894,
+    "sample_multi": 0.1046935858585856,
+    "other": 0.43371945454545435,
+    "propose": 4.7094335151514075
+   },
+   "phase_hostbound_idle_ms": {
+    "vfwd": 0.0051203636363636364,
+    "other": 0.20834565656565657,
+    "propose": 0.02717856565656563
+   },
+   "idle_ms": 2.1493925151515256,
+   "idle_by_next_launch": {
+    "vfwd|host|long(>20us)": 1.385,
+    "propose|host|long(>20us)": 0.262,
+    "other|host|long(>20us)": 0.205,
+    "vfwd|device|short": 0.181,
+    "propose|device|short": 0.062,
+    "sample_multi|device|short": 0.021,
+    "propose|device|long(>20us)": 0.01,
+    "propose|host|short": 0.007,
+    "other|device|short": 0.005,
+    "sample_multi|device|long(>20us)": 0.005,
+    "other|host|short": 0.005,
+    "vfwd|device|long(>20us)": 0.002,
+    "vfwd|host|short": 0.002,
+    "other|device|long(>20us)": 0.0
+   },
+   "template": {
+    "round_wall_ms": 53.837485,
+    "blocks": [
+     {
+      "kernels": 14,
+      "us": 435.8,
+      "gaps_us": 1.8,
+      "fam": {
+       "dense": 224.5,
+       "xchg": 146.4,
+       "kda": 38.1,
+       "hc": 21.1,
+       "other": 5.7
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 260.6,
+      "gaps_us": 0.7,
+      "fam": {
+       "dense": 237.4,
+       "hc": 14.4,
+       "xchg": 8.8
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 288.5,
+      "gaps_us": 1.7,
+      "fam": {
+       "dense": 215.5,
+       "kda": 33.2,
+       "xchg": 21.7,
+       "hc": 18.1
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 258.1,
+      "gaps_us": 0.7,
+      "fam": {
+       "dense": 232.3,
+       "hc": 14.4,
+       "xchg": 11.4
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 332.6,
+      "gaps_us": 1.6,
+      "fam": {
+       "dense": 212.1,
+       "xchg": 69.8,
+       "kda": 33.1,
+       "hc": 17.6
+      }
+     },
+     {
+      "kernels": 8,
+      "us": 326.8,
+      "gaps_us": 0.8,
+      "fam": {
+       "dense": 233.5,
+       "xchg": 78.9,
+       "hc": 14.4
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 452.8,
+      "gaps_us": 3.1,
+      "fam": {
+       "dense": 184.5,
+       "attn": 167.9,
+       "xchg": 68.3,
+       "hc": 16.2,
+       "router": 11.2,
+       "other": 4.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 975.2,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 726.6,
+       "xchg": 156.8,
+       "dense": 51.2,
+       "router": 24.9,
+       "hc": 14.5,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 334.0,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 218.1,
+       "xchg": 65.9,
+       "kda": 33.5,
+       "hc": 16.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1020.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 725.9,
+       "xchg": 206.7,
+       "dense": 49.8,
+       "router": 23.4,
+       "hc": 13.9,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 310.0,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 217.7,
+       "xchg": 41.0,
+       "kda": 33.5,
+       "hc": 17.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 842.4,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 732.5,
+       "dense": 49.1,
+       "router": 23.7,
+       "xchg": 21.2,
+       "hc": 14.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 15,
+      "us": 278.8,
+      "gaps_us": 1.6,
+      "fam": {
+       "dense": 213.9,
+       "kda": 34.5,
+       "hc": 19.8,
+       "xchg": 10.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 834.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 724.8,
+       "dense": 46.6,
+       "xchg": 24.2,
+       "router": 23.2,
+       "hc": 14.8,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 384.1,
+      "gaps_us": 2.7,
+      "fam": {
+       "dense": 183.8,
+       "attn": 163.9,
+       "hc": 16.2,
+       "router": 9.4,
+       "xchg": 7.8,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 815.6,
+      "gaps_us": 1.8,
+      "fam": {
+       "experts": 697.7,
+       "dense": 47.7,
+       "xchg": 30.4,
+       "router": 24.5,
+       "hc": 14.0,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 277.9,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 219.5,
+       "kda": 35.2,
+       "hc": 15.4,
+       "xchg": 7.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 812.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 705.6,
+       "dense": 47.6,
+       "router": 23.3,
+       "xchg": 19.7,
+       "hc": 15.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 277.1,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 215.7,
+       "kda": 34.4,
+       "hc": 16.9,
+       "xchg": 10.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 952.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 701.5,
+       "xchg": 166.3,
+       "dense": 47.8,
+       "router": 21.6,
+       "hc": 13.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 310.6,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 214.1,
+       "xchg": 45.6,
+       "kda": 33.9,
+       "hc": 17.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 1051.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 728.3,
+       "xchg": 235.7,
+       "dense": 49.0,
+       "router": 23.2,
+       "hc": 14.3,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 517.3,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 184.2,
+       "attn": 165.2,
+       "xchg": 137.1,
+       "hc": 16.3,
+       "router": 11.4,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 988.1,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 723.0,
+       "xchg": 170.7,
+       "dense": 53.9,
+       "router": 24.9,
+       "hc": 14.3,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 283.4,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 215.2,
+       "kda": 33.5,
+       "xchg": 19.0,
+       "hc": 15.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 937.2,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 703.9,
+       "xchg": 143.1,
+       "dense": 50.2,
+       "router": 24.2,
+       "hc": 14.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 314.0,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 214.2,
+       "xchg": 51.3,
+       "kda": 33.5,
+       "hc": 15.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 944.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 614.3,
+       "xchg": 242.5,
+       "dense": 48.5,
+       "router": 23.1,
+       "hc": 15.3,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 317.1,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 212.6,
+       "xchg": 54.7,
+       "kda": 33.3,
+       "hc": 16.5
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 941.5,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 710.1,
+       "xchg": 140.7,
+       "dense": 51.5,
+       "router": 23.3,
+       "hc": 14.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 25,
+      "us": 579.3,
+      "gaps_us": 3.1,
+      "fam": {
+       "xchg": 197.9,
+       "dense": 182.9,
+       "attn": 164.0,
+       "hc": 19.7,
+       "router": 11.8,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 790.7,
+      "gaps_us": 4.2,
+      "fam": {
+       "experts": 691.3,
+       "dense": 49.3,
+       "router": 22.6,
+       "hc": 14.2,
+       "xchg": 12.0,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 283.4,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 212.0,
+       "kda": 35.9,
+       "xchg": 18.9,
+       "hc": 16.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 776.9,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 657.3,
+       "dense": 51.9,
+       "xchg": 29.5,
+       "router": 22.7,
+       "hc": 14.3,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 268.9,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 209.6,
+       "kda": 34.5,
+       "hc": 16.9,
+       "xchg": 7.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 728.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 615.5,
+       "dense": 50.4,
+       "xchg": 24.8,
+       "router": 22.0,
+       "hc": 14.8,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 271.6,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 215.2,
+       "kda": 33.6,
+       "hc": 15.1,
+       "xchg": 7.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 709.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 605.2,
+       "dense": 48.4,
+       "router": 22.8,
+       "xchg": 18.2,
+       "hc": 13.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 390.5,
+      "gaps_us": 3.0,
+      "fam": {
+       "dense": 179.8,
+       "attn": 161.2,
+       "xchg": 18.3,
+       "hc": 16.6,
+       "router": 11.6,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 711.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 610.8,
+       "dense": 49.3,
+       "router": 25.9,
+       "hc": 15.0,
+       "xchg": 9.5,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 287.9,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 217.3,
+       "kda": 32.5,
+       "xchg": 23.3,
+       "hc": 14.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 696.7,
+      "gaps_us": 2.1,
+      "fam": {
+       "experts": 597.5,
+       "dense": 47.4,
+       "router": 22.5,
+       "hc": 14.3,
+       "xchg": 13.7,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 278.0,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 214.7,
+       "kda": 32.1,
+       "hc": 16.8,
+       "xchg": 14.4
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 831.8,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 703.3,
+       "dense": 49.9,
+       "xchg": 41.0,
+       "router": 22.2,
+       "hc": 14.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 271.3,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 214.1,
+       "kda": 32.9,
+       "hc": 16.5,
+       "xchg": 7.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 796.0,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 662.9,
+       "dense": 49.1,
+       "xchg": 44.7,
+       "router": 23.8,
+       "hc": 14.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 379.0,
+      "gaps_us": 2.7,
+      "fam": {
+       "dense": 174.7,
+       "attn": 163.7,
+       "hc": 14.9,
+       "xchg": 11.3,
+       "router": 11.3,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 685.1,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 511.2,
+       "xchg": 81.1,
+       "dense": 52.1,
+       "router": 25.2,
+       "hc": 14.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 440.9,
+      "gaps_us": 1.6,
+      "fam": {
+       "dense": 214.0,
+       "xchg": 175.3,
+       "kda": 34.7,
+       "hc": 16.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 790.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 531.6,
+       "xchg": 169.7,
+       "dense": 50.0,
+       "router": 23.7,
+       "hc": 13.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 15,
+      "us": 319.5,
+      "gaps_us": 1.6,
+      "fam": {
+       "dense": 226.3,
+       "xchg": 41.9,
+       "kda": 34.0,
+       "hc": 17.3
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 747.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 647.0,
+       "dense": 50.9,
+       "router": 23.3,
+       "hc": 14.5,
+       "xchg": 10.9,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 301.5,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 213.7,
+       "xchg": 38.4,
+       "kda": 32.8,
+       "hc": 16.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 651.4,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 544.2,
+       "dense": 46.9,
+       "xchg": 23.3,
+       "router": 22.2,
+       "hc": 13.6,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 385.6,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 180.3,
+       "attn": 160.3,
+       "xchg": 17.9,
+       "hc": 15.6,
+       "router": 8.5,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 594.4,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 493.0,
+       "dense": 50.4,
+       "router": 24.5,
+       "hc": 16.9,
+       "xchg": 8.3,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 291.9,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 216.7,
+       "kda": 38.3,
+       "xchg": 21.2,
+       "hc": 15.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 791.3,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 659.5,
+       "dense": 47.6,
+       "xchg": 46.3,
+       "router": 22.0,
+       "hc": 14.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 275.7,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 212.8,
+       "kda": 32.8,
+       "hc": 16.4,
+       "xchg": 13.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 722.7,
+      "gaps_us": 4.3,
+      "fam": {
+       "experts": 618.6,
+       "dense": 48.6,
+       "router": 24.6,
+       "hc": 14.8,
+       "xchg": 14.8,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 287.1,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 218.2,
+       "kda": 32.1,
+       "xchg": 20.2,
+       "hc": 16.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 717.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 621.9,
+       "dense": 49.6,
+       "router": 22.1,
+       "hc": 14.2,
+       "xchg": 8.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 396.4,
+      "gaps_us": 2.6,
+      "fam": {
+       "dense": 179.4,
+       "attn": 159.9,
+       "xchg": 26.3,
+       "hc": 17.1,
+       "router": 10.7,
+       "other": 3.0
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 708.9,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 610.5,
+       "dense": 50.6,
+       "router": 23.6,
+       "hc": 14.5,
+       "xchg": 8.4,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 286.4,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 216.7,
+       "kda": 33.9,
+       "xchg": 19.9,
+       "hc": 15.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 705.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 603.0,
+       "dense": 47.4,
+       "router": 22.0,
+       "xchg": 17.9,
+       "hc": 14.1,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 271.4,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 215.7,
+       "kda": 33.4,
+       "hc": 14.6,
+       "xchg": 7.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 613.1,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 501.2,
+       "dense": 48.8,
+       "router": 24.0,
+       "xchg": 23.5,
+       "hc": 14.4,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 15,
+      "us": 274.7,
+      "gaps_us": 1.6,
+      "fam": {
+       "dense": 214.7,
+       "kda": 31.5,
+       "hc": 20.8,
+       "xchg": 7.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 746.2,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 641.3,
+       "dense": 50.2,
+       "router": 22.5,
+       "xchg": 16.1,
+       "hc": 14.8,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 390.9,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 178.2,
+       "attn": 166.5,
+       "hc": 16.4,
+       "xchg": 15.4,
+       "router": 11.5,
+       "other": 2.9
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 725.9,
+      "gaps_us": 2.1,
+      "fam": {
+       "experts": 607.0,
+       "dense": 51.3,
+       "router": 27.0,
+       "xchg": 24.8,
+       "hc": 14.5,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 276.8,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 218.4,
+       "kda": 34.4,
+       "hc": 16.3,
+       "xchg": 7.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 733.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 613.6,
+       "dense": 50.0,
+       "xchg": 31.7,
+       "router": 22.5,
+       "hc": 14.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 272.8,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 215.0,
+       "kda": 33.7,
+       "hc": 16.4,
+       "xchg": 7.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 730.5,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 623.5,
+       "dense": 49.0,
+       "router": 23.2,
+       "xchg": 19.3,
+       "hc": 14.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 274.6,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 209.1,
+       "kda": 31.1,
+       "xchg": 19.7,
+       "hc": 14.7
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 656.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 559.2,
+       "dense": 50.9,
+       "router": 22.8,
+       "hc": 14.4,
+       "xchg": 8.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 24,
+      "us": 403.5,
+      "gaps_us": 2.9,
+      "fam": {
+       "dense": 181.7,
+       "attn": 162.8,
+       "xchg": 27.6,
+       "hc": 16.7,
+       "router": 11.6,
+       "other": 3.1
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 725.7,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 625.5,
+       "dense": 48.6,
+       "router": 23.7,
+       "hc": 15.0,
+       "xchg": 11.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 288.7,
+      "gaps_us": 1.5,
+      "fam": {
+       "dense": 217.8,
+       "kda": 32.2,
+       "xchg": 24.1,
+       "hc": 14.6
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 722.7,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 626.5,
+       "dense": 48.5,
+       "router": 24.1,
+       "hc": 14.1,
+       "xchg": 8.2,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 284.3,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 214.3,
+       "kda": 32.9,
+       "xchg": 20.8,
+       "hc": 16.3
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 743.8,
+      "gaps_us": 2.0,
+      "fam": {
+       "experts": 645.7,
+       "dense": 52.1,
+       "router": 22.3,
+       "hc": 14.3,
+       "xchg": 8.2,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 291.4,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 214.6,
+       "kda": 32.6,
+       "xchg": 28.0,
+       "hc": 16.2
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 804.9,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 704.2,
+       "dense": 52.4,
+       "router": 23.0,
+       "hc": 14.1,
+       "xchg": 9.9,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 25,
+      "us": 400.4,
+      "gaps_us": 3.0,
+      "fam": {
+       "dense": 176.0,
+       "attn": 163.0,
+       "xchg": 29.6,
+       "hc": 17.9,
+       "router": 10.7,
+       "other": 3.2
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 761.5,
+      "gaps_us": 4.0,
+      "fam": {
+       "experts": 648.9,
+       "dense": 48.2,
+       "xchg": 24.7,
+       "router": 23.1,
+       "hc": 15.4,
+       "other": 1.2
+      }
+     },
+     {
+      "kernels": 14,
+      "us": 278.9,
+      "gaps_us": 1.4,
+      "fam": {
+       "dense": 221.1,
+       "kda": 33.4,
+       "hc": 16.6,
+       "xchg": 7.8
+      }
+     },
+     {
+      "kernels": 20,
+      "us": 770.6,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 650.8,
+       "dense": 52.8,
+       "xchg": 27.3,
+       "router": 24.8,
+       "hc": 13.6,
+       "other": 1.3
+      }
+     },
+     {
+      "kernels": 29,
+      "us": 911.1,
+      "gaps_us": 30.5,
+      "fam": {
+       "dense": 809.8,
+       "attn": 42.7,
+       "xchg": 30.4,
+       "other": 23.4,
+       "hc": 4.8
+      }
+     },
+     {
+      "kernels": 34,
+      "us": 1174.7,
+      "gaps_us": 113.0,
+      "fam": {
+       "kda": 628.9,
+       "dense": 328.4,
+       "attn": 163.3,
+       "other": 32.2,
+       "router": 13.9,
+       "xchg": 8.0
+      }
+     },
+     {
+      "kernels": 19,
+      "us": 571.4,
+      "gaps_us": 1.9,
+      "fam": {
+       "experts": 484.2,
+       "dense": 51.8,
+       "router": 23.1,
+       "xchg": 8.2,
+       "other": 4.1
+      }
+     },
+     {
+      "kernels": 29,
+      "us": 889.8,
+      "gaps_us": 13.8,
+      "fam": {
+       "dense": 803.0,
+       "attn": 37.4,
+       "xchg": 26.8,
+       "other": 18.4,
+       "sample": 4.2
+      }
+     },
+     {
+      "kernels": 0,
+      "us": 0,
+      "gaps_us": 0,
+      "fam": {}
+     }
+    ],
+    "first_layers": [
+     [
+      [
+       "_embed_b16",
+       "other",
+       5.7,
+       0.0,
+       [
+        3,
+        64,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       8.1,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       13.0,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       149.1,
+       0.22,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       3.4,
+       0.22,
+       [
+        37,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       3.1,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.7,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.7,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       38.1,
+       0.1,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.0,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       55.9,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.7,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       146.4,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       7.7,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       154.2,
+       0.1,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       2.3,
+       -0.16,
+       [
+        3,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       79.8,
+       -0.16,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.1,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       8.8,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.7,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       9.3,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       7.1,
+       0.1,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       144.1,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.9,
+       0.13,
+       [
+        37,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.7,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.8,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       33.2,
+       0.13,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       57.3,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       21.7,
+       0.1,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       7.8,
+       0.1,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       154.2,
+       0.1,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.2,
+       -0.13,
+       [
+        3,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       75.8,
+       -0.13,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       11.4,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       11.0,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.1,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       144.4,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.1,
+       0.13,
+       [
+        37,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.1,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.7,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.6,
+       0.1,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       33.1,
+       0.13,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       54.6,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.1,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       69.8,
+       0.1,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       7.6,
+       0.1,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.5,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       154.3,
+       0.13,
+       [
+        1,
+        192,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.2,
+       -0.13,
+       [
+        3,
+        12,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       76.9,
+       -0.13,
+       [
+        1,
+        64,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.1,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       78.9,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.7,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       9.2,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       28.3,
+       0.13,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       3.0,
+       0.13,
+       [
+        6,
+        1,
+        1
+       ]
+      ],
+      [
+       "_rmsnorm",
+       "other",
+       3.3,
+       0.1,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_rmsnorm",
+       "other",
+       1.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       40.0,
+       0.13,
+       [
+        1,
+        128,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.8,
+       0.1,
+       [
+        24,
+        1,
+        1
+       ]
+      ],
+      [
+       "_absorb2",
+       "attn",
+       33.2,
+       0.13,
+       [
+        256,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       7.2,
+       0.13,
+       [
+        1,
+        3,
+        8
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.2,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       10.0,
+       0.13,
+       [
+        1,
+        4,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.2,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lwrite8",
+       "attn",
+       3.8,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_index_write",
+       "attn",
+       3.4,
+       0.16,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_pool_keys",
+       "attn",
+       4.0,
+       0.13,
+       [
+        2,
+        1,
+        1
+       ]
+      ],
+      [
+       "_lchunks",
+       "attn",
+       48.3,
+       0.13,
+       [
+        6,
+        6,
+        1
+       ]
+      ],
+      [
+       "_lmerge",
+       "attn",
+       3.6,
+       0.13,
+       [
+        96,
+        1,
+        1
+       ]
+      ],
+      [
+       "_expand2",
+       "attn",
+       71.6,
+       0.13,
+       [
+        128,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.0,
+       0.13,
+       [
+        3,
+        8,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       100.6,
+       0.13,
+       [
+        1,
+        64,
+        8
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.4,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       68.3,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       7.8,
+       0.1,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.4,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       14.5,
+       0.1,
+       [
+        1,
+        9,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "_topk",
+       "router",
+       4.0,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group",
+       "router",
+       3.1,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "rot_in_kernel",
+       "experts",
+       7.9,
+       0.1,
+       [
+        27,
+        32,
+        2
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       466.4,
+       0.1,
+       [
+        25,
+        8,
+        8
+       ]
+      ],
+      [
+       "gateup_epilogue_kernel",
+       "experts",
+       9.6,
+       -0.13,
+       [
+        27,
+        8,
+        1
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       236.8,
+       -0.13,
+       [
+        25,
+        32,
+        1
+       ]
+      ],
+      [
+       "down_epilogue_kernel",
+       "experts",
+       5.9,
+       -0.13,
+       [
+        27,
+        32,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       27.2,
+       -0.13,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       2.0,
+       0.1,
+       [
+        6,
+        1,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       2.8,
+       0.13,
+       [
+        3,
+        2,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       17.3,
+       0.1,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.9,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "elementwise_kernel",
+       "other",
+       1.2,
+       0.13,
+       [
+        48,
+        1,
+        1
+       ]
+      ],
+      [
+       "_combine",
+       "router",
+       1.9,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       156.8,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.9,
+       0.1,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       9.3,
+       0.13,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       148.4,
+       0.13,
+       [
+        1,
+        197,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       3.6,
+       -0.13,
+       [
+        37,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       -0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       3.7,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       0.9,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       4.8,
+       0.13,
+       [
+        1,
+        64,
+        1
+       ]
+      ],
+      [
+       "chain_kernel",
+       "kda",
+       33.5,
+       0.13,
+       [
+        32,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group_sums",
+       "dense",
+       1.0,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       53.8,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       65.9,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ],
+     [
+      [
+       "_hc_post",
+       "hc",
+       1.3,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "_hc_partial",
+       "hc",
+       7.3,
+       0.1,
+       [
+        3,
+        16,
+        1
+       ]
+      ],
+      [
+       "_hc_finish",
+       "hc",
+       5.3,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_router_part",
+       "router",
+       13.1,
+       0.13,
+       [
+        1,
+        9,
+        8
+       ]
+      ],
+      [
+       "_router_sum",
+       "router",
+       1.4,
+       0.1,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "_topk",
+       "router",
+       4.1,
+       0.13,
+       [
+        3,
+        1,
+        1
+       ]
+      ],
+      [
+       "_group",
+       "router",
+       2.9,
+       0.13,
+       [
+        1,
+        1,
+        1
+       ]
+      ],
+      [
+       "rot_in_kernel",
+       "experts",
+       5.2,
+       0.13,
+       [
+        27,
+        32,
+        2
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       468.6,
+       0.1,
+       [
+        25,
+        8,
+        8
+       ]
+      ],
+      [
+       "gateup_epilogue_kernel",
+       "experts",
+       8.3,
+       -0.16,
+       [
+        27,
+        8,
+        1
+       ]
+      ],
+      [
+       "grouped_kernel",
+       "experts",
+       237.8,
+       -0.13,
+       [
+        25,
+        32,
+        1
+       ]
+      ],
+      [
+       "down_epilogue_kernel",
+       "experts",
+       6.0,
+       -0.13,
+       [
+        27,
+        32,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       29.8,
+       -0.13,
+       [
+        1,
+        32,
+        4
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.1,
+       [
+        6,
+        1,
+        1
+       ]
+      ],
+      [
+       "_swiglu",
+       "dense",
+       1.0,
+       0.13,
+       [
+        3,
+        2,
+        1
+       ]
+      ],
+      [
+       "_qmm",
+       "dense",
+       17.0,
+       0.13,
+       [
+        1,
+        64,
+        2
+       ]
+      ],
+      [
+       "_reduce",
+       "dense",
+       1.0,
+       0.13,
+       [
+        12,
+        1,
+        1
+       ]
+      ],
+      [
+       "elementwise_kernel",
+       "other",
+       1.2,
+       0.13,
+       [
+        48,
+        1,
+        1
+       ]
+      ],
+      [
+       "_combine",
+       "router",
+       1.9,
+       0.13,
+       [
+        3,
+        4,
+        1
+       ]
+      ],
+      [
+       "gather_kernel",
+       "xchg",
+       206.7,
+       0.13,
+       [
+        4,
+        1,
+        1
+       ]
+      ]
+     ]
+    ]
+   }
+  }
+ ],
+ "skew": {
+  "n0": 30974,
+  "n1": 30974,
+  "end_offset_resid_us": {
+   "p5": -17.123250000000002,
+   "p95": 13.773500000000002
+  },
+  "arrival_skew_us": {
+   "median": -5.0095,
+   "mean": -7.827511751791826,
+   "mean_abs": 37.03783666946471,
+   "p10": -43.418499999999995,
+   "p90": 21.012999999999998,
+   "r1_later_frac": 0.38480661199715893
+  },
+  "gather_us": {
+   "r0_median": 17.632,
+   "r0_mean": 32.48217915025505,
+   "r1_median": 22.8645,
+   "r1_mean": 39.385424807903405,
+   "min_of_pair_median": 11.776,
+   "min_of_pair_mean": 13.660632982501452
+  },
+  "skew_by_producer": {
+   "_reduce": {
+    "n": 17050,
+    "mean_us": -4.08,
+    "mean_abs_us": 26.22
+   },
+   "_combine": {
+    "n": 12286,
+    "mean_us": -11.53,
+    "mean_abs_us": 47.38
+   },
+   "CatArrayBatchedCopy_vectorized": {
+    "n": 987,
+    "mean_us": -17.66,
+    "mean_abs_us": 42.92
+   },
+   "_fq4": {
+    "n": 240,
+    "mean_us": 6.51,
+    "mean_abs_us": 82.89
+   },
+   "_combine_s": {
+    "n": 210,
+    "mean_us": -33.55,
+    "mean_abs_us": 180.53
+   },
+   "CatArrayBatchedCopy_alignedK_contig": {
+    "n": 201,
+    "mean_us": -40.78,
+    "mean_abs_us": 88.69
+   }
+  },
+  "wait_beyond_min_ms_total": {
+   "r0": 582.978571,
+   "r1": 796.799702
+  }
+ }
+}

@@ -25,7 +25,7 @@ the W7 ranks agree within 0.5 point.
 
 | roof | value | source |
 | --- | ---: | --- |
-| DRAM (LPDDR5x, unified) | **230 GB/s** attainable (273 nominal) | the best kernels here run at 207-233 GB/s: the head `_qmm` at 207, `grouped_kernel` at 200, `_combine_s` at 202; OPS-GPUWATCH: 224-233 |
+| DRAM (LPDDR5x, unified) | **230 GB/s** attainable (273 nominal); **W11 measured: 235 GB/s streaming read** (233-238 for one decode round's expert volumes, gathered or contiguous; 230.5 for the verify's dense q4 set in 304 launches; copy 216-220; a single launch needs ~8 MB for 219, ~16 MB for 229) | the best kernels here run at 207-233 GB/s: the head `_qmm` at 207, `grouped_kernel` at 200, `_combine_s` at 202; OPS-GPUWATCH: 224-233; `results/W11/probe.cu` |
 | bf16 / f16 `mma.sync` m16n8k16, fp32 accumulate | **110 TFLOP/s** | measured (EXPERT-TC.md, PATCHES 0080); spec 48 SMs x 1,024 FLOP/clk x ~2.5 GHz = 123; cuBLAS-class health check 94.8 (OPS-GPUWATCH) |
 | e4m3 / int8 `mma.sync` m16n8k32 | ~220 TFLOP/s (TOPS), 2x bf16 | spec ratio ("1 PFLOP FP4 sparse" = 500 FP4 dense = 250 FP8 = 125 BF16). Repo: "about twice the bf16 rate" (0083). Needs both operands in 8 bits, so FP8 activations, which were rejected for quality. **Not available to this quant policy.** |
 | FP4 block-scaled mma (`kind::mxf4`) | ~440 dense | sm_121a only, not sm_121 (EXPERT-TC.md section 2); new bits |
@@ -178,6 +178,12 @@ Times are per call on a 512-row lean sub-block unless noted.
    the tax away. Exposed NCCL + memcpy + host gaps are ~18 us a token (2.6%).
 
 ## 2. Decode
+
+> **Today's round is measured in W11** (`docs/RESULTS.md` W11 §2, `docs/DECODE-PLAN.md` §1): b4 + RoCE + 0370 / 0380 /
+> 0390, 1 stream prose **53.3 ms uncaptured (54.6 captured)** = experts 27.8 (205 GB/s, U 20) + dense 16.1 (**175 GB/s**)
+> + exchanges 2.3 exposed (100 RoCE all-gathers, 14.5 us median) + attention 2.1 + hc / router 2.6 + KDA 1.6 + other 0.3
+> + idle 1.8, no gap between rounds; floor 37.2 ms (68%). 4 streams **121.3 ms** (experts 75.5, dense 21.7, exchanges
+> 4.2, KDA 6.0, attention 4.8, idle 5.1; floor 89.0). Sections 2.1-2.3 below are W7's (pre-RoCE) trace.
 
 ### 2.1 Bytes a round, from first principles
 

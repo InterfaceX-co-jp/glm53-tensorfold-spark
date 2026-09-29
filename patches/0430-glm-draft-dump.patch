@@ -1,0 +1,624 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+index b0af09e..c83d3f2 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -1997,12 +1997,19 @@ class Batcher:
+             sampled = sample_multi(w, logits, specs)
+         shared = len(active) > 1
+         tokens = 0
+-        for s, q, (off, R, _, _), rows, n in zip(active, seqs, specs, sampled, ran):
++        from . import dump as dump_mod          # patches/0430
++        dumped = [] if dump_mod.DUMP is not None else None
++        for s, q, (off, R, _, _), rows, n, win in zip(active, seqs, specs, sampled, ran, windows):
++            pos = self.states[s].pos
+             with self._on(s) as e:
+                 keep = q.stepper.accept(e, rows, off, shared, n) if n != R else q.stepper.accept(e, rows, off, shared)
++            if dumped is not None:
++                dumped.append((self.states[s], off, keep, win[:keep], pos))
+             tokens += keep
+             out = q.stepper.out
+             self._emit(q, rows[:keep][:max(0, q.job.max_tokens - (len(out) - keep))])
++        if dumped:                              # patches/0430: the kept rows as training records (reads only)
++            dump_mod.decode_round(g.e, logits, dumped)
+         self.round_costs.record(parts, tokens)
+         verify_ms = (time.perf_counter() - t_round) * 1e3      # patches/0200: forward, sampling, accept, commit
+         for q in seqs:
+diff --git c/src/tensorfold/families/glm5_next/cuda/decode.py w/src/tensorfold/families/glm5_next/cuda/decode.py
+index 869bc08..94e1d03 100644
+--- c/src/tensorfold/families/glm5_next/cuda/decode.py
++++ w/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -22,6 +22,7 @@ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+ from . import comm as comm_mod, draftvocab, fastpf, fp8pf, lean as lean_mod, pfglue, pfgrid, profile
+ from . import decode_overlap as dover                                       # patches/0370
++from . import dump as dump_mod                                               # patches/0430
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .weights import Weights
+@@ -512,6 +513,8 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+             drafter.add_taps(e.tap_rows(R))
+             if prof:
+                 profile.lap("drafter")
++        if dump_mod.DUMP is not None:               # patches/0430: the chunk's rows as training records (reads only)
++            dump_mod.prefill_chunk(e, prompt, start, stop, begin)
+         if lean is not None:
+             lean_mod.commit(w, st, lean, R)
+         else:
+diff --git c/src/tensorfold/families/glm5_next/cuda/dump.py w/src/tensorfold/families/glm5_next/cuda/dump.py
+new file mode 100644
+index 0000000..f08b85e
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/dump.py
+@@ -0,0 +1,441 @@
++"""patches/0430: per-token training records for the drafters (GLM53_TF_DRAFT_DUMP=<dir>; off by default).
++
++While the engine serves or generates, every row it commits becomes a record for self-distilling the MTP head and
++re-fitting a block drafter (docs/DRAFTER-TRAINING.md): the token, the main model's final-normed row (what the MTP head
++reads, ``decode.Engine.main_hidden``), the DFlash2 taps of that row (the mean of the streams after the drafter's tap
++layers, ``Engine.tap_rows``) and the target's next-token distribution as its top-k log-probabilities over the whole
++vocabulary. Two sites feed it:
++
++- prefill (``decode._prefill``, every mode: exact, fast, lean, row-split, pipelined): each chunk's rows. The engine
++  computes the head for the last row only, so the hook runs the head (the engine's own ``qmm.matmul`` on the
++  final-normed rows, ``HEAD_ROWS`` rows at a time) for all of them;
++- decode (``batch.Batcher._verify``, GLM53_TF_BATCH >= 2 as in production): each round's kept rows, whose logits the
++  verify forward already computed. Single-request engines (GLM53_TF_BATCH=1) dump prefill only.
++
++So a request's records cover its prompt (kind ``p``) and every token it generated (kind ``d``, the target's own
++samples: self-distillation data) in position order.
++
++Both ranks hold half of the vocabulary: each takes the top-k of its half and the log-sum-exp of its half, one
++all-gather (the NCCL control path, never captured) brings both to both ranks, and the merge keeps the k largest of
++the 2k with log-probabilities against the full log-sum-exp. The hidden rows and taps are the same on both ranks, so
++only rank 0 writes (on its host). Both ranks must run with the same GLM53_TF_DRAFT_DUMP on/off (checked at start,
++``setup``); rank 1 computes and gathers but writes nothing.
++
++Nothing here changes a token: the hook reads buffers after the engine used them (before they are overwritten by the
++next forward) and runs its own head matmul into its own scratch; replies are byte-identical with the dump on or off.
++
++Linking. Records are written as segments (a prefill chunk; up to ``FLUSH_ROWS`` decode rows of one slot). A segment
++carries the blake2b-128 hash of the token ids before it (``h0``) and through it (``h1``); a request that resumed from
++a snapshot (sessions, shared prefixes, the previous turn) links to the segments that wrote its prefix, whichever
++request wrote them. ``train/dumpdata.py`` assembles documents by following h1 -> h0 from the empty prefix and drops
++duplicates.
++
++Files (rank 0): ``<dir>/<host>-<pid>-<start>/meta.json``, ``index.jsonl`` (one JSON line a segment: kind, start, n,
++h0, h1, shard, and every array's byte offset, dtype and shape) and ``shard-NNNNN.bin`` (raw little-endian arrays,
++``SHARD_GIB`` GiB each). Per token: tokens int32, hidden bf16 [D], taps bf16 [T D] (or e4m3 + one fp32
++power-of-two scale per tap with GLM53_TF_DRAFT_DUMP_TAPS=fp8, or none with 0), lp float16 [k] (log-probabilities of
++the top k, largest first) and ids int32 [k]. GLM-5.3-Flash (D 4,096, 5 taps, k 32): 49,348 B a token with bf16 taps,
++28,888 B with fp8 taps, 8,388 B without taps.
++
++Knobs (load time, both ranks the same):
++
++    GLM53_TF_DRAFT_DUMP              dir (empty / 0: off)
++    GLM53_TF_DRAFT_DUMP_TOPK         k (32)
++    GLM53_TF_DRAFT_DUMP_TAPS         bf16 | fp8 | 0 (bf16)
++    GLM53_TF_DRAFT_DUMP_WHAT         prefill,decode (both)
++    GLM53_TF_DRAFT_DUMP_GIB          stop writing past this many GiB (512)
++    GLM53_TF_DRAFT_DUMP_TAP_LAYERS   comma list: tap these target layers instead of the drafter's (e.g. DFlash2-G's
++                                     5,9,14,19,24,28,33,38,42 or DSpark's 20,28,32,36,40,44). The loaded DFlash2
++                                     drafter is then not used (its taps would not match): MTP / lookup drafts only.
++"""
++
++from __future__ import annotations
++
++import atexit
++import hashlib
++import json
++import os
++import queue
++import socket
++import sys
++import threading
++import time
++from pathlib import Path
++from typing import Sequence
++
++import numpy as np
++import torch
++
++VERSION = 1
++
++
++def _env(name: str, default: str) -> str:
++    return os.environ.get(name, default).strip()
++
++
++def root() -> str:
++    v = _env("GLM53_TF_DRAFT_DUMP", "")
++    return "" if v.lower() in ("", "0", "off", "no", "false") else v
++
++
++ON = bool(root())
++TOPK = int(_env("GLM53_TF_DRAFT_DUMP_TOPK", "32") or 32)
++TAPS = _env("GLM53_TF_DRAFT_DUMP_TAPS", "bf16").lower() or "bf16"
++WHAT = {x.strip() for x in (_env("GLM53_TF_DRAFT_DUMP_WHAT", "prefill,decode") or "prefill,decode").split(",")}
++GIB = float(_env("GLM53_TF_DRAFT_DUMP_GIB", "512") or 512)
++SHARD_GIB = 4.0
++HEAD_ROWS = 256          # prefill rows a head block (a [256, V/2] bf16 logits block is 40 MB)
++FLUSH_ROWS = 256         # decode rows of a slot collected before they become a segment
++FLUSH_S = 10.0           # ... or after this many seconds
++if TAPS not in ("bf16", "fp8", "0"):
++    raise ValueError(f"GLM53_TF_DRAFT_DUMP_TAPS={TAPS!r}: expected bf16, fp8 or 0")
++if not 1 <= TOPK <= 256:
++    raise ValueError(f"GLM53_TF_DRAFT_DUMP_TOPK={TOPK}: expected 1 to 256")
++
++DUMP: "Dumper | None" = None       # built by ``setup`` (both ranks), armed once the engine is ready
++
++
++def tap_layers_env() -> tuple[int, ...] | None:
++    v = _env("GLM53_TF_DRAFT_DUMP_TAP_LAYERS", "")
++    return tuple(int(x) for x in v.split(",") if x.strip()) if v else None
++
++
++def setup(engine, rank: int, drafter):
++    """Before the engine's buffers are built: check both ranks agree, pick the tap layers. -> (drafter, taps)."""
++
++    global DUMP
++    layers = tap_layers_env() if ON else None
++    mine = [int(ON), TOPK, ("bf16", "fp8", "0").index(TAPS), len(layers or ())]
++    both = engine._gather_ints(mine)
++    if both[0] != both[1]:
++        raise RuntimeError(f"the two ranks were started with different GLM53_TF_DRAFT_DUMP settings (on, topk, taps, "
++                           f"tap layers): {both[0]}, {both[1]}")
++    taps = drafter.tap_layers if drafter is not None else ()
++    if layers is not None and tuple(layers) != tuple(taps):
++        if rank == 0:
++            print(f"[tensorfold] draft dump (patches/0430): taps at layers {list(layers)}; the DFlash2 drafter "
++                  f"(taps {list(taps)}) is not used while they differ", flush=True)
++        drafter, taps = None, tuple(layers)
++    if ON:
++        DUMP = Dumper(engine.w, root(), taps)
++    return drafter, taps
++
++
++def arm() -> None:
++    """The engine is ready: records from here on (calibration and graph-capture passes are not written)."""
++
++    if DUMP is not None:
++        DUMP.armed = True
++        if DUMP.rank == 0:
++            print(f"[tensorfold] draft dump (patches/0430): {DUMP.dir} (top {TOPK}, taps {TAPS} "
++                  f"{list(DUMP.tap_layers)}, {sorted(WHAT)}, up to {GIB:g} GiB; ~{DUMP.bytes_per_token():,} B a "
++                  "token)", flush=True)
++
++
++def _hash_ids(ids) -> "hashlib._Hash":
++    h = hashlib.blake2b(digest_size=16)
++    if len(ids):
++        h.update(np.asarray(ids, dtype="<i4").tobytes())
++    return h
++
++
++def _bf16_bytes(t: torch.Tensor) -> np.ndarray:
++    return t.contiguous().view(torch.int16).cpu().numpy().view(np.uint16)
++
++
++def fp8_rows(x: torch.Tensor, taps: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """[R, taps * D] bf16 -> (e4m3 bytes [R, taps * D] uint8, fp32 scales [R, taps]): per (row, tap) the smallest
++    power of two s with amax / s <= 448, values rounded to nearest even (patches/0220's latent-row rule)."""
++
++    R = x.shape[0]
++    xf = x.float().view(R, taps, -1)
++    amax = xf.abs().amax(-1).clamp_min(2.0 ** -120)
++    e = torch.ceil(torch.log2(amax / 448.0))
++    scale = torch.exp2(e)
++    q = (xf / scale[..., None]).to(torch.float8_e4m3fn)
++    return q.view(torch.uint8).view(R, -1), scale.float()
++
++
++class _Writer:
++    """Rank 0's shard files, index and the thread that writes them."""
++
++    def __init__(self, d: Path, meta: dict) -> None:
++        self.dir = d
++        d.mkdir(parents=True, exist_ok=True)
++        (d / "meta.json").write_text(json.dumps(meta, indent=1))
++        self.index = open(d / "index.jsonl", "a", buffering=1)
++        self.shard_no, self.shard, self.shard_bytes = 0, None, 0
++        self.total = 0
++        self.segs = 0
++        self.dropped = 0
++        self.full = False
++        self.q: queue.Queue = queue.Queue(maxsize=4)          # <= 4 segments in flight (~0.8 GB host RAM at most)
++        self.t = threading.Thread(target=self._run, name="draft-dump", daemon=True)
++        self.t.start()
++
++    def _open(self) -> None:
++        if self.shard is not None:
++            self.shard.close()
++        self.shard_no += 1
++        self.shard_name = f"shard-{self.shard_no:05d}.bin"
++        self.shard = open(self.dir / self.shard_name, "ab")
++        self.shard_bytes = self.shard.tell()
++
++    def put(self, rec: dict) -> None:
++        if self.full:
++            return
++        try:
++            self.q.put(rec, timeout=30)
++        except queue.Full:
++            self.dropped += 1
++            if self.dropped == 1:
++                print("[tensorfold] draft dump: the writer fell behind; segments dropped (counted in meta)",
++                      file=sys.stderr, flush=True)
++
++    def _run(self) -> None:
++        while True:
++            rec = self.q.get()
++            if rec is None:
++                break
++            try:
++                self._write(rec)
++            except Exception as exc:  # noqa: BLE001 - a dump failure never stops serving
++                print(f"[tensorfold] draft dump: write failed ({type(exc).__name__}: {exc}); dump stopped",
++                      file=sys.stderr, flush=True)
++                self.full = True
++
++    def _write(self, rec: dict) -> None:
++        arrays = rec.pop("arrays")
++        size = sum(a.nbytes for a in arrays.values())
++        if self.total + size > GIB * 2**30:
++            if not self.full:
++                print(f"[tensorfold] draft dump: {GIB:g} GiB written; dump stopped", file=sys.stderr, flush=True)
++            self.full = True
++            return
++        if self.shard is None or self.shard_bytes + size > SHARD_GIB * 2**30:
++            self._open()
++        where = {}
++        for name, a in arrays.items():
++            a = np.ascontiguousarray(a)
++            where[name] = [self.shard_bytes, rec["dtypes"].get(name, str(a.dtype)), list(a.shape)]
++            self.shard.write(a.tobytes())
++            self.shard_bytes += a.nbytes
++        self.shard.flush()
++        self.total += size
++        self.segs += 1
++        rec.pop("dtypes")
++        rec.update(seg=self.segs, shard=self.shard_name, arrays=where)
++        self.index.write(json.dumps(rec) + "\n")
++
++    def close(self) -> None:
++        self.q.put(None)
++        self.t.join(timeout=120)
++        if self.shard is not None:
++            self.shard.close()
++        self.index.close()
++
++
++class Dumper:
++    def __init__(self, w, where: str, taps: Sequence[int]) -> None:
++        self.w = w
++        self.rank = int(w.rank)
++        self.world = int(w.world)
++        self.tap_layers = tuple(int(t) for t in taps) if TAPS != "0" else ()
++        self.armed = False
++        self.chains: dict[int, list] = {}          # id(State) -> [pos, blake2b of the ids before pos]
++        self.pending: dict[int, dict] = {}         # id(State) -> decode rows not yet written
++        self.writer = None
++        self.stats = {"prefill_rows": 0, "decode_rows": 0, "segments": 0}
++        if self.rank == 0:
++            d = Path(where) / f"{socket.gethostname()}-{os.getpid()}-{int(time.time())}"
++            c = w.cfg
++            meta = {"version": VERSION, "topk": TOPK, "taps": TAPS, "tap_layers": list(self.tap_layers),
++                    "hidden": c.hidden, "vocab": c.vocab, "layers": c.layers, "eos": list(c.eos),
++                    "hidden_is": "final-normed row (decode.Engine.main_hidden: the MTP head's input)",
++                    "taps_are": "mean of the 4 residual streams after each tap layer (DFlash2 taps)",
++                    "lp_are": "log-probabilities of the top-k tokens of the row's next-token distribution, "
++                              "full vocabulary, temperature 1",
++                    "nonexpert": os.environ.get("GLM53_TF_NONEXPERT", "bf16"),
++                    "model": str(w.meta.get("model_dir", "")), "started": time.time(),
++                    "env": {k: v for k, v in os.environ.items() if k.startswith("GLM53_TF_")}}
++            self.writer = _Writer(d, meta)
++            self.dir = d
++            atexit.register(self.close)
++        else:
++            self.dir = Path(where)
++
++    def bytes_per_token(self) -> int:
++        D = self.w.cfg.hidden
++        T = len(self.tap_layers)
++        taps = {"bf16": 2 * T * D, "fp8": T * D + 4 * T, "0": 0}[TAPS] if T else 0
++        return 4 + 2 * D + taps + TOPK * 6
++
++    # -- the target's distribution, both halves of the vocabulary ------------------------------------------------
++    def _local_topk(self, logits: torch.Tensor):
++        lf = logits.float()
++        k = min(TOPK, lf.shape[1])
++        vals, idx = torch.topk(lf, k, dim=-1)
++        lse = torch.logsumexp(lf, dim=-1)
++        ids = (idx + self.w.vocab_offset).to(torch.float32)          # exact: vocab < 2^24
++        return torch.cat([vals, ids, lse[:, None]], dim=1)
++
++    def _merge(self, packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """[R, 2k+1] of this rank -> (lp [R, k] fp32, ids [R, k] int32) over the whole vocabulary."""
++
++        R, width = packed.shape
++        k = (width - 1) // 2
++        w = self.w
++        if w.comm is not None and self.world > 1:
++            got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=packed.device)
++            w.comm.all_gather(packed.contiguous().view(-1), got)
++            g = got.view(self.world, R, width)
++        else:
++            g = packed.view(1, R, width)
++        vals = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1)
++        ids = torch.cat([g[r, :, k:2 * k] for r in range(g.shape[0])], dim=1)
++        lse = torch.logsumexp(g[:, :, 2 * k], dim=0)
++        top, pick = torch.topk(vals, k, dim=-1)
++        return top - lse[:, None], torch.gather(ids, 1, pick).to(torch.int32)
++
++    def _head_rows(self, hidden: torch.Tensor) -> torch.Tensor:
++        """The engine's head over rows it did not compute logits for: the same kernel as a verify window."""
++
++        from . import qmm
++
++        w = self.w
++        out = []
++        for a in range(0, hidden.shape[0], HEAD_ROWS):
++            x = hidden[a:a + HEAD_ROWS]
++            if not x.is_contiguous():
++                x = x.contiguous()
++            xs = qmm.group_sums(x) if isinstance(w.head, qmm.Q4) else None
++            logits = qmm.matmul(x, w.head, xs)
++            out.append(self._local_topk(logits))
++            del logits
++        return torch.cat(out, dim=0)
++
++    def _taps(self, taps: torch.Tensor | None) -> dict:
++        if taps is None or not self.tap_layers:
++            return {}
++        if TAPS == "fp8":
++            q, s = fp8_rows(taps, len(self.tap_layers))
++            return {"taps": q, "tap_scale": s}
++        return {"taps": taps}
++
++    # -- sites ---------------------------------------------------------------------------------------------------
++    @torch.no_grad()
++    def prefill_chunk(self, e, prompt: Sequence[int], start: int, stop: int, begin: int) -> None:
++        if not self.armed or "prefill" not in WHAT:
++            return
++        R = stop - start
++        hidden = e.main_hidden(slice(0, R))
++        taps = e.tap_rows(R) if self.tap_layers else None
++        lp, ids = self._merge(self._head_rows(hidden))
++        key = id(e.st)
++        if self.rank != 0:
++            return
++        if start == begin or key not in self.chains or self.chains[key][0] != start:
++            self._flush(key)                         # a new request on this state: its decode rows end here
++            self.chains[key] = [start, _hash_ids(prompt[:start])]
++        chain = self.chains[key]
++        h0 = chain[1].hexdigest()
++        toks = np.asarray(prompt[start:stop], dtype="<i4")
++        chain[1].update(toks.tobytes())
++        chain[0] = stop
++        arrays = {"tokens": toks, "hidden": hidden, "lp": lp, "ids": ids, **self._taps(taps)}
++        self._emit("p", start, R, h0, chain[1].hexdigest(), arrays)
++        self.stats["prefill_rows"] += R
++
++    @torch.no_grad()
++    def decode_round(self, e, logits: torch.Tensor, items: Sequence[tuple]) -> None:
++        """``items``: (state, row offset in the forward, rows kept, the kept rows' input tokens, position of the
++        first) for every slot of the round, in the same order on both ranks."""
++
++        if not self.armed or "decode" not in WHAT or not items:
++            return
++        rows = torch.cat([torch.arange(off, off + keep, device=logits.device) for _, off, keep, _, _ in items])
++        packed = self._local_topk(logits.index_select(0, rows))
++        lp, ids = self._merge(packed)
++        if self.rank != 0:
++            return
++        b = e.buf
++        hidden = b.fnormed.index_select(0, rows)
++        taps = torch.cat([t.index_select(0, rows) for t in b.taps], dim=1) if (self.tap_layers and b.taps) else None
++        tp = self._taps(taps)
++        at = 0
++        now = time.monotonic()
++        host = {"hidden": hidden.cpu(), "lp": lp.cpu(), "ids": ids.cpu(), **{k: v.cpu() for k, v in tp.items()}}
++        for st, off, keep, toks, pos in items:
++            key = id(st)
++            chain = self.chains.get(key)
++            if chain is None or chain[0] != pos:
++                self._flush(key)
++                chain = self.chains[key] = [pos, None]          # prefix unknown: an orphan run (h0 null)
++            p = self.pending.get(key)
++            if p is None:
++                p = self.pending[key] = {"start": pos, "h0": chain[1].hexdigest() if chain[1] is not None else None,
++                                         "tok": [], "parts": [], "t": now}
++            p["tok"].extend(int(t) for t in toks[:keep])
++            p["parts"].append({k: v[at:at + keep] for k, v in host.items()})
++            if chain[1] is not None:
++                chain[1].update(np.asarray(toks[:keep], dtype="<i4").tobytes())
++            chain[0] = pos + keep
++            at += keep
++            self.stats["decode_rows"] += keep
++            if len(p["tok"]) >= FLUSH_ROWS:
++                self._flush(key)
++        for key, p in list(self.pending.items()):
++            if now - p["t"] > FLUSH_S:
++                self._flush(key)
++
++    def _flush(self, key: int) -> None:
++        p = self.pending.pop(key, None)
++        if p is None or not p["tok"]:
++            return
++        chain = self.chains.get(key)
++        h1 = chain[1].hexdigest() if chain is not None and chain[1] is not None else None
++        arrays = {"tokens": np.asarray(p["tok"], dtype="<i4")}
++        for name in p["parts"][0]:
++            arrays[name] = torch.cat([part[name] for part in p["parts"]], dim=0)
++        self._emit("d", p["start"], len(p["tok"]), p["h0"], h1, arrays)
++
++    def _emit(self, kind: str, start: int, n: int, h0, h1, arrays: dict) -> None:
++        dtypes = {}
++        host = {}
++        for name, a in arrays.items():
++            if isinstance(a, torch.Tensor):
++                if a.dtype == torch.bfloat16:
++                    host[name] = _bf16_bytes(a)
++                    dtypes[name] = "bfloat16"
++                    continue
++                if name == "lp":
++                    a = a.to(torch.float16)
++                a = a.cpu().numpy()
++            if name == "taps" and TAPS == "fp8":
++                dtypes[name] = "float8_e4m3fn"
++            host[name] = a
++        self.stats["segments"] += 1
++        self.writer.put({"kind": kind, "start": int(start), "n": int(n), "h0": h0, "h1": h1, "t": round(time.time(), 3),
++                         "tap_layers": list(self.tap_layers), "arrays": host, "dtypes": dtypes})
++
++    def close(self) -> None:
++        if self.writer is None:
++            return
++        for key in list(self.pending):
++            self._flush(key)
++        w, self.writer = self.writer, None
++        w.close()
++        meta = json.loads((w.dir / "meta.json").read_text())
++        meta.update(closed=time.time(), bytes=w.total, segments=w.segs, dropped=w.dropped, stats=self.stats)
++        (w.dir / "meta.json").write_text(json.dumps(meta, indent=1))
++
++
++# -- the engine's hooks (no-ops when the dump is off) ---------------------------------------------------------------
++def prefill_chunk(e, prompt, start: int, stop: int, begin: int) -> None:
++    if DUMP is not None:
++        DUMP.prefill_chunk(e, prompt, start, stop, begin)
++
++
++def decode_round(e, logits, items) -> None:
++    if DUMP is not None:
++        DUMP.decode_round(e, logits, items)
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index 8b08be8..cd6e5fb 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -247,7 +247,9 @@ class GlmEngine:
+                                "--drafter none to both) and give both the same flags (and GLM53_TF_LONGCTX_GRAPHS, "
+                                "GLM53_TF_PREFILL_ROWS, GLM53_TF_PREFILL_ROWS_MAX, GLM53_TF_MAX_DRAFT_ROWS, "
+                                "GLM53_TF_DFLASH_BLOCK)")
+-        w = load(model_dir, rank=rank)
++        from . import mtpw                  # patches/0430: GLM53_TF_MTP_WEIGHTS (unset: ``load`` as before)
++
++        w = mtpw.load(model_dir, rank=rank)
+         fastboot.mark("weights", f"{w.nbytes() / 1e9:.1f} GB on the GPU")
+         w.comm = self.comm
+         self.comm.barrier()
+@@ -384,9 +386,12 @@ class GlmEngine:
+ 
+             self.drafter = Drafter(drafter, w, capacity=capacity, block=dblock or None)     # patches/0380
+             fastboot.mark("DFlash2 drafter weights")
++        # patches/0430 (GLM53_TF_DRAFT_DUMP): both ranks agree on the dump; its tap layers (the drafter's by default)
++        from . import dump as dump_mod
++
++        self.drafter, taps = dump_mod.setup(self, rank, self.drafter)
+         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=rows_max, graphs=True,
+-                        graph_rows=GRAPH_ROWS,
+-                        long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
++                        graph_rows=GRAPH_ROWS, long_context=long_context, taps=taps)
+         self.e.prefill_rows = prefill_rows          # patches/0090: the default chunk; the buffers hold rows_max
+         # patches/0090: long-context graphs can be switched on per request only when their buffers exist
+         self.longctx_buffers = self.e.longctx
+@@ -475,6 +480,7 @@ class GlmEngine:
+             self.batch = Batcher(self, n)
+         self.store = self._sessions()       # patches/0110
+         fastboot.mark("engine ready (session store, batcher)")
++        dump_mod.arm()                      # patches/0430: records from here on (not the calibration passes)
+ 
+     def _sessions(self):
+         """patches/0110: the session store (``sessions.py``), or None (GLM53_TF_SESSION_GIB=0, the default).
+diff --git c/src/tensorfold/families/glm5_next/cuda/mtpw.py w/src/tensorfold/families/glm5_next/cuda/mtpw.py
+new file mode 100644
+index 0000000..93e70e5
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/mtpw.py
+@@ -0,0 +1,87 @@
++"""patches/0430, GLM53_TF_MTP_WEIGHTS=<dir>: serve a distilled MTP head (``train/mtp_distill.py``'s export) in place of
++the checkpoint's own. Off (unset / empty / 0): ``weights.load`` exactly as before.
++
++The folder holds full, unsplit BF16 tensors under the checkpoint's own names (``*.safetensors``), only for the MTP
++layer (``model.language_model.layers.<num_hidden_layers>.*``: attention, eh_proj, norms, router, shared expert). Each
++replaces the checkpoint's tensor of that name; this rank's part is sliced by the checkpoint's own split rules
++(``split.rule``) and stored the way the engine stores the checkpoint's (GLM53_TF_NONEXPERT: q4mse in production), so
++the exported BF16 weights go through the same quantization at load that training emulated. The routed experts stay
++the checkpoint's (EXL3).
++
++It lives outside ``weights.py`` so the prepared folders of patches/0140 (keyed by a digest of ``weights.py``) stay
++valid when the knob is off; with the knob on, the folder's files join the prepared tree's key (another head is
++another tree)."""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++
++def mtp_weights_dir() -> str:
++    v = os.environ.get("GLM53_TF_MTP_WEIGHTS", "").strip()
++    return "" if v.lower() in ("", "0", "off") else v
++
++
++class _Overlay:
++    """A ``split.RankReader`` whose MTP-layer tensors come from the override folder when it has them."""
++
++    def __init__(self, base, over, prefix: str) -> None:
++        self.base, self.over, self.prefix = base, over, prefix
++        self.names = set(over.index)
++        bad = sorted(n for n in self.names if not n.startswith(prefix))
++        if bad:
++            raise ValueError(f"GLM53_TF_MTP_WEIGHTS may only replace MTP-layer tensors ({prefix}*); found {bad[:3]}")
++        self.used: set[str] = set()
++
++    def get(self, name: str):
++        if name in self.names:
++            self.used.add(name)
++            return self.over.get(name)
++        return self.base.get(name)
++
++    def __getattr__(self, name):
++        return getattr(self.base, name)
++
++
++def load(model_dir, *, rank: int, device: str = "cuda"):
++    """``weights.load`` with the MTP layer's tensors replaced from GLM53_TF_MTP_WEIGHTS (when set)."""
++
++    from . import fastboot, split, weights
++
++    where = mtp_weights_dir()
++    if not where:
++        return weights.load(model_dir, rank=rank, device=device)
++
++    def build():
++        cfg = weights.Config.read(model_dir)
++        if not cfg.mtp_layers:
++            raise ValueError("GLM53_TF_MTP_WEIGHTS: this checkpoint has no MTP layer")
++        prefix = weights.PREFIX + f"layers.{cfg.layers}."
++        orig = split.RankReader
++        made: list[_Overlay] = []
++
++        def reader(d, r):
++            o = _Overlay(orig(d, r), orig(where, r), prefix)
++            made.append(o)
++            return o
++
++        split.RankReader = reader            # ``load_checkpoint`` imports it at call time
++        try:
++            w = weights.load_checkpoint(model_dir, rank=rank, device=device)
++        finally:
++            split.RankReader = orig
++        ov = made[0]
++        missing = sorted(ov.names - ov.used)
++        if missing:
++            raise ValueError(f"GLM53_TF_MTP_WEIGHTS: tensors the engine does not read: {missing[:5]}")
++        if rank == 0:
++            print(f"[tensorfold] MTP head (patches/0430): {len(ov.used)} tensors from {where}", flush=True)
++        w.meta["mtp_weights"] = str(where)
++        return w
++
++    if fastboot.prepared_root() is None:
++        return build()
++    extra = {"mtp_weights": [str(Path(where).resolve()), fastboot.files_ident(where)]}
++    return fastboot.cached_tree("weights", fastboot.weights_key(model_dir, rank, device=device, extra=extra), build,
++                                device)

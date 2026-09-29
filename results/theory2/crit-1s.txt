@@ -1,0 +1,229 @@
+
+== r0 segment 0: 94 rounds, wall 55.36 ms, busy 53.61, idle 1.75, >=2 kernels in flight 0.035 ms
+   kernels 1859 (graph 1726, eager 133); graph launches 3.1; host us in eager launch calls 618 (4.66 us each)
+   streams: 7: 1859 k / 53.65 ms
+   gaps: <1.5us 1602 x = 0.217 ms, 1.5-5us 12 x = 0.027 ms, 5-20us 4 x = 0.042 ms, 20-100us 3 x = 0.136 ms, >100us 1 x = 0.180 ms; host-bound 0.174 ms
+   gaps by launch phase: vfwd 0.191, propose 0.242, sample_multi 0.025, plan 0.000, other 0.143
+   kernel sizes: <3us 818 x = 1.13 ms, 3-10us 522 x = 3.09 ms, 10-50us 315 x = 7.38 ms, 50-200us 135 x = 14.55 ms, >=200us 70 x = 27.50 ms
+   families ms: experts 28.66, dense 16.07, xchg 2.34, attn 2.07, kda 1.59, hc 1.46, router 1.17, other 0.26, nccl 0.03, sample 0.01
+   phase host ms: vfwd 2.29, propose 4.93, sample_multi 47.91 | device busy by launch phase: vfwd 48.88, sample_multi 0.08, other 0.41, propose 4.28 | host-bound idle by phase: vfwd 0.007, other 0.138, propose 0.029
+   idle by the next kernel's launch (phase|who waited|size), ms a round: {"vfwd|host|long(>20us)": 1.157, "vfwd|device|short": 0.185, "propose|host|long(>20us)": 0.167, "other|host|long(>20us)": 0.134, "propose|device|short": 0.063, "sample_multi|device|short": 0.021, "propose|device|long(>20us)": 0.006, "propose|host|short": 0.006, "other|host|short": 0.005, "other|device|short": 0.004, "sample_multi|device|long(>20us)": 0.003, "vfwd|host|short": 0.002}
+   template round 54.33 ms, 101 blocks between exchanges; first blocks:
+     block 0: 14 kernels, 314.8 us busy, 1.7 us gaps: {'dense': 226.4, 'xchg': 37.2, 'kda': 30.3, 'hc': 16.9, 'other': 4.0}
+     block 1: 8 kernels, 260.9 us busy, 0.8 us gaps: {'dense': 227.8, 'xchg': 18.3, 'hc': 14.8}
+     block 2: 14 kernels, 265.5 us busy, 1.4 us gaps: {'dense': 208.7, 'kda': 29.1, 'hc': 16.0, 'xchg': 11.7}
+     block 3: 8 kernels, 258.3 us busy, 0.7 us gaps: {'dense': 227.6, 'xchg': 16.4, 'hc': 14.3}
+     block 4: 14 kernels, 269.2 us busy, 1.4 us gaps: {'dense': 209.4, 'kda': 29.5, 'hc': 17.5, 'xchg': 12.8}
+     block 5: 8 kernels, 264.8 us busy, 0.7 us gaps: {'dense': 233.0, 'xchg': 17.4, 'hc': 14.4}
+     block 6: 24 kernels, 503.8 us busy, 3.0 us gaps: {'dense': 226.1, 'attn': 191.0, 'router': 59.3, 'hc': 16.3, 'xchg': 8.0, 'other': 3.1}
+     block 7: 20 kernels, 939.1 us busy, 2.0 us gaps: {'experts': 841.6, 'dense': 48.4, 'router': 23.8, 'hc': 15.1, 'xchg': 8.9, 'other': 1.3}
+     block 8: 14 kernels, 371.1 us busy, 1.5 us gaps: {'dense': 312.8, 'kda': 33.6, 'hc': 16.9, 'xchg': 7.8}
+     block 9: 20 kernels, 932.2 us busy, 1.9 us gaps: {'experts': 830.1, 'dense': 50.2, 'router': 25.4, 'hc': 15.3, 'xchg': 9.9, 'other': 1.3}
+
+== r0 segment 1: 168 rounds, wall 53.50 ms, busy 51.71, idle 1.79, >=2 kernels in flight 0.035 ms
+   kernels 1853 (graph 1734, eager 119); graph launches 3.0; host us in eager launch calls 583 (4.89 us each)
+   streams: 7: 1853 k / 51.74 ms
+   gaps: <1.5us 1596 x = 0.213 ms, 1.5-5us 12 x = 0.026 ms, 5-20us 5 x = 0.047 ms, 20-100us 2 x = 0.122 ms, >100us 1 x = 0.192 ms; host-bound 0.182 ms
+   gaps by launch phase: vfwd 0.188, propose 0.239, sample_multi 0.025, plan 0.000, other 0.148
+   kernel sizes: <3us 820 x = 1.13 ms, 3-10us 518 x = 3.07 ms, 10-50us 307 x = 7.05 ms, 50-200us 143 x = 15.25 ms, >=200us 66 x = 25.25 ms
+   families ms: experts 26.96, dense 15.95, xchg 2.27, attn 2.07, kda 1.59, hc 1.45, router 1.16, other 0.26, nccl 0.02, sample 0.01
+   phase host ms: vfwd 2.17, propose 4.77, sample_multi 46.30 | device busy by launch phase: vfwd 47.12, sample_multi 0.08, other 0.45, propose 4.10 | host-bound idle by phase: vfwd 0.006, other 0.143, propose 0.033
+   idle by the next kernel's launch (phase|who waited|size), ms a round: {"vfwd|host|long(>20us)": 1.198, "vfwd|device|short": 0.183, "propose|host|long(>20us)": 0.16, "other|host|long(>20us)": 0.14, "propose|device|short": 0.062, "sample_multi|device|short": 0.021, "propose|host|short": 0.01, "propose|device|long(>20us)": 0.007, "other|device|short": 0.005, "other|host|short": 0.004, "sample_multi|device|long(>20us)": 0.004, "vfwd|host|short": 0.002}
+   template round 50.99 ms, 103 blocks between exchanges; first blocks:
+     block 0: 14 kernels, 278.9 us busy, 2.7 us gaps: {'dense': 223.2, 'kda': 29.5, 'hc': 14.6, 'xchg': 7.9, 'other': 3.7}
+     block 1: 8 kernels, 274.4 us busy, 0.7 us gaps: {'dense': 232.7, 'xchg': 27.0, 'hc': 14.7}
+     block 2: 14 kernels, 259.1 us busy, 1.5 us gaps: {'dense': 205.7, 'kda': 29.0, 'hc': 14.9, 'xchg': 9.5}
+     block 3: 8 kernels, 269.8 us busy, 0.8 us gaps: {'dense': 224.3, 'xchg': 30.8, 'hc': 14.7}
+     block 4: 14 kernels, 261.3 us busy, 1.5 us gaps: {'dense': 209.5, 'kda': 29.0, 'hc': 15.1, 'xchg': 7.7}
+     block 5: 8 kernels, 261.7 us busy, 0.8 us gaps: {'dense': 225.9, 'xchg': 21.5, 'hc': 14.3}
+     block 6: 24 kernels, 370.3 us busy, 2.9 us gaps: {'dense': 172.6, 'attn': 160.6, 'hc': 14.7, 'xchg': 11.4, 'router': 8.0, 'other': 3.0}
+     block 7: 20 kernels, 827.2 us busy, 1.9 us gaps: {'experts': 720.2, 'dense': 48.7, 'router': 21.9, 'xchg': 20.6, 'hc': 14.5, 'other': 1.3}
+     block 8: 14 kernels, 277.0 us busy, 1.5 us gaps: {'dense': 222.9, 'kda': 29.6, 'hc': 16.7, 'xchg': 7.8}
+     block 9: 20 kernels, 815.9 us busy, 1.9 us gaps: {'experts': 716.4, 'dense': 47.8, 'router': 27.1, 'hc': 15.1, 'xchg': 8.3, 'other': 1.2}
+
+== r0 segment 2: 91 rounds, wall 64.67 ms, busy 62.92, idle 1.75, >=2 kernels in flight 0.026 ms
+   kernels 1880 (graph 1301, eager 579); graph launches 2.8; host us in eager launch calls 3510 (6.06 us each)
+   streams: 7: 1880 k / 62.95 ms
+   gaps: <1.5us 1683 x = 0.310 ms, 1.5-5us 12 x = 0.025 ms, 5-20us 6 x = 0.063 ms, 20-100us 3 x = 0.135 ms, >100us 1 x = 0.261 ms; host-bound 0.261 ms
+   gaps by launch phase: vfwd 0.298, propose 0.271, sample_multi 0.025, plan 0.000, other 0.201
+   kernel sizes: <3us 818 x = 1.20 ms, 3-10us 515 x = 3.09 ms, 10-50us 336 x = 7.86 ms, 50-200us 131 x = 13.56 ms, >=200us 80 x = 37.24 ms
+   families ms: experts 36.79, dense 16.55, xchg 2.76, attn 2.09, kda 1.68, hc 1.50, router 1.22, other 0.29, nccl 0.04, sample 0.01
+   phase host ms: vfwd 9.85, propose 5.33, sample_multi 49.16 | device busy by launch phase: vfwd 57.77, sample_multi 0.08, other 0.68, propose 4.42 | host-bound idle by phase: other 0.196, vfwd 0.024, propose 0.042
+   idle by the next kernel's launch (phase|who waited|size), ms a round: {"vfwd|host|long(>20us)": 0.973, "vfwd|device|short": 0.274, "other|host|long(>20us)": 0.188, "propose|host|long(>20us)": 0.185, "propose|device|short": 0.066, "sample_multi|device|short": 0.023, "propose|host|short": 0.013, "other|host|short": 0.009, "vfwd|host|short": 0.008, "propose|device|long(>20us)": 0.006, "other|device|short": 0.004, "sample_multi|device|long(>20us)": 0.001, "other|device|long(>20us)": 0.0}
+   template round 66.26 ms, 103 blocks between exchanges; first blocks:
+     block 0: 14 kernels, 332.1 us busy, 2.1 us gaps: {'dense': 231.9, 'xchg': 44.4, 'kda': 35.5, 'hc': 16.3, 'other': 4.0}
+     block 1: 8 kernels, 262.3 us busy, 0.8 us gaps: {'dense': 230.8, 'xchg': 16.0, 'hc': 15.5}
+     block 2: 14 kernels, 281.9 us busy, 1.5 us gaps: {'dense': 211.6, 'kda': 35.3, 'xchg': 18.6, 'hc': 16.4}
+     block 3: 8 kernels, 269.1 us busy, 0.8 us gaps: {'dense': 231.1, 'xchg': 23.1, 'hc': 14.9}
+     block 4: 14 kernels, 277.5 us busy, 1.6 us gaps: {'dense': 210.1, 'kda': 35.0, 'hc': 16.6, 'xchg': 15.8}
+     block 5: 8 kernels, 266.5 us busy, 0.8 us gaps: {'dense': 236.1, 'xchg': 16.1, 'hc': 14.3}
+     block 6: 24 kernels, 401.9 us busy, 3.0 us gaps: {'dense': 182.7, 'attn': 164.3, 'xchg': 23.7, 'hc': 17.1, 'router': 11.2, 'other': 2.9}
+     block 7: 20 kernels, 1226.1 us busy, 1.9 us gaps: {'experts': 1122.8, 'dense': 49.2, 'router': 24.3, 'hc': 14.8, 'xchg': 13.7, 'other': 1.3}
+     block 8: 14 kernels, 295.8 us busy, 1.5 us gaps: {'dense': 217.3, 'kda': 34.9, 'xchg': 26.5, 'hc': 17.1}
+     block 9: 20 kernels, 1218.2 us busy, 2.0 us gaps: {'experts': 1118.6, 'dense': 48.0, 'router': 25.9, 'hc': 14.8, 'xchg': 9.6, 'other': 1.3}
+
+== r0 segment 3: 651 rounds, wall 51.61 ms, busy 49.77, idle 1.85, >=2 kernels in flight 0.036 ms
+   kernels 1845 (graph 1771, eager 75); graph launches 3.0; host us in eager launch calls 312 (4.18 us each)
+   streams: 7: 1845 k / 49.80 ms
+   gaps: <1.5us 1584 x = 0.203 ms, 1.5-5us 11 x = 0.027 ms, 5-20us 4 x = 0.043 ms, 20-100us 2 x = 0.127 ms, >100us 1 x = 0.232 ms; host-bound 0.212 ms
+   gaps by launch phase: vfwd 0.174, propose 0.254, sample_multi 0.025, plan 0.000, other 0.180
+   kernel sizes: <3us 815 x = 1.12 ms, 3-10us 521 x = 3.08 ms, 10-50us 302 x = 7.01 ms, 50-200us 144 x = 15.58 ms, >=200us 63 x = 23.02 ms
+   families ms: experts 25.10, dense 15.93, xchg 2.27, attn 2.09, kda 1.53, hc 1.45, router 1.16, other 0.25, nccl 0.02, sample 0.01
+   phase host ms: vfwd 1.40, propose 4.80, sample_multi 45.52, plan 0.87 | device busy by launch phase: vfwd 45.19, sample_multi 0.08, other 0.40, propose 4.13 | host-bound idle by phase: other 0.176, propose 0.036, vfwd 0.001
+   idle by the next kernel's launch (phase|who waited|size), ms a round: {"vfwd|host|long(>20us)": 1.116, "propose|host|long(>20us)": 0.178, "vfwd|device|short": 0.173, "other|host|long(>20us)": 0.171, "plan|host|long(>20us)": 0.098, "propose|device|short": 0.06, "sample_multi|device|short": 0.022, "propose|host|short": 0.01, "propose|device|long(>20us)": 0.005, "other|host|short": 0.005, "other|device|short": 0.004, "sample_multi|device|long(>20us)": 0.004, "vfwd|host|short": 0.0, "other|device|long(>20us)": 0.0}
+   template round 50.66 ms, 103 blocks between exchanges; first blocks:
+     block 0: 14 kernels, 413.6 us busy, 5.3 us gaps: {'dense': 222.2, 'xchg': 141.2, 'kda': 32.8, 'hc': 14.7, 'other': 2.7}
+     block 1: 8 kernels, 255.4 us busy, 0.7 us gaps: {'dense': 232.4, 'hc': 14.7, 'xchg': 8.3}
+     block 2: 14 kernels, 278.6 us busy, 1.5 us gaps: {'dense': 208.8, 'kda': 30.8, 'xchg': 24.2, 'hc': 14.8}
+     block 3: 8 kernels, 250.4 us busy, 0.8 us gaps: {'dense': 227.8, 'hc': 14.8, 'xchg': 7.8}
+     block 4: 14 kernels, 275.9 us busy, 1.5 us gaps: {'dense': 207.9, 'kda': 33.3, 'xchg': 17.7, 'hc': 17.0}
+     block 5: 8 kernels, 253.5 us busy, 0.7 us gaps: {'dense': 231.0, 'hc': 14.2, 'xchg': 8.3}
+     block 6: 24 kernels, 381.6 us busy, 2.9 us gaps: {'dense': 176.4, 'attn': 155.7, 'xchg': 23.9, 'hc': 15.0, 'router': 7.7, 'other': 2.9}
+     block 7: 20 kernels, 732.4 us busy, 1.9 us gaps: {'experts': 638.6, 'dense': 46.4, 'router': 23.0, 'hc': 14.8, 'xchg': 8.3, 'other': 1.3}
+     block 8: 14 kernels, 301.8 us busy, 1.6 us gaps: {'dense': 214.6, 'xchg': 37.5, 'kda': 33.1, 'hc': 16.6}
+     block 9: 20 kernels, 805.1 us busy, 1.9 us gaps: {'experts': 704.4, 'dense': 48.7, 'router': 25.8, 'hc': 15.0, 'xchg': 9.9, 'other': 1.3}
+
+== r1 segment 0: 94 rounds, wall 55.37 ms, busy 53.59, idle 1.78, >=2 kernels in flight 0.035 ms
+   kernels 1859 (graph 1726, eager 133); graph launches 3.1; host us in eager launch calls 626 (4.72 us each)
+   streams: 7: 1859 k / 53.62 ms
+   gaps: <1.5us 1602 x = 0.217 ms, 1.5-5us 11 x = 0.026 ms, 5-20us 4 x = 0.042 ms, 20-100us 2 x = 0.118 ms, >100us 1 x = 0.188 ms; host-bound 0.170 ms
+   gaps by launch phase: vfwd 0.190, propose 0.240, sample_multi 0.024, plan 0.000, other 0.137
+   kernel sizes: <3us 803 x = 1.10 ms, 3-10us 526 x = 3.07 ms, 10-50us 323 x = 7.61 ms, 50-200us 137 x = 14.68 ms, >=200us 69 x = 27.16 ms
+   families ms: experts 28.51, dense 16.03, xchg 2.50, attn 2.10, kda 1.58, hc 1.44, router 1.18, other 0.26, nccl 0.02, sample 0.01
+   phase host ms: vfwd 2.31, propose 4.95, sample_multi 47.89 | device busy by launch phase: vfwd 48.82, sample_multi 0.11, other 0.41, propose 4.29 | host-bound idle by phase: vfwd 0.007, other 0.133, propose 0.030
+   idle by the next kernel's launch (phase|who waited|size), ms a round: {"vfwd|host|long(>20us)": 1.193, "vfwd|device|short": 0.183, "propose|host|long(>20us)": 0.162, "other|host|long(>20us)": 0.129, "propose|device|short": 0.063, "sample_multi|device|short": 0.021, "propose|host|short": 0.008, "propose|device|long(>20us)": 0.007, "other|host|short": 0.005, "other|device|short": 0.003, "sample_multi|device|long(>20us)": 0.003, "vfwd|host|short": 0.002, "other|device|long(>20us)": 0.0}
+   template round 54.33 ms, 101 blocks between exchanges; first blocks:
+     block 0: 14 kernels, 282.1 us busy, 1.7 us gaps: {'dense': 223.7, 'kda': 29.4, 'hc': 16.7, 'xchg': 8.1, 'other': 4.2}
+     block 1: 8 kernels, 265.4 us busy, 0.8 us gaps: {'dense': 235.7, 'hc': 15.0, 'xchg': 14.7}
+     block 2: 14 kernels, 270.3 us busy, 1.7 us gaps: {'dense': 207.5, 'kda': 29.0, 'xchg': 17.8, 'hc': 16.0}
+     block 3: 8 kernels, 253.3 us busy, 0.8 us gaps: {'dense': 226.0, 'hc': 14.6, 'xchg': 12.7}
+     block 4: 14 kernels, 273.3 us busy, 1.6 us gaps: {'dense': 210.5, 'kda': 29.5, 'hc': 16.9, 'xchg': 16.4}
+     block 5: 8 kernels, 260.0 us busy, 0.7 us gaps: {'dense': 232.9, 'hc': 15.5, 'xchg': 11.6}
+     block 6: 24 kernels, 514.5 us busy, 2.8 us gaps: {'dense': 178.0, 'attn': 160.5, 'xchg': 145.1, 'hc': 15.8, 'router': 11.2, 'other': 3.9}
+     block 7: 20 kernels, 938.5 us busy, 2.0 us gaps: {'experts': 693.5, 'xchg': 155.3, 'dense': 48.2, 'router': 26.5, 'hc': 13.8, 'other': 1.2}
+     block 8: 14 kernels, 372.3 us busy, 1.4 us gaps: {'dense': 215.2, 'xchg': 111.1, 'kda': 29.6, 'hc': 16.4}
+     block 9: 20 kernels, 921.4 us busy, 2.0 us gaps: {'experts': 698.2, 'xchg': 132.6, 'dense': 49.9, 'router': 25.2, 'hc': 14.2, 'other': 1.3}
+
+== r1 segment 1: 168 rounds, wall 53.50 ms, busy 51.67, idle 1.83, >=2 kernels in flight 0.034 ms
+   kernels 1853 (graph 1734, eager 119); graph launches 3.0; host us in eager launch calls 605 (5.07 us each)
+   streams: 7: 1853 k / 51.70 ms
+   gaps: <1.5us 1597 x = 0.214 ms, 1.5-5us 11 x = 0.026 ms, 5-20us 4 x = 0.044 ms, 20-100us 2 x = 0.112 ms, >100us 1 x = 0.214 ms; host-bound 0.196 ms
+   gaps by launch phase: vfwd 0.186, propose 0.240, sample_multi 0.024, plan 0.000, other 0.160
+   kernel sizes: <3us 808 x = 1.11 ms, 3-10us 523 x = 3.06 ms, 10-50us 312 x = 7.23 ms, 50-200us 145 x = 15.40 ms, >=200us 65 x = 24.91 ms
+   families ms: experts 26.71, dense 15.87, xchg 2.56, attn 2.10, kda 1.59, hc 1.44, router 1.16, other 0.26, nccl 0.01, sample 0.01
+   phase host ms: vfwd 2.21, propose 4.73, sample_multi 46.28 | device busy by launch phase: vfwd 47.07, sample_multi 0.10, other 0.45, propose 4.09 | host-bound idle by phase: vfwd 0.005, other 0.156, propose 0.035
+   idle by the next kernel's launch (phase|who waited|size), ms a round: {"vfwd|host|long(>20us)": 1.229, "vfwd|device|short": 0.181, "propose|host|long(>20us)": 0.162, "other|host|long(>20us)": 0.153, "propose|device|short": 0.061, "sample_multi|device|short": 0.021, "propose|host|short": 0.011, "propose|device|long(>20us)": 0.005, "other|host|short": 0.004, "other|device|short": 0.003, "sample_multi|device|long(>20us)": 0.003, "vfwd|host|short": 0.002}
+   template round 51.01 ms, 103 blocks between exchanges; first blocks:
+     block 0: 14 kernels, 288.2 us busy, 3.4 us gaps: {'dense': 225.4, 'kda': 35.3, 'hc': 15.3, 'xchg': 8.1, 'other': 4.1}
+     block 1: 8 kernels, 269.3 us busy, 0.7 us gaps: {'dense': 230.8, 'xchg': 23.5, 'hc': 15.0}
+     block 2: 14 kernels, 264.4 us busy, 1.4 us gaps: {'dense': 206.1, 'kda': 32.4, 'hc': 16.0, 'xchg': 9.9}
+     block 3: 8 kernels, 261.7 us busy, 0.8 us gaps: {'dense': 226.3, 'xchg': 21.0, 'hc': 14.4}
+     block 4: 14 kernels, 268.3 us busy, 1.5 us gaps: {'dense': 208.7, 'kda': 32.2, 'hc': 17.1, 'xchg': 10.3}
+     block 5: 8 kernels, 260.5 us busy, 0.8 us gaps: {'dense': 229.4, 'hc': 15.7, 'xchg': 15.4}
+     block 6: 24 kernels, 375.3 us busy, 3.0 us gaps: {'dense': 174.2, 'attn': 162.8, 'hc': 16.5, 'xchg': 10.8, 'router': 8.0, 'other': 3.0}
+     block 7: 20 kernels, 802.3 us busy, 1.9 us gaps: {'experts': 695.9, 'dense': 49.3, 'router': 24.7, 'xchg': 17.2, 'hc': 13.9, 'other': 1.3}
+     block 8: 14 kernels, 274.5 us busy, 1.5 us gaps: {'dense': 216.7, 'kda': 32.7, 'hc': 16.9, 'xchg': 8.2}
+     block 9: 20 kernels, 816.3 us busy, 2.1 us gaps: {'experts': 709.3, 'dense': 49.7, 'router': 26.0, 'xchg': 15.5, 'hc': 14.6, 'other': 1.2}
+
+== r1 segment 2: 91 rounds, wall 64.68 ms, busy 62.89, idle 1.78, >=2 kernels in flight 0.024 ms
+   kernels 1880 (graph 1301, eager 579); graph launches 2.8; host us in eager launch calls 3428 (5.92 us each)
+   streams: 7: 1880 k / 62.92 ms
+   gaps: <1.5us 1683 x = 0.312 ms, 1.5-5us 12 x = 0.026 ms, 5-20us 5 x = 0.056 ms, 20-100us 3 x = 0.133 ms, >100us 2 x = 0.272 ms; host-bound 0.261 ms
+   gaps by launch phase: vfwd 0.304, propose 0.271, sample_multi 0.024, plan 0.000, other 0.200
+   kernel sizes: <3us 799 x = 1.16 ms, 3-10us 523 x = 3.08 ms, 10-50us 343 x = 8.00 ms, 50-200us 136 x = 13.90 ms, >=200us 79 x = 36.78 ms
+   families ms: experts 36.59, dense 16.50, xchg 2.95, attn 2.13, kda 1.70, hc 1.48, router 1.23, other 0.29, nccl 0.04, sample 0.01
+   phase host ms: vfwd 9.89, propose 5.33, sample_multi 49.12 | device busy by launch phase: vfwd 57.70, sample_multi 0.11, other 0.68, propose 4.42 | host-bound idle by phase: other 0.195, vfwd 0.030, propose 0.036
+   idle by the next kernel's launch (phase|who waited|size), ms a round: {"vfwd|host|long(>20us)": 1.008, "vfwd|device|short": 0.274, "other|host|long(>20us)": 0.189, "propose|host|long(>20us)": 0.181, "propose|device|short": 0.066, "sample_multi|device|short": 0.021, "propose|host|short": 0.012, "propose|device|long(>20us)": 0.011, "vfwd|host|short": 0.009, "other|host|short": 0.008, "other|device|short": 0.004, "sample_multi|device|long(>20us)": 0.003, "other|device|long(>20us)": 0.0}
+   template round 66.29 ms, 103 blocks between exchanges; first blocks:
+     block 0: 14 kernels, 295.8 us busy, 1.7 us gaps: {'dense': 228.4, 'kda': 35.6, 'hc': 16.9, 'xchg': 10.4, 'other': 4.5}
+     block 1: 8 kernels, 270.5 us busy, 0.7 us gaps: {'dense': 237.0, 'xchg': 18.4, 'hc': 15.1}
+     block 2: 14 kernels, 279.5 us busy, 1.5 us gaps: {'dense': 210.9, 'kda': 35.7, 'hc': 16.8, 'xchg': 16.1}
+     block 3: 8 kernels, 264.5 us busy, 0.7 us gaps: {'dense': 236.9, 'hc': 14.5, 'xchg': 13.1}
+     block 4: 14 kernels, 284.3 us busy, 1.5 us gaps: {'dense': 213.7, 'kda': 35.4, 'xchg': 18.3, 'hc': 16.9}
+     block 5: 8 kernels, 267.5 us busy, 0.8 us gaps: {'dense': 233.1, 'xchg': 19.0, 'hc': 15.4}
+     block 6: 24 kernels, 393.3 us busy, 2.9 us gaps: {'dense': 183.2, 'attn': 167.8, 'hc': 15.5, 'xchg': 12.2, 'router': 11.5, 'other': 3.1}
+     block 7: 20 kernels, 1237.7 us busy, 2.0 us gaps: {'experts': 1124.9, 'dense': 48.5, 'router': 26.6, 'xchg': 22.4, 'hc': 14.0, 'other': 1.3}
+     block 8: 14 kernels, 282.6 us busy, 1.5 us gaps: {'dense': 220.2, 'kda': 35.6, 'hc': 16.5, 'xchg': 10.3}
+     block 9: 20 kernels, 1234.7 us busy, 2.0 us gaps: {'experts': 1107.6, 'dense': 51.3, 'xchg': 33.2, 'router': 26.8, 'hc': 14.5, 'other': 1.3}
+
+== r1 segment 3: 651 rounds, wall 51.62 ms, busy 49.69, idle 1.93, >=2 kernels in flight 0.035 ms
+   kernels 1845 (graph 1771, eager 75); graph launches 3.0; host us in eager launch calls 319 (4.28 us each)
+   streams: 7: 1845 k / 49.72 ms
+   gaps: <1.5us 1584 x = 0.204 ms, 1.5-5us 11 x = 0.026 ms, 5-20us 4 x = 0.041 ms, 20-100us 2 x = 0.126 ms, >100us 1 x = 0.250 ms; host-bound 0.227 ms
+   gaps by launch phase: vfwd 0.173, propose 0.258, sample_multi 0.025, plan 0.000, other 0.191
+   kernel sizes: <3us 803 x = 1.09 ms, 3-10us 525 x = 3.07 ms, 10-50us 309 x = 7.23 ms, 50-200us 146 x = 15.72 ms, >=200us 62 x = 22.61 ms
+   families ms: experts 24.88, dense 15.83, xchg 2.51, attn 2.12, kda 1.52, hc 1.43, router 1.16, other 0.25, nccl 0.02, sample 0.01
+   phase host ms: vfwd 1.46, propose 4.79, sample_multi 45.47 | device busy by launch phase: vfwd 45.09, sample_multi 0.11, other 0.40, propose 4.12 | host-bound idle by phase: other 0.187, propose 0.039, vfwd 0.001
+   idle by the next kernel's launch (phase|who waited|size), ms a round: {"vfwd|host|long(>20us)": 1.187, "other|host|long(>20us)": 0.283, "propose|host|long(>20us)": 0.183, "vfwd|device|short": 0.171, "propose|device|short": 0.059, "sample_multi|device|short": 0.022, "propose|host|short": 0.011, "propose|device|long(>20us)": 0.005, "other|host|short": 0.005, "sample_multi|device|long(>20us)": 0.003, "other|device|short": 0.003, "vfwd|device|long(>20us)": 0.0, "vfwd|host|short": 0.0, "other|device|long(>20us)": 0.0}
+   template round 50.64 ms, 103 blocks between exchanges; first blocks:
+     block 0: 14 kernels, 462.2 us busy, 1.8 us gaps: {'dense': 222.7, 'xchg': 184.8, 'kda': 35.9, 'hc': 14.6, 'other': 4.2}
+     block 1: 8 kernels, 259.3 us busy, 1.0 us gaps: {'dense': 231.7, 'hc': 15.2, 'xchg': 12.4}
+     block 2: 14 kernels, 289.3 us busy, 1.5 us gaps: {'dense': 207.7, 'xchg': 33.6, 'kda': 33.4, 'hc': 14.6}
+     block 3: 8 kernels, 253.9 us busy, 0.8 us gaps: {'dense': 231.9, 'hc': 14.1, 'xchg': 7.9}
+     block 4: 14 kernels, 285.4 us busy, 1.2 us gaps: {'dense': 208.2, 'kda': 34.7, 'xchg': 27.8, 'hc': 14.7}
+     block 5: 8 kernels, 254.2 us busy, 1.0 us gaps: {'dense': 230.6, 'hc': 15.7, 'xchg': 7.9}
+     block 6: 24 kernels, 392.2 us busy, 2.6 us gaps: {'dense': 174.2, 'attn': 168.1, 'xchg': 19.2, 'hc': 16.0, 'router': 11.7, 'other': 3.0}
+     block 7: 20 kernels, 1021.4 us busy, 1.9 us gaps: {'experts': 924.4, 'dense': 48.8, 'router': 24.2, 'hc': 14.4, 'xchg': 8.3, 'other': 1.3}
+     block 8: 14 kernels, 289.0 us busy, 1.5 us gaps: {'dense': 217.4, 'kda': 35.7, 'xchg': 19.4, 'hc': 16.5}
+     block 9: 20 kernels, 997.2 us busy, 2.0 us gaps: {'experts': 896.4, 'dense': 50.0, 'router': 25.8, 'hc': 14.3, 'xchg': 9.4, 'other': 1.3}
+
+== skew {
+ "n0": 101674,
+ "n1": 101674,
+ "end_offset_resid_us": {
+  "p5": -10.982,
+  "p95": 9.64225
+ },
+ "arrival_skew_us": {
+  "median": -2.103,
+  "mean": -2.8028682357338157,
+  "mean_abs": 22.161418622263312,
+  "p10": -24.4795,
+  "p90": 13.9305,
+  "r1_later_frac": 0.43444735133859197
+ },
+ "gather_us": {
+  "r0_median": 14.943,
+  "r0_mean": 23.44404992426776,
+  "r1_median": 17.057,
+  "r1_mean": 25.751188120856856,
+  "min_of_pair_median": 9.536,
+  "min_of_pair_mean": 10.81075870920786
+ },
+ "skew_by_producer": {
+  "_reduce": {
+   "n": 54974,
+   "mean_us": 2.75,
+   "mean_abs_us": 17.76
+  },
+  "_combine": {
+   "n": 43558,
+   "mean_us": -8.61,
+   "mean_abs_us": 26.09
+  },
+  "CatArrayBatchedCopy_vectorized": {
+   "n": 1674,
+   "mean_us": -20.81,
+   "mean_abs_us": 34.57
+  },
+  "CatArrayBatchedCopy_alignedK_contig": {
+   "n": 1018,
+   "mean_us": -27.16,
+   "mean_abs_us": 41.6
+  },
+  "_fq4": {
+   "n": 240,
+   "mean_us": 13.05,
+   "mean_abs_us": 57.92
+  },
+  "_combine_s": {
+   "n": 210,
+   "mean_us": -6.5,
+   "mean_abs_us": 126.02
+  }
+ },
+ "wait_beyond_min_ms_total": {
+  "r0": 1284.477251,
+  "r1": 1519.05322
+ }
+}

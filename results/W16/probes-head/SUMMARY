@@ -1,0 +1,8 @@
+22:10:36 start head image glm53-tensorfold:b8
+22:11:42 cpu rc=0 66s :: 169 passed in 61.14s (0:01:01) 
+22:11:49 littles rc=1 7s :: GATE item8: no result (rc 1) 
+22:14:43 cold rc=0 174s :: GATE item7: new >= 1.10x old cold on shapes < 8 MB (KDA o, shared gate/up/down, DSA q_b/kv, index) [rotate+flush]: passing ['4096x1024 (shared down)', '8192x512 (DSA kv_b)', '4096x1536 (index q_b)', '160x4096 (index k)']; failing none; not 
+22:14:43 head probes done
+23:54:52 start head image glm53-tensorfold:b8
+23:55:02 littles rc=0 10s :: GATE item8: nc reaches >= 230 GB/s at <= 4.0 KB/SM in flight with <= 112 regs/thread: PASS (tile D1 C2, 232.7 GB/s, 8 warps/SM, 54 regs, 4 data regs) GATE item8: nc reaches >= 230 GB/s at <= 4.0 KB/SM in flight with <= 112 regs/thread: PASS
+23:55:02 head probes done

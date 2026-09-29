@@ -22,6 +22,11 @@ What it shows:
    more than two sequences ahead of the proxy. Controls: a flag posted on another queue pair than its payload, or a
    third slot of lag, are caught.
 4. 0350's failure watch classifies the W2 failure as "arrived after the timeout", not "delivered but not seen".
+5. patches/0460: shards below ``GLM53_TF_ROCE_STRIPE_KB`` travel on ONE HCA (seq % HCAs; the kernel waits for that
+   HCA's flag only) and stripes up to ``GLM53_TF_ROCE_INLINE`` bytes are posted inline (the proxy copies the staged
+   bytes at post time; the NIC never reads the send slot for them). Random schedules with mixed sizes keep every
+   invariant, and the payload a proxy copies is always the op's own. Controls: a kernel that waits for another HCA
+   than the sender used, or ranks with different thresholds, time out (hence the setting is agreed at load).
 
 Run: pytest -q tests/test_roce_protocol_model.py  (no dependencies; ~2 s)
 """
@@ -50,6 +55,7 @@ class Kernel:
     payload: int
     state: str = "start"          # start -> wait -> done
     seq: int = 0
+    nbytes: int = 16384           # patches/0460: the padded shard size (decides striped / one HCA)
 
 
 @dataclass
@@ -69,14 +75,23 @@ class Rank:
     flag: dict = field(default_factory=dict)                         # (src, slot, hca) -> seq
     queue: deque = field(default_factory=deque)                      # launched kernels, in stream order
     watch: dict | None = None                                        # 0350: the proxy's view at the failure
+    slot_nbytes: list = field(default_factory=lambda: [0] * SLOTS)   # 0460: ctrl[CTRL_SLOT_NBYTES + slot]
+    stripe_min: int = 0                                              # 0460: this rank's GLM53_TF_ROCE_STRIPE_KB
 
 
 class Model:
     """Two (or more) ranks in one box. ``flag_qp_skew``: control -- the flag of HCA h is posted on HCA h + 1's queue
     pair (not ordered after its payload). ``lag_slots``: the proxy's catch-up bound (0230: SLOTS)."""
 
-    def __init__(self, world=2, n_hca=2, seed=None, flag_qp_skew=False, lag_slots=SLOTS, proxy_delay=0.0):
+    def __init__(self, world=2, n_hca=2, seed=None, flag_qp_skew=False, lag_slots=SLOTS, proxy_delay=0.0,
+                 stripe_min=0, inline_max=0, wait_rule_skew=False, stripe_mins=None):
         self.ranks = [Rank(r, world, n_hca) for r in range(world)]
+        # patches/0460: the one-HCA threshold (per rank for the mismatch control), inline posts, and a control whose
+        # kernel waits for another HCA than the one the sender used
+        for rk in self.ranks:
+            rk.stripe_min = stripe_mins[rk.r] if stripe_mins is not None else stripe_min
+        self.inline_max = inline_max
+        self.wait_rule_skew = wait_rule_skew
         self.world, self.n_hca = world, n_hca
         self.nic: dict[tuple[int, int, int], deque] = {}     # (src, dst, hca) -> RC queue pair's work requests
         self.rng = random.Random(seed) if seed is not None else None
@@ -86,8 +101,18 @@ class Model:
         self.log: list[str] = []
 
     # host side
-    def launch(self, r: int, payload: int) -> None:
-        self.ranks[r].queue.append(Kernel(r, payload))
+    def launch(self, r: int, payload: int, nbytes: int = 16384) -> None:
+        self.ranks[r].queue.append(Kernel(r, payload, nbytes=nbytes))
+
+    def hcas(self, rk: Rank, seq: int, nbytes: int, waiting: bool = False) -> list[int]:
+        """patches/0460 (roce_common.h ``one_hca`` / ``single_hca``): the HCAs an op uses."""
+
+        if rk.stripe_min and nbytes < rk.stripe_min and self.n_hca > 1:
+            h = seq % self.n_hca
+            if waiting and self.wait_rule_skew:
+                h = (seq + 1) % self.n_hca
+            return [h]
+        return list(range(self.n_hca))
 
     # one step of each actor; each returns True when it changed something
     def _kernel_step(self, rk: Rank) -> bool:
@@ -103,10 +128,11 @@ class Model:
             # the NIC must have read what it still owes a peer from this slot
             for (src, dst, h), q in self.nic.items():
                 for wr in q:
-                    if src == rk.r and wr[0] == "data" and wr[2] == slot and wr[3] != k.seq:
+                    if src == rk.r and wr[0] == "data" and wr[2] == slot and wr[3] != k.seq and len(wr) < 6:
                         raise Violation(f"rank {rk.r} restaged send slot {slot} for seq {k.seq} while the NIC still "
                                         f"owes seq {wr[3]} from it")
             rk.send[slot] = (rk.r, k.seq, k.payload)
+            rk.slot_nbytes[slot] = k.nbytes
             rk.doorbell = k.seq
             k.state = "wait"
             return True
@@ -115,7 +141,7 @@ class Model:
             for p in range(self.world):
                 if p == rk.r:
                     continue
-                for h in range(self.n_hca):
+                for h in self.hcas(rk, k.seq, k.nbytes, waiting=True):
                     if rk.flag.get((p, slot, h), 0) != k.seq:
                         return False
             for p in range(self.world):
@@ -136,11 +162,21 @@ class Model:
         if pending > self.lag_slots:
             raise Violation(f"rank {rk.r}: doorbell {rk.doorbell} is {pending} ahead of the proxy")
         for s in range(rk.proxy_last + 1, rk.doorbell + 1):
+            nbytes = rk.slot_nbytes[s % SLOTS]                  # the catch-up reads the slot's byte count
+            used = self.hcas(rk, s, nbytes)
             for p in range(self.world):
                 if p == rk.r:
                     continue
-                for h in range(self.n_hca):
-                    self.nic.setdefault((rk.r, p, h), deque()).append(("data", p, s % SLOTS, s, h))
+                for h in used:                              # per HCA: its stripe, then its flag (0230's order)
+                    stripe = nbytes if len(used) == 1 else -(-nbytes // len(used))
+                    if self.inline_max and stripe <= self.inline_max:
+                        staged = rk.send[s % SLOTS]             # 0460 inline: the proxy copies the slot NOW
+                        if staged is None or staged[1] != s:
+                            raise Violation(f"rank {rk.r} proxy copied slot {s % SLOTS} for seq {s} inline but it "
+                                            f"holds {staged}")
+                        self.nic.setdefault((rk.r, p, h), deque()).append(("data", p, s % SLOTS, s, h, staged))
+                    else:
+                        self.nic.setdefault((rk.r, p, h), deque()).append(("data", p, s % SLOTS, s, h))
                     hq = (h + 1) % self.n_hca if self.flag_qp_skew else h
                     self.nic.setdefault((rk.r, p, hq), deque()).append(("flag", p, s % SLOTS, s, h))
             rk.proxy_last = s
@@ -150,11 +186,13 @@ class Model:
         q = self.nic.get(key)
         if not q:
             return False
-        kind, dst, slot, seq, h = q.popleft()
+        wr = q.popleft()
+        kind, dst, slot, seq, h = wr[:5]
         src = key[0]
         d = self.ranks[dst]
         if kind == "data":
-            staged = self.ranks[src].send[slot]              # read from the sender's slot when transmitted
+            # read from the sender's slot when transmitted; 0460 inline: the copy the proxy made at post time
+            staged = wr[5] if len(wr) > 5 else self.ranks[src].send[slot]
             if staged is None or staged[1] != seq:
                 raise Violation(f"NIC of rank {src} sent slot {slot} for seq {seq} but it holds {staged}")
             d.recv[(src, slot)] = staged
@@ -216,7 +254,8 @@ class Model:
             rk = waiting[0]
             k = rk.queue[0]
             slot = k.seq % SLOTS
-            miss = [(p, h) for p in range(self.world) if p != rk.r for h in range(self.n_hca)
+            miss = [(p, h) for p in range(self.world) if p != rk.r
+                    for h in self.hcas(rk, k.seq, k.nbytes, waiting=True)
                     if rk.flag.get((p, slot, h), 0) != k.seq]
             p, h = miss[0]
             if not rk.failed:
@@ -384,3 +423,85 @@ def test_control_proxy_lag_bound_is_reached():
             assert "ahead of the proxy" in str(exc)
             caught += 1
     assert caught > 0
+
+
+# -- 5. patches/0460: one-HCA small ops and inline posts -------------------------------------------------------------
+SIZES = [16, 112, 1024, 16384, 32768, 65536, 131072]
+
+
+def _mixed_program(m: Model, rng: random.Random, n_ops: int) -> None:
+    """``_random_program`` with a size per op (the same on every rank: an all-gather's shards are equal)."""
+
+    sizes = [rng.choice(SIZES) for _ in range(n_ops)]
+    done = [0] * m.world
+    while min(done) < n_ops:
+        burst = rng.randint(1, 12)
+        for r in rng.sample(range(m.world), m.world):
+            for _ in range(min(burst, n_ops - done[r])):
+                m.launch(r, rng.randint(0, 1 << 30), sizes[done[r]])
+                done[r] += 1
+            if rng.random() < 0.5:
+                m.run()
+        if len(set(done)) == 1 and rng.random() < 0.3:
+            m.synchronize()
+    m.synchronize()
+
+
+@pytest.mark.parametrize("inline_max", [0, 1024])
+@pytest.mark.parametrize("stripe_min", [0, 32768, 1 << 20])
+@pytest.mark.parametrize("seed", range(12))
+def test_one_hca_and_inline_keep_the_invariants(seed, stripe_min, inline_max):
+    rng = random.Random(7000 + seed)
+    m = Model(n_hca=2, seed=seed, proxy_delay=0.3, stripe_min=stripe_min, inline_max=inline_max)
+    _mixed_program(m, rng, 60)
+    assert m.check(0) is None and m.check(1) is None
+    assert m.ranks[0].completed == m.ranks[1].completed == 60
+
+
+def test_one_hca_three_ranks():
+    for seed in range(6):
+        m = Model(world=3, n_hca=2, seed=seed, proxy_delay=0.3, stripe_min=32768, inline_max=512)
+        _mixed_program(m, random.Random(seed), 40)
+        assert all(m.check(r) is None for r in range(3))
+
+
+def test_one_hca_ops_use_one_queue_pair():
+    """A small op posts its payload and flag on HCA seq % 2 only; a large one on both (the proxy's rule)."""
+
+    m = Model(n_hca=2, stripe_min=32768)
+    for size, used in ((16384, 1), (65536, 2), (16, 1), (32768, 2)):
+        for r in (0, 1):
+            m.launch(r, 0, size)
+        m.run()
+        assert m.check(0) is None and m.check(1) is None
+        seq = m.ranks[0].completed
+        hcas = {h for (src, slot, h), v in m.ranks[1].flag.items() if src == 0 and v == seq}
+        assert len(hcas) == used and (used == 2 or hcas == {seq % 2})
+
+
+def test_control_wait_rule_mismatch_times_out():
+    """A kernel waiting for another HCA's flag than the sender set (a rule not shared by kernel and proxy) never
+    completes: the model's timeout fires on the first small op."""
+
+    m = Model(n_hca=2, seed=1, stripe_min=32768, wait_rule_skew=True)
+    for r in (0, 1):
+        m.launch(r, 0, 16384)
+    m.synchronize()
+    assert m.check(0) is not None and m.check(0)["seq"] == 1
+
+
+def test_control_threshold_mismatch_times_out():
+    """Ranks started with different thresholds disagree on the HCA of a small op: a timeout (why
+    ``Settings.agreed`` carries GLM53_TF_ROCE_STRIPE_KB)."""
+
+    hung = 0
+    for seq_first in range(4):
+        m = Model(n_hca=2, stripe_mins=[32768, 0])
+        for _ in range(seq_first):
+            for r in (0, 1):
+                m.launch(r, 0, 65536)                 # striped on both ranks: fine
+        for r in (0, 1):
+            m.launch(r, 0, 16384)                     # rank 0: one HCA; rank 1: striped
+        m.synchronize()
+        hung += int(m.check(0) is not None or m.check(1) is not None)
+    assert hung == 4

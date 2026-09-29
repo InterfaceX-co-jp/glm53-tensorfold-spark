@@ -1,0 +1,20 @@
+[
+ {
+  "size": "10000x10000",
+  "code": 400,
+  "error": {
+   "message": "image of 10000x10000 pixels: more than 67108864 (GLM53_TF_VISION_MAX_PIXELS)",
+   "type": "invalid_request_error",
+   "param": "messages"
+  }
+ },
+ {
+  "size": "8000x8000",
+  "code": 400,
+  "error": {
+   "message": "could not decode the image: image file is truncated (0 bytes not processed)",
+   "type": "invalid_request_error",
+   "param": "messages"
+  }
+ }
+]

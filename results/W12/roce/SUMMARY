@@ -1,0 +1,9 @@
+13:45:35 base rc0=0 rc1=0 20s :: saved a 90-exchange step (graph): 16384 B: 2.66 ms, 32768 B: 3.31 ms, 65536 B: 4.90 ms, 131072 B: 4.05 ms, 262144 B: 4.65 ms
+13:45:44 lean rc0=0 rc1=0 9s :: saved a 90-exchange step (graph): 16384 B: 3.06 ms, 32768 B: 3.53 ms, 65536 B: 4.95 ms, 131072 B: 3.87 ms, 262144 B: 4.83 ms
+13:45:54 stripe32 rc0=0 rc1=0 10s :: saved a 90-exchange step (graph): 16384 B: 2.40 ms, 32768 B: 3.46 ms, 65536 B: 5.14 ms, 131072 B: 3.93 ms, 262144 B: 4.65 ms
+13:46:03 stripe64 rc0=0 rc1=0 9s :: saved a 90-exchange step (graph): 16384 B: 3.00 ms, 32768 B: 2.83 ms, 65536 B: 5.01 ms, 131072 B: 4.09 ms, 262144 B: 4.67 ms
+13:46:12 inline256 rc0=0 rc1=0 9s :: saved a 90-exchange step (graph): 16384 B: 3.04 ms, 32768 B: 3.39 ms, 65536 B: 5.05 ms, 131072 B: 4.10 ms, 262144 B: 4.61 ms
+13:46:22 lazycq rc0=0 rc1=0 10s :: saved a 90-exchange step (graph): 16384 B: 2.67 ms, 32768 B: 3.35 ms, 65536 B: 5.29 ms, 131072 B: 4.11 ms, 262144 B: 4.59 ms
+13:46:31 all rc0=0 rc1=0 9s :: saved a 90-exchange step (graph): 16384 B: 2.98 ms, 32768 B: 2.75 ms, 65536 B: 5.07 ms, 131072 B: 3.90 ms, 262144 B: 4.63 ms
+13:46:40 base2 rc0=0 rc1=0 9s :: saved a 90-exchange step (graph): 16384 B: 3.12 ms, 32768 B: 3.30 ms, 65536 B: 4.95 ms, 131072 B: 4.33 ms, 262144 B: 4.89 ms
+roce bench done 13:46:40

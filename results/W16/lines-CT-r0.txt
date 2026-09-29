@@ -1,0 +1,16 @@
+[tensorfold] graph probe (patches/0510) r0 ('main', 1, 0) pieces=1 n=15: replay host us p50 4 p90 6 (first piece p50 4); first node +us p50 5 p10 5 p90 8
+[tensorfold] graph probe (patches/0510) r0 ('main', 1, 1) pieces=1 n=28: replay host us p50 11 p90 23 (first piece p50 11); first node +us p50 12 p10 5 p90 22
+[tensorfold] graph probe (patches/0510) r0 ('main', 2, 1) pieces=1 n=12: replay host us p50 14 p90 16 (first piece p50 14); first node +us p50 15 p10 14 p90 17
+[tensorfold] graph probe (patches/0510) r0 ('main', 3, 1) pieces=1 n=12: replay host us p50 13 p90 14 (first piece p50 13); first node +us p50 14 p10 13 p90 15
+[tensorfold] graph probe (patches/0510) r0 ('main', 4, 1) pieces=1 n=11: replay host us p50 14 p90 14 (first piece p50 14); first node +us p50 14 p10 14 p90 15
+[tensorfold] graph probe (patches/0510) r0 ('main', 5, 1) pieces=1 n=11: replay host us p50 13 p90 14 (first piece p50 13); first node +us p50 14 p10 12 p90 15
+[tensorfold] graph probe (patches/0510) r0 ('main', 6, 1) pieces=1 n=11: replay host us p50 13 p90 14 (first piece p50 13); first node +us p50 14 p10 11 p90 15
+[tensorfold] RoCE trace dump (patches/0530): every 65536 exchanges -> /sessions/w16-roce-CT-r0.jsonl (ring 4096, tensorfold.families.glm5_next.cuda.roce)
+[tensorfold] graph probe (patches/0510) r0 ('main', 1, 1) pieces=1 n=15: replay host us p50 24 p90 26 (first piece p50 24); first node +us p50 25 p10 24 p90 27
+[tensorfold] graph probe (patches/0510) r0 ('main', 2, 0) pieces=1 n=2: replay host us p50 10 p90 612 (first piece p50 10); first node +us p50 12 p10 12 p90 132
+[tensorfold] graph probe (patches/0510) r0 ('main', 2, 1) pieces=1 n=15: replay host us p50 15 p90 15 (first piece p50 15); first node +us p50 15 p10 14 p90 16
+[tensorfold] graph probe (patches/0510) r0 ('main', 3, 1) pieces=1 n=15: replay host us p50 14 p90 14 (first piece p50 14); first node +us p50 14 p10 11 p90 15
+[tensorfold] graph probe (patches/0510) r0 ('main', 4, 1) pieces=1 n=20: replay host us p50 13 p90 14 (first piece p50 13); first node +us p50 14 p10 11 p90 18
+[tensorfold] graph probe (patches/0510) r0 ('main', 5, 0) pieces=1 n=1: replay host us p50 501 p90 501 (first piece p50 501); first node +us p50 183 p10 183 p90 183
+[tensorfold] graph probe (patches/0510) r0 ('main', 5, 1) pieces=1 n=16: replay host us p50 13 p90 14 (first piece p50 13); first node +us p50 14 p10 12 p90 15
+[tensorfold] graph probe (patches/0510) r0 ('main', 6, 1) pieces=1 n=16: replay host us p50 13 p90 14 (first piece p50 13); first node +us p50 14 p10 11 p90 30

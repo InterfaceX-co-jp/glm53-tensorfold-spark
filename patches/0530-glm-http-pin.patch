@@ -1,0 +1,268 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/cpupin.py w/src/tensorfold/families/glm5_next/cuda/cpupin.py
+index a487b8a..9dc24b2 100644
+--- i/src/tensorfold/families/glm5_next/cuda/cpupin.py
++++ w/src/tensorfold/families/glm5_next/cuda/cpupin.py
+@@ -21,6 +21,13 @@ Settings (both ranks read their own; scheduling only, replies unchanged):
+   plus ``nice=N`` (0..19) for the HTTP request threads (default 0: a lower priority buys nothing while they have
+   cores of their own, and a descheduled thread that holds the GIL stalls the round loop).
+ 
++- ``http`` (patches/0530, THEORY-2 idea 6): only rank 0's HTTP request threads (``tf-http``: tokenizing, streaming,
++  detokenizing) move, onto ``http=`` cpus (default: the allowed cores that are not fast cores, i.e. the A725s on GB10:
++  0-4, 10-14); nothing else is pinned, so the engine's threads (round loop, RoCE proxy, NCCL) keep the scheduler's
++  placement but no longer share cores with the HTTP threads. ``http=0-4,10-14;engine=fast`` (or ``engine=<cpus>``)
++  also keeps every other thread on those cpus. Without batching the request thread decodes itself: while it does
++  (``serving_request``) it runs on the engine's cpus (``engine``, else every allowed cpu), then goes back.
++
+ Threads made later inherit their maker's cpus: the HTTP threads the main thread's (``rest``), a thread made by the
+ round loop its single core; ``tick`` (every round, cheap) re-sorts the threads every ``GLM53_TF_CPU_PIN_EVERY`` s
+ (30). ``serving`` names the round loop's thread ``tf-serve`` (``ps -L -o tid,psr,pcpu,comm``). Linux only; on
+@@ -51,8 +58,14 @@ class Plan:
+     roce: int | None = None
+     nice: int = 0
+     fast: tuple[int, ...] = ()
++    http: frozenset[int] = frozenset()          # patches/0530: mode "http" only
++    engine: frozenset[int] | None = None        # patches/0530: None = the other threads stay where they are
++    allowed: frozenset[int] = frozenset()
+ 
+     def describe(self) -> str:
++        if self.mode == "http":                 # patches/0530
++            eng = cpulist(self.engine) if self.engine is not None else "unpinned"
++            return f"http: HTTP threads on {cpulist(self.http)}, the engine's threads {eng}"
+         roce = f" roce {self.roce}" if self.roce is not None else ""
+         return (f"{self.mode}: serve {cpulist(self.serve)}{roce} comm {cpulist(self.comm)} rest {cpulist(self.rest)}"
+                 + (f", HTTP nice {self.nice}" if self.nice else ""))
+@@ -169,6 +182,8 @@ def plan(spec: str | None, cpus: dict[int, Cpu], allowed, *, roce: bool = False)
+     if not allowed:
+         raise ValueError("GLM53_TF_CPU_PIN: no cpus allowed")
+     fast = fast_cpus(cpus, allowed)
++    if low == "http" or low.startswith("http=") or low.startswith("http;"):
++        return _http_plan(spec, low, fast, allowed)
+     if low == "fast":
+         f = frozenset(fast)
+         return Plan("fast", f, f, f, None, 0, tuple(fast))
+@@ -216,6 +231,41 @@ def plan(spec: str | None, cpus: dict[int, Cpu], allowed, *, roce: bool = False)
+     return p
+ 
+ 
++def _http_plan(spec, low: str, fast: list[int], allowed: frozenset[int]) -> Plan:
++    """patches/0530: ``http[=cpus][;engine=cpus|fast]``."""
++
++    http, engine = None, None
++    for i, part in enumerate(low.split(";")):
++        part = part.strip()
++        if not part:
++            continue
++        key, eq, val = part.partition("=")
++        key, val = key.strip(), val.strip()
++        if i == 0 and key == "http":
++            http = parse_cpulist(val) if eq else None
++            if eq and not http:
++                raise ValueError(f"GLM53_TF_CPU_PIN={spec!r}: http= is empty")
++        elif key == "engine" and eq:
++            engine = frozenset(fast) if val == "fast" else parse_cpulist(val)
++            if not engine:
++                raise ValueError(f"GLM53_TF_CPU_PIN={spec!r}: engine= is empty")
++        else:
++            raise ValueError(f"GLM53_TF_CPU_PIN={spec!r}: expected http, http=<cpus> or http=<cpus>;engine=<cpus|fast>")
++    if http is None:
++        http = allowed - frozenset(fast)
++        if not http:                            # no slow cores: the lower half of the allowed ones
++            ids = sorted(allowed)
++            http = frozenset(ids[:max(1, len(ids) // 2)])
++    for name, got in (("http", http), ("engine", engine)):
++        if got is not None and not got <= allowed:
++            raise ValueError(f"GLM53_TF_CPU_PIN {name}={cpulist(got)}: cpus {cpulist(got - allowed)} are not allowed "
++                             f"here (allowed: {cpulist(allowed)})")
++    if engine is not None and engine & http:
++        raise ValueError(f"GLM53_TF_CPU_PIN={spec!r}: engine and http cpus overlap ({cpulist(engine & http)})")
++    return Plan("http", frozenset(), frozenset(), frozenset(), None, 0, tuple(fast), http=http, engine=engine,
++                allowed=allowed)
++
++
+ # -- the process's state --------------------------------------------------------------------------------------------
+ @dataclass
+ class _State:
+@@ -228,6 +278,7 @@ class _State:
+ 
+ 
+ _S = _State()
++_DUMP = bool(os.environ.get("GLM53_TF_ROCE_TRACE_DUMP", "").strip())   # patches/0530 (rocedump.py)
+ _PR_SET_NAME = 15
+ 
+ 
+@@ -273,6 +324,10 @@ def classify(tid: int, name: str, current: frozenset[int], p: Plan, serve_tids)
+     """The cpus a thread belongs on (None: leave it). The RoCE proxy pins itself (``GLM53_TF_ROCE_CPU``): a thread
+     that sits on exactly the roce cpu is left there."""
+ 
++    if p.mode == "http":                        # patches/0530: by thread name only
++        if name == "tf-http":
++            return p.http
++        return p.engine
+     if tid in serve_tids:
+         return p.serve
+     if name.startswith("NCCL"):
+@@ -328,7 +383,11 @@ def early(rank: int = 0) -> Plan | None:
+             p.roce = int(os.environ["GLM53_TF_ROCE_CPU"])
+         except ValueError:
+             pass
+-    os.sched_setaffinity(0, p.rest)
++    if p.mode == "http":                        # patches/0530: the main thread only when the engine is pinned too
++        if p.engine is not None:
++            os.sched_setaffinity(0, p.engine)
++    else:
++        os.sched_setaffinity(0, p.rest)
+     _S.ready = True
+     print(f"[tensorfold] CPU pinning (patches/0370) rank {rank}: {p.describe()} (fast cores here: "
+           f"{cpulist(p.fast)}, allowed {cpulist(allowed)})", flush=True)
+@@ -345,6 +404,11 @@ def serving() -> None:
+     with _S.lock:
+         _S.serve_tids.add(tid)
+     set_thread_name("tf-serve")
++    if p.mode == "http":                        # patches/0530
++        if p.engine is not None:
++            _set(tid, p.engine)
++            sweep()
++        return
+     _set(tid, p.serve)
+     sweep()
+ 
+@@ -357,6 +421,16 @@ def serving_request():
+     if p is None or p.mode == "fast":
+         yield
+         return
++    if p.mode == "http":                        # patches/0530: the request thread decodes on the engine's cpus
++        tid = threading.get_native_id()
++        set_thread_name("tf-serve")
++        _set(tid, p.engine if p.engine is not None else p.allowed)
++        try:
++            yield
++        finally:
++            set_thread_name("tf-http")
++            _set(tid, p.http)
++        return
+     tid = threading.get_native_id()
+     with _S.lock:
+         _S.serve_tids.add(tid)
+@@ -380,6 +454,8 @@ def http_thread() -> None:
+     if p is None:
+         return
+     set_thread_name("tf-http")
++    if p.mode == "http":                        # patches/0530
++        _set(threading.get_native_id(), p.http)
+     if p.nice:
+         try:
+             os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), p.nice)
+@@ -388,7 +464,11 @@ def http_thread() -> None:
+ 
+ 
+ def tick() -> None:
+-    """Every round (cheap): a sweep when one is due."""
++    """Every round (cheap): a sweep when one is due; patches/0530: the RoCE trace dump when due."""
+ 
+     if _S.plan is not None and time.monotonic() >= _S.next_sweep:
+         sweep()
++    if _DUMP:
++        from . import rocedump
++
++        rocedump.tick()
+diff --git i/src/tensorfold/families/glm5_next/cuda/roce.py w/src/tensorfold/families/glm5_next/cuda/roce.py
+index 2896a08..3fc6888 100644
+--- i/src/tensorfold/families/glm5_next/cuda/roce.py
++++ w/src/tensorfold/families/glm5_next/cuda/roce.py
+@@ -658,6 +658,9 @@ def classify(seq: int, gpu_seen: int, host_now: int, watch: dict | None) -> tupl
+     return "never", f"the flag never arrived (host memory holds {host_now})"
+ 
+ 
++COMMS: list = []                                # patches/0530: every RoceComm made in this process
++
++
+ class RoceComm:
+     """The engine's communicator with the RoCE runtime beside NCCL: ``all_gather`` (control exchanges) stays on
+     ``base``; ``all_gather_fast`` (the model's exchanges) goes over RoCE when one rank's shard is at most
+@@ -667,6 +670,7 @@ class RoceComm:
+         self.base, self.rt, self.max_bytes = base, rt, int(max_bytes)
+         self.rank, self.world = base.rank, base.world
+         self.fast_ops = self.slow_ops = 0
++        COMMS.append(self)                      # patches/0530: rocedump finds the runtime here
+ 
+     def __getattr__(self, name):                   # store, lib, comm, ... of the NCCL communicator
+         if name == "base":
+diff --git i/src/tensorfold/families/glm5_next/cuda/rocedump.py w/src/tensorfold/families/glm5_next/cuda/rocedump.py
+new file mode 100644
+index 0000000..cd1abdb
+--- /dev/null
++++ w/src/tensorfold/families/glm5_next/cuda/rocedump.py
+@@ -0,0 +1,73 @@
++"""patches/0530: the RoCE exchange trace (0460's ``GLM53_TF_ROCE_TRACE`` ring) dumped from a running server, so the
++per-exchange transport / skew split (``roce.trace_summary``) can be measured in production conditions without nsys
++(THEORY-2 idea 6). Off by default.
++
++- ``GLM53_TF_ROCE_TRACE_DUMP=<path prefix>`` (needs ``GLM53_TF_ROCE_TRACE=N``): each rank appends one JSON line to
++  ``<prefix>-r<rank>.jsonl`` whenever at least ``GLM53_TF_ROCE_TRACE_EVERY`` exchanges completed since its last dump
++  (default 16 x the ring): ``{"t", "rank", "completed", "rows": roce.Runtime.trace_rows()}``. Both ranks number the
++  exchanges alike, so a reader pairs the two ranks' rows by ``seq`` (results/THEORY2-SESSION/rocetrace.py).
++- Checked once a round (``cpupin.tick``, both ranks, between rounds); a dump reads the ring after the round's work
++  (one small device-to-host copy). Reads only: no exchange, no kernel changes.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++import time
++
++_S = {"on": None, "path": None, "every": 0, "last": 0, "errors": 0}
++
++
++def _setup() -> bool:
++    raw = os.environ.get("GLM53_TF_ROCE_TRACE_DUMP", "").strip()
++    _S["on"] = False
++    if not raw:
++        return False
++    from . import roce
++
++    rt = _runtime()
++    if rt is None or getattr(rt, "trace_buf", None) is None:
++        return False                            # NCCL, or no trace ring: nothing to dump (checked again later)
++    ring = int(rt.s.trace)
++    every = int(os.environ.get("GLM53_TF_ROCE_TRACE_EVERY", "") or 16 * ring)
++    _S.update(on=True, path=f"{raw}-r{rt.rank}.jsonl", every=max(1, every), last=0)
++    print(f"[tensorfold] RoCE trace dump (patches/0530): every {_S['every']} exchanges -> {_S['path']} "
++          f"(ring {ring}, {roce.__name__})", file=sys.stderr, flush=True)
++    return True
++
++
++def _runtime():
++    from . import roce
++
++    comms = getattr(roce, "COMMS", None)
++    return comms[-1].rt if comms else None
++
++
++def tick() -> None:
++    """Once a round: a dump when due (cheap otherwise: one host read of the completed counter)."""
++
++    if _S["on"] is False:
++        return
++    if _S["on"] is None and not _setup():
++        if _runtime() is None:
++            _S["on"] = None                     # the communicator is made after the first ticks: look again
++        return
++    rt = _runtime()
++    try:
++        from .roce import CTRL_COMPLETED
++
++        done = int(rt.ctrl[CTRL_COMPLETED])
++        if done - _S["last"] < _S["every"]:
++            return
++        rows = rt.trace_rows()
++        with open(_S["path"], "a") as f:
++            f.write(json.dumps({"t": time.time(), "rank": rt.rank, "completed": done, "rows": rows}) + "\n")
++        _S["last"] = done
++    except Exception as exc:                    # noqa: BLE001 - a measurement must never stop serving
++        _S["errors"] += 1
++        if _S["errors"] <= 3:
++            print(f"[tensorfold] RoCE trace dump failed ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
++        if _S["errors"] >= 3:
++            _S["on"] = False

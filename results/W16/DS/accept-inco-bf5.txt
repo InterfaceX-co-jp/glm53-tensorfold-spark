@@ -1,0 +1,64 @@
+class        temp     arm      rounds  depth tok/rnd  a_j (conditional, positions 1..)
+all          all      DFlash2    1602   3.68   3.568  0.78 0.80 0.83 0.88 0.91 0.91 0.89   (n [1602, 1132, 763, 533, 410, 313, 227])
+all          all      lookup      233  14.58  15.464  1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99   (n [233, 233, 232, 232, 227, 226, 225, 225])
+all          all      MTP        3634   2.39   2.737  0.81 0.79 0.79 0.77 0.76 0.78 0.75 0.71   (n [3634, 2239, 1213, 561, 207, 59, 16, 7])
+all          greedy   DFlash2    1602   3.68   3.568  0.78 0.80 0.83 0.88 0.91 0.91 0.89   (n [1602, 1132, 763, 533, 410, 313, 227])
+all          greedy   lookup      110  14.56  15.545  1.00 0.99 1.00 1.00 1.00 1.00 1.00 1.00   (n [110, 110, 109, 109, 107, 106, 106, 106])
+all          greedy   MTP        1265   2.32   2.560  0.77 0.73 0.75 0.70 0.76 0.75 0.75 0.50   (n [1265, 774, 374, 149, 45, 16, 4, 2])
+all          sampled  lookup      123  14.59  15.390  1.00 1.00 1.00 0.99 1.00 0.99 1.00 0.98   (n [123, 123, 123, 123, 120, 120, 119, 119])
+all          sampled  MTP        2369   2.43   2.831  0.83 0.82 0.81 0.79 0.77 0.79 0.75 0.80   (n [2369, 1465, 839, 412, 162, 43, 12, 5])
+agent        all      DFlash2     359   5.05   5.189  0.90 0.91 0.92 0.93 0.94 0.95 0.93   (n [359, 306, 262, 216, 191, 166, 135])
+agent        all      lookup      232  14.62  15.522  1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99   (n [232, 232, 232, 232, 227, 226, 225, 225])
+agent        all      MTP         761   2.93   3.360  0.89 0.90 0.87 0.82 0.83 0.83 0.91 0.67   (n [761, 528, 380, 220, 107, 35, 11, 6])
+agent        greedy   DFlash2     359   5.05   5.189  0.90 0.91 0.92 0.93 0.94 0.95 0.93   (n [359, 306, 262, 216, 191, 166, 135])
+agent        greedy   lookup      109  14.67  15.670  1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00   (n [109, 109, 109, 109, 107, 106, 106, 106])
+agent        greedy   MTP         131   3.12   3.359  0.82 0.92 0.91 0.82 0.94 0.75 1.00 0.00   (n [131, 89, 67, 40, 18, 8, 2, 1])
+agent        sampled  lookup      123  14.59  15.390  1.00 1.00 1.00 0.99 1.00 0.99 1.00 0.98   (n [123, 123, 123, 123, 120, 120, 119, 119])
+agent        sampled  MTP         630   2.89   3.360  0.90 0.89 0.86 0.82 0.81 0.85 0.89 0.80   (n [630, 439, 313, 180, 89, 27, 9, 5])
+code         all      DFlash2     321   4.74   4.679  0.89 0.91 0.88 0.92 0.90 0.90 0.84   (n [321, 264, 216, 179, 146, 115, 80])
+code         all      lookup        1   3.00   2.000  1.00 0.00   -    (n [1, 1, 0])
+code         all      MTP         788   2.91   3.272  0.90 0.84 0.83 0.77 0.71 0.70 0.67 1.00   (n [788, 619, 397, 208, 70, 20, 3, 1])
+code         greedy   DFlash2     321   4.74   4.679  0.89 0.91 0.88 0.92 0.90 0.90 0.84   (n [321, 264, 216, 179, 146, 115, 80])
+code         greedy   lookup        1   3.00   2.000  1.00 0.00   -    (n [1, 1, 0])
+code         greedy   MTP         174   2.89   3.126  0.91 0.75 0.77 0.69 0.73 0.80 1.00 1.00   (n [174, 144, 83, 36, 11, 5, 1, 1])
+code         sampled  MTP         614   2.92   3.313  0.90 0.87 0.85 0.79 0.71 0.67 0.50   -    (n [614, 475, 314, 172, 59, 15, 2, 0])
+prose        all      DFlash2     515   2.84   2.565  0.69 0.66 0.72 0.79 0.80 0.70 0.71   (n [515, 314, 160, 82, 54, 20, 7])
+prose        all      MTP        1672   1.94   2.269  0.73 0.72 0.65 0.66 0.65 1.00 0.00   (n [1672, 847, 332, 85, 20, 1, 1])
+prose        greedy   DFlash2     515   2.84   2.565  0.69 0.66 0.72 0.79 0.80 0.70 0.71   (n [515, 314, 160, 82, 54, 20, 7])
+prose        greedy   MTP         547   2.02   2.261  0.71 0.71 0.63 0.52 0.50   -    (n [547, 296, 120, 25, 6, 0])
+prose        sampled  MTP        1125   1.90   2.272  0.74 0.73 0.66 0.72 0.71 1.00 0.00   (n [1125, 551, 212, 60, 14, 1, 1])
+prose-think  all      DFlash2     407   2.69   2.531  0.71 0.72 0.69 0.71 0.90 0.67 1.00   (n [407, 248, 125, 56, 19, 12, 5])
+prose-think  all      MTP         413   2.23   2.462  0.76 0.69 0.76 0.71 0.60 0.67 0.00   (n [413, 245, 104, 48, 10, 3, 1])
+prose-think  greedy   DFlash2     407   2.69   2.531  0.71 0.72 0.69 0.71 0.90 0.67 1.00   (n [407, 248, 125, 56, 19, 12, 5])
+prose-think  greedy   MTP         413   2.23   2.462  0.76 0.69 0.76 0.71 0.60 0.67 0.00   (n [413, 245, 104, 48, 10, 3, 1])
+
+chat           prose       T=0.0 tokens   512  50.13 tok/s  tok/round 2.733  arms {'f': 92, 'm': 95}
+chat           prose       T=1.0 tokens   512  51.59 tok/s  tok/round 2.542  arms {'m': 201}
+essay          prose       T=0.0 tokens   512  43.69 tok/s  tok/round 2.261  arms {'f': 134, 'm': 92}
+essay          prose       T=1.0 tokens   512  45.05 tok/s  tok/round 2.112  arms {'m': 242}
+hashmap        prose       T=0.0 tokens   512  53.63 tok/s  tok/round 2.92  arms {'f': 102, 'm': 73}
+hashmap        prose       T=1.0 tokens   512  49.81 tok/s  tok/round 2.505  arms {'m': 204}
+tides          prose       T=0.0 tokens   512  49.68 tok/s  tok/round 2.493  arms {'f': 72, 'm': 133}
+tides          prose       T=1.0 tokens   512  50.41 tok/s  tok/round 2.422  arms {'m': 211}
+letter         prose       T=0.0 tokens   512  41.44 tok/s  tok/round 1.9  arms {'f': 115, 'm': 154}
+letter         prose       T=1.0 tokens   512  43.79 tok/s  tok/round 1.914  arms {'m': 267}
+code-lru       code        T=0.0 tokens   512  67.89 tok/s  tok/round 4.294  arms {'f': 86, 'm': 33}
+code-lru       code        T=1.0 tokens   512  58.26 tok/s  tok/round 3.34  arms {'m': 153}
+code-fib       code        T=0.0 tokens   512  72.56 tok/s  tok/round 4.731  arms {'f': 87, 'm': 21}
+code-fib       code        T=1.0 tokens   501   59.4 tok/s  tok/round 3.448  arms {'m': 145}
+code-go        code        T=0.0 tokens   512  58.11 tok/s  tok/round 3.384  arms {'f': 88, 'm': 62, 'l': 1}
+code-go        code        T=1.0 tokens   512  56.08 tok/s  tok/round 3.097  arms {'m': 165}
+code-ts        code        T=0.0 tokens   512   67.6 tok/s  tok/round 4.331  arms {'f': 60, 'm': 58}
+code-ts        code        T=1.0 tokens   512   58.1 tok/s  tok/round 3.384  arms {'m': 151}
+agent-rename   agent       T=0.0 tokens  1024 114.92 tok/s  tok/round 12.787  arms {'f': 23, 'm': 4, 'l': 53}
+agent-rename   agent       T=1.0 tokens  1024 118.53 tok/s  tok/round 12.325  arms {'m': 23, 'l': 60}
+agent-log      agent       T=0.0 tokens  1024 117.81 tok/s  tok/round 12.787  arms {'f': 23, 'm': 4, 'l': 53}
+agent-log      agent       T=1.0 tokens  1024 106.76 tok/s  tok/round 9.561  arms {'m': 50, 'l': 57}
+agent-diff     agent       T=0.0 tokens   428  74.33 tok/s  tok/round 5.474  arms {'f': 57, 'm': 21}
+agent-diff     agent       T=1.0 tokens   507  58.35 tok/s  tok/round 3.721  arms {'m': 130, 'l': 6}
+agent-json     agent       T=0.0 tokens  1024  83.69 tok/s  tok/round 5.53  arms {'f': 153, 'm': 32}
+agent-json     agent       T=1.0 tokens  1024  68.79 tok/s  tok/round 4.176  arms {'m': 245}
+agent-plan     agent       T=0.0 tokens   512  53.05 tok/s  tok/round 2.903  arms {'f': 103, 'm': 70, 'l': 3}
+agent-plan     agent       T=1.0 tokens   436  49.63 tok/s  tok/round 2.39  arms {'m': 182}
+essay-think    prose-think T=0.0 tokens  1024  47.65 tok/s  tok/round 2.436  arms {'f': 205, 'm': 215}
+tides-think    prose-think T=0.0 tokens  1024  51.04 tok/s  tok/round 2.558  arms {'f': 202, 'm': 198}

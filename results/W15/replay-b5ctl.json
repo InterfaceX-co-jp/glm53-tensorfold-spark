@@ -1,0 +1,666 @@
+{
+ "rows": [
+  {
+   "depth": 8192,
+   "pair": 0,
+   "cold": {
+    "ttft": 5.241,
+    "wall": 5.243,
+    "sha": "1e04be9956a27dd9",
+    "text": " the maintenance schedule for the northern warehouse.",
+    "prompt_tokens": 8192,
+    "cached_tokens": 0,
+    "log": {
+     "n": 25,
+     "prompt": 8192,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 2,
+     "prefill_s": 5.0851,
+     "prefill_tps": 1611.0,
+     "queue_s": 0.003,
+     "first_s": 5.197,
+     "slot": 0,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 5.141,
+    "wall": 5.181,
+    "sha": "1e04be9956a27dd9",
+    "text": " the maintenance schedule for the northern warehouse.",
+    "prompt_tokens": 8192,
+    "cached_tokens": 0,
+    "log": {
+     "n": 26,
+     "prompt": 8192,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 2,
+     "prefill_s": 5.0578,
+     "prefill_tps": 1619.7,
+     "queue_s": 0.009,
+     "first_s": 5.104,
+     "slot": 1,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1563.1,
+   "replay_tps": 1593.5
+  },
+  {
+   "depth": 8192,
+   "pair": 1,
+   "cold": {
+    "ttft": 5.142,
+    "wall": 5.185,
+    "sha": "1e04be9956a27dd9",
+    "text": " the maintenance schedule for the northern warehouse.",
+    "prompt_tokens": 8192,
+    "cached_tokens": 0,
+    "log": {
+     "n": 27,
+     "prompt": 8192,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 2,
+     "prefill_s": 5.0616,
+     "prefill_tps": 1618.5,
+     "queue_s": 0.004,
+     "first_s": 5.112,
+     "slot": 2,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 5.132,
+    "wall": 5.175,
+    "sha": "1e04be9956a27dd9",
+    "text": " the maintenance schedule for the northern warehouse.",
+    "prompt_tokens": 8192,
+    "cached_tokens": 0,
+    "log": {
+     "n": 28,
+     "prompt": 8192,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 2,
+     "prefill_s": 5.06,
+     "prefill_tps": 1619.0,
+     "queue_s": 0.005,
+     "first_s": 5.103,
+     "slot": 3,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1593.2,
+   "replay_tps": 1596.3
+  },
+  {
+   "depth": 8192,
+   "pair": 2,
+   "cold": {
+    "ttft": 5.076,
+    "wall": 5.16,
+    "sha": "1e04be9956a27dd9",
+    "text": " the maintenance schedule for the northern warehouse.",
+    "prompt_tokens": 8192,
+    "cached_tokens": 0,
+    "log": {
+     "n": 29,
+     "prompt": 8192,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 2,
+     "prefill_s": 5.0396,
+     "prefill_tps": 1625.5,
+     "queue_s": 0.003,
+     "first_s": 5.046,
+     "slot": 0,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 5.134,
+    "wall": 5.174,
+    "sha": "1e04be9956a27dd9",
+    "text": " the maintenance schedule for the northern warehouse.",
+    "prompt_tokens": 8192,
+    "cached_tokens": 0,
+    "log": {
+     "n": 30,
+     "prompt": 8192,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 2,
+     "prefill_s": 5.0623,
+     "prefill_tps": 1618.2,
+     "queue_s": 0.003,
+     "first_s": 5.104,
+     "slot": 1,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1613.9,
+   "replay_tps": 1595.6
+  },
+  {
+   "depth": 32768,
+   "pair": 0,
+   "cold": {
+    "ttft": 20.013,
+    "wall": 20.05,
+    "sha": "3b0caf02e4b6c3f9",
+    "text": " reviews quarterly logistics, inventory forecasts, and",
+    "prompt_tokens": 32768,
+    "cached_tokens": 0,
+    "log": {
+     "n": 31,
+     "prompt": 32768,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 8,
+     "prefill_s": 19.8955,
+     "prefill_tps": 1647.0,
+     "queue_s": 0.01,
+     "first_s": 19.975,
+     "slot": 2,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 10.218,
+    "wall": 10.254,
+    "sha": "3b0caf02e4b6c3f9",
+    "text": " reviews quarterly logistics, inventory forecasts, and",
+    "prompt_tokens": 32768,
+    "cached_tokens": 16384,
+    "log": {
+     "n": 32,
+     "prompt": 32768,
+     "cached": 16384,
+     "cache_src": "disk",
+     "pieces": 4,
+     "prefill_s": 9.9322,
+     "prefill_tps": 1649.6,
+     "queue_s": 0.202,
+     "first_s": 10.182,
+     "slot": 3,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1637.3,
+   "replay_tps": 3206.9
+  },
+  {
+   "depth": 32768,
+   "pair": 1,
+   "cold": {
+    "ttft": 20.099,
+    "wall": 20.102,
+    "sha": "3b0caf02e4b6c3f9",
+    "text": " reviews quarterly logistics, inventory forecasts, and",
+    "prompt_tokens": 32768,
+    "cached_tokens": 0,
+    "log": {
+     "n": 33,
+     "prompt": 32768,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 8,
+     "prefill_s": 19.9302,
+     "prefill_tps": 1644.1,
+     "queue_s": 0.009,
+     "first_s": 20.07,
+     "slot": 0,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 10.103,
+    "wall": 10.144,
+    "sha": "3b0caf02e4b6c3f9",
+    "text": " reviews quarterly logistics, inventory forecasts, and",
+    "prompt_tokens": 32768,
+    "cached_tokens": 16384,
+    "log": {
+     "n": 34,
+     "prompt": 32768,
+     "cached": 16384,
+     "cache_src": "disk",
+     "pieces": 4,
+     "prefill_s": 9.8603,
+     "prefill_tps": 1661.6,
+     "queue_s": 0.156,
+     "first_s": 10.066,
+     "slot": 1,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1630.3,
+   "replay_tps": 3243.4
+  },
+  {
+   "depth": 32768,
+   "pair": 2,
+   "cold": {
+    "ttft": 20.09,
+    "wall": 20.128,
+    "sha": "f7575177887a8e3f",
+    "text": " quarterly logistics, inventory forecasts, and the",
+    "prompt_tokens": 32768,
+    "cached_tokens": 0,
+    "log": {
+     "n": 35,
+     "prompt": 32768,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 8,
+     "prefill_s": 19.9818,
+     "prefill_tps": 1639.9,
+     "queue_s": 0.01,
+     "first_s": 20.055,
+     "slot": 2,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 10.378,
+    "wall": 10.415,
+    "sha": "f7575177887a8e3f",
+    "text": " quarterly logistics, inventory forecasts, and the",
+    "prompt_tokens": 32768,
+    "cached_tokens": 16384,
+    "log": {
+     "n": 36,
+     "prompt": 32768,
+     "cached": 16384,
+     "cache_src": "disk",
+     "pieces": 4,
+     "prefill_s": 10.1218,
+     "prefill_tps": 1618.7,
+     "queue_s": 0.169,
+     "first_s": 10.339,
+     "slot": 3,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1631.1,
+   "replay_tps": 3157.4
+  },
+  {
+   "depth": 65536,
+   "pair": 0,
+   "cold": {
+    "ttft": 41.383,
+    "wall": 41.389,
+    "sha": "06d34ec90f5e75a9",
+    "text": " maintenance schedule for the northern warehouse. The",
+    "prompt_tokens": 65536,
+    "cached_tokens": 0,
+    "log": {
+     "n": 37,
+     "prompt": 65536,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 16,
+     "prefill_s": 41.1543,
+     "prefill_tps": 1592.4,
+     "queue_s": 0.023,
+     "first_s": 41.343,
+     "slot": 0,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 10.852,
+    "wall": 10.892,
+    "sha": "06d34ec90f5e75a9",
+    "text": " maintenance schedule for the northern warehouse. The",
+    "prompt_tokens": 65536,
+    "cached_tokens": 49152,
+    "log": {
+     "n": 38,
+     "prompt": 65536,
+     "cached": 49152,
+     "cache_src": "disk",
+     "pieces": 4,
+     "prefill_s": 10.2876,
+     "prefill_tps": 1592.6,
+     "queue_s": 0.45,
+     "first_s": 10.806,
+     "slot": 1,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1583.6,
+   "replay_tps": 6039.1
+  },
+  {
+   "depth": 65536,
+   "pair": 1,
+   "cold": {
+    "ttft": 40.505,
+    "wall": 40.545,
+    "sha": "06d34ec90f5e75a9",
+    "text": " maintenance schedule for the northern warehouse. The",
+    "prompt_tokens": 65536,
+    "cached_tokens": 0,
+    "log": {
+     "n": 39,
+     "prompt": 65536,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 16,
+     "prefill_s": 40.3569,
+     "prefill_tps": 1623.9,
+     "queue_s": 0.022,
+     "first_s": 40.469,
+     "slot": 2,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 10.859,
+    "wall": 10.9,
+    "sha": "06d34ec90f5e75a9",
+    "text": " maintenance schedule for the northern warehouse. The",
+    "prompt_tokens": 65536,
+    "cached_tokens": 49152,
+    "log": {
+     "n": 40,
+     "prompt": 65536,
+     "cached": 49152,
+     "cache_src": "disk",
+     "pieces": 4,
+     "prefill_s": 10.2757,
+     "prefill_tps": 1594.4,
+     "queue_s": 0.473,
+     "first_s": 10.822,
+     "slot": 3,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1618.0,
+   "replay_tps": 6035.2
+  },
+  {
+   "depth": 65536,
+   "pair": 2,
+   "cold": {
+    "ttft": 40.394,
+    "wall": 40.504,
+    "sha": "1e04be9956a27dd9",
+    "text": " the maintenance schedule for the northern warehouse.",
+    "prompt_tokens": 65536,
+    "cached_tokens": 0,
+    "log": {
+     "n": 41,
+     "prompt": 65536,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 16,
+     "prefill_s": 40.3189,
+     "prefill_tps": 1625.4,
+     "queue_s": 0.023,
+     "first_s": 40.358,
+     "slot": 0,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 11.001,
+    "wall": 11.039,
+    "sha": "1e04be9956a27dd9",
+    "text": " the maintenance schedule for the northern warehouse.",
+    "prompt_tokens": 65536,
+    "cached_tokens": 49152,
+    "log": {
+     "n": 42,
+     "prompt": 65536,
+     "cached": 49152,
+     "cache_src": "disk",
+     "pieces": 4,
+     "prefill_s": 10.4449,
+     "prefill_tps": 1568.6,
+     "queue_s": 0.453,
+     "first_s": 10.967,
+     "slot": 1,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1622.4,
+   "replay_tps": 5957.3
+  },
+  {
+   "depth": 32700,
+   "pair": 0,
+   "cold": {
+    "ttft": 19.97,
+    "wall": 20.007,
+    "sha": "cc934facb8b2d577",
+    "text": " The quick brown fox jumps over the lazy",
+    "prompt_tokens": 32700,
+    "cached_tokens": 0,
+    "log": {
+     "n": 43,
+     "prompt": 32700,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 8,
+     "prefill_s": 19.8628,
+     "prefill_tps": 1646.3,
+     "queue_s": 0.009,
+     "first_s": 19.936,
+     "slot": 2,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 0.296,
+    "wall": 0.333,
+    "sha": "cc934facb8b2d577",
+    "text": " The quick brown fox jumps over the lazy",
+    "prompt_tokens": 32700,
+    "cached_tokens": 32640,
+    "log": {
+     "n": 44,
+     "prompt": 32700,
+     "cached": 32640,
+     "cache_src": "slot",
+     "pieces": 1,
+     "prefill_s": 0.1976,
+     "prefill_tps": 303.6,
+     "queue_s": 0.008,
+     "first_s": 0.255,
+     "slot": 2,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1637.5,
+   "replay_tps": 110473.0
+  },
+  {
+   "depth": 32700,
+   "pair": 1,
+   "cold": {
+    "ttft": 20.012,
+    "wall": 20.05,
+    "sha": "cc934facb8b2d577",
+    "text": " The quick brown fox jumps over the lazy",
+    "prompt_tokens": 32700,
+    "cached_tokens": 0,
+    "log": {
+     "n": 45,
+     "prompt": 32700,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 8,
+     "prefill_s": 19.9073,
+     "prefill_tps": 1642.6,
+     "queue_s": 0.012,
+     "first_s": 19.983,
+     "slot": 3,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 0.293,
+    "wall": 0.331,
+    "sha": "cc934facb8b2d577",
+    "text": " The quick brown fox jumps over the lazy",
+    "prompt_tokens": 32700,
+    "cached_tokens": 32640,
+    "log": {
+     "n": 46,
+     "prompt": 32700,
+     "cached": 32640,
+     "cache_src": "slot",
+     "pieces": 1,
+     "prefill_s": 0.1957,
+     "prefill_tps": 306.6,
+     "queue_s": 0.01,
+     "first_s": 0.254,
+     "slot": 3,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1634.0,
+   "replay_tps": 111604.1
+  },
+  {
+   "depth": 32700,
+   "pair": 2,
+   "cold": {
+    "ttft": 20.13,
+    "wall": 20.137,
+    "sha": "d46c1202514a538e",
+    "text": " quick brown fox jumps over the lazy dog",
+    "prompt_tokens": 32700,
+    "cached_tokens": 0,
+    "log": {
+     "n": 47,
+     "prompt": 32700,
+     "cached": 0,
+     "cache_src": "none",
+     "pieces": 8,
+     "prefill_s": 19.9534,
+     "prefill_tps": 1638.8,
+     "queue_s": 0.01,
+     "first_s": 20.095,
+     "slot": 0,
+     "finish": "length"
+    }
+   },
+   "replay": {
+    "ttft": 0.255,
+    "wall": 0.33,
+    "sha": "d46c1202514a538e",
+    "text": " quick brown fox jumps over the lazy dog",
+    "prompt_tokens": 32700,
+    "cached_tokens": 32640,
+    "log": {
+     "n": 48,
+     "prompt": 32700,
+     "cached": 32640,
+     "cache_src": "slot",
+     "pieces": 1,
+     "prefill_s": 0.1966,
+     "prefill_tps": 305.2,
+     "queue_s": 0.011,
+     "first_s": 0.216,
+     "slot": 0,
+     "finish": "length"
+    }
+   },
+   "same_tokens": true,
+   "cold_tps": 1624.4,
+   "replay_tps": 128235.3
+  }
+ ],
+ "summary": {
+  "8192": {
+   "cold_ttft_med": 5.142,
+   "cold_tps_med": 1593.2,
+   "replay_ttft_med": 5.134,
+   "replay_ttft_max": 5.141,
+   "replay_tps_med": 1595.6,
+   "replay_cached": [
+    0
+   ],
+   "want_cached": 8128,
+   "replay_pieces": [
+    2
+   ],
+   "cold_pieces": [
+    2
+   ],
+   "same_tokens": true
+  },
+  "32768": {
+   "cold_ttft_med": 20.09,
+   "cold_tps_med": 1631.1,
+   "replay_ttft_med": 10.218,
+   "replay_ttft_max": 10.378,
+   "replay_tps_med": 3206.9,
+   "replay_cached": [
+    16384
+   ],
+   "want_cached": 32704,
+   "replay_pieces": [
+    4
+   ],
+   "cold_pieces": [
+    8
+   ],
+   "same_tokens": true
+  },
+  "65536": {
+   "cold_ttft_med": 40.505,
+   "cold_tps_med": 1618.0,
+   "replay_ttft_med": 10.859,
+   "replay_ttft_max": 11.001,
+   "replay_tps_med": 6035.2,
+   "replay_cached": [
+    49152
+   ],
+   "want_cached": 65472,
+   "replay_pieces": [
+    4
+   ],
+   "cold_pieces": [
+    16
+   ],
+   "same_tokens": true
+  },
+  "32700": {
+   "cold_ttft_med": 20.012,
+   "cold_tps_med": 1634.0,
+   "replay_ttft_med": 0.293,
+   "replay_ttft_max": 0.296,
+   "replay_tps_med": 111604.1,
+   "replay_cached": [
+    32640
+   ],
+   "want_cached": 32640,
+   "replay_pieces": [
+    1
+   ],
+   "cold_pieces": [
+    8
+   ],
+   "same_tokens": true
+  }
+ }
+}

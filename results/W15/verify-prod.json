@@ -1,0 +1,314 @@
+[
+ {
+  "n": 8192,
+  "cold_cached": 0,
+  "cold_src": "none",
+  "replay_identical": true,
+  "rows": {
+   "cold": {
+    "ttft": 5.42,
+    "tps": 1511.4,
+    "sha": "5f972505652ce43f",
+    "changed_at": null,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 2,
+    "prefill_s": 5.3817,
+    "first_s": 5.388,
+    "n": 88
+   },
+   "replay": {
+    "ttft": 0.308,
+    "tps": 26597.4,
+    "sha": "5f972505652ce43f",
+    "changed_at": null,
+    "cached": 8128,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.2674,
+    "first_s": 0.273,
+    "n": 89
+   },
+   "replay2": {
+    "ttft": 0.305,
+    "tps": 26859.0,
+    "sha": "5f972505652ce43f",
+    "changed_at": null,
+    "cached": 8128,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.2671,
+    "first_s": 0.273,
+    "n": 90
+   },
+   "start": {
+    "ttft": 5.434,
+    "tps": 1507.5,
+    "sha": "8b69631c133b5853",
+    "changed_at": 3,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 2,
+    "prefill_s": 5.4012,
+    "first_s": 5.407,
+    "n": 91
+   },
+   "middle": {
+    "ttft": 5.709,
+    "tps": 1434.9,
+    "sha": "7310cf7b2cb573b2",
+    "changed_at": 4259,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 2,
+    "prefill_s": 5.6764,
+    "first_s": 5.683,
+    "n": 92
+   },
+   "end10": {
+    "ttft": 0.311,
+    "tps": 26340.8,
+    "sha": "65626e3e113c0d85",
+    "changed_at": 8182,
+    "cached": 8128,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.2777,
+    "first_s": 0.284,
+    "n": 93
+   },
+   "end100": {
+    "ttft": 2.811,
+    "tps": 2914.3,
+    "sha": "54e343d78f23fa12",
+    "changed_at": 8092,
+    "cached": 4224,
+    "cache_src": "ram",
+    "pieces": 1,
+    "prefill_s": 2.7636,
+    "first_s": 2.772,
+    "n": 94
+   },
+   "other": {
+    "ttft": 5.435,
+    "tps": 1507.3,
+    "sha": "3bd80eba56c43a32",
+    "changed_at": null,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 2,
+    "prefill_s": 5.3923,
+    "first_s": 5.398,
+    "n": 95
+   }
+  }
+ },
+ {
+  "n": 32768,
+  "cold_cached": 0,
+  "cold_src": "none",
+  "replay_identical": true,
+  "rows": {
+   "cold": {
+    "ttft": 20.965,
+    "tps": 1563.0,
+    "sha": "9e5b373acea69ece",
+    "changed_at": null,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 8,
+    "prefill_s": 20.9229,
+    "first_s": 20.936,
+    "n": 96
+   },
+   "replay": {
+    "ttft": 0.311,
+    "tps": 105363.3,
+    "sha": "9e5b373acea69ece",
+    "changed_at": null,
+    "cached": 32704,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.2583,
+    "first_s": 0.273,
+    "n": 97
+   },
+   "replay2": {
+    "ttft": 0.307,
+    "tps": 106736.2,
+    "sha": "9e5b373acea69ece",
+    "changed_at": null,
+    "cached": 32704,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.2581,
+    "first_s": 0.271,
+    "n": 98
+   },
+   "start": {
+    "ttft": 20.925,
+    "tps": 1566.0,
+    "sha": "7dc49f4d8bced462",
+    "changed_at": 3,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 8,
+    "prefill_s": 20.8714,
+    "first_s": 20.886,
+    "n": 99
+   },
+   "middle": {
+    "ttft": 10.978,
+    "tps": 2984.9,
+    "sha": "dabb21a6e37b88ba",
+    "changed_at": 17039,
+    "cached": 16384,
+    "cache_src": "ram",
+    "pieces": 4,
+    "prefill_s": 10.9219,
+    "first_s": 10.937,
+    "n": 100
+   },
+   "end10": {
+    "ttft": 0.329,
+    "tps": 99598.8,
+    "sha": "9319e112ed46392a",
+    "changed_at": 32758,
+    "cached": 32704,
+    "cache_src": "ram",
+    "pieces": 1,
+    "prefill_s": 0.2736,
+    "first_s": 0.291,
+    "n": 101
+   },
+   "end100": {
+    "ttft": 10.354,
+    "tps": 3164.8,
+    "sha": "338916894d1def23",
+    "changed_at": 32668,
+    "cached": 17024,
+    "cache_src": "ram",
+    "pieces": 4,
+    "prefill_s": 10.3024,
+    "first_s": 10.319,
+    "n": 102
+   },
+   "other": {
+    "ttft": 20.975,
+    "tps": 1562.2,
+    "sha": "9b7317d58861be77",
+    "changed_at": null,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 8,
+    "prefill_s": 20.9205,
+    "first_s": 20.936,
+    "n": 103
+   }
+  }
+ },
+ {
+  "n": 65536,
+  "cold_cached": 0,
+  "cold_src": "none",
+  "replay_identical": true,
+  "rows": {
+   "cold": {
+    "ttft": 42.327,
+    "tps": 1548.3,
+    "sha": "fa581d22fd24ca6d",
+    "changed_at": null,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 16,
+    "prefill_s": 42.2517,
+    "first_s": 42.283,
+    "n": 104
+   },
+   "replay": {
+    "ttft": 0.34,
+    "tps": 192752.9,
+    "sha": "fa581d22fd24ca6d",
+    "changed_at": null,
+    "cached": 65472,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.274,
+    "first_s": 0.298,
+    "n": 105
+   },
+   "replay2": {
+    "ttft": 0.329,
+    "tps": 199197.6,
+    "sha": "fa581d22fd24ca6d",
+    "changed_at": null,
+    "cached": 65472,
+    "cache_src": "slot",
+    "pieces": 1,
+    "prefill_s": 0.2686,
+    "first_s": 0.293,
+    "n": 106
+   },
+   "start": {
+    "ttft": 42.226,
+    "tps": 1552.0,
+    "sha": "0afec33c654c78bc",
+    "changed_at": 3,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 16,
+    "prefill_s": 42.1581,
+    "first_s": 42.19,
+    "n": 107
+   },
+   "middle": {
+    "ttft": 21.898,
+    "tps": 2992.8,
+    "sha": "fa581d22fd24ca6d",
+    "changed_at": 34078,
+    "cached": 32768,
+    "cache_src": "ram",
+    "pieces": 8,
+    "prefill_s": 21.8221,
+    "first_s": 21.854,
+    "n": 108
+   },
+   "end10": {
+    "ttft": 0.356,
+    "tps": 184089.9,
+    "sha": "a01adca695348cb6",
+    "changed_at": 65526,
+    "cached": 65472,
+    "cache_src": "ram",
+    "pieces": 1,
+    "prefill_s": 0.294,
+    "first_s": 0.321,
+    "n": 109
+   },
+   "end100": {
+    "ttft": 11.125,
+    "tps": 5890.9,
+    "sha": "c687c4c88c26d9c2",
+    "changed_at": 65436,
+    "cached": 49152,
+    "cache_src": "disk",
+    "pieces": 4,
+    "prefill_s": 10.9987,
+    "first_s": 11.08,
+    "n": 110
+   },
+   "other": {
+    "ttft": 43.263,
+    "tps": 1514.8,
+    "sha": "8fda5ccae5fcc2c4",
+    "changed_at": null,
+    "cached": 0,
+    "cache_src": "none",
+    "pieces": 16,
+    "prefill_s": 43.1938,
+    "first_s": 43.226,
+    "n": 111
+   }
+  }
+ }
+]

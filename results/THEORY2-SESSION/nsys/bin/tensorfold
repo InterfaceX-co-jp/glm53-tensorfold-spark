@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# W16 shim (W11's): the real /usr/local/bin/tensorfold under an idle nsys session "w16" (collection starts with
+# `nsys start`). Graph-level tracing by default (THEORY-2 §7 rule 3: node-level tracing inflates graph launches);
+# W16_GRAPH_TRACE=node for per-kernel attribution inside graphs.
+if [[ "${W16_NSYS:-0}" == 1 ]]; then
+    exec nsys launch --session-new=w16 --trace=cuda-sw,nvtx --cuda-graph-trace="${W16_GRAPH_TRACE:-graph}" \
+        --cuda-event-trace=false --trace-fork-before-exec=false /usr/local/bin/tensorfold "$@"
+fi
+exec /usr/local/bin/tensorfold "$@"

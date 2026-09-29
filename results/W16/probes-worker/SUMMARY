@@ -1,0 +1,8 @@
+22:10:37 start worker image glm53-tensorfold:b8
+22:11:04 glp-plain rc=0 27s :: GATE item2: uncaptured first-node delay at ~1650 nodes = 4 us (>= 400 us -> build the split): FAIL 
+22:11:34 glp-graph rc=0 30s :: GATE item2: uncaptured first-node delay at ~1650 nodes = 193 us (>= 400 us -> build the split): FAIL  [informational: this run is under a profiler / not tagged plain; the gate reads the plain run] 
+22:12:07 glp-node rc=0 33s :: GATE item2: uncaptured first-node delay at ~1650 nodes = 188 us (>= 400 us -> build the split): FAIL  [informational: this run is under a profiler / not tagged plain; the gate reads the plain run] 
+22:13:30 t510 rc=0 83s :: 19 passed in 78.93s (0:01:18) 
+22:13:47 t520 rc=0 17s :: 76 passed in 13.94s 
+22:14:00 hcbench rc=2 13s :: GATE item3 hc_fused: fused <= 50% of the 3 Triton kernels (cold, rows 1-16): FAIL (worst R=16 1.39x, geomean 1.02x, same bits True); est. saving a 1-stream round 0.96 ms at R=1, 0.01 ms at R=4, -0.26 ms at R=8; 32/64 rows ratio {32: 1.34798
+22:14:00 worker probes done
