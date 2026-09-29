@@ -10,6 +10,8 @@ Three sets of receipts, newest first:
 3. **The W13 baseline (2026-09-29, image b5 = patches through 0490):** [`tensorfold-20260929/`](tensorfold-20260929/),
    the section after that.
 
+- Alex Ellis's published vLLM receipts (unmodified copies, MIT): [`reference-alexellis/`](reference-alexellis/README.md)
+
 ## Release run (3 rounds, averaged)
 
 Production after W17 (image b9: W15's config plus 0560's multi-slot prefill on, `GLM53_TF_MULTI_PREFILL=1`; 0550 in
