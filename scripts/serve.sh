@@ -6,6 +6,8 @@
 #                               then runs the canary (scripts/canary.py)
 #   scripts/serve.sh restart    stop, then start
 #   scripts/serve.sh stop | status | logs [0|1] | canary | xid [SINCE] | watch [--once] | preflight
+#   scripts/serve.sh gpucheck   GB10 clock / power / slow-state check of both nodes (scripts/gpuwatch.py check);
+#                               non-zero when a node is degraded or was recently slow: gate benchmark runs on it
 #
 # Configuration: config/tensorfold.env (override with CONFIG=path).
 set -euo pipefail
@@ -13,7 +15,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 CONFIG="${CONFIG:-config/tensorfold.env}"
 # A non-empty caller export wins over the same key in the config file:
 #   CONTEXT=32768 GLM53_TF_NONEXPERT=q4mse scripts/serve.sh start
-caller_env=$(env | grep -E '^(HEAD_PREPARED|WORKER_PREPARED|CONTEXT|MTP_DRAFTS|NO_DRAFTS|IMAGE|PORT|HOST|DRAFTER|MODEL_PATH|EXTRA_ARGS|SERVED_NAME|MAX_TOKENS|CANARY[A-Z_]*|MEM_GATE_[A-Z_]+|START_ATTEMPTS|READY_TIMEOUT|LOG_MAX_[A-Z]+|WATCH_[A-Z_]+|WARMUP_LENGTHS|PREFLIGHT|NCCL_PASSTHROUGH|GLM53_TF_[A-Z0-9_]+)=.' || true)
+caller_env=$(env | grep -E '^(HEAD_PREPARED|WORKER_PREPARED|HEAD_SESSIONS|WORKER_SESSIONS|CONTEXT|MTP_DRAFTS|NO_DRAFTS|IMAGE|PORT|HOST|DRAFTER|MODEL_PATH|EXTRA_ARGS|SERVED_NAME|MAX_TOKENS|CPUSET|HEAD_CPUSET|WORKER_CPUSET|CANARY[A-Z_]*|MEM_GATE_[A-Z_]+|START_ATTEMPTS|READY_TIMEOUT|LOG_MAX_[A-Z]+|WATCH_[A-Z_]+|GPUWATCH_[A-Z_]+|WARMUP_LENGTHS|PREFLIGHT|NCCL_PASSTHROUGH|GLM53_TF_[A-Z0-9_]+)=.' || true)
 # shellcheck disable=SC1090
 set -a; source "$CONFIG"; set +a
 while IFS= read -r kv; do [[ -n "$kv" ]] && export "${kv?}"; done <<< "$caller_env"
@@ -44,21 +46,39 @@ LOG_MAX_SIZE="${LOG_MAX_SIZE:-}"              # e.g. 200m: docker json-file log 
 LOG_MAX_FILE="${LOG_MAX_FILE:-3}"
 PREFLIGHT="${PREFLIGHT:-off}"                 # before start: off | warn (log problems) | strict (refuse to start on one)
 NCCL_PASSTHROUGH="${NCCL_PASSTHROUGH:-0}"     # 1: every other NCCL_* variable set here reaches both ranks
+# patches/0370: docker --cpuset-cpus for the containers (empty: every cpu, as before). GB10's Cortex-X925 cores are
+# 5-9,15-19 on both Sparks; CPUSET="5-9,15-19" is the container-level form of GLM53_TF_CPU_PIN=fast. HEAD_ / WORKER_
+# override it per node
+CPUSET="${CPUSET:-}"
+HEAD_CPUSET="${HEAD_CPUSET:-$CPUSET}"
+WORKER_CPUSET="${WORKER_CPUSET:-$CPUSET}"
+# preflight's GPU state check (scripts/gpuwatch.py check, docs/OPS-GPUWATCH.md): off | on (a degraded node -- clock or
+# power clamp, a step-time regression past the transient window -- is a preflight problem; warnings are logged) |
+# strict (a warning is a problem too: a recent slow state, an idle clock asymmetry; use for benchmark windows)
+GPUWATCH_PREFLIGHT="${GPUWATCH_PREFLIGHT:-on}"
 STATE_DIR="${STATE_DIR:-${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/glm53-tf}"
 # patches/0140: prepared rank folders (scripts/prepare.sh), next to each node's HF cache unless set
 HEAD_PREPARED="${HEAD_PREPARED:-${HEAD_HF%/*}/glm53-tf/prepared}"
 WORKER_PREPARED="${WORKER_PREPARED:-${WORKER_HF%/*}/glm53-tf/prepared}"
+# patches/0250: the session store's NVMe tier, mounted at /sessions in both ranks (used when GLM53_TF_SESSION_DISK=/sessions;
+# up to GLM53_TF_SESSION_DISK_GIB a node, default 64), next to each node's HF cache unless set
+HEAD_SESSIONS="${HEAD_SESSIONS:-${HEAD_HF%/*}/glm53-tf/sessions}"
+WORKER_SESSIONS="${WORKER_SESSIONS:-${WORKER_HF%/*}/glm53-tf/sessions}"
 IMAGE_ID="${IMAGE_ID:-}"
 log() { echo "[glm53-tf] $*"; }
 wssh() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "$@"; }
 
 run_args() { # $1 = rank, $2 = host HF cache dir
-    local rank=$1 hf=$2 prep
+    local rank=$1 hf=$2 prep sess
     # patches/0140: this node's prepared rank folders (scripts/prepare.sh) at /prepared; the image id and the launch
     # time key the calibration cache and start the [boot] timeline
     if [[ "$rank" == 0 ]]; then prep="$HEAD_PREPARED"; else prep="$WORKER_PREPARED"; fi
+    if [[ "$rank" == 0 ]]; then sess="$HEAD_SESSIONS"; else sess="$WORKER_SESSIONS"; fi   # patches/0250
+    local cpuset="$HEAD_CPUSET"; [[ "$rank" == 0 ]] || cpuset="$WORKER_CPUSET"             # patches/0370
     echo --name "$NAME-r$rank" -d --gpus all --ipc=host --network host \
+        ${cpuset:+--cpuset-cpus "$cpuset"} \
         -v "$prep:/prepared" -e GLM53_TF_PREPARED=/prepared -e GLM53_TF_PREPARED_WRITE="${GLM53_TF_PREPARED_WRITE:-1}" \
+        -v "$sess:/sessions" \
         -e GLM53_TF_CALIB="${GLM53_TF_CALIB:-cached}" -e GLM53_TF_IMAGE_ID="$IMAGE_ID" \
         -e GLM53_TF_LAUNCH_T0="$(date +%s.%N)" \
         --device /dev/infiniband --ulimit memlock=-1 --cap-add IPC_LOCK \
@@ -148,7 +168,23 @@ preflight() { # read-only checks; non-zero on a problem a retry cannot fix
     w=$(wssh nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)
     [[ "$h" == "$w" ]] || log "preflight: warning: NVIDIA driver differs (head ${h:-?}, worker ${w:-?})"
     [[ "$h $w" != *590.* ]] || log "preflight: warning: driver 590.x (a GB10 CUDA-graph deadlock is reported on 590; 580.x is the known-good line)"
+    gpu_state "$GPUWATCH_PREFLIGHT" || bad=1
     return $bad
+}
+
+gpu_state() { # $1 = off | on | strict: the GB10 clock / power / slow-state check of both nodes; non-zero on a problem
+    [[ "$1" != off && -f scripts/gpuwatch.py ]] || return 0
+    local out rc=0 args=(check --state-dir "$STATE_DIR" --worker "$WORKER_SSH" --port "$PORT")
+    [[ "$1" == strict ]] && args+=(--strict)
+    out=$(python3 scripts/gpuwatch.py "${args[@]}" 2>&1) || rc=$?
+    [[ -z "$out" ]] || while IFS= read -r l; do log "preflight: $l"; done <<< "$out"
+    case $rc in
+        0) return 0 ;;
+        1) if [[ "$1" == strict ]]; then log "preflight: GPU warning above (GPUWATCH_PREFLIGHT=strict)"; return 1; fi
+           log "preflight: warning: GPU state (above)"; return 0 ;;
+        2) log "preflight: a node's GPU is degraded (docs/OPS-GPUWATCH.md: power-drain a clamped node)"; return 1 ;;
+        *) log "preflight: warning: cannot check the GPU state (rc $rc)"; return 0 ;;
+    esac
 }
 
 stop_both() { # both ranks at once
@@ -177,9 +213,9 @@ start_once() { # 0: ready; 1: failed (containers left for the caller to inspect 
     IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo "$IMAGE")   # same id after save | load
     # both ranks at once (rank 1 waits for rank 0's TCP store either way); patches/0140
     # shellcheck disable=SC2046
-    wssh "mkdir -p '$WORKER_PREPARED' && docker run $(run_args 1 "$WORKER_HF")" >/dev/null &
+    wssh "mkdir -p '$WORKER_PREPARED' '$WORKER_SESSIONS' && docker run $(run_args 1 "$WORKER_HF")" >/dev/null &
     local wpid=$!
-    mkdir -p "$HEAD_PREPARED"
+    mkdir -p "$HEAD_PREPARED" "$HEAD_SESSIONS"
     # shellcheck disable=SC2046
     docker run $(run_args 0 "$HEAD_HF") >/dev/null
     wait "$wpid" || { log "rank 1 did not start"; return 1; }
@@ -377,10 +413,13 @@ xid)
     cmd_xid "${2:--1h}" ;;
 preflight)
     preflight && log "preflight ok" ;;
+gpucheck)   # for benchmark runs: strict unless GPUWATCH_PREFLIGHT says otherwise; exits 1 on any problem
+    mode="${GPUWATCH_PREFLIGHT:-on}"; [[ "$mode" == on ]] && mode=strict
+    gpu_state "$mode" && log "gpucheck ok" ;;
 watch)
     if [[ "${2:-}" == --once ]]; then watch_tick; exit $?; fi
     while :; do watch_tick || true; sleep "$WATCH_INTERVAL"; done
     ;;
 *)
-    sed -n '2,10p' "$0"; exit 2 ;;
+    sed -n '2,12p' "$0"; exit 2 ;;
 esac

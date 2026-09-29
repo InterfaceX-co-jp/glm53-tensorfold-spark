@@ -1,0 +1,6 @@
+dec1 rounds 106 wall 59.47 ms
+ grouped_kernel ms a round 25.4 ; expert-layer reads a round 809.5 = 5.09 GB; largest window rows: mean 3.71 median 3.0
+ rows histogram [(2, 22), (3, 40), (4, 18), (5, 16), (6, 2), (7, 4), (8, 2), (10, 1), (11, 1)]
+dec4 rounds 145 wall 125.51 ms
+ grouped_kernel ms a round 69.12 ; expert-layer reads a round 2196.1 = 13.81 GB; largest window rows: mean 10.81 median 11
+ rows histogram [(5, 1), (8, 11), (9, 29), (10, 31), (11, 24), (12, 20), (13, 15), (14, 9), (15, 2), (16, 3)]

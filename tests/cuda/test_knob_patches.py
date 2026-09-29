@@ -101,6 +101,8 @@ def test_header_block_round_trip():
     for k, v in (("moe_glue", 7), ("mtp_window", 4096), ("hc_fused", 3), ("attn_bm32", 1)):   # patches/0190
         if k in knobs.HEADER:
             values[k] = v
+    if "b12x" in knobs.HEADER:                                   # patches/0240
+        values["b12x"] = 5
     block = knobs.encode(values)
     assert block[0] == len(knobs.HEADER) == len(block) - 1
     code = [4, 2, 8, 30000, 1, 4]

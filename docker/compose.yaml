@@ -63,6 +63,11 @@ x-env: &env
   GLM53_TF_FAST_PREFILL: ${GLM53_TF_FAST_PREFILL:-0}
   GLM53_TF_FAST_GATHER: ${GLM53_TF_FAST_GATHER:-bf16}
   GLM53_TF_SESSION_GIB: ${GLM53_TF_SESSION_GIB:-12}
+  # patches/0250: the store's NVMe tier (/sessions below; empty: off)
+  GLM53_TF_SESSION_DISK: ${GLM53_TF_SESSION_DISK:-}
+  GLM53_TF_SESSION_DISK_GIB: ${GLM53_TF_SESSION_DISK_GIB:-}
+  GLM53_TF_SESSION_DISK_WRITE: ${GLM53_TF_SESSION_DISK_WRITE:-}
+  GLM53_TF_SESSION_DISK_MIN: ${GLM53_TF_SESSION_DISK_MIN:-}
   GLM53_TF_DECODE_KERNELS: ${GLM53_TF_DECODE_KERNELS:-}
   GLM53_TF_DEC_EXL3_NT: ${GLM53_TF_DEC_EXL3_NT:-8,8}
   GLM53_TF_DEC_PF_KB: ${GLM53_TF_DEC_PF_KB:-16}
@@ -87,6 +92,7 @@ services:
       - ${HEAD_HF:?set HEAD_HF (head node HF cache)}:/root/.cache/huggingface
       - cache:/cache
       - ${HEAD_PREPARED:-prepared}:/prepared
+      - ${HEAD_SESSIONS:-sessions}:/sessions
 
   rank1:
     <<: *rank
@@ -99,6 +105,7 @@ services:
       - ${WORKER_HF:?set WORKER_HF (worker node HF cache)}:/root/.cache/huggingface
       - cache:/cache
       - ${WORKER_PREPARED:-prepared}:/prepared
+      - ${WORKER_SESSIONS:-sessions}:/sessions
 
 volumes:
   cache:
@@ -107,3 +114,6 @@ volumes:
   prepared:
     # patches/0140: prepared rank folders when HEAD_PREPARED / WORKER_PREPARED are not set (~83 GB a key a rank)
     name: ${NAME:-glm53-tf}-prepared
+  sessions:
+    # patches/0250: the session store's NVMe tier when HEAD_SESSIONS / WORKER_SESSIONS are not set (GLM53_TF_SESSION_DISK_GIB a rank)
+    name: ${NAME:-glm53-tf}-sessions

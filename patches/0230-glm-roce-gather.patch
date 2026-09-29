@@ -1,0 +1,2038 @@
+diff --git a/THIRD_PARTY_NOTICES.md b/THIRD_PARTY_NOTICES.md
+index 80291cc..5755abd 100644
+--- a/THIRD_PARTY_NOTICES.md
++++ b/THIRD_PARTY_NOTICES.md
+@@ -50,6 +50,18 @@ kernels are written for TensorFold. What they follow:
+   text below): its trellis layout, its "mcg" codebook and its tensor-core fragment order. The decoder and kernels
+   are written for TensorFold and checked bit for bit against ExLlamaV3's dequantization.
+ 
++## Code adapted from b12x
++
++GLM-5.3-Flash's RoCE all-gather (`families/glm5_next/cuda/roce.cpp`, `roce.cu`, `roce_common.h`, `roce.py`;
++glm53-tensorfold-spark patch 0230) adapts "RoCEnante" from [b12x](https://github.com/local-inference-lab/b12x)
++(`b12x/comm/roce/`: `_roce_proxy.c`, `_allgather_cute.py`, `_cute_intrinsics.py`, `roce_oneshot.py`), Copyright
++2026 Luke Alonso and the b12x contributors, licensed under the Apache License, Version 2.0; the license text is in
++[`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt). b12x has no NOTICE file. Changes: the RDMA proxy is C++ in a
++torch extension with one RoCE v2 GID index per HCA and an optional CPU; the all-gather kernel is CUDA C++ instead of
++CuTe DSL, dim-0 only, for any alignment and byte count, with a wall-clock timeout and b12x PR #438's completion word
++and wrap-safe failure flag; setup, GID detection, HCA pairing by subnet, the NCCL probe and fallback, and the
++engine integration are new.
++
+ ## Vendored code
+ 
+ - `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is
+diff --git a/pyproject.toml b/pyproject.toml
+index 2c78cbc..d4a2e2d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -53,7 +53,7 @@ where = ["src"]
+ "tensorfold.families.qwen3_5.cuda" = ["*.cu", "*.cpp"]
+ "tensorfold.families.qwen4_exp.cuda" = ["*.cu", "*.cpp", "*.txt"]
+ "tensorfold.families.nemotron_h" = ["*.txt"]
+-"tensorfold.families.glm5_next.cuda" = ["*.cu", "*.cpp"]
++"tensorfold.families.glm5_next.cuda" = ["*.cu", "*.cpp", "*.h"]
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+diff --git a/src/tensorfold/families/glm5_next/cuda/batch.py b/src/tensorfold/families/glm5_next/cuda/batch.py
+index d4a61af..18fffdd 100644
+--- a/src/tensorfold/families/glm5_next/cuda/batch.py
++++ b/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -110,7 +110,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, choose_rows
+ 
+-from . import batchplan, decode_v2 as dv2, glue, kda as kda_mod, latent, qmm, sparse
++from . import batchplan, comm as comm_mod, decode_v2 as dv2, glue, kda as kda_mod, latent, qmm, sparse
+ from .attention import attention, kv_write
+ from .forward import State, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+ 
+@@ -301,8 +301,9 @@ def sample_multi(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Sequen
+     else:
+         world = w.world
+         buf = torch.empty((world * flat.numel(),), dtype=torch.float32, device=logits.device)
+-        w.comm.all_gather(flat, buf)
++        comm_mod.fast_gather(w.comm, flat, buf)            # patches/0230
+         got = buf.view(world, -1).cpu()
++        comm_mod.check(w.comm)
+     out, at = [], 0
+     for (off, R, positions, sampling), k in zip(specs, ks):
+         seg = got[:, at:at + R * 2 * k].reshape(world, R, 2 * k)
+@@ -344,8 +345,9 @@ def sample_drafts(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Any,
+     else:
+         world = w.world
+         buf = torch.empty((world * flat.numel(),), dtype=torch.float32, device=logits.device)
+-        w.comm.all_gather(flat, buf)
++        comm_mod.fast_gather(w.comm, flat, buf)            # patches/0230
+         got = buf.view(world, -1).cpu()
++        comm_mod.check(w.comm)
+     out, at = [], 0
+     for (row, pos, sampling, want), k in zip(specs, ks):
+         seg = got[:, at:at + 2 * k].reshape(world, 1, 2 * k)
+diff --git a/src/tensorfold/families/glm5_next/cuda/comm.py b/src/tensorfold/families/glm5_next/cuda/comm.py
+index f80011c..cc45519 100644
+--- a/src/tensorfold/families/glm5_next/cuda/comm.py
++++ b/src/tensorfold/families/glm5_next/cuda/comm.py
+@@ -14,7 +14,8 @@ import os
+ 
+ import torch
+ 
+-_DTYPES = {torch.float32: 7, torch.bfloat16: 9, torch.int32: 2, torch.int64: 4}
++_DTYPES = {torch.float32: 7, torch.bfloat16: 9, torch.int32: 2, torch.int64: 4,
++           torch.uint8: 1, torch.int8: 0, torch.float16: 6}      # patches/0230: byte gathers (the RoCE probe)
+ 
+ 
+ class _UniqueId(ctypes.Structure):
+@@ -88,3 +89,26 @@ class NCCL:
+         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
+         self.all_gather(x, y)
+         torch.cuda.synchronize()
++
++
++# -- patches/0230: the model's exchanges, which GLM53_TF_COMM_BACKEND=roce may send over RoCE --------------------------
++def fast_gather(comm, send: torch.Tensor, recv: torch.Tensor) -> None:
++    """``comm.all_gather`` for an exchange of the model (partials, sampler candidates, drafter rows): the RoCE
++    communicator (``roce.RoceComm``) sends it over RoCE when it is small enough; any other communicator (NCCL, the
++    tests' stand-ins) gathers it as before. Control exchanges (settings, headers, prompts, calibration) keep calling
++    ``comm.all_gather``: they stay on NCCL, which may wait for the other rank forever."""
++
++    fast = getattr(comm, "all_gather_fast", None)
++    if fast is None:
++        comm.all_gather(send, recv)
++    else:
++        fast(send, recv)
++
++
++def check(comm) -> None:
++    """Raise if the communicator's RoCE runtime recorded a failure (a host memory read; no-op for NCCL). Called
++    after the samplers' exchanges have synchronized, so a timed-out step is never turned into tokens."""
++
++    c = getattr(comm, "check", None)
++    if c is not None:
++        c()
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index e86e5c5..5b6d774 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -20,7 +20,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+-from . import fastpf, fp8pf, lean as lean_mod, pfglue, pfgrid, profile
++from . import comm as comm_mod, fastpf, fp8pf, lean as lean_mod, pfglue, pfgrid, profile
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .weights import Weights
+@@ -43,8 +43,9 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
+     else:
+         packed = torch.cat([vals, ids.view(torch.float32)], dim=1).contiguous()
+         got = torch.empty((w.world * packed.numel(),), dtype=torch.float32, device=logits.device)
+-        w.comm.all_gather(packed.view(-1), got)
++        comm_mod.fast_gather(w.comm, packed.view(-1), got)      # patches/0230
+         g = got.view(w.world, R, 2 * k).cpu()
++        comm_mod.check(w.comm)                   # a failed RoCE exchange of this step raises before any token
+         values = torch.cat([g[r, :, :k] for r in range(w.world)], dim=1).numpy().astype(np.float32)
+         tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(w.world)], dim=1).numpy()
+         tokens = tokens.astype(np.int64)
+diff --git a/src/tensorfold/families/glm5_next/cuda/dflash2.py b/src/tensorfold/families/glm5_next/cuda/dflash2.py
+index abc9d6b..4b4a449 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dflash2.py
++++ b/src/tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -31,7 +31,7 @@ from safetensors import safe_open
+ 
+ from tensorfold.engine.exact_sampling import Sampling, uniform_rows
+ 
+-from . import glue, qmm
++from . import comm as comm_mod, glue, qmm
+ from .weights import Weights
+ 
+ EDGE = 0.6        # the selector's edge score weight in a chain pick
+@@ -389,7 +389,7 @@ class Drafter:
+         if self.world == 1 or self.w.comm is None:
+             return part.to(torch.bfloat16)
+         got = torch.empty((self.world * part.numel(),), dtype=torch.float32, device=self.dev)
+-        self.w.comm.all_gather(part.reshape(-1), got)
++        comm_mod.fast_gather(self.w.comm, part.reshape(-1), got)        # patches/0230
+         g = got.view(self.world, *part.shape)
+         acc = g[0].clone()
+         for i in range(1, self.world):
+@@ -465,7 +465,7 @@ class Drafter:
+         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()
+         if self.world > 1 and self.w.comm is not None:
+             got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=self.dev)
+-            self.w.comm.all_gather(packed.view(-1), got)
++            comm_mod.fast_gather(self.w.comm, packed.view(-1), got)     # patches/0230
+             self.packed = got.view(self.world, n - 1, 2 * self.top_k)
+         else:
+             self.packed = packed.view(1, n - 1, 2 * self.top_k)
+@@ -509,6 +509,7 @@ class Drafter:
+         else:
+             self._block_compute()
+         g = self.packed[:, :depth].cpu()
++        comm_mod.check(self.w.comm)              # patches/0230: a failed RoCE exchange raises before any draft
+         k = self.top_k
+         values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
+         tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 2d68741..6b9c78c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -202,6 +202,15 @@ class GlmEngine:
+         self.comm = comm if comm is not None else NCCL(rank, 2, master, port)
+         self.comm.barrier()
+         fastboot.mark("NCCL init (both ranks up)")
++        if comm is None:
++            # patches/0230: GLM53_TF_COMM_BACKEND=roce sends the model's small exchanges over a one-shot RoCE
++            # all-gather (checked equal on both ranks; a failed setup falls back to NCCL on both)
++            # (both ranks always call it: it compares the ranks' settings, whichever backend they asked for)
++            from .roce import select as comm_select
++
++            self.comm = comm_select(self.comm)
++            if hasattr(self.comm, "rt"):
++                fastboot.mark("RoCE all-gather connected")
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         self.f_most = auto_f_most()
+         longctx = int(os.environ.get("GLM53_TF_LONGCTX_GRAPHS", "1").strip() != "0")      # patches/0050
+diff --git a/src/tensorfold/families/glm5_next/cuda/forward.py b/src/tensorfold/families/glm5_next/cuda/forward.py
+index 95c2137..039f5e4 100644
+--- a/src/tensorfold/families/glm5_next/cuda/forward.py
++++ b/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -29,6 +29,7 @@ import triton.language as tl
+ 
+ from . import decode_v2 as dv2, fastpf, glue, kda as kda_mod, latent, profile, qmm, sparse
+ from .attention import AttnScratch, attention, kv_write
++from .comm import fast_gather
+ from .weights import LayerW, Weights
+ 
+ 
+@@ -330,10 +331,10 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
+             b.gath16 = torch.empty(b.gath.shape, dtype=torch.bfloat16, device=b.gath.device)
+         p16, g16 = b.part16[:R], b.gath16[:b.world * R * d]
+         p16.copy_(b.part[:R])
+-        w.comm.all_gather(p16.reshape(-1), g16)
++        fast_gather(w.comm, p16.reshape(-1), g16)      # patches/0230: RoCE when GLM53_TF_COMM_BACKEND=roce
+         out.copy_(g16)
+     else:
+-        w.comm.all_gather(b.part[:R].reshape(-1), out)
++        fast_gather(w.comm, b.part[:R].reshape(-1), out)
+     if profile.ON:
+         profile.lap("allgather")
+     return out.view(b.world, R, d)
+diff --git a/src/tensorfold/families/glm5_next/cuda/pfoverlap.py b/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+index f2d34a0..5e3ddff 100644
+--- a/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
++++ b/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+@@ -65,7 +65,7 @@ from dataclasses import dataclass
+ 
+ import torch
+ 
+-from . import fastpf, glue, lean, profile, qmm
++from . import comm as comm_mod, fastpf, glue, lean, profile, qmm
+ 
+ ENV = "GLM53_TF_PREFILL_OVERLAP"
+ SLAB_ENV = "GLM53_TF_PREFILL_HC_SLAB"
+@@ -214,14 +214,14 @@ class Pipe:
+         recv = self.gath[i][:self.world * R * self.D]
+         out = recv.view(self.world, R, self.D)
+         if not self.overlap:
+-            w.comm.all_gather(send.reshape(-1), recv)
++            comm_mod.fast_gather(w.comm, send.reshape(-1), recv)
+             if profile.ON:
+                 profile.lap("allgather")
+             return Pending(out, None, None, None)
+         self.busy[i] = True
+         if not self.cuda:
+             def job(send=send, recv=recv):
+-                w.comm.all_gather(send.reshape(-1), recv)
++                comm_mod.fast_gather(w.comm, send.reshape(-1), recv)
+ 
+             self.queue.append(job)
+             return Pending(out, None, job, i)
+@@ -229,7 +229,7 @@ class Pipe:
+         ready.record()                   # on the compute stream, after the partial's producer
+         self.stream.wait_event(ready)
+         with torch.cuda.stream(self.stream):
+-            w.comm.all_gather(send.reshape(-1), recv)
++            comm_mod.fast_gather(w.comm, send.reshape(-1), recv)
+         self.done[i].record(self.stream)
+         return Pending(out, self.done[i], None, i)
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce.cpp b/src/tensorfold/families/glm5_next/cuda/roce.cpp
+new file mode 100644
+index 0000000..a4b8e33
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/roce.cpp
+@@ -0,0 +1,760 @@
++// RDMA proxy and bindings for the one-shot RoCE all-gather (patches/0230, GLM53_TF_COMM_BACKEND=roce).
++//
++// Adapted from b12x's RoCEnante proxy (b12x/comm/roce/_roce_proxy.c, https://github.com/local-inference-lab/b12x,
++// Copyright 2026 Luke Alonso and the b12x contributors, Apache License 2.0; see LICENSES/Apache-2.0.txt and
++// THIRD_PARTY_NOTICES.md). Changes: C++ in the torch extension instead of a separately built C library; one RoCE
++// v2 GID index per HCA (they differ between the two CX7 functions and move on reboot); an optional CPU for the
++// proxy thread; a magic word in the connection record; the pinned region allocation and the kernel launcher are
++// bound here too.
++//
++// One rank owns one pinned host region, laid out as
++//
++//   recv[src][slot]       world * SLOTS * slot_bytes   filled by the peers' RDMA writes
++//   flag[src][slot][hca]  world * SLOTS * MAX_HCAS * FLAG_STRIDE   the sequence written after that HCA's stripe
++//   send[slot]            SLOTS * slot_bytes           staged by the local GPU kernel
++//   ctrl                  FLAG_STRIDE                  the control record (roce_common.h)
++//
++// The GPU kernel stages its input into send[seq & 1], publishes the padded byte count and seq in ctrl, then spins
++// on flag[peer][seq & 1][hca] for every peer and HCA. The proxy thread below spins on ctrl[CTRL_SEQ] and, for every
++// peer, stripes the payload across the HCAs; each stripe is followed by its own 4-byte seq write on the same
++// reliable-connected queue pair, so its flag cannot become visible before its payload. Nothing on the receive path
++// involves the host: the DGX Spark's GB10 reads the pinned host memory the NIC wrote in place (no GPUDirect RDMA).
++
++#include <errno.h>
++#include <infiniband/verbs.h>
++#include <pthread.h>
++#include <sched.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++
++#include <atomic>
++#include <string>
++#include <vector>
++
++#include <c10/cuda/CUDAStream.h>
++#include <cuda_runtime.h>
++#include <torch/extension.h>
++
++#include "roce_common.h"
++
++namespace tfroce {
++
++constexpr int MAX_PEERS = 16;
++constexpr int MAX_HCAS = 2;
++constexpr int SLOTS = 2;
++constexpr int FLAG_STRIDE = 128;
++constexpr int PORT = 1;
++constexpr int SEND_DEPTH = 256;
++constexpr uint32_t BLOB_MAGIC = 0x54465243u;   // "TFRC", bumped with the record's layout
++// Model graphs leave sub-millisecond gaps between collectives: keep the proxy hot across them (a sleep there adds a
++// scheduler wakeup to every collective on the critical path); after this many idle polls it naps 20 us at a time.
++constexpr uint64_t IDLE_SPINS = 20000000ull;
++
++struct Blob {
++    uint32_t magic;
++    uint32_t n_hca;
++    uint64_t region_addr;
++    uint32_t rkey[MAX_HCAS];
++    uint32_t lid[MAX_HCAS];
++    uint8_t gid[MAX_HCAS][16];
++    uint32_t mtu[MAX_HCAS];
++    uint32_t qp_num[MAX_HCAS][MAX_PEERS];
++};
++
++struct Hca {
++    ibv_context *ctx = nullptr;
++    ibv_pd *pd = nullptr;
++    ibv_mr *mr = nullptr;
++    ibv_cq *cq = nullptr;
++    ibv_qp *qp[MAX_PEERS] = {};
++    uint32_t outstanding[MAX_PEERS] = {};
++    uint64_t writes_completed = 0;
++    uint64_t bytes_posted = 0;
++    ibv_gid gid{};
++    uint16_t lid = 0;
++    ibv_mtu mtu = IBV_MTU_1024;
++    int gid_index = 0;
++};
++
++bool layout(int world, uint64_t slot_bytes, uint64_t out[7]) {
++    // out = {recv_off, flag_off, send_off, ctrl_off, total_bytes, flag_stride, slots}
++    if (world < 2 || world > MAX_PEERS || slot_bytes == 0 || (slot_bytes % 4096) != 0 ||
++        slot_bytes > (uint64_t(1) << 40)) {
++        return false;
++    }
++    const uint64_t recv_bytes = uint64_t(world) * SLOTS * slot_bytes;
++    const uint64_t flag_bytes = uint64_t(world) * SLOTS * MAX_HCAS * FLAG_STRIDE;
++    const uint64_t send_bytes = uint64_t(SLOTS) * slot_bytes;
++    out[0] = 0;
++    out[1] = recv_bytes;
++    out[2] = recv_bytes + flag_bytes;
++    out[3] = out[2] + send_bytes;
++    out[4] = out[3] + FLAG_STRIDE;
++    out[5] = FLAG_STRIDE;
++    out[6] = SLOTS;
++    return true;
++}
++
++class Proxy {
++  public:
++    Proxy(int world, int rank, std::vector<std::string> names, std::vector<int> gid_index, int traffic_class,
++          uint64_t region, uint64_t region_bytes, uint64_t slot_bytes)
++        : world_(world), rank_(rank), n_hca_(int(names.size())), tc_(traffic_class),
++          region_(reinterpret_cast<uint8_t *>(region)), region_bytes_(region_bytes), slot_bytes_(slot_bytes) {
++        uint64_t lay[7];
++        if (!layout(world, slot_bytes, lay) || lay[4] > region_bytes || rank < 0 || rank >= world || n_hca_ < 1 ||
++            n_hca_ > MAX_HCAS || gid_index.size() != names.size() || tc_ < 0 || tc_ > 255) {
++            throw std::runtime_error("roce: invalid runtime geometry");
++        }
++        recv_off_ = lay[0];
++        flag_off_ = lay[1];
++        send_off_ = lay[2];
++        ctrl_off_ = lay[3];
++        for (int h = 0; h < n_hca_; h++) {
++            hca_[h].gid_index = gid_index[h];
++            if (!open_hca(h, names[h])) {
++                std::string e = err_;
++                destroy();
++                throw std::runtime_error("roce: " + e);
++            }
++        }
++    }
++
++    ~Proxy() { destroy(); }
++
++    py::bytes local_blob() const {
++        Blob b;
++        memset(&b, 0, sizeof(b));
++        b.magic = BLOB_MAGIC;
++        b.n_hca = uint32_t(n_hca_);
++        b.region_addr = uint64_t(reinterpret_cast<uintptr_t>(region_));
++        for (int h = 0; h < n_hca_; h++) {
++            b.rkey[h] = hca_[h].mr->rkey;
++            b.lid[h] = hca_[h].lid;
++            b.mtu[h] = uint32_t(hca_[h].mtu);
++            memcpy(b.gid[h], hca_[h].gid.raw, 16);
++            for (int p = 0; p < world_; p++) {
++                b.qp_num[h][p] = p == rank_ ? 0 : hca_[h].qp[p]->qp_num;
++            }
++        }
++        return py::bytes(reinterpret_cast<const char *>(&b), sizeof(b));
++    }
++
++    void connect(const std::string &blobs) {
++        if (blobs.size() != sizeof(Blob) * size_t(world_)) {
++            throw std::runtime_error("roce: connection records of the wrong size (different builds on the ranks?)");
++        }
++        std::vector<Blob> all(world_);
++        memcpy(all.data(), blobs.data(), blobs.size());
++        for (int p = 0; p < world_; p++) {
++            if (p == rank_) {
++                continue;
++            }
++            if (all[p].magic != BLOB_MAGIC || int(all[p].n_hca) != n_hca_) {
++                throw std::runtime_error("roce: rank " + std::to_string(p) +
++                                         "'s connection record does not match (build or HCA count)");
++            }
++            peer_addr_[p] = all[p].region_addr;
++            for (int h = 0; h < n_hca_; h++) {
++                peer_rkey_[h][p] = all[p].rkey[h];
++                if (!connect_qp(h, p, all[p])) {
++                    throw std::runtime_error("roce: " + err_);
++                }
++            }
++        }
++    }
++
++    void start(int cpu) {
++        if (running_.load()) {
++            return;
++        }
++        if (!started_) {
++            // a restart continues from the last posted sequence, so ops rung while stopped are still posted
++            last_seq_ = ctrl()[CTRL_SEQ];
++            started_ = true;
++        }
++        cpu_ = cpu;
++        failed_.store(0);
++        running_.store(1);
++        int rc = pthread_create(&thread_, nullptr, &Proxy::main_tramp, this);
++        if (rc != 0) {
++            running_.store(0);
++            throw std::runtime_error(std::string("roce: pthread_create: ") + strerror(rc));
++        }
++    }
++
++    void stop() {
++        if (running_.exchange(0)) {
++            pthread_join(thread_, nullptr);
++        }
++    }
++
++    bool failed() const { return failed_.load() != 0; }
++
++    std::string error() const { return err_; }
++
++    std::vector<uint64_t> stats() const {
++        std::vector<uint64_t> out = {ops_posted_, writes_completed_, last_seq_};
++        for (int h = 0; h < n_hca_; h++) {
++            out.push_back(hca_[h].writes_completed);
++            out.push_back(hca_[h].bytes_posted);
++        }
++        return out;
++    }
++
++    void destroy() {
++        stop();
++        for (int h = 0; h < MAX_HCAS; h++) {
++            Hca &x = hca_[h];
++            for (int p = 0; p < MAX_PEERS; p++) {
++                if (x.qp[p] != nullptr) {
++                    ibv_destroy_qp(x.qp[p]);
++                    x.qp[p] = nullptr;
++                }
++            }
++            if (x.cq != nullptr) {
++                ibv_destroy_cq(x.cq);
++                x.cq = nullptr;
++            }
++            if (x.mr != nullptr) {
++                ibv_dereg_mr(x.mr);
++                x.mr = nullptr;
++            }
++            if (x.pd != nullptr) {
++                ibv_dealloc_pd(x.pd);
++                x.pd = nullptr;
++            }
++            if (x.ctx != nullptr) {
++                ibv_close_device(x.ctx);
++                x.ctx = nullptr;
++            }
++        }
++    }
++
++  private:
++    volatile uint32_t *ctrl() const { return reinterpret_cast<volatile uint32_t *>(region_ + ctrl_off_); }
++
++    void set_err(const char *what, int e) { err_ = std::string(what) + ": " + (e ? strerror(e) : "failed"); }
++
++    bool open_hca(int h, const std::string &name) {
++        int num = 0;
++        ibv_device **list = ibv_get_device_list(&num);
++        if (list == nullptr) {
++            set_err("ibv_get_device_list", errno);
++            return false;
++        }
++        ibv_device *dev = nullptr;
++        for (int i = 0; i < num; i++) {
++            if (name == ibv_get_device_name(list[i])) {
++                dev = list[i];
++                break;
++            }
++        }
++        if (dev == nullptr) {
++            ibv_free_device_list(list);
++            err_ = "RDMA device " + name + " not found (is /dev/infiniband passed to the container?)";
++            return false;
++        }
++        Hca &x = hca_[h];
++        x.ctx = ibv_open_device(dev);
++        ibv_free_device_list(list);
++        if (x.ctx == nullptr) {
++            set_err("ibv_open_device", errno);
++            return false;
++        }
++        ibv_port_attr port;
++        if (ibv_query_port(x.ctx, PORT, &port) != 0) {
++            set_err("ibv_query_port", errno);
++            return false;
++        }
++        if (port.state != IBV_PORT_ACTIVE) {
++            err_ = "RDMA device " + name + " port 1 is not active";
++            return false;
++        }
++        x.lid = port.lid;
++        x.mtu = port.active_mtu;
++        if (ibv_query_gid(x.ctx, PORT, x.gid_index, &x.gid) != 0) {
++            set_err("ibv_query_gid", errno);
++            return false;
++        }
++        x.pd = ibv_alloc_pd(x.ctx);
++        if (x.pd == nullptr) {
++            set_err("ibv_alloc_pd", errno);
++            return false;
++        }
++        x.mr = ibv_reg_mr(x.pd, region_, region_bytes_, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
++        if (x.mr == nullptr) {
++            set_err("ibv_reg_mr(pinned region; memlock limit? run with --ulimit memlock=-1)", errno);
++            return false;
++        }
++        x.cq = ibv_create_cq(x.ctx, SEND_DEPTH * MAX_PEERS, nullptr, nullptr, 0);
++        if (x.cq == nullptr) {
++            set_err("ibv_create_cq", errno);
++            return false;
++        }
++        for (int p = 0; p < world_; p++) {
++            if (p == rank_) {
++                continue;
++            }
++            ibv_qp_init_attr attr;
++            memset(&attr, 0, sizeof(attr));
++            attr.send_cq = x.cq;
++            attr.recv_cq = x.cq;
++            attr.qp_type = IBV_QPT_RC;
++            attr.cap.max_send_wr = SEND_DEPTH;
++            attr.cap.max_recv_wr = 1;
++            attr.cap.max_send_sge = 1;
++            attr.cap.max_recv_sge = 1;
++            attr.cap.max_inline_data = 16;
++            x.qp[p] = ibv_create_qp(x.pd, &attr);
++            if (x.qp[p] == nullptr) {
++                set_err("ibv_create_qp", errno);
++                return false;
++            }
++            ibv_qp_attr init;
++            memset(&init, 0, sizeof(init));
++            init.qp_state = IBV_QPS_INIT;
++            init.pkey_index = 0;
++            init.port_num = PORT;
++            init.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
++            int rc = ibv_modify_qp(x.qp[p], &init, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
++            if (rc != 0) {
++                set_err("ibv_modify_qp(INIT)", rc);
++                return false;
++            }
++        }
++        return true;
++    }
++
++    bool connect_qp(int h, int p, const Blob &peer) {
++        Hca &x = hca_[h];
++        ibv_qp_attr rtr;
++        memset(&rtr, 0, sizeof(rtr));
++        rtr.qp_state = IBV_QPS_RTR;
++        rtr.path_mtu = ibv_mtu(peer.mtu[h] < uint32_t(x.mtu) ? peer.mtu[h] : uint32_t(x.mtu));
++        rtr.dest_qp_num = peer.qp_num[h][rank_];
++        rtr.rq_psn = 0;
++        rtr.max_dest_rd_atomic = 1;
++        rtr.min_rnr_timer = 12;
++        rtr.ah_attr.is_global = 1;
++        rtr.ah_attr.dlid = uint16_t(peer.lid[h]);
++        rtr.ah_attr.sl = 0;
++        rtr.ah_attr.src_path_bits = 0;
++        rtr.ah_attr.port_num = PORT;
++        memcpy(rtr.ah_attr.grh.dgid.raw, peer.gid[h], 16);
++        rtr.ah_attr.grh.sgid_index = uint8_t(x.gid_index);
++        rtr.ah_attr.grh.hop_limit = 64;
++        rtr.ah_attr.grh.traffic_class = uint8_t(tc_);
++        rtr.ah_attr.grh.flow_label = 0;
++        int rc = ibv_modify_qp(x.qp[p], &rtr,
++                               IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
++                                   IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
++        if (rc != 0) {
++            set_err("ibv_modify_qp(RTR)", rc);
++            return false;
++        }
++        ibv_qp_attr rts;
++        memset(&rts, 0, sizeof(rts));
++        rts.qp_state = IBV_QPS_RTS;
++        rts.timeout = 14;
++        rts.retry_cnt = 7;
++        rts.rnr_retry = 7;
++        rts.sq_psn = 0;
++        rts.max_rd_atomic = 1;
++        rc = ibv_modify_qp(x.qp[p], &rts,
++                           IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
++                               IBV_QP_MAX_QP_RD_ATOMIC);
++        if (rc != 0) {
++            set_err("ibv_modify_qp(RTS)", rc);
++            return false;
++        }
++        return true;
++    }
++
++    bool drain_cq(int h) {
++        ibv_wc wc[32];
++        int n = ibv_poll_cq(hca_[h].cq, 32, wc);
++        if (n < 0) {
++            set_err("ibv_poll_cq", errno);
++            return false;
++        }
++        for (int i = 0; i < n; i++) {
++            if (wc[i].status != IBV_WC_SUCCESS) {
++                char buf[256];
++                snprintf(buf, sizeof(buf), "RDMA write to rank %u on HCA %d failed: %s (vendor_err 0x%x, seq %u)",
++                         unsigned(wc[i].wr_id), h, ibv_wc_status_str(wc[i].status), wc[i].vendor_err, last_seq_);
++                err_ = buf;
++                return false;
++            }
++            hca_[h].outstanding[wc[i].wr_id] -= 1;
++            hca_[h].writes_completed += 1;
++            writes_completed_ += 1;
++        }
++        return true;
++    }
++
++    bool post_op(uint32_t seq, uint32_t nbytes) {
++        if (nbytes == 0 || nbytes % 16 != 0 || nbytes > slot_bytes_) {
++            err_ = "RoCE payload of " + std::to_string(nbytes) + " bytes (seq " + std::to_string(seq) +
++                   "): expected a positive multiple of 16 up to the slot size";
++            return false;
++        }
++        const uint32_t slot = seq & 1u;
++        uint8_t *send = region_ + send_off_ + size_t(slot) * slot_bytes_;
++        uint32_t seq_copy = seq;
++        const uint32_t total_packs = nbytes / 16;
++        for (int p = 0; p < world_; p++) {
++            if (p == rank_) {
++                continue;
++            }
++            uint32_t pack_offset = 0;
++            for (int h = 0; h < n_hca_; h++) {
++                Hca &x = hca_[h];
++                // two work requests per stripe; keep the queue at most a quarter full
++                while (x.outstanding[p] >= SEND_DEPTH / 4) {
++                    if (!drain_cq(h)) {
++                        return false;
++                    }
++                    // a peer that stopped acknowledging keeps the QP retrying for a long time: honour a stop
++                    if (!running_.load(std::memory_order_relaxed)) {
++                        err_ = "RoCE proxy stopped with " + std::to_string(x.outstanding[p]) +
++                               " writes outstanding to rank " + std::to_string(p);
++                        return false;
++                    }
++                }
++                uint32_t stripe_packs = total_packs / uint32_t(n_hca_);
++                if (uint32_t(h) < total_packs % uint32_t(n_hca_)) {
++                    stripe_packs += 1;
++                }
++                const uint32_t stripe_bytes = stripe_packs * 16;
++                const uint64_t byte_offset = uint64_t(pack_offset) * 16;
++                const uint64_t remote = peer_addr_[p];
++
++                ibv_sge flag_sge;
++                flag_sge.addr = uint64_t(reinterpret_cast<uintptr_t>(&seq_copy));
++                flag_sge.length = 4;
++                flag_sge.lkey = 0;
++                ibv_send_wr flag_wr;
++                memset(&flag_wr, 0, sizeof(flag_wr));
++                flag_wr.wr_id = uint64_t(p);
++                flag_wr.sg_list = &flag_sge;
++                flag_wr.num_sge = 1;
++                flag_wr.opcode = IBV_WR_RDMA_WRITE;
++                flag_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
++                flag_wr.wr.rdma.remote_addr =
++                    remote + flag_off_ + ((uint64_t(rank_) * SLOTS + slot) * uint64_t(n_hca_) + uint64_t(h)) * FLAG_STRIDE;
++                flag_wr.wr.rdma.rkey = peer_rkey_[h][p];
++
++                ibv_send_wr data_wr;
++                ibv_sge data_sge;
++                ibv_send_wr *first = &flag_wr;
++                if (stripe_bytes != 0) {
++                    data_sge.addr = uint64_t(reinterpret_cast<uintptr_t>(send + byte_offset));
++                    data_sge.length = stripe_bytes;
++                    data_sge.lkey = x.mr->lkey;
++                    memset(&data_wr, 0, sizeof(data_wr));
++                    data_wr.wr_id = uint64_t(p);
++                    data_wr.next = &flag_wr;
++                    data_wr.sg_list = &data_sge;
++                    data_wr.num_sge = 1;
++                    data_wr.opcode = IBV_WR_RDMA_WRITE;
++                    data_wr.wr.rdma.remote_addr =
++                        remote + recv_off_ + (uint64_t(rank_) * SLOTS + slot) * slot_bytes_ + byte_offset;
++                    data_wr.wr.rdma.rkey = peer_rkey_[h][p];
++                    first = &data_wr;
++                }
++                ibv_send_wr *bad = nullptr;
++                int rc = ibv_post_send(x.qp[p], first, &bad);
++                if (rc != 0) {
++                    set_err("ibv_post_send", rc);
++                    return false;
++                }
++                x.outstanding[p] += 1;
++                x.bytes_posted += stripe_bytes;
++                pack_offset += stripe_packs;
++            }
++        }
++        ops_posted_ += 1;
++        for (int h = 0; h < n_hca_; h++) {
++            if (!drain_cq(h)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    static void *main_tramp(void *self) {
++        static_cast<Proxy *>(self)->main_loop();
++        return nullptr;
++    }
++
++    void main_loop() {
++        if (cpu_ >= 0) {
++            cpu_set_t set;
++            CPU_ZERO(&set);
++            CPU_SET(cpu_, &set);
++            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);   // best effort
++        }
++        volatile uint32_t *c = ctrl();
++        uint64_t idle = 0;
++        const timespec nap = {0, 20000};
++        while (running_.load(std::memory_order_relaxed)) {
++            const uint32_t seq = __atomic_load_n(&c[CTRL_SEQ], __ATOMIC_ACQUIRE);
++            if (seq == last_seq_) {
++                idle++;
++                if (idle % 64 == 0) {
++                    for (int h = 0; h < n_hca_; h++) {
++                        if (!drain_cq(h)) {
++                            failed_.store(1);
++                            return;
++                        }
++                    }
++                }
++                if (idle >= IDLE_SPINS) {
++                    nanosleep(&nap, nullptr);
++                }
++                continue;
++            }
++            idle = 0;
++            // The doorbell holds only the newest sequence. Our kernel for op N completes on the peers' payloads
++            // alone, so op N+1 can ring before this thread saw op N. A peer cannot get more than one op ahead of
++            // us, so at most SLOTS doorbells are pending and every send slot is intact: post each missed sequence
++            // in order with its slot's byte count.
++            uint32_t pending = seq - last_seq_;
++            if (pending > uint32_t(SLOTS)) {
++                char buf[160];
++                snprintf(buf, sizeof(buf), "doorbell skipped %u ops (last posted %u, now %u)", pending, last_seq_, seq);
++                err_ = buf;
++                failed_.store(1);
++                return;
++            }
++            for (uint32_t s = last_seq_ + 1; pending > 0; s++, pending--) {
++                const uint32_t nbytes = c[CTRL_SLOT_NBYTES + (s & 1u)];
++                if (!post_op(s, nbytes)) {
++                    failed_.store(1);
++                    return;
++                }
++                last_seq_ = s;
++            }
++        }
++    }
++
++    int world_, rank_, n_hca_, tc_;
++    uint8_t *region_;
++    uint64_t region_bytes_, slot_bytes_;
++    uint64_t recv_off_ = 0, flag_off_ = 0, send_off_ = 0, ctrl_off_ = 0;
++    Hca hca_[MAX_HCAS];
++    uint64_t peer_addr_[MAX_PEERS] = {};
++    uint32_t peer_rkey_[MAX_HCAS][MAX_PEERS] = {};
++    pthread_t thread_{};
++    std::atomic<int> running_{0};
++    std::atomic<int> failed_{0};
++    bool started_ = false;
++    int cpu_ = -1;
++    uint32_t last_seq_ = 0;
++    uint64_t ops_posted_ = 0;
++    uint64_t writes_completed_ = 0;
++    std::string err_;
++};
++
++// -- pinned region -------------------------------------------------------------------------------------------------
++static void check_cuda(cudaError_t e, const char *what) {
++    if (e != cudaSuccess) {
++        throw std::runtime_error(std::string("roce: ") + what + ": " + cudaGetErrorString(e));
++    }
++}
++
++// (host address, device address) of a zeroed, pinned, device-mapped host allocation
++std::vector<uint64_t> alloc_pinned(uint64_t nbytes) {
++    void *host = nullptr;
++    check_cuda(cudaHostAlloc(&host, nbytes, cudaHostAllocMapped | cudaHostAllocPortable), "cudaHostAlloc");
++    memset(host, 0, nbytes);
++    void *dev = nullptr;
++    cudaError_t e = cudaHostGetDevicePointer(&dev, host, 0);
++    if (e != cudaSuccess) {
++        cudaFreeHost(host);
++        check_cuda(e, "cudaHostGetDevicePointer");
++    }
++    return {uint64_t(reinterpret_cast<uintptr_t>(host)), uint64_t(reinterpret_cast<uintptr_t>(dev))};
++}
++
++void free_pinned(uint64_t host) { cudaFreeHost(reinterpret_cast<void *>(host)); }
++
++std::vector<uint64_t> py_layout(int world, uint64_t slot_bytes) {
++    uint64_t out[7];
++    if (!layout(world, slot_bytes, out)) {
++        throw std::invalid_argument("roce: unsupported geometry (2..16 ranks, slot_bytes a positive multiple of 4096)");
++    }
++    return std::vector<uint64_t>(out, out + 7);
++}
++
++// -- the launcher -----------------------------------------------------------------------------------------------------
++class Launcher {
++  public:
++    Launcher(uint64_t recv_base, uint64_t flag_base, uint64_t send_base, uint64_t ctrl_base, uint64_t slot_bytes,
++             uint64_t epoch, uint64_t poison, int world, int rank, int n_hca, int flag_stride, int slots, int threads)
++        : threads_(threads) {
++        memset(&a_, 0, sizeof(a_));
++        a_.recv_base = recv_base;
++        a_.flag_base = flag_base;
++        a_.send_base = send_base;
++        a_.ctrl_base = ctrl_base;
++        a_.slot_bytes = slot_bytes;
++        a_.epoch = reinterpret_cast<uint32_t *>(epoch);
++        a_.poison = reinterpret_cast<uint32_t *>(poison);
++        a_.world = world;
++        a_.rank = rank;
++        a_.n_hca = n_hca;
++        a_.flag_stride = flag_stride;
++        a_.slots = slots;
++        if (threads < world * n_hca || threads % 32 != 0 || threads > 1024) {
++            throw std::invalid_argument("roce: threads must be a multiple of 32, <= 1024 and >= world x HCAs");
++        }
++    }
++
++    // recv [world x nbytes] <- every rank's [nbytes] in rank order, on the current stream
++    void run(uint64_t in, uint64_t out, uint64_t nbytes, int grid, uint64_t stage_ctr, uint64_t tail_ctr,
++             uint64_t timeout_ns) {
++        if (nbytes == 0 || nbytes > a_.slot_bytes || grid < 1 || (grid & (grid - 1)) != 0) {
++            throw std::invalid_argument("roce: gather of " + std::to_string(nbytes) + " bytes on " +
++                                        std::to_string(grid) + " blocks (slot " + std::to_string(a_.slot_bytes) + ")");
++        }
++        GatherArgs a = a_;
++        a.in = reinterpret_cast<const uint8_t *>(in);
++        a.out = reinterpret_cast<uint8_t *>(out);
++        a.nbytes = nbytes;
++        a.stage_ctr = reinterpret_cast<uint32_t *>(stage_ctr);
++        a.tail_ctr = reinterpret_cast<uint32_t *>(tail_ctr);
++        a.timeout_ns = timeout_ns;
++        check_cuda(launch_gather(a, grid, threads_, c10::cuda::getCurrentCUDAStream().stream()), "gather launch");
++    }
++
++  private:
++    GatherArgs a_;
++    int threads_;
++};
++
++// -- tests on one GPU: a thread that plays every peer ------------------------------------------------------------------
++// It polls the doorbell like the proxy and, for each sequence, "delivers" every peer's shard as this rank's staged
++// shard XOR ``xor_key`` into recv[peer][slot], then the per-HCA flags (release stores after a full fence: the NIC's
++// payload-before-flag order). ``stall_after`` >= 0: stop delivering after that many ops (timeout tests).
++class Loop {
++  public:
++    Loop(uint64_t host, uint64_t recv_off, uint64_t flag_off, uint64_t send_off, uint64_t ctrl_off, uint64_t slot_bytes,
++         int world, int rank, int n_hca, int flag_stride, int slots, int xor_key, int64_t stall_after)
++        : region_(reinterpret_cast<uint8_t *>(host)), recv_off_(recv_off), flag_off_(flag_off), send_off_(send_off),
++          ctrl_off_(ctrl_off), slot_bytes_(slot_bytes), world_(world), rank_(rank), n_hca_(n_hca),
++          flag_stride_(flag_stride), slots_(slots), xor_(uint8_t(xor_key)), stall_after_(stall_after) {
++        last_ = ctrl()[CTRL_SEQ];
++        running_.store(1);
++        int rc = pthread_create(&thread_, nullptr, &Loop::tramp, this);
++        if (rc != 0) {
++            running_.store(0);
++            throw std::runtime_error(std::string("roce loop: pthread_create: ") + strerror(rc));
++        }
++    }
++
++    ~Loop() { destroy(); }
++
++    void destroy() {
++        if (running_.exchange(0)) {
++            pthread_join(thread_, nullptr);
++        }
++    }
++
++    int64_t delivered() const { return delivered_.load(); }
++
++  private:
++    volatile uint32_t *ctrl() const { return reinterpret_cast<volatile uint32_t *>(region_ + ctrl_off_); }
++
++    static void *tramp(void *self) {
++        static_cast<Loop *>(self)->run();
++        return nullptr;
++    }
++
++    void run() {
++        volatile uint32_t *c = ctrl();
++        while (running_.load(std::memory_order_relaxed)) {
++            const uint32_t seq = __atomic_load_n(&c[CTRL_SEQ], __ATOMIC_ACQUIRE);
++            if (seq == last_) {
++                continue;
++            }
++            for (uint32_t s = last_ + 1; s != seq + 1; s++) {
++                if (stall_after_ >= 0 && delivered_.load() >= stall_after_) {
++                    break;
++                }
++                const uint32_t slot = s & 1u;
++                const uint32_t nbytes = c[CTRL_SLOT_NBYTES + slot];
++                const uint8_t *send = region_ + send_off_ + size_t(slot) * slot_bytes_;
++                for (int p = 0; p < world_; p++) {
++                    if (p == rank_) {
++                        continue;
++                    }
++                    uint8_t *dst = region_ + recv_off_ + (uint64_t(p) * slots_ + slot) * slot_bytes_;
++                    for (uint32_t i = 0; i < nbytes; i++) {
++                        dst[i] = uint8_t(send[i] ^ xor_);
++                    }
++                    std::atomic_thread_fence(std::memory_order_seq_cst);
++                    for (int h = 0; h < n_hca_; h++) {
++                        uint32_t *flag = reinterpret_cast<uint32_t *>(
++                            region_ + flag_off_ + ((uint64_t(p) * slots_ + slot) * n_hca_ + h) * flag_stride_);
++                        __atomic_store_n(flag, s, __ATOMIC_RELEASE);
++                    }
++                }
++                delivered_.fetch_add(1);
++            }
++            last_ = seq;
++        }
++    }
++
++    uint8_t *region_;
++    uint64_t recv_off_, flag_off_, send_off_, ctrl_off_, slot_bytes_;
++    int world_, rank_, n_hca_, flag_stride_, slots_;
++    uint8_t xor_;
++    int64_t stall_after_;
++    uint32_t last_ = 0;
++    pthread_t thread_{};
++    std::atomic<int> running_{0};
++    std::atomic<int64_t> delivered_{0};
++};
++
++// CUDA's id of the capture the current stream is in, 0 when it is not capturing
++uint64_t capture_id() {
++    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
++    unsigned long long id = 0;
++    check_cuda(cudaStreamGetCaptureInfo(c10::cuda::getCurrentCUDAStream().stream(), &status, &id), "capture info");
++    return status == cudaStreamCaptureStatusActive ? uint64_t(id) : 0;
++}
++
++}  // namespace tfroce
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    using namespace tfroce;
++    m.def("layout", &py_layout);
++    m.def("alloc_pinned", &alloc_pinned);
++    m.def("free_pinned", &free_pinned);
++    m.def("capture_id", &capture_id);
++    m.attr("CTRL_WORDS") = int(CTRL_WORDS);
++    m.attr("MAX_HCAS") = MAX_HCAS;
++    py::class_<Proxy>(m, "Proxy")
++        .def(py::init<int, int, std::vector<std::string>, std::vector<int>, int, uint64_t, uint64_t, uint64_t>())
++        .def("local_blob", &Proxy::local_blob)
++        .def("connect", &Proxy::connect)
++        .def("start", &Proxy::start, py::call_guard<py::gil_scoped_release>())
++        .def("stop", &Proxy::stop, py::call_guard<py::gil_scoped_release>())
++        .def("failed", &Proxy::failed)
++        .def("error", &Proxy::error)
++        .def("stats", &Proxy::stats)
++        .def("destroy", &Proxy::destroy, py::call_guard<py::gil_scoped_release>());
++    py::class_<Launcher>(m, "Launcher")
++        .def(py::init<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, int, int, int, int, int,
++                      int>())
++        .def("run", &Launcher::run);
++    py::class_<Loop>(m, "Loop")
++        .def(py::init<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, int, int, int, int, int, int,
++                      int64_t>())
++        .def("delivered", &Loop::delivered)
++        .def("destroy", &Loop::destroy, py::call_guard<py::gil_scoped_release>());
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce.cu b/src/tensorfold/families/glm5_next/cuda/roce.cu
+new file mode 100644
+index 0000000..ffda11d
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/roce.cu
+@@ -0,0 +1,239 @@
++// One-shot RoCE all-gather kernel for GLM-5.3-Flash's two-Spark tensor parallelism (patches/0230).
++//
++// Adapted from b12x's RoCEnante all-gather (b12x/comm/roce/_allgather_cute.py and _cute_intrinsics.py,
++// https://github.com/local-inference-lab/b12x, Copyright 2026 Luke Alonso and the b12x contributors, Apache
++// License 2.0; see LICENSES/Apache-2.0.txt and THIRD_PARTY_NOTICES.md). Changes: rewritten from CuTe DSL into
++// CUDA C++; only the dim-0 concatenation (NCCL's all-gather layout); any input/output alignment and any byte
++// count (the send slot is padded to 16 bytes, only nbytes are copied out); a wall-clock timeout (%globaltimer)
++// instead of a poll count; b12x PR #438's host-visible completion word and wrap-safe failure flag; the poison word
++// read once per block (no divergent early exit around a barrier).
++//
++// Protocol (one op, sequence seq = epoch + 1, slot = seq & 1; see roce.cpp for the pinned region's layout):
++//   1. every block stages its share of the input into the pinned send slot;
++//   2. the last block to finish staging publishes the padded byte count and rings the doorbell (ctrl[0] = seq)
++//      that the host proxy thread polls; the proxy RDMA-writes the slot to the peer, then a 4-byte seq flag on
++//      the same reliable-connected queue pair (so the flag lands after the payload), striped over the HCAs;
++//   3. one thread per (peer, HCA) spins on the peer's flag in this rank's pinned region with system-scope
++//      acquire loads, until it reads seq or the timeout expires (then: error words + poison, fail-stop);
++//   4. every block copies its share of every rank's shard into the output, rank order (the local shard from the
++//      input, the peer's from the NIC-written receive slot with system-scope loads);
++//   5. the last block to finish advances the device-resident epoch (so a replayed CUDA graph carries on with
++//      the next sequence) and mirrors it into the host-visible completion word.
++// Data are only moved, never combined: the gathered bytes equal NCCL's.
++
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++#include "roce_common.h"
++
++namespace tfroce {
++
++__device__ __forceinline__ uint32_t ld_relaxed_gpu(const uint32_t *p) {
++    uint32_t v;
++    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
++    return v;
++}
++
++__device__ __forceinline__ uint32_t ld_relaxed_sys(const uint32_t *p) {
++    uint32_t v;
++    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
++    return v;
++}
++
++__device__ __forceinline__ uint32_t ld_acquire_sys(const uint32_t *p) {
++    uint32_t v;
++    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
++    return v;
++}
++
++__device__ __forceinline__ uint4 ld_relaxed_sys_v4(const void *p) {
++    uint4 v;
++    asm volatile("ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];"
++                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
++                 : "l"(p)
++                 : "memory");
++    return v;
++}
++
++__device__ __forceinline__ uint32_t ld_relaxed_sys_u8(const uint8_t *p) {
++    uint32_t v;
++    asm volatile("ld.relaxed.sys.global.u8 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
++    return v;
++}
++
++__device__ __forceinline__ void st_relaxed_sys(uint32_t *p, uint32_t v) {
++    asm volatile("st.relaxed.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
++}
++
++__device__ __forceinline__ void st_release_gpu(uint32_t *p, uint32_t v) {
++    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
++}
++
++__device__ __forceinline__ uint32_t atom_add_relaxed_gpu(uint32_t *p, uint32_t v) {
++    uint32_t old;
++    asm volatile("atom.relaxed.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
++    return old;
++}
++
++__device__ __forceinline__ void fence_sc_sys() { asm volatile("fence.sc.sys;" ::: "memory"); }
++
++__device__ __forceinline__ void fence_sc_gpu() { asm volatile("fence.sc.gpu;" ::: "memory"); }
++
++__device__ __forceinline__ uint64_t globaltimer() {
++    uint64_t t;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++    return t;
++}
++
++// Spin until *flag == want (system scope, acquire). false after timeout_ns of wall-clock time without a match.
++__device__ __noinline__ bool wait_flag(const uint32_t *flag, uint32_t want, uint64_t timeout_ns) {
++    const uint64_t t0 = globaltimer();
++    uint32_t polls = 0;
++    while (true) {
++        if (ld_acquire_sys(flag) == want) {
++            return true;
++        }
++        if ((++polls & 1023u) == 0u && globaltimer() - t0 > timeout_ns) {
++            return ld_acquire_sys(flag) == want;   // one last look
++        }
++    }
++}
++
++// dst[i] <- src[i] for i in [0, n), a grid-stride loop; vector width chosen from the alignment of both pointers and n.
++// ``sys_src``: the source is NIC-written pinned memory, read with system-scope loads.
++template <bool SysSrc>
++__device__ __forceinline__ void copy_bytes(uint8_t *dst, const uint8_t *src, uint64_t n, uint64_t index,
++                                           uint64_t stride) {
++    const uint64_t a = reinterpret_cast<uint64_t>(dst) | reinterpret_cast<uint64_t>(src) | n;
++    if ((a & 15u) == 0u) {
++        const uint64_t packs = n >> 4;
++        for (uint64_t i = index; i < packs; i += stride) {
++            uint4 v;
++            if (SysSrc) {
++                v = ld_relaxed_sys_v4(src + (i << 4));
++            } else {
++                v = reinterpret_cast<const uint4 *>(src)[i];
++            }
++            reinterpret_cast<uint4 *>(dst)[i] = v;
++        }
++    } else if ((a & 3u) == 0u) {
++        const uint64_t words = n >> 2;
++        for (uint64_t i = index; i < words; i += stride) {
++            uint32_t v;
++            if (SysSrc) {
++                v = ld_relaxed_sys(reinterpret_cast<const uint32_t *>(src) + i);
++            } else {
++                v = reinterpret_cast<const uint32_t *>(src)[i];
++            }
++            reinterpret_cast<uint32_t *>(dst)[i] = v;
++        }
++    } else {
++        for (uint64_t i = index; i < n; i += stride) {
++            uint32_t v;
++            if (SysSrc) {
++                v = ld_relaxed_sys_u8(src + i);
++            } else {
++                v = src[i];
++            }
++            dst[i] = static_cast<uint8_t>(v);
++        }
++    }
++}
++
++__global__ void __launch_bounds__(1024) gather_kernel(GatherArgs a) {
++    __shared__ uint32_t s_flag;
++    const uint32_t tid = threadIdx.x;
++    const uint32_t gdim = gridDim.x;
++    const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + tid;
++    const uint64_t stride = static_cast<uint64_t>(gdim) * blockDim.x;
++    uint32_t *ctrl = reinterpret_cast<uint32_t *>(a.ctrl_base);
++
++    // A recorded timeout poisons the runtime: later launches do nothing (the host raises on its next check).
++    // One read per block, so no thread of the block leaves before a barrier the others wait at.
++    if (tid == 0) {
++        s_flag = ld_relaxed_gpu(a.poison);
++    }
++    __syncthreads();
++    if (s_flag != 0u) {
++        return;
++    }
++    const uint32_t seq = ld_relaxed_gpu(a.epoch) + 1u;
++    const uint64_t slot = seq & 1u;
++    uint8_t *send = reinterpret_cast<uint8_t *>(a.send_base + slot * a.slot_bytes);
++
++    // 1. stage this rank's shard into the pinned send slot
++    copy_bytes<false>(send, a.in, a.nbytes, index, stride);
++    __syncthreads();
++
++    // 2. the last block to finish staging rings the proxy's doorbell (one system fence per block after the
++    //    barrier orders the block's staging stores before its arrival)
++    if (tid == 0) {
++        fence_sc_sys();
++        const uint32_t prior = atom_add_relaxed_gpu(a.stage_ctr, 1u);
++        if (((prior + 1u) & (gdim - 1u)) == 0u) {
++            const uint32_t padded = static_cast<uint32_t>((a.nbytes + 15u) & ~static_cast<uint64_t>(15u));
++            st_relaxed_sys(ctrl + CTRL_NBYTES, padded);
++            st_relaxed_sys(ctrl + CTRL_SLOT_NBYTES + slot, padded);
++            fence_sc_sys();
++            st_relaxed_sys(ctrl + CTRL_SEQ, seq);
++        }
++    }
++
++    // 3. wait for every peer's per-HCA flag of this sequence
++    if (tid < static_cast<uint32_t>(a.world * a.n_hca)) {
++        const int peer = static_cast<int>(tid) / a.n_hca;
++        const int hca = static_cast<int>(tid) - peer * a.n_hca;
++        if (peer != a.rank) {
++            const uint32_t *flag = reinterpret_cast<const uint32_t *>(
++                a.flag_base + ((static_cast<uint64_t>(peer) * a.slots + slot) * a.n_hca + hca) * a.flag_stride);
++            if (!wait_flag(flag, seq, a.timeout_ns)) {
++                st_relaxed_sys(ctrl + CTRL_ERR_PEER, static_cast<uint32_t>(peer));
++                st_relaxed_sys(ctrl + CTRL_ERR_HCA, static_cast<uint32_t>(hca));
++                st_relaxed_sys(ctrl + CTRL_ERR_SEQ, seq);
++                st_relaxed_sys(ctrl + CTRL_FAILED, 1u);
++                fence_sc_sys();
++                st_release_gpu(a.poison, 1u);
++            }
++        }
++    }
++    __syncthreads();
++    if (tid == 0) {
++        s_flag = ld_relaxed_gpu(a.poison);
++    }
++    __syncthreads();
++
++    // 4. every rank's shard, in rank order (a timed-out wait leaves the peer slot unreliable: nothing is copied)
++    if (s_flag == 0u) {
++        for (int src = 0; src < a.world; src++) {
++            uint8_t *dst = a.out + static_cast<uint64_t>(src) * a.nbytes;
++            if (src == a.rank) {
++                copy_bytes<false>(dst, a.in, a.nbytes, index, stride);
++            } else {
++                const uint8_t *peer_slot = reinterpret_cast<const uint8_t *>(
++                    a.recv_base + (static_cast<uint64_t>(src) * a.slots + slot) * a.slot_bytes);
++                copy_bytes<true>(dst, peer_slot, a.nbytes, index, stride);
++            }
++        }
++    }
++
++    // 5. the last block to finish publishes the next epoch (not after a failure: later launches stay no-ops)
++    fence_sc_gpu();
++    __syncthreads();
++    if (tid == 0) {
++        const uint32_t prior = atom_add_relaxed_gpu(a.tail_ctr, 1u);
++        if (((prior + 1u) & (gdim - 1u)) == 0u) {
++            fence_sc_gpu();
++            if (ld_relaxed_sys(ctrl + CTRL_FAILED) == 0u) {
++                st_release_gpu(a.epoch, seq);
++                st_relaxed_sys(ctrl + CTRL_COMPLETED, seq);
++            }
++        }
++    }
++}
++
++cudaError_t launch_gather(const GatherArgs &args, int grid, int threads, cudaStream_t stream) {
++    gather_kernel<<<grid, threads, 0, stream>>>(args);
++    return cudaGetLastError();
++}
++
++}  // namespace tfroce
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce.py b/src/tensorfold/families/glm5_next/cuda/roce.py
+new file mode 100644
+index 0000000..83f4f9f
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/roce.py
+@@ -0,0 +1,709 @@
++"""One-shot RoCE all-gather for the decode-sized exchanges of GLM-5.3-Flash's two-Spark tensor parallelism
++(patches/0230, ``GLM53_TF_COMM_BACKEND=roce``).
++
++Why
++---
++Every forward exchanges 90 fp32 partials (16 KiB a row a rank; ``docs/COMM-ANALYSIS.md``). NCCL's all-gather
++captured in a CUDA graph costs about 27 us however small the payload: its kernel hands the send to NCCL's network
++proxy thread, and the one-row step spends ~2.4 ms of its ~30 ms there, all latency. This transport is b12x's
++"RoCEnante" (https://github.com/local-inference-lab/b12x, ``b12x/comm/roce``, Apache-2.0; adapted in
++``roce.cpp`` / ``roce.cu``, see their headers): each rank owns a pinned host region that the ConnectX-7 RDMA-writes
++into and the GB10 reads in place (no GPUDirect RDMA needed); one kernel stages the shard, rings a doorbell that a
++busy-spinning C++ proxy thread turns into RDMA writes (payload, then a 4-byte sequence flag on the same RC queue
++pair, striped over both CX7 PCIe functions), waits for the peer's flags with system-scope loads and copies the shards
++out in rank order. The epoch lives on the device, so a replayed CUDA graph continues the sequence.
++
++Exactness: an all-gather moves bytes. The output is every rank's shard in rank order, exactly NCCL's layout and
++bits; the consumers (``glue.hc_post``, the MTP head's residual add, the drafter's row sum, the samplers) are
++unchanged, so both ranks still add the same partials rank 0 first and hold identical bits.
++
++What goes over RoCE
++-------------------
++Only the model's own exchanges, through ``comm.fast_gather``: ``forward.gather`` (every block's partials; decode,
++verify, MTP, batched rounds and prefill chunks that fit), the samplers' candidate exchanges, the DFlash2 drafter's
++rows and candidates, and 0084's pipelined prefill exchanges -- each only when one rank's shard is at most
++``GLM53_TF_ROCE_MAX_KB`` (default 256 KiB: a 16-row fp32 window; larger ones stay on NCCL). Everything else stays
++on NCCL: the engine's control exchanges (settings checks, request headers and prompts sent to rank 1, calibration),
++in particular the follower's idle wait for the next request, which must be able to wait forever.
++
++Knobs (both ranks must agree on all but the CPU; checked at load)
++-----------------------------------------------------------------
++``GLM53_TF_COMM_BACKEND``   ``nccl`` (default) | ``roce``
++``GLM53_TF_ROCE_MAX_KB``    largest shard (KiB a rank) sent over RoCE; also the slot size (pinned: 6 slots). 256
++``GLM53_TF_ROCE_TIMEOUT_S`` a wait for the peer's flag gives up after this many seconds (fail-stop, below). 120
++``GLM53_TF_ROCE_HCA``       ``name[:gid],...`` RDMA devices (and optionally RoCE v2 GID indices); default: every
++                            ACTIVE Ethernet port, GID auto-detected
++``GLM53_TF_ROCE_HCAS``      stripe over at most this many HCAs (1 or 2). 2
++``GLM53_TF_ROCE_BLOCKS`` / ``_THREADS``   largest kernel grid (power of two) / threads a block. 8 / 512
++``GLM53_TF_ROCE_TC``        RoCE traffic class (DSCP/ECN byte); default ``NCCL_IB_TC`` or 0
++``GLM53_TF_ROCE_CPU``       pin the proxy thread to this CPU (default: not pinned; the thread busy-spins one core)
++``GLM53_TF_ROCE_FALLBACK``  ``nccl`` (default): a failed setup or load-time probe on either rank -> both ranks
++                            serve on NCCL, with a log line; ``error``: refuse to start
++``GLM53_TF_ROCE_MARK``      file written when a RoCE collective fails at run time; while it exists (on either rank)
++                            both ranks start on NCCL. Default ``/cache/roce-failed`` when ``/cache`` exists; empty:
++                            none. Delete it to try RoCE again.
++
++GIDs: RoCE v2 GID indices move on reboot and differ per port, so they are never hard-coded: for each ACTIVE port
++the lowest index whose type is ``RoCE v2`` and whose GID is IPv4-mapped (``::ffff:a.b.c.d``) is used (the same rule
++as the vLLM kit's ``detect-gids.sh``). The ranks' HCAs are paired by IPv4 subnet (e.g. rocep1s0f1 <-> a.b.100.x,
++roceP2p1s0f1 <-> a.b.101.x), so names and order may differ between the nodes.
++
++Failure model (b12x issues #313 / PR #438, sparkring #278)
++-----------------------------------------------------------
++Setup (HCA detection, queue pairs, a probe gather compared with NCCL's result) is collective: any failure on any
++rank makes both ranks fall back to NCCL (or both refuse, with ``GLM53_TF_ROCE_FALLBACK=error``). At run time a wait
++that times out records the peer, HCA and sequence in the host-visible control record, sets a wrap-safe failure word
++and poisons the runtime (later launches do nothing, so a wedged peer costs one timeout, not one per exchange). The
++engine checks after every sampler exchange (each step has one, after the step's graphs) and raises a clear error
++that says whether the peer's flag had reached this host's memory (lost in the GPU's view, sparkring #278's
++signature) or never arrived, and what this rank's proxy had posted; the marker file makes the restarted pair use
++NCCL. A timed-out step's data are not trusted: nothing derived from it is returned.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import fcntl
++import json
++import os
++import socket
++import struct
++import sys
++import threading
++import time
++from dataclasses import dataclass
++from pathlib import Path
++
++import numpy as np
++import torch
++
++BACKEND_ENV = "GLM53_TF_COMM_BACKEND"
++BACKENDS = ("nccl", "roce")
++PACK = 16
++SLOT_ALIGN = 4096
++SYSFS = "/sys/class/infiniband"
++PROBE_TIMEOUT_S = 15.0
++DEFAULT_MARK = "/cache/roce-failed"
++# control record words (roce_common.h)
++CTRL_SEQ, CTRL_NBYTES, CTRL_ERR_SEQ, CTRL_ERR_PEER, CTRL_SLOT_NBYTES, CTRL_ERR_HCA, CTRL_FAILED, CTRL_COMPLETED = \
++    0, 1, 2, 3, 4, 6, 7, 8
++CTRL_WORDS = 9
++MAX_HCAS = 2
++
++
++class RoceError(RuntimeError):
++    """A RoCE collective failed at run time (timeout or proxy error); the runtime is poisoned."""
++
++
++class SetupError(RuntimeError):
++    """RoCE setup failed on some rank (every rank raises it, with every rank's reason)."""
++
++
++def _log(msg: str) -> None:
++    print(f"[tensorfold] roce: {msg}", file=sys.stderr, flush=True)
++
++
++# -- knobs ------------------------------------------------------------------------------------------------------------
++def backend(raw: str | None = None) -> str:
++    v = (os.environ.get(BACKEND_ENV, "") if raw is None else raw).strip().lower() or "nccl"
++    if v not in BACKENDS:
++        raise ValueError(f"{BACKEND_ENV}={v!r}: expected nccl or roce")
++    return v
++
++
++@dataclass(frozen=True)
++class Settings:
++    max_bytes: int = 256 * 1024
++    timeout_s: float = 120.0
++    hcas: int = 2
++    blocks: int = 8
++    threads: int = 512
++    traffic_class: int = 0
++    fallback: str = "nccl"
++    cpu: int = -1
++    hca_spec: str = ""
++
++    def agreed(self) -> list[int]:
++        """The integers both ranks must share (everything but the proxy's CPU and the device names)."""
++
++        return [self.max_bytes, int(round(self.timeout_s * 1000)), self.hcas, self.blocks, self.threads,
++                self.traffic_class, int(self.fallback == "error")]
++
++
++def _int(name: str, default: int, lo: int, hi: int) -> int:
++    raw = os.environ.get(name, "").strip()
++    if not raw:
++        return default
++    try:
++        v = int(raw, 0)
++    except ValueError:
++        raise ValueError(f"{name}={raw!r}: expected an integer") from None
++    if not lo <= v <= hi:
++        raise ValueError(f"{name}={v}: expected {lo}..{hi}")
++    return v
++
++
++def settings() -> Settings:
++    kb = _int("GLM53_TF_ROCE_MAX_KB", 256, 1, 65536)
++    raw_t = os.environ.get("GLM53_TF_ROCE_TIMEOUT_S", "").strip()
++    try:
++        timeout = float(raw_t) if raw_t else 120.0
++    except ValueError:
++        raise ValueError(f"GLM53_TF_ROCE_TIMEOUT_S={raw_t!r}: expected seconds") from None
++    if not 0.01 <= timeout <= 86400:
++        raise ValueError(f"GLM53_TF_ROCE_TIMEOUT_S={timeout}: expected 0.01..86400")
++    blocks = _int("GLM53_TF_ROCE_BLOCKS", 8, 1, 64)
++    if blocks & (blocks - 1):
++        raise ValueError(f"GLM53_TF_ROCE_BLOCKS={blocks}: expected a power of two")   # the arrival counters' modulus
++    threads = _int("GLM53_TF_ROCE_THREADS", 512, 32, 1024)
++    if threads % 32:
++        raise ValueError(f"GLM53_TF_ROCE_THREADS={threads}: expected a multiple of 32")
++    tc_name = "GLM53_TF_ROCE_TC" if os.environ.get("GLM53_TF_ROCE_TC", "").strip() else "NCCL_IB_TC"
++    fallback = os.environ.get("GLM53_TF_ROCE_FALLBACK", "").strip().lower() or "nccl"
++    if fallback not in ("nccl", "error"):
++        raise ValueError(f"GLM53_TF_ROCE_FALLBACK={fallback!r}: expected nccl or error")
++    return Settings(max_bytes=kb * 1024, timeout_s=timeout, hcas=_int("GLM53_TF_ROCE_HCAS", 2, 1, MAX_HCAS),
++                    blocks=blocks, threads=threads, traffic_class=_int(tc_name, 0, 0, 255), fallback=fallback,
++                    cpu=_int("GLM53_TF_ROCE_CPU", -1, -1, 4095), hca_spec=os.environ.get("GLM53_TF_ROCE_HCA", ""))
++
++
++def marker() -> Path | None:
++    raw = os.environ.get("GLM53_TF_ROCE_MARK")
++    if raw is None:
++        return Path(DEFAULT_MARK) if Path(DEFAULT_MARK).parent.is_dir() else None
++    return Path(raw) if raw.strip() else None
++
++
++# -- HCAs and GIDs ----------------------------------------------------------------------------------------------------
++@dataclass(frozen=True)
++class Hca:
++    name: str
++    gid_index: int
++    ipv4: str | None = None
++    prefix: int = 24
++    netdev: str | None = None
++
++    def key(self) -> tuple:
++        """What pairs this port with a peer's: its IPv4 subnet (else its name)."""
++
++        if self.ipv4 is None:
++            return ("name", self.name)
++        ip = int.from_bytes(socket.inet_aton(self.ipv4), "big")
++        mask = (0xFFFFFFFF << (32 - self.prefix)) & 0xFFFFFFFF
++        return ("net", ip & mask, self.prefix)
++
++
++def _read(path: Path) -> str | None:
++    try:
++        return path.read_text().strip()
++    except OSError:
++        return None
++
++
++def ipv4_of_gid(gid: str) -> str | None:
++    """``0000:...:ffff:c633:640a`` -> ``198.51.100.10``; None for a GID that is not IPv4-mapped."""
++
++    h = gid.replace(":", "").lower()
++    if len(h) != 32 or h[:20] != "0" * 20 or h[20:24] != "ffff":
++        return None
++    return ".".join(str(int(h[24 + 2 * i:26 + 2 * i], 16)) for i in range(4))
++
++
++def _prefix(netdev: str | None) -> int:
++    """The IPv4 prefix length of ``netdev`` (SIOCGIFNETMASK), 24 when unknown."""
++
++    if not netdev:
++        return 24
++    try:
++        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
++            res = fcntl.ioctl(s.fileno(), 0x891B, struct.pack("256s", netdev.encode()[:15]))
++        return bin(int.from_bytes(res[20:24], "big")).count("1")
++    except OSError:
++        return 24
++
++
++def parse_hca_spec(spec: str) -> list[tuple[str, int | None]]:
++    out = []
++    for item in spec.split(","):
++        item = item.strip()
++        if not item:
++            continue
++        name, _, gid = item.partition(":")
++        try:
++            out.append((name.strip(), int(gid) if gid.strip() else None))
++        except ValueError:
++            raise ValueError(f"GLM53_TF_ROCE_HCA: {item!r}: expected name or name:gid_index") from None
++    return out
++
++
++def detect(spec: str = "", root: str | None = None) -> list[Hca]:
++    """Active RoCE ports with their RoCE v2 GID index (the lowest IPv4-mapped one; ``name:gid`` in ``spec`` forces
++    it). ``spec`` (``GLM53_TF_ROCE_HCA``) restricts to the named devices, in its order."""
++
++    wanted = parse_hca_spec(spec)
++    base = Path(root or SYSFS)
++    names = [n for n, _ in wanted] if wanted else sorted(p.name for p in base.iterdir()) if base.is_dir() else []
++    forced = dict(wanted)
++    out = []
++    for name in names:
++        port = base / name / "ports" / "1"
++        state = _read(port / "state")
++        if state is None or "ACTIVE" not in state:
++            if wanted:
++                raise ValueError(f"GLM53_TF_ROCE_HCA: {name} port 1 is {state or 'missing'}, not ACTIVE")
++            continue
++        link = _read(port / "link_layer")
++        if link is not None and link != "Ethernet":
++            continue
++        try:
++            indices = sorted(int(x) for x in os.listdir(port / "gids"))
++        except OSError:
++            indices = []
++        chosen = None
++        for i in indices:
++            gid = _read(port / "gids" / str(i))
++            if gid is None:
++                continue
++            if forced.get(name) is not None and i != forced[name]:
++                continue
++            if forced.get(name) is None and _read(port / "gid_attrs" / "types" / str(i)) != "RoCE v2":
++                continue
++            ip = ipv4_of_gid(gid)
++            if ip is None and forced.get(name) is None:
++                continue
++            netdev = _read(port / "gid_attrs" / "ndevs" / str(i))
++            chosen = Hca(name, i, ip, _prefix(netdev) if ip else 24, netdev)
++            break
++        if chosen is None and forced.get(name) is not None:
++            chosen = Hca(name, int(forced[name]))
++        if chosen is None:
++            if wanted:
++                raise ValueError(f"GLM53_TF_ROCE_HCA: {name} has no IPv4-mapped RoCE v2 GID")
++            continue
++        out.append(chosen)
++    return out
++
++
++def pair(lists: list[list[Hca]], most: int) -> list[list[int]]:
++    """Per rank, the indices of the HCAs to use, HCA h of every rank on one subnet (rank 0's order); at most
++    ``most``. The same answer on every rank (a function of every rank's list)."""
++
++    chosen: list[list[int]] = [[] for _ in lists]
++    for i, h0 in enumerate(lists[0]):
++        if len(chosen[0]) >= most:
++            break
++        picks = [i]
++        for r in range(1, len(lists)):
++            j = next((j for j, h in enumerate(lists[r]) if j not in chosen[r] and h.key() == h0.key()), None)
++            if j is None:
++                break
++            picks.append(j)
++        if len(picks) == len(lists):
++            for r, j in enumerate(picks):
++                chosen[r].append(j)
++    return chosen
++
++
++# -- the extension ----------------------------------------------------------------------------------------------------
++_EXT = None
++
++
++def _ext():
++    global _EXT
++    if _EXT is None:
++        from torch.utils.cpp_extension import load
++
++        here = Path(__file__).parent
++        _EXT = load(name="tensorfold_glm_roce_v1", sources=[str(here / "roce.cpp"), str(here / "roce.cu")],
++                    extra_cflags=["-O2"], extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
++    return _EXT
++
++
++def _align(v: int, a: int) -> int:
++    return (int(v) + a - 1) // a * a
++
++
++def grid_blocks(nbytes: int, threads: int, most: int) -> int:
++    """A power-of-two grid with about two 16-byte packs a thread (b12x's choice), at most ``most`` blocks."""
++
++    packs = max(1, (int(nbytes) + PACK - 1) // PACK)
++    need = max(1, (packs + 2 * threads - 1) // (2 * threads))
++    return min(1 << (need - 1).bit_length(), most)
++
++
++class Runtime:
++    """This rank's pinned region, device counters, kernel launcher and RDMA proxy (``hcas``), or, for tests on one
++    GPU, a loop-back thread that plays the peers (``loop_xor``: every peer's shard = this rank's XOR the key)."""
++
++    def __init__(self, *, rank: int, world: int, hcas: list[Hca], s: Settings, loop_xor: int | None = None,
++                 loop_stall_after: int = -1, n_hca: int | None = None) -> None:
++        ext = _ext()
++        self.ext, self.rank, self.world, self.s = ext, rank, world, s
++        self.hcas = list(hcas)
++        self.n_hca = len(self.hcas) if n_hca is None else int(n_hca)
++        if not 1 <= self.n_hca <= MAX_HCAS:
++            raise ValueError(f"roce: {self.n_hca} HCAs")
++        self.slot_bytes = _align(max(s.max_bytes, PACK), SLOT_ALIGN)
++        (self.recv_off, self.flag_off, self.send_off, self.ctrl_off, self.total, self.flag_stride,
++         self.slots) = (int(v) for v in ext.layout(world, self.slot_bytes))
++        self.host, self.dev = (int(v) for v in ext.alloc_pinned(self.total))
++        self._freed = False
++        self.proxy = None
++        self.loop = None
++        self.classes = s.blocks.bit_length()
++        # epoch, stage arrivals per grid size, tail arrivals per grid size, poison
++        self.counters = torch.zeros(2 + 2 * self.classes, dtype=torch.int32, device="cuda")
++        base = self.counters.data_ptr()
++        self._epoch_addr, self._poison_addr = base, base + 4 * (1 + 2 * self.classes)
++        words = (ctypes.c_uint32 * CTRL_WORDS).from_address(self.host + self.ctrl_off)
++        self.ctrl = np.frombuffer(words, dtype=np.uint32)
++        nflag = world * self.slots * MAX_HCAS * self.flag_stride // 4
++        self.flags = np.frombuffer((ctypes.c_uint32 * nflag).from_address(self.host + self.flag_off), dtype=np.uint32)
++        d = self.dev
++        self.launcher = ext.Launcher(d + self.recv_off, d + self.flag_off, d + self.send_off, d + self.ctrl_off,
++                                     self.slot_bytes, self._epoch_addr, self._poison_addr, world, rank, self.n_hca,
++                                     self.flag_stride, self.slots, s.threads)
++        self.timeout_ns = int(s.timeout_s * 1e9)
++        self.lock = threading.Lock()
++        self.event = torch.cuda.Event()
++        self._last: tuple | None = None           # (stream, capture id) of the last collective
++        self.ops = 0
++        self._reported = False
++        self.marking = True                        # a run-time failure leaves the marker (not the load-time probe)
++        try:
++            if loop_xor is not None:
++                self.loop = ext.Loop(self.host, self.recv_off, self.flag_off, self.send_off, self.ctrl_off,
++                                     self.slot_bytes, world, rank, self.n_hca, self.flag_stride, self.slots,
++                                     int(loop_xor) & 0xFF, int(loop_stall_after))
++            else:
++                self.proxy = ext.Proxy(world, rank, [h.name for h in self.hcas], [h.gid_index for h in self.hcas],
++                                       s.traffic_class, self.host, self.total, self.slot_bytes)
++        except Exception:
++            self._free()
++            raise
++
++    # -- setup
++    def blob(self) -> bytes:
++        return bytes(self.proxy.local_blob())
++
++    def connect(self, blobs: list[bytes]) -> None:
++        self.proxy.connect(b"".join(blobs))
++        self.proxy.start(self.s.cpu)
++
++    # -- the collective
++    def _counter_addrs(self, blocks: int) -> tuple[int, int]:
++        c = blocks.bit_length() - 1
++        return self._epoch_addr + 4 * (1 + c), self._epoch_addr + 4 * (1 + self.classes + c)
++
++    def _order(self) -> None:
++        """One epoch, one doorbell, two slots: collectives must run in launch order even across streams. Eager, or
++        both in one capture: a switch of stream waits for the previous stream (an event recorded there now covers
++        the last collective). A capture starts after a device sync, so its first collective needs no edge."""
++
++        cur = torch.cuda.current_stream()
++        cid = int(self.ext.capture_id()) if torch.cuda.is_current_stream_capturing() else 0
++        last = self._last
++        if last is not None and last[0] != cur and last[1] == cid:
++            self.event.record(last[0])
++            cur.wait_event(self.event)
++        self._last = (cur, cid)
++
++    def gather(self, send: torch.Tensor, recv: torch.Tensor, timeout_ns: int | None = None) -> None:
++        """recv [world x n] <- every rank's send [n], rank order (NCCL's all-gather), on the current stream."""
++
++        nbytes = send.numel() * send.element_size()
++        if recv.numel() * recv.element_size() != self.world * nbytes or recv.dtype != send.dtype:
++            raise ValueError("roce all_gather: recv must hold world x send of the same dtype")
++        if not (send.is_contiguous() and recv.is_contiguous() and send.is_cuda and recv.is_cuda):
++            raise ValueError("roce all_gather: contiguous CUDA tensors only")
++        if nbytes == 0:
++            return
++        with self.lock:
++            capturing = torch.cuda.is_current_stream_capturing()
++            if not capturing:
++                self.check()
++            self._order()
++            blocks = grid_blocks(nbytes, self.s.threads, self.s.blocks)
++            stage, tail = self._counter_addrs(blocks)
++            self.launcher.run(send.data_ptr(), recv.data_ptr(), nbytes, blocks, stage, tail,
++                              self.timeout_ns if timeout_ns is None else int(timeout_ns))
++            self.ops += 1
++
++    # -- health
++    @property
++    def failed(self) -> bool:
++        return bool(self.ctrl[CTRL_FAILED]) or (self.proxy is not None and self.proxy.failed())
++
++    def check(self) -> None:
++        """Raise ``RoceError`` if a wait timed out or the proxy stopped on an error (two host memory reads). Reads no
++        device memory and never synchronizes, so it is safe while a kernel is still running."""
++
++        proxy_failed = self.proxy is not None and self.proxy.failed()
++        if not self.ctrl[CTRL_FAILED] and not proxy_failed:
++            return
++        msg = self.diagnose()
++        if not self._reported:
++            self._reported = True
++            _log(msg)
++            mark = marker() if self.marking else None
++            if mark is not None:
++                try:
++                    mark.write_text(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} rank {self.rank}: {msg}\n")
++                except OSError:
++                    pass
++        raise RoceError(msg)
++
++    def snapshot(self) -> dict:
++        """The control record, every flag word per (peer, slot, HCA) and the proxy's counters, from host memory."""
++
++        flags = {}
++        for p in range(self.world):
++            if p == self.rank:
++                continue
++            for slot in range(self.slots):
++                for h in range(self.n_hca):
++                    flags[f"{p}/{slot}/{h}"] = int(self.flags[self._flag_word(p, slot, h)])
++        out = {"doorbell": int(self.ctrl[CTRL_SEQ]), "completed": int(self.ctrl[CTRL_COMPLETED]),
++               "failed": int(self.ctrl[CTRL_FAILED]), "err_seq": int(self.ctrl[CTRL_ERR_SEQ]),
++               "err_peer": int(self.ctrl[CTRL_ERR_PEER]), "err_hca": int(self.ctrl[CTRL_ERR_HCA]),
++               "flags": flags, "ops": self.ops}
++        if self.proxy is not None:
++            st = [int(v) for v in self.proxy.stats()]
++            out.update(ops_posted=st[0], writes_completed=st[1], proxy_last_seq=st[2],
++                       per_hca=[{"writes": st[3 + 2 * h], "bytes": st[4 + 2 * h]} for h in range(self.n_hca)],
++                       proxy_error=self.proxy.error())
++        return out
++
++    def _flag_word(self, peer: int, slot: int, hca: int) -> int:
++        return ((peer * self.slots + slot) * self.n_hca + hca) * self.flag_stride // 4
++
++    def diagnose(self) -> str:
++        snap = self.snapshot()
++        if self.proxy is not None and self.proxy.failed():
++            return (f"RoCE proxy on rank {self.rank} stopped: {snap.get('proxy_error')} (doorbell "
++                    f"{snap['doorbell']}, completed {snap['completed']}); the runtime is unusable")
++        seq, peer, h = snap["err_seq"], snap["err_peer"], snap["err_hca"]
++        seen = int(self.flags[self._flag_word(peer, seq & 1, h)]) if peer < self.world and h < self.n_hca else -1
++        name = self.hcas[h].name if h < len(self.hcas) else f"HCA {h}"
++        where = ("the flag HAS reached this host's memory (the GPU did not observe it: sparkring #278's signature)"
++                 if seen == seq else f"the flag never arrived (host memory holds {seen})")
++        posted = f", this rank's proxy posted up to {snap['proxy_last_seq']}" if "proxy_last_seq" in snap else ""
++        return (f"RoCE all-gather on rank {self.rank} timed out after {self.s.timeout_s:g} s waiting for rank "
++                f"{peer} on {name} at sequence {seq}: {where}; doorbell {snap['doorbell']}, completed "
++                f"{snap['completed']}{posted}. The runtime is poisoned (later exchanges do nothing) and this step's "
++                f"data are not trusted: restart both ranks (GLM53_TF_COMM_BACKEND=nccl avoids RoCE; "
++                f"{marker() or 'GLM53_TF_ROCE_MARK'} makes the next start use NCCL)")
++
++    # -- teardown
++    def _free(self) -> None:
++        if not self._freed:
++            self._freed = True
++            self.ext.free_pinned(self.host)
++
++    def close(self, free: bool = True) -> None:
++        """Stop the proxy (or loop) and release the queue pairs; ``free``: also the pinned region (only when no
++        kernel can still use it: after a device sync)."""
++
++        for x in (self.proxy, self.loop):
++            if x is not None:
++                x.destroy()
++        self.proxy = self.loop = None
++        if free:
++            self._free()
++
++
++class RoceComm:
++    """The engine's communicator with the RoCE runtime beside NCCL: ``all_gather`` (control exchanges) stays on
++    ``base``; ``all_gather_fast`` (the model's exchanges) goes over RoCE when one rank's shard is at most
++    ``max_bytes`` (a decision of the size alone, so both ranks take the same path)."""
++
++    def __init__(self, base, rt, max_bytes: int) -> None:
++        self.base, self.rt, self.max_bytes = base, rt, int(max_bytes)
++        self.rank, self.world = base.rank, base.world
++        self.fast_ops = self.slow_ops = 0
++
++    def __getattr__(self, name):                   # store, lib, comm, ... of the NCCL communicator
++        if name == "base":
++            raise AttributeError(name)
++        return getattr(self.base, name)
++
++    def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
++        self.base.all_gather(send, recv)
++
++    def all_gather_fast(self, send: torch.Tensor, recv: torch.Tensor) -> None:
++        n = send.numel() * send.element_size()
++        if 0 < n <= self.max_bytes and send.is_contiguous() and recv.is_contiguous():
++            self.rt.gather(send, recv)
++            self.fast_ops += 1
++        else:
++            self.base.all_gather(send, recv)
++            self.slow_ops += 1
++
++    def barrier(self) -> None:
++        self.base.barrier()
++        self.rt.check()
++
++    def check(self) -> None:
++        self.rt.check()
++
++
++# -- collective setup -------------------------------------------------------------------------------------------------
++def _dev(base) -> str:
++    return getattr(base, "device", "cuda")      # host-only tests pass a communicator on the CPU
++
++
++def _gather_ints(base, values: list[int]) -> list[list[int]]:
++    mine = torch.tensor(values, dtype=torch.int64, device=_dev(base))
++    got = torch.empty((base.world * len(values),), dtype=torch.int64, device=_dev(base))
++    base.all_gather(mine, got)
++    flat = got.tolist()
++    return [flat[r * len(values):(r + 1) * len(values)] for r in range(base.world)]
++
++
++def exchange(base, obj) -> list:
++    """Every rank's JSON-able ``obj`` in rank order, over ``base``'s all-gather."""
++
++    data = json.dumps(obj).encode()
++    lens = [v[0] for v in _gather_ints(base, [len(data)])]
++    width = max(1, (max(lens) + 3) // 4)
++    buf = np.zeros((width * 4,), dtype=np.uint8)
++    buf[:len(data)] = np.frombuffer(data, dtype=np.uint8)
++    mine = torch.from_numpy(buf.view(np.int32).copy()).to(_dev(base))
++    got = torch.empty((base.world * width,), dtype=torch.int32, device=_dev(base))
++    base.all_gather(mine, got)
++    raw = got.cpu().numpy().tobytes()
++    return [json.loads(raw[r * width * 4:r * width * 4 + lens[r]]) for r in range(base.world)]
++
++
++def _verdict(base, error: str | None, what: str) -> list:
++    got = exchange(base, {"error": error})
++    bad = [f"rank {r}: {g['error']}" for r, g in enumerate(got) if g.get("error")]
++    if bad:
++        raise SetupError(f"{what}: " + "; ".join(bad))
++    return got
++
++
++def pattern(rank: int, nbytes: int, salt: int) -> torch.Tensor:
++    """Deterministic bytes a rank sends in the probe."""
++
++    i = torch.arange(nbytes, dtype=torch.int64, device="cuda")
++    return ((i * 131 + rank * 71 + salt * 29 + (i >> 8) * 7) & 0xFF).to(torch.uint8)
++
++
++def probe(rt: Runtime, base, sizes=None, timeout_s: float = PROBE_TIMEOUT_S) -> float:
++    """Gathers of several sizes (odd, unaligned, the largest slot) compared byte for byte with NCCL's result for the
++    same inputs; returns the mean eager latency (us) of 16-KiB gathers. Raises on any difference or timeout."""
++
++    sizes = sizes or [4, 7, 100, 16 * 1024, 16 * 1024 + 4, min(rt.s.max_bytes, 128 * 1024), rt.s.max_bytes]
++    timeout_ns = int(timeout_s * 1e9)
++    for salt, n in enumerate(sizes):
++        off = (4 if n % 16 else 0) if n % 4 == 0 else 1     # unaligned views too (NCCL takes any pointer)
++        src = torch.empty((n + off,), dtype=torch.uint8, device="cuda")
++        src[off:] = pattern(rt.rank, n, salt)
++        send = src[off:]
++        mine = torch.empty((rt.world * n,), dtype=torch.uint8, device="cuda")
++        ref = torch.empty_like(mine)
++        rt.gather(send, mine, timeout_ns)
++        base.all_gather(send, ref)
++        torch.cuda.synchronize()
++        rt.check()
++        if not torch.equal(mine, ref):
++            bad = int((mine != ref).nonzero()[0].item())
++            raise RuntimeError(f"probe of {n} bytes: RoCE result differs from NCCL's at byte {bad}")
++    x = pattern(rt.rank, 16 * 1024, 99)
++    y = torch.empty((rt.world * x.numel(),), dtype=torch.uint8, device="cuda")
++    for _ in range(8):
++        rt.gather(x, y, timeout_ns)
++    torch.cuda.synchronize()
++    t = time.perf_counter()
++    for _ in range(64):
++        rt.gather(x, y, timeout_ns)
++    torch.cuda.synchronize()
++    rt.check()
++    return (time.perf_counter() - t) / 64 * 1e6
++
++
++def connect(base, s: Settings) -> RoceComm:
++    """Collective: detect and pair the HCAs, open and connect the queue pairs, start the proxy, probe. Every rank
++    raises ``SetupError`` (with every rank's reason) when any rank fails."""
++
++    rank, world = base.rank, base.world
++    try:
++        mine = [h.__dict__ for h in detect(s.hca_spec)]
++        err = None if mine else f"no ACTIVE RoCE port with an IPv4-mapped RoCE v2 GID under {SYSFS}"
++    except Exception as exc:  # noqa: BLE001 - reported collectively
++        mine, err = [], f"{type(exc).__name__}: {exc}"
++    got = exchange(base, {"hcas": mine, "error": err})
++    bad = [f"rank {r}: {g['error']}" for r, g in enumerate(got) if g.get("error")]
++    if bad:
++        raise SetupError("HCA detection: " + "; ".join(bad))
++    lists = [[Hca(**h) for h in g["hcas"]] for g in got]
++    chosen = pair(lists, s.hcas)
++    if not chosen[0]:
++        raise SetupError("no pair of RoCE ports on a common subnet: " +
++                         "; ".join(f"rank {r}: {[(h.name, h.ipv4) for h in lst]}" for r, lst in enumerate(lists)))
++    hcas = [lists[rank][j] for j in chosen[rank]]
++    rt, err, blob = None, None, ""
++    try:
++        rt = Runtime(rank=rank, world=world, hcas=hcas, s=s)
++        blob = rt.blob().hex()
++    except Exception as exc:  # noqa: BLE001
++        err = f"{type(exc).__name__}: {exc}"
++    try:
++        got = exchange(base, {"blob": blob, "error": err})
++        bad = [f"rank {r}: {g['error']}" for r, g in enumerate(got) if g.get("error")]
++        if bad:
++            raise SetupError("queue pairs: " + "; ".join(bad))
++        err = None
++        try:
++            rt.connect([bytes.fromhex(g["blob"]) for g in got])
++        except Exception as exc:  # noqa: BLE001
++            err = f"{type(exc).__name__}: {exc}"
++        _verdict(base, err, "connect")
++        err, us = None, 0.0
++        rt.marking = False                         # a failed probe falls back now; it need not pin later starts
++        try:
++            us = probe(rt, base)
++        except Exception as exc:  # noqa: BLE001
++            err = f"{type(exc).__name__}: {exc}"
++        _verdict(base, err, "probe")
++        rt.marking = True
++    except BaseException:
++        if rt is not None:
++            torch.cuda.synchronize()
++            rt.close()
++        raise
++    if rank == 0:
++        ports = ", ".join(f"{h.name} (GID {h.gid_index}, {h.ipv4})" for h in hcas)
++        _log(f"all-gathers of up to {s.max_bytes // 1024} KiB a rank over RoCE on {ports}; timeout "
++             f"{s.timeout_s:g} s; probe {us:.1f} us eager at 16 KiB")
++    return RoceComm(base, rt, s.max_bytes)
++
++
++def select(base):
++    """``GLM53_TF_COMM_BACKEND``: ``base`` (NCCL) or a ``RoceComm`` over it. Collective (both ranks call it at the same
++    point); refuses to start when the ranks' settings differ."""
++
++    want = backend()
++    s = settings()
++    mark = marker()
++    marked = mark is not None and mark.exists()
++    both = _gather_ints(base, [BACKENDS.index(want)] + s.agreed() + [int(marked)])
++    if any(b[:-1] != both[0][:-1] for b in both):
++        raise RuntimeError("the two ranks were started with different GLM53_TF_COMM_BACKEND / GLM53_TF_ROCE_* "
++                           f"settings: {[b[:-1] for b in both]} (backend, max bytes, timeout ms, HCAs, blocks, "
++                           "threads, traffic class, fallback=error)")
++    if want == "nccl":
++        return base
++    if any(b[-1] for b in both):
++        who = [r for r, b in enumerate(both) if b[-1]]
++        _log(f"a RoCE failure marker is present on rank(s) {who} ({mark}): serving on NCCL; delete it to use RoCE")
++        return base
++    try:
++        return connect(base, s)
++    except SetupError as exc:
++        if s.fallback == "error":
++            raise RuntimeError(f"GLM53_TF_COMM_BACKEND=roce: setup failed ({exc}); GLM53_TF_ROCE_FALLBACK=error") \
++                from None
++        _log(f"setup failed, serving on NCCL: {exc}")
++        return base
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce_common.h b/src/tensorfold/families/glm5_next/cuda/roce_common.h
+new file mode 100644
+index 0000000..fd012da
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/roce_common.h
+@@ -0,0 +1,47 @@
++// Shared by roce.cpp (host proxy, bindings) and roce.cu (kernel): the control record and the kernel arguments.
++// patches/0230; the protocol is adapted from b12x's RoCEnante (Apache-2.0, see roce.cu).
++#pragma once
++
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++namespace tfroce {
++
++// 32-bit words of the control record (one FLAG_STRIDE block at the end of the pinned region). The kernel writes all
++// of them but CTRL_SEQ's reader (the proxy); the host reads them without touching the device.
++enum : int {
++    CTRL_SEQ = 0,          // doorbell: the newest sequence staged (proxy polls it)
++    CTRL_NBYTES = 1,       // padded bytes of the newest op
++    CTRL_ERR_SEQ = 2,      // sequence whose wait timed out
++    CTRL_ERR_PEER = 3,     // the peer it waited for
++    CTRL_SLOT_NBYTES = 4,  // [4], [5]: padded bytes per slot (the proxy's catch-up after a missed doorbell)
++    CTRL_ERR_HCA = 6,      // the HCA whose flag never came
++    CTRL_FAILED = 7,       // 1 once any wait timed out (wrap-safe, unlike a sequence number)
++    CTRL_COMPLETED = 8,    // the last sequence completed on this rank (doorbell ahead of it: an op is in flight)
++    CTRL_WORDS = 9,
++};
++
++struct GatherArgs {
++    const uint8_t *in;
++    uint8_t *out;
++    uint64_t nbytes;       // bytes of one rank's shard
++    uint64_t recv_base;    // device addresses of the pinned region's parts
++    uint64_t flag_base;
++    uint64_t send_base;
++    uint64_t ctrl_base;
++    uint64_t slot_bytes;
++    uint32_t *epoch;       // device counters: epoch, this grid size's stage / tail arrivals, poison
++    uint32_t *stage_ctr;
++    uint32_t *tail_ctr;
++    uint32_t *poison;
++    uint64_t timeout_ns;
++    int world;
++    int rank;
++    int n_hca;
++    int flag_stride;
++    int slots;
++};
++
++cudaError_t launch_gather(const GatherArgs &args, int grid, int threads, cudaStream_t stream);
++
++}  // namespace tfroce

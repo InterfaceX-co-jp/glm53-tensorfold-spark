@@ -1,0 +1,991 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/app.py b/src/tensorfold/families/glm5_next/cuda/app.py
+index d50097b..2eede0d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/app.py
++++ b/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -155,6 +155,9 @@ class GlmApp(App):
+         return ids
+ 
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
++        from . import cpupin
++
++        cpupin.http_thread()                    # patches/0370 (GLM53_TF_CPU_PIN): a name for ps, ``nice`` when set
+         apply_effort(body, field=self.effort_field, default=self.default_effort,
+                      default_thinking=self.default_thinking)           # patches/0150 (validated by ``check``)
+         model = str(body.get("model") or "")
+diff --git a/src/tensorfold/families/glm5_next/cuda/batch.py b/src/tensorfold/families/glm5_next/cuda/batch.py
+index e890e43..f6ff2b0 100644
+--- a/src/tensorfold/families/glm5_next/cuda/batch.py
++++ b/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -129,6 +129,7 @@ import torch
+ from tensorfold.engine.exact_sampling import MARGIN, choose_rows
+ 
+ from . import adapt as adapt_mod                                            # patches/0340
++from . import cpupin, decode_overlap as dover                              # patches/0370
+ from . import batchplan, comm as comm_mod, decode_v2 as dv2, glue, kda as kda_mod, kvpool, latent, qmm, sparse
+ from .attention import attention, kv_write
+ from .forward import State, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+@@ -300,10 +301,14 @@ def stage_multi(w, sts: Sequence[State], b, windows: Sequence[Sequence[int]]) ->
+     return T
+ 
+ 
+-def sample_multi(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Sequence[int], Any]]) -> list[list[int]]:
++def sample_multi(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Sequence[int], Any]],
++                 rider: torch.Tensor | None = None):
+     """``decode.sample_rows`` for several sequences' rows (specs: (row offset, rows, positions, sampling)) with ONE
+     all-gather of every row's candidates: each sequence's top-k is the call ``sample_rows`` makes, and the draw is
+-    the same keyed rule on the same gathered candidates."""
++    the same keyed rule on the same gathered candidates.
++
++    patches/0370: ``rider`` (int32 [P] on the device, the same P on both ranks) travels at the end of the exchange;
++    then -> (tokens, rank 0's P words)."""
+ 
+     parts, ks = [], []
+     for off, R, _, sampling in specs:
+@@ -313,6 +318,8 @@ def sample_multi(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Sequen
+         ids = (ids + w.vocab_offset).to(torch.int32)
+         parts.append(torch.cat([vals, ids.view(torch.float32)], dim=1).reshape(-1))
+         ks.append(k)
++    if rider is not None:                               # patches/0370: bits, moved as they are
++        parts.append(rider.view(torch.float32))
+     flat = torch.cat(parts).contiguous()
+     if w.comm is None:
+         world = 1
+@@ -335,6 +342,8 @@ def sample_multi(w, logits: torch.Tensor, specs: Sequence[tuple[int, int, Sequen
+             out.append([int(tokens[i, order[i, 0]]) for i in range(R)])
+         else:
+             out.append(choose_rows(values, tokens, list(positions), sampling))
++    if rider is not None:                               # patches/0370: rank 0's words
++        return out, got[0, at:at + rider.numel()].contiguous().view(torch.int32).tolist()
+     return out
+ 
+ 
+@@ -864,6 +873,11 @@ class Batcher:
+     kvp = None                                    # patches/0290: the KV page pool (None: every slot owns its caches)
+     pool_check = False
+     _spills: Sequence[int] = ()                   # patches/0290: this round's spilled slots (rank 0's plan)
++    overlap = dover.Overlap()                     # patches/0370 defaults (off)
++    _ahead: list[int] | None = None               # patches/0370: the next round's plan, received in this round
++    _held: list | None = None                     # patches/0370: rank 0's tokens not handed to the HTTP threads yet
++    rider_n = 0
++    rider_host = rider_dev = None
+ 
+     def __init__(self, g, n: int) -> None:
+         from .engine import GRAPH_ROWS, MAX_ROWS
+@@ -920,6 +934,14 @@ class Batcher:
+                                "GLM53_TF_BATCH_MTP, GLM53_TF_BATCH_ROW_MS, GLM53_TF_BATCH_BUCKETS, "
+                                "GLM53_TF_BATCH_PAD_TIE, GLM53_TF_BATCH_ADAPT, GLM53_TF_BATCH_ADAPT_EVERY, "
+                                "GLM53_TF_BATCH_ADAPT_WINDOW, GLM53_TF_BATCH_ADAPT_SERIAL)")
++        # patches/0370 (GLM53_TF_DECODE_OVERLAP): host work off the round's critical path; ``plan`` changes what
++        # the sampler's all-gather carries, so both ranks must agree on it
++        self.overlap = dover.env()
++        both = g._gather_ints([int(self.overlap.plan)])
++        if both[0] != both[1]:
++            raise RuntimeError(f"the two ranks were started with different GLM53_TF_DECODE_OVERLAP 'plan' parts: rank 0 "
++                               f"{both[0]}, rank 1 {both[1]}")
++        dover.apply_gil(self.overlap)
+         # rank 0 only: scheduling (its decisions travel in the round plans)
+         self.fair = batchplan.Fairness(float(os.environ.get("GLM53_TF_BATCH_PREFILL_SHARE", "") or 0.5))
+         # memory kept free: at load, for the slots (prefill transients, lazily captured graphs); at admission, while
+@@ -979,6 +1001,10 @@ class Batcher:
+         self.f_taps = [torch.zeros((BACKLOG, len(b.taps) * w.cfg.hidden), dtype=torch.bfloat16, device=w.device)
+                        if b.taps else None for _ in range(n)]
+         self.pool = torch.cuda.graph_pool_handle() if self.use_graphs else None
++        if self.overlap.plan:                          # patches/0370: the plan rider's staging (same size both ranks)
++            self.rider_n = dover.rider_size(n)
++            self.rider_host = torch.zeros((self.rider_n,), dtype=torch.int32).pin_memory()
++            self.rider_dev = torch.zeros((self.rider_n,), dtype=torch.int32, device=w.device)
+         # patches/0280: the route sources of a padded round (host staging + the device table graphs read)
+         self.src_host = self.src_dev = None
+         if self.tie:
+@@ -1010,6 +1036,9 @@ class Batcher:
+                       f"pieces of {self.solo} tokens (chunks of at most {most} rows"
+                       + ("" if most >= self.solo else "; raise GLM53_TF_PREFILL_ROWS_MAX for chunks as big as the "
+                          "piece") + ")", flush=True)
++            if self.overlap.on:                        # patches/0370
++                print(f"[tensorfold] decode overlap (patches/0370): {self.overlap.describe()}"
++                      + (f", switch interval {self.overlap.switch_us} us" if self.overlap.gil else ""), flush=True)
+             if self.kvp is not None:
+                 kp = self.kvp
+                 print(f"[tensorfold] KV pool (patches/0290): {kp.npages * kp.page} tokens in {kp.npages} pages of "
+@@ -1332,10 +1361,14 @@ class Batcher:
+         """Rank 0's loop thread: plan a round (shared with rank 1), run it."""
+ 
+         torch.cuda.set_device(0)
++        cpupin.serving()                        # patches/0370 (GLM53_TF_CPU_PIN): this thread on its core
+         try:
+             with torch.no_grad():
+                 while True:
+-                    plan = self._plan()
++                    cpupin.tick()
++                    plan = self._take_ahead()   # patches/0370: decided and shared inside the last round
++                    if plan is None:
++                        plan = self._plan()
+                     if plan is None:
+                         return
+                     cancels, admits, pieces = plan
+@@ -1348,6 +1381,7 @@ class Batcher:
+         except BaseException as exc:            # noqa: BLE001 - every waiting request must hear about it
+             traceback.print_exc()
+             self.error = exc
++            self._flush()                       # patches/0370: tokens decided before the failure first
+             with self.cv:
+                 jobs = [s.job for s in self.seqs if s is not None] + list(self.queue)
+                 self.queue.clear()
+@@ -1359,8 +1393,14 @@ class Batcher:
+         """Rank 1: run every round rank 0 plans, forever."""
+ 
+         self.following = True                   # patches/0180: the save decisions come from rank 0 too
++        cpupin.serving()                        # patches/0370 (GLM53_TF_CPU_PIN)
+         with torch.no_grad():
+             while True:
++                cpupin.tick()
++                ahead = self._take_ahead()      # patches/0370: rank 0's plan came with the last round's sampler
++                if ahead is not None:
++                    self._execute(*ahead)       # cancels only: no spills, no admissions, no pieces
++                    continue
+                 cancels, admits, pieces = batchplan.parse_plan(self.g._share(None))
+                 if self.kvp is not None:                # patches/0290: the slots rank 0 spills this round
+                     got = self.g._share(None)
+@@ -1378,6 +1418,7 @@ class Batcher:
+     def _plan(self) -> tuple[list[int], list[tuple[int, int, Job]], list[int]] | None:
+         """Rank 0: this round's cancels, admissions and prefill piece, shared with rank 1 (None: ``stop``)."""
+ 
++        self._flush()                           # patches/0370: nothing is launched before this plan is shared
+         with self.cv:
+             while not self.queue and not any(s is not None for s in self.seqs):
+                 if self.stopping:
+@@ -1567,9 +1608,51 @@ class Batcher:
+             return
+         new = tokens[max(0, job.sent - start):]
+         if new:
+-            job.out.put(list(new))
++            if self.overlap.emit:               # patches/0370: after the next forward's launch (``_flush``)
++                if self._held is None:
++                    self._held = []
++                self._held.append((job, list(new)))
++            else:
++                job.out.put(list(new))
+             job.sent = start + len(tokens)
+ 
++    def _flush(self) -> None:
++        """patches/0370 (``emit``): the held tokens to their callers, in order."""
++
++        held, self._held = self._held, None
++        for job, tokens in held or ():
++            job.out.put(tokens)
++
++    # -- patches/0370 (``plan``): the next round's plan inside this round's sampler exchange ---------------------------
++    def _plan_ahead(self) -> list[int] | None:
++        """Rank 0, while this round's verify forward runs: the next round's plan when it can only be cancels (every
++        slot in flight decodes, nothing waits, not stopping), else None (the loop plans at the top of the next
++        round, as before). A slot that ends in this round and is cancelled in the next is skipped by ``_execute``."""
++
++        with self.cv:
++            if self.queue or self.stopping:
++                return None
++            if any(s is not None and s.stepper is None for s in self.seqs):
++                return None                     # a prompt prefills: its piece is the loop's decision
++            cancels = [i for i, s in enumerate(self.seqs) if s is not None and s.job.cancel]
++        return batchplan.encode_plan(cancels, [], [])
++
++    def _rider(self) -> torch.Tensor:
++        plan = None if self.following else self._plan_ahead()
++        self.rider_host.numpy()[:] = dover.rider_encode(plan, self.rider_n)
++        self.rider_dev.copy_(self.rider_host, non_blocking=True)
++        return self.rider_dev
++
++    def _take_ahead(self):
++        plan, self._ahead = self._ahead, None
++        if plan is None:
++            return None
++        cancels, admits, pieces = batchplan.parse_plan(plan)
++        if admits or pieces:
++            raise RuntimeError("a round plan rider held admissions or pieces: both ranks must run the same patched "
++                               "TensorFold")
++        return cancels, [], []
++
+     # -- a round (both ranks) --------------------------------------------------------------------------------------------
+     def _execute(self, cancels: list[int], admits: list[tuple[int, int, Job]], pieces: list[int]) -> None:
+         self.round += 1
+@@ -1881,11 +1964,15 @@ class Batcher:
+         windows = [q.stepper.window() for q in seqs]
+         self.last_rows = [len(x) for x in windows]
+         logits = self._forward(active, windows)
++        ov = self.overlap
++        if ov.emit:                             # patches/0370: the GPU is busy now; the HTTP threads may run
++            self._flush()
+         ran = list(self.last_rows)              # patches/0200: rows per slot in the forward (padded or not)
+         # patches/0280: tied padded rows read no experts of their own; the depth model prices the real rows
+         priced = [len(x) for x in windows] if self.tie else ran
+         parts = [(a, n, st_, bl) for (a, _, st_, bl), n in zip((q.stepper.part() for q in seqs), priced)]
+-        torch.cuda.synchronize()
++        if not ov.sync:                         # patches/0370: timing only; the sampler's readback waits anyway
++            torch.cuda.synchronize()
+         specs, off = [], 0
+         for s, q, win, n in zip(active, seqs, windows, ran):
+             pos = self.states[s].pos
+@@ -1893,7 +1980,11 @@ class Batcher:
+             off += n
+             q.kinds[self.last_kind] += 1
+             q.kinds["pad_rows"] += n - len(win)
+-        sampled = sample_multi(w, logits, specs)
++        if ov.plan:                             # patches/0370: the next round's plan rides on this exchange
++            sampled, words = sample_multi(w, logits, specs, rider=self._rider())
++            self._ahead = dover.rider_decode(words)
++        else:
++            sampled = sample_multi(w, logits, specs)
+         shared = len(active) > 1
+         tokens = 0
+         for s, q, (off, R, _, _), rows, n in zip(active, seqs, specs, sampled, ran):
+@@ -1937,6 +2028,7 @@ class Batcher:
+     def _finish(self, slot: int, *, cancelled: bool = False) -> None:
+         from .decode import take_snapshot
+ 
++        self._flush()                           # patches/0370: its tokens before its end
+         q = self.seqs[slot]
+         self.seqs[slot] = None
+         job = q.job
+diff --git a/src/tensorfold/families/glm5_next/cuda/cpupin.py b/src/tensorfold/families/glm5_next/cuda/cpupin.py
+new file mode 100644
+index 0000000..a487b8a
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/cpupin.py
+@@ -0,0 +1,394 @@
++"""patches/0370 (N1a): the engine's host threads on GB10's fast cores (GLM53_TF_CPU_PIN, off by default).
++
++GB10 has 10 Cortex-X925 cores (``CPU part`` 0xd85, up to 3.9 GHz, 2 MB L2) and 10 Cortex-A725 (0xd87, 2.8 GHz,
++512 KB L2) in two clusters: on both Sparks cpus 0-4 / 10-14 are A725, 5-9 / 15-19 X925; cluster 0-9 shares an 8 MB
++L3, cluster 10-19 a 16 MB one; ``cpu_capacity`` 718 / 731 (A725), 997 / 1017 / 1024 (X925; cpu 19 the highest).
++Nothing pinned anything before this patch: the kernel's scheduler placed the round loop, NCCL's proxy and 0230's
++busy-spinning RoCE proxy wherever it liked (sampled on the prod container: mostly X925, sometimes cpu 0 / 10).
++
++Settings (both ranks read their own; scheduling only, replies unchanged):
++
++- ``0`` / unset: nothing pinned (as before).
++- ``fast``: every thread of the process on the fast cores the container allows (the same as starting the container
++  with ``--cpuset-cpus`` = those cores, ``CPUSET`` in scripts/serve.sh), without dedicating any core.
++- ``1`` / ``auto`` / ``roles``: dedicated cores, best first (highest ``cpu_capacity``, then the larger L3, then the
++  higher id): the round loop's thread (``serve``: rank 0's batch thread, rank 1's main thread; without batching the
++  request's thread while it decodes) on the best one; 0230's RoCE proxy (``GLM53_TF_ROCE_CPU``, when
++  ``GLM53_TF_COMM_BACKEND=roce`` and that is unset) on the next; NCCL's threads (``comm``, named by
++  ``NCCL_SET_THREAD_NAME=1``) on the next two; every other thread (HTTP, tokenizer, session disk, torch pools:
++  ``rest``) on the remaining cores. On GB10: serve 19, roce 18, comm 16-17, rest 0-15.
++- explicit roles, ``;``-separated, any subset (the rest from ``auto``): ``serve=19;roce=18;comm=16-17;rest=0-15``,
++  plus ``nice=N`` (0..19) for the HTTP request threads (default 0: a lower priority buys nothing while they have
++  cores of their own, and a descheduled thread that holds the GIL stalls the round loop).
++
++Threads made later inherit their maker's cpus: the HTTP threads the main thread's (``rest``), a thread made by the
++round loop its single core; ``tick`` (every round, cheap) re-sorts the threads every ``GLM53_TF_CPU_PIN_EVERY`` s
++(30). ``serving`` names the round loop's thread ``tf-serve`` (``ps -L -o tid,psr,pcpu,comm``). Linux only; on
++anything else (or when the allowed cpus cannot be read) a warning and nothing pinned.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import ctypes
++import os
++import sys
++import threading
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++
++SYS_CPU = Path("/sys/devices/system/cpu")
++X925, A725 = 0xD85, 0xD87
++
++
++@dataclass
++class Plan:
++    mode: str                                   # "fast" | "roles"
++    serve: frozenset[int]
++    comm: frozenset[int]
++    rest: frozenset[int]
++    roce: int | None = None
++    nice: int = 0
++    fast: tuple[int, ...] = ()
++
++    def describe(self) -> str:
++        roce = f" roce {self.roce}" if self.roce is not None else ""
++        return (f"{self.mode}: serve {cpulist(self.serve)}{roce} comm {cpulist(self.comm)} rest {cpulist(self.rest)}"
++                + (f", HTTP nice {self.nice}" if self.nice else ""))
++
++
++def cpulist(cpus) -> str:
++    """{0, 1, 2, 5} -> "0-2,5"."""
++
++    out, run = [], []
++    for c in sorted(cpus):
++        if run and c == run[-1] + 1:
++            run.append(c)
++            continue
++        if run:
++            out.append(f"{run[0]}-{run[-1]}" if len(run) > 1 else str(run[0]))
++        run = [c]
++    if run:
++        out.append(f"{run[0]}-{run[-1]}" if len(run) > 1 else str(run[0]))
++    return ",".join(out)
++
++
++def parse_cpulist(text: str) -> frozenset[int]:
++    cpus: set[int] = set()
++    for part in str(text).replace(" ", "").split(","):
++        if not part:
++            continue
++        if "-" in part:
++            a, b = part.split("-", 1)
++            if int(b) < int(a):
++                raise ValueError(f"cpu range {part!r}")
++            cpus.update(range(int(a), int(b) + 1))
++        else:
++            cpus.add(int(part))
++    return frozenset(cpus)
++
++
++@dataclass
++class Cpu:
++    id: int
++    capacity: int = 0
++    l3_kb: int = 0
++    part: int = 0
++    max_khz: int = 0
++
++
++def _read(path: Path) -> str:
++    try:
++        return path.read_text().strip()
++    except OSError:
++        return ""
++
++
++def _kb(text: str) -> int:
++    t = text.upper()
++    try:
++        return int(t[:-1]) * (1024 if t.endswith("M") else 1) if t[-1:] in "KM" else int(t or 0) // 1024
++    except ValueError:
++        return 0
++
++
++def read_cpus(root: Path = SYS_CPU, cpuinfo: Path = Path("/proc/cpuinfo")) -> dict[int, Cpu]:
++    """Every cpu's capacity, L3 size, part number and max clock (whatever the system exposes)."""
++
++    cpus: dict[int, Cpu] = {}
++    for d in sorted(root.glob("cpu[0-9]*")):
++        try:
++            n = int(d.name[3:])
++        except ValueError:
++            continue
++        c = Cpu(n)
++        c.capacity = int(_read(d / "cpu_capacity") or 0)
++        c.max_khz = int(_read(d / "cpufreq" / "cpuinfo_max_freq") or 0)
++        for idx in sorted((d / "cache").glob("index*")):
++            if _read(idx / "level") == "3":
++                c.l3_kb = _kb(_read(idx / "size"))
++        cpus[n] = c
++    cur = None
++    for line in _read(cpuinfo).splitlines():
++        key, _, val = line.partition(":")
++        key, val = key.strip(), val.strip()
++        if key == "processor":
++            cur = int(val) if val.isdigit() else None
++        elif key == "CPU part" and cur is not None:
++            cpus.setdefault(cur, Cpu(cur)).part = int(val, 16)
++    return cpus
++
++
++def fast_cpus(cpus: dict[int, Cpu], allowed) -> list[int]:
++    """The allowed fast cores, best first: X925 by part number, else the top capacity / clock class; ordered by
++    capacity, L3 size, id (all descending)."""
++
++    allowed = set(allowed)
++    pool = [c for n, c in cpus.items() if n in allowed]
++    if not pool:
++        return sorted(allowed, reverse=True)
++    if any(c.part == X925 for c in pool):
++        fast = [c for c in pool if c.part == X925]
++    else:
++        key = (lambda c: c.capacity) if any(c.capacity for c in pool) else (lambda c: c.max_khz)
++        top = max(key(c) for c in pool)
++        fast = [c for c in pool if key(c) >= 0.9 * top] if top else pool
++    fast.sort(key=lambda c: (c.capacity, c.l3_kb, c.max_khz, c.id), reverse=True)
++    return [c.id for c in fast]
++
++
++def plan(spec: str | None, cpus: dict[int, Cpu], allowed, *, roce: bool = False) -> Plan | None:
++    """GLM53_TF_CPU_PIN -> a Plan (None: off)."""
++
++    s = str(spec or "").strip()
++    low = s.lower()
++    if low in ("", "0", "off", "no", "false"):
++        return None
++    allowed = frozenset(allowed)
++    if not allowed:
++        raise ValueError("GLM53_TF_CPU_PIN: no cpus allowed")
++    fast = fast_cpus(cpus, allowed)
++    if low == "fast":
++        f = frozenset(fast)
++        return Plan("fast", f, f, f, None, 0, tuple(fast))
++    explicit: dict[str, str] = {}
++    if low not in ("1", "on", "auto", "roles", "yes", "true"):
++        for part in s.split(";"):
++            if not part.strip():
++                continue
++            key, eq, val = part.partition("=")
++            key = key.strip().lower()
++            if not eq or key not in ("serve", "comm", "roce", "rest", "nice"):
++                raise ValueError(f"GLM53_TF_CPU_PIN={spec!r}: expected 0, fast, auto, or roles like "
++                                 "'serve=19;roce=18;comm=16-17;rest=0-15;nice=0'")
++            explicit[key] = val.strip()
++    order = list(fast)
++    serve = frozenset(order[:1])
++    left = order[1:]
++    roce_cpu = None
++    if roce and len(left) >= 3:
++        roce_cpu, left = left[0], left[1:]
++    comm = frozenset(left[:2]) if len(left) >= 3 else frozenset()
++    dedicated = serve | comm | ({roce_cpu} if roce_cpu is not None else set())
++    rest = allowed - dedicated or allowed
++    if not comm:
++        comm = rest
++    p = Plan("roles", serve, comm, rest, roce_cpu, 0, tuple(fast))
++    for key, val in explicit.items():
++        if key == "nice":
++            n = int(val)
++            if not 0 <= n <= 19:
++                raise ValueError(f"GLM53_TF_CPU_PIN nice={n}: expected 0..19")
++            p.nice = n
++            continue
++        if key == "roce":
++            p.roce = None if val.lower() in ("", "none", "-1") else int(val)
++            got = frozenset([p.roce]) if p.roce is not None else frozenset()
++        else:
++            got = parse_cpulist(val)
++            if not got:
++                raise ValueError(f"GLM53_TF_CPU_PIN {key}= is empty")
++            setattr(p, key, got)
++        if not got <= allowed:
++            raise ValueError(f"GLM53_TF_CPU_PIN {key}={val}: cpus {cpulist(got - allowed)} are not allowed here "
++                             f"(allowed: {cpulist(allowed)})")
++    return p
++
++
++# -- the process's state --------------------------------------------------------------------------------------------
++@dataclass
++class _State:
++    plan: Plan | None = None
++    serve_tids: set[int] = field(default_factory=set)
++    every: float = 30.0
++    next_sweep: float = 0.0
++    lock: threading.Lock = field(default_factory=threading.Lock)
++    ready: bool = False
++
++
++_S = _State()
++_PR_SET_NAME = 15
++
++
++def _libc():
++    try:
++        return ctypes.CDLL(None, use_errno=True)
++    except OSError:
++        return None
++
++
++def set_thread_name(name: str) -> None:
++    """The calling thread's OS name (``comm``, 15 bytes), best effort."""
++
++    lib = _libc()
++    if lib is not None and hasattr(lib, "prctl"):
++        try:
++            lib.prctl(_PR_SET_NAME, ctypes.c_char_p(name.encode()[:15]), 0, 0, 0)
++        except Exception:                       # noqa: BLE001 - a name is only for ps
++            pass
++
++
++def _tids() -> list[int]:
++    try:
++        return [int(t) for t in os.listdir("/proc/self/task")]
++    except OSError:
++        return []
++
++
++def _comm(tid: int) -> str:
++    return _read(Path(f"/proc/self/task/{tid}/comm"))
++
++
++def _set(tid: int, cpus) -> bool:
++    try:
++        if set(os.sched_getaffinity(tid)) != set(cpus):
++            os.sched_setaffinity(tid, cpus)
++        return True
++    except (ProcessLookupError, PermissionError, OSError):
++        return False
++
++
++def classify(tid: int, name: str, current: frozenset[int], p: Plan, serve_tids) -> frozenset[int] | None:
++    """The cpus a thread belongs on (None: leave it). The RoCE proxy pins itself (``GLM53_TF_ROCE_CPU``): a thread
++    that sits on exactly the roce cpu is left there."""
++
++    if tid in serve_tids:
++        return p.serve
++    if name.startswith("NCCL"):
++        return p.comm
++    if p.roce is not None and current == frozenset([p.roce]):
++        return None
++    return p.rest
++
++
++def sweep() -> int:
++    """Every thread of this process onto its role's cpus; -> threads moved (or already right)."""
++
++    p = _S.plan
++    if p is None:
++        return 0
++    done = 0
++    for tid in _tids():
++        try:
++            cur = frozenset(os.sched_getaffinity(tid))
++        except OSError:
++            continue
++        want = classify(tid, _comm(tid), cur, p, _S.serve_tids)
++        if want is not None and want != cur and _set(tid, want):
++            done += 1
++    _S.next_sweep = time.monotonic() + _S.every
++    return done
++
++
++def early(rank: int = 0) -> Plan | None:
++    """Engine start, before NCCL makes its threads: the plan, NCCL's thread names, the RoCE proxy's cpu, and the
++    main thread (whose cpus later threads inherit) on ``rest``."""
++
++    if not sys.platform.startswith("linux"):
++        if os.environ.get("GLM53_TF_CPU_PIN", "").strip() not in ("", "0"):
++            print("[tensorfold] GLM53_TF_CPU_PIN: not Linux, nothing pinned", file=sys.stderr, flush=True)
++        return None
++    try:
++        allowed = os.sched_getaffinity(0)
++        roce = os.environ.get("GLM53_TF_COMM_BACKEND", "nccl").strip().lower() == "roce"
++        p = plan(os.environ.get("GLM53_TF_CPU_PIN"), read_cpus(), allowed, roce=roce)
++    except OSError as exc:
++        print(f"[tensorfold] GLM53_TF_CPU_PIN: cannot read the cpus ({exc}); nothing pinned", file=sys.stderr,
++              flush=True)
++        return None
++    _S.plan = p
++    if p is None:
++        return None
++    _S.every = float(os.environ.get("GLM53_TF_CPU_PIN_EVERY", "") or 30.0)
++    os.environ.setdefault("NCCL_SET_THREAD_NAME", "1")
++    if p.roce is not None:
++        os.environ.setdefault("GLM53_TF_ROCE_CPU", str(p.roce))
++        try:
++            p.roce = int(os.environ["GLM53_TF_ROCE_CPU"])
++        except ValueError:
++            pass
++    os.sched_setaffinity(0, p.rest)
++    _S.ready = True
++    print(f"[tensorfold] CPU pinning (patches/0370) rank {rank}: {p.describe()} (fast cores here: "
++          f"{cpulist(p.fast)}, allowed {cpulist(allowed)})", flush=True)
++    return p
++
++
++def serving() -> None:
++    """The calling thread runs the round loop: it gets ``serve``, its name, and every other thread is sorted."""
++
++    p = _S.plan
++    if p is None:
++        return
++    tid = threading.get_native_id()
++    with _S.lock:
++        _S.serve_tids.add(tid)
++    set_thread_name("tf-serve")
++    _set(tid, p.serve)
++    sweep()
++
++
++@contextlib.contextmanager
++def serving_request():
++    """Without batching: the request's (HTTP) thread decodes on ``serve`` while it runs, then goes back."""
++
++    p = _S.plan
++    if p is None or p.mode == "fast":
++        yield
++        return
++    tid = threading.get_native_id()
++    with _S.lock:
++        _S.serve_tids.add(tid)
++    try:
++        before = os.sched_getaffinity(0)
++    except OSError:
++        before = p.rest
++    _set(tid, p.serve)
++    try:
++        yield
++    finally:
++        with _S.lock:
++            _S.serve_tids.discard(tid)
++        _set(tid, before)
++
++
++def http_thread() -> None:
++    """Rank 0's request threads: a name, and ``nice`` when set."""
++
++    p = _S.plan
++    if p is None:
++        return
++    set_thread_name("tf-http")
++    if p.nice:
++        try:
++            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), p.nice)
++        except OSError:
++            pass
++
++
++def tick() -> None:
++    """Every round (cheap): a sweep when one is due."""
++
++    if _S.plan is not None and time.monotonic() >= _S.next_sweep:
++        sweep()
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 6bd64d4..b21beb3 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -21,6 +21,7 @@ import torch
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+ from . import comm as comm_mod, fastpf, fp8pf, lean as lean_mod, pfglue, pfgrid, profile
++from . import decode_overlap as dover                                       # patches/0370
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .weights import Weights
+@@ -549,6 +550,14 @@ def _sync(w: Weights) -> None:
+     torch.cuda.synchronize()
+ 
+ 
++def _forward_sync() -> None:
++    """After a verify forward: the host waits for it here unless GLM53_TF_DECODE_OVERLAP has ``sync`` (patches/0370;
++    the sampler's readback then waits for it, and the stages' "forward" / "sample" split moves accordingly)."""
++
++    if not dover.env().sync:
++        torch.cuda.synchronize()
++
++
+ @torch.no_grad()
+ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
+                   stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+@@ -562,7 +571,7 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+         t0 = time.perf_counter()
+         logits = e.forward([out[-1]])
+-        torch.cuda.synchronize()
++        _forward_sync()                     # patches/0370
+         t1 = time.perf_counter()
+         tok = e.sample(logits[:1], [st.pos + 1], sampling)[0]
+         t2 = time.perf_counter()
+@@ -622,7 +631,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         tokens = [out[-1]] + drafts
+         R = len(tokens)
+         logits = e.forward(tokens)
+-        torch.cuda.synchronize()
++        _forward_sync()                     # patches/0370
+         t1 = time.perf_counter()
+         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+         keep = 1
+@@ -690,7 +699,7 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+         tokens = [out[-1]] + drafts
+         R = len(tokens)
+         logits = e.forward(tokens)
+-        torch.cuda.synchronize()
++        _forward_sync()                     # patches/0370
+         t2 = time.perf_counter()
+         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+         keep = 1
+@@ -811,6 +820,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+     lookup = getattr(e, "lookup", None)     # patches/0020: prompt-lookup drafts (lookup.py), set per request
+     timer = getattr(e, "calib", None)       # patches/0070: rank 0's online window costs (calib.py), or None
+     opt = getattr(e, "depth", None)         # patches/0071: cost-derived depths (depth.py); None: the policies
++    # patches/0370 (GLM53_TF_DECODE_OVERLAP ``sync``): no host wait after the forward; the online calibration reads
++    # the forward's time from two CUDA events once the sampler's readback has synchronized
++    no_sync = dover.env().sync
++    fwd_timer = dover.ForwardTimer() if no_sync and timer is not None else None
+     _sync(w)
+     start = time.perf_counter()
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+@@ -843,12 +856,19 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+         t1 = time.perf_counter()
+         tokens = [out[-1]] + drafts
+         R = len(tokens)
++        if fwd_timer is not None:
++            fwd_timer.start()
+         logits = e.forward(tokens)
+-        torch.cuda.synchronize()
++        if fwd_timer is not None:
++            fwd_timer.stop()
++        if not no_sync:
++            torch.cuda.synchronize()
+         t2 = time.perf_counter()
+-        if timer is not None:
++        if timer is not None and fwd_timer is None:
+             timer(R, (t2 - t1) * 1e3)
+         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
++        if fwd_timer is not None:           # patches/0370: after the readback, the events are done
++            timer(R, fwd_timer.ms())
+         keep = 1
+         for i, d in enumerate(drafts):
+             if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode_overlap.py b/src/tensorfold/families/glm5_next/cuda/decode_overlap.py
+new file mode 100644
+index 0000000..f947748
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/decode_overlap.py
+@@ -0,0 +1,200 @@
++"""patches/0370 (N1b): host work off the decode round's critical path (GLM53_TF_DECODE_OVERLAP, off by default).
++
++A decode round's GPU work waits for host work in three places that do not need to be there (docs/DECODE-OVERLAP.md):
++
++- ``sync``: the explicit ``torch.cuda.synchronize()`` after the verify forward (``Batcher._verify``; ``auto_decode`` /
++  ``mtp_decode`` / ``dflash_decode`` / ``serial_decode``). The sampler's readback synchronizes anyway; the explicit
++  one only made the host wait before launching the sampler's top-k and all-gather, and timed the forward for 0070's
++  online calibration, which now reads two CUDA events instead.
++- ``emit``: rank 0 hands a round's tokens to the HTTP threads after the NEXT round's verify forward has been
++  launched (batch mode), so their detokenizing / SSE work holds the GIL while the host waits for the GPU instead of
++  while it drafts; a request's last tokens go out when it ends. Without batching, a request's tokens go to an
++  emitter thread (``Emitter``) instead of running the HTTP callback inside the decode loop.
++- ``plan``: in a round where every slot decodes and nothing waits (no queue, no prompt prefilling), rank 0 decides
++  the NEXT round's plan (its cancels) while this round's verify forward runs and sends it inside the sampler's
++  all-gather, which both ranks make anyway (``rider_*``): no plan share at the top of the next round (two to four
++  NCCL all-gathers, each with a host synchronization). Any other round plans as before. Both ranks must agree
++  (checked at load).
++- ``gil``: the interpreter's thread switch interval ``GLM53_TF_SWITCH_US`` (default 500 us instead of Python's 5 ms),
++  so the round loop gets the GIL back from an HTTP thread sooner when its GPU wait ends.
++
++``1`` = all four; a comma list picks some (``sync,plan``). Scheduling only: the same kernels on the same inputs, the
++same collectives in the same order on both ranks, so replies are unchanged (drafted == serial, batched == alone).
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++import queue
++import sys
++import threading
++from dataclasses import dataclass
++from typing import Any, Callable, Sequence
++
++PARTS = ("sync", "emit", "plan", "gil")
++
++
++@dataclass(frozen=True)
++class Overlap:
++    sync: bool = False
++    emit: bool = False
++    plan: bool = False
++    gil: bool = False
++    switch_us: int = 500
++
++    @property
++    def on(self) -> bool:
++        return self.sync or self.emit or self.plan or self.gil
++
++    def code(self) -> int:
++        return sum(1 << i for i, p in enumerate(PARTS) if getattr(self, p))
++
++    def describe(self) -> str:
++        return ",".join(p for p in PARTS if getattr(self, p)) or "off"
++
++
++def parse(spec: str | None, switch_us: str | None = None) -> Overlap:
++    """GLM53_TF_DECODE_OVERLAP: ``0`` / empty (off), ``1`` (all), or a comma list of ``sync``, ``emit``, ``plan``,
++    ``gil``; GLM53_TF_SWITCH_US: the switch interval with ``gil`` (100..5000 us)."""
++
++    s = str(spec or "").strip().lower()
++    if s in ("", "0", "off", "false", "no"):
++        parts: set[str] = set()
++    elif s in ("1", "on", "true", "yes", "all"):
++        parts = set(PARTS)
++    else:
++        parts = {p.strip() for p in s.replace(";", ",").split(",") if p.strip()}
++        bad = parts - set(PARTS)
++        if bad:
++            raise ValueError(f"GLM53_TF_DECODE_OVERLAP={spec!r}: unknown part(s) {sorted(bad)}; expected 0, 1 or a "
++                             f"comma list of {', '.join(PARTS)}")
++    us = str(switch_us or "").strip()
++    try:
++        us_i = int(us) if us else 500
++    except ValueError:
++        raise ValueError(f"GLM53_TF_SWITCH_US={switch_us!r}: expected microseconds (100..5000)") from None
++    if not 100 <= us_i <= 5000:
++        raise ValueError(f"GLM53_TF_SWITCH_US={us_i}: expected 100..5000 microseconds")
++    return Overlap(**{p: p in parts for p in PARTS}, switch_us=us_i)
++
++
++@functools.lru_cache(maxsize=1)
++def env() -> Overlap:
++    """The process's setting (read once; tests call ``env.cache_clear()``)."""
++
++    return parse(os.environ.get("GLM53_TF_DECODE_OVERLAP"), os.environ.get("GLM53_TF_SWITCH_US"))
++
++
++_GIL_SET = False
++
++
++def apply_gil(ov: Overlap | None = None) -> None:
++    """``gil``: set the interpreter's switch interval once a process (both ranks; idempotent)."""
++
++    global _GIL_SET
++    ov = env() if ov is None else ov
++    if ov.gil and not _GIL_SET:
++        sys.setswitchinterval(ov.switch_us / 1e6)
++        _GIL_SET = True
++
++
++# -- emit (without batching): the HTTP callback on its own thread ----------------------------------------------------
++class Emitter:
++    """``on_tokens`` run on a thread of its own, in order: the decode loop only queues the token lists. ``close``
++    delivers everything still queued, joins, and raises the first exception the callback raised (the loop decoded on
++    meanwhile: without batching a request's decode never listened to the callback's answer)."""
++
++    def __init__(self, fn: Callable[[list[int]], Any], name: str = "tf-emit") -> None:
++        self.fn = fn
++        self.q: queue.SimpleQueue = queue.SimpleQueue()
++        self.error: BaseException | None = None
++        self.thread = threading.Thread(target=self._run, name=name, daemon=True)
++        self.thread.start()
++
++    def _run(self) -> None:
++        while True:
++            item = self.q.get()
++            if item is None:
++                return
++            if self.error is not None:
++                continue
++            try:
++                self.fn(item)
++            except BaseException as exc:        # noqa: BLE001 - raised by ``close`` on the decode thread
++                self.error = exc
++
++    def __call__(self, tokens: Sequence[int]) -> bool:
++        self.q.put(list(tokens))
++        return False
++
++    def close(self, raise_error: bool = True) -> None:
++        self.q.put(None)
++        self.thread.join()
++        if self.error is not None and raise_error:
++            raise self.error
++
++
++# -- sync: the forward's time for 0070's online calibration from CUDA events ------------------------------------------
++class ForwardTimer:
++    """Two CUDA events around a verify forward (``start`` / ``stop``); ``ms`` after the sampler's readback has
++    synchronized. Without CUDA (tests on the CPU) it falls back to the host clock."""
++
++    def __init__(self) -> None:
++        import time
++
++        import torch
++
++        self._clock = time.perf_counter
++        self.cuda = torch.cuda.is_available()
++        if self.cuda:
++            self.a = torch.cuda.Event(enable_timing=True)
++            self.b = torch.cuda.Event(enable_timing=True)
++        self.t0 = 0.0
++
++    def start(self) -> None:
++        self.t0 = self._clock()
++        if self.cuda:
++            self.a.record()
++
++    def stop(self) -> None:
++        if self.cuda:
++            self.b.record()
++
++    def ms(self) -> float:
++        if self.cuda:
++            self.b.synchronize()
++            return float(self.a.elapsed_time(self.b))
++        return (self._clock() - self.t0) * 1e3
++
++
++# -- plan: the next round's plan inside the sampler's all-gather ------------------------------------------------------
++RIDER_EXTRA = 8
++
++
++def rider_size(slots: int) -> int:
++    """int32 words appended to every batched sampler exchange (both ranks: the same size): a flag, the plan's length
++    and a cancels-only plan of up to ``slots`` cancels (``batchplan.encode_plan``: 3 + cancels ints)."""
++
++    return int(slots) + RIDER_EXTRA
++
++
++def rider_encode(plan: Sequence[int] | None, size: int) -> list[int]:
++    """Rank 0's words: [1, len, plan..., 0...] for a plan, [0, ...] for none (rank 1 always sends [0, ...])."""
++
++    if plan is None:
++        return [0] * size
++    plan = [int(v) for v in plan]
++    if 2 + len(plan) > size:
++        raise ValueError(f"a {len(plan)}-int plan does not fit the {size}-word rider")
++    return [1, len(plan), *plan] + [0] * (size - 2 - len(plan))
++
++
++def rider_decode(words: Sequence[int]) -> list[int] | None:
++    words = [int(v) for v in words]
++    if not words or words[0] == 0:
++        return None
++    if words[0] != 1 or not 0 <= words[1] <= len(words) - 2:
++        raise RuntimeError(f"a round plan rider {words[:4]}...: both ranks must run the same patched TensorFold with "
++                           "the same GLM53_TF_DECODE_OVERLAP")
++    return words[2:2 + words[1]]
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index c91e435..aa20fae 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -201,6 +201,10 @@ class GlmEngine:
+         long_context = context > cfg.dense_limit
+         capacity = max(DENSE_CAPACITY, context + MAX_ROWS) if long_context else DENSE_CAPACITY
+         self.limit = capacity - MAX_ROWS if long_context else cfg.dense_limit
++        from . import cpupin, decode_overlap
++
++        cpupin.early(rank)                  # patches/0370 (GLM53_TF_CPU_PIN): before NCCL makes its threads
++        decode_overlap.apply_gil()          # patches/0370 (GLM53_TF_DECODE_OVERLAP ``gil``)
+         self.comm = comm if comm is not None else NCCL(rank, 2, master, port)
+         self.comm.barrier()
+         fastboot.mark("NCCL init (both ranks up)")
+@@ -1039,8 +1043,21 @@ class GlmEngine:
+             self._share(sess.encode(self.store.index.digest()))
+         self._adopt(table)
+         self.depth_cost = cost
+-        with self._knobs(values):
+-            stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, sess)
++        from . import cpupin, decode_overlap
++
++        # patches/0370: this request's thread decodes on the serving core (GLM53_TF_CPU_PIN); with
++        # GLM53_TF_DECODE_OVERLAP ``emit`` the HTTP callback runs on an emitter thread, not inside the decode loop
++        emitter = decode_overlap.Emitter(on_tokens) if decode_overlap.env().emit else None
++        try:
++            with cpupin.serving_request(), self._knobs(values):
++                stats = self._run(list(prompt), max_tokens, sampling, stop_eos, emitter or on_tokens, code, hit,
++                                  draft, sess)
++        except BaseException:
++            if emitter is not None:
++                emitter.close(raise_error=False)
++            raise
++        if emitter is not None:
++            emitter.close()                 # every token delivered (or the callback's exception) before the stats
+         stats.update(policy=spec, drafts=draft)
+         if self.store is not None:          # patches/0110
+             stats["sessions"] = self.store.describe()
+@@ -1059,7 +1076,11 @@ class GlmEngine:
+ 
+         if self.batch is not None:
+             return self.batch.follow()
++        from . import cpupin
++
++        cpupin.serving()                    # patches/0370 (GLM53_TF_CPU_PIN)
+         while True:
++            cpupin.tick()
+             max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, n, *rest = \
+                 self._share(None)
+             table, code = rest[:n], rest[n:]            # patches/0070: rank 0's cost table, then the policy code

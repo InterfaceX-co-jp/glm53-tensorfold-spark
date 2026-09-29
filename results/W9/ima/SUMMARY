@@ -1,0 +1,15 @@
+19:38:31 e1-prefix rc=0 175s :: 31 passed in 171.37s (0:02:51)
+e1 done 19:38:31
+19:40:29 e3-twoproc rc=1 73s :: 1 failed, 15 deselected in 70.28s (0:01:10)
+19:42:14 e3-prefix rc=0 105s :: 31 passed in 101.52s (0:01:41)
+e3 done 19:42:14
+19:43:29 e5-twoproc rc=1 75s :: 1 failed, 15 deselected in 71.58s (0:01:11)
+19:45:12 e5-prefix rc=0 103s :: 31 passed in 99.86s (0:01:39)
+e5 done 19:45:12
+19:47:05 e7-twoproc rc=1 70s :: 1 failed, 15 deselected in 66.83s (0:01:06)
+19:47:21 e7-prefix rc=0 16s :: 31 passed in 12.78s
+e7 done 19:47:21
+19:48:33 e9-twoproc rc=1 69s :: 1 failed, 15 deselected in 65.65s (0:01:05)
+19:48:49 e9-prefix rc=0 16s :: 31 passed in 12.73s
+e9 done 19:48:49
+19:50:17 p1 rc=0 27s :: POISON OK

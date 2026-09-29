@@ -1,0 +1,226 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/batch.py w/src/tensorfold/families/glm5_next/cuda/batch.py
+index 6b03ac9..2997df6 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batch.py
++++ w/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -86,6 +86,15 @@ over the slots still drafting; the head's weights read once a pass instead of on
+ cost-derived depths (``batchplan.verify_ms``; the table's flattening top alone, ~4.5 ms, drafts too deep at 3-4
+ sequences where a row costs 6-10 ms).
+ 
++Round buckets (patches/0280, off by default): ``GLM53_TF_BATCH_BUCKETS=4,8`` pads EVERY window of a multi-slot round
++(graph path only) to the smallest listed size >= the round's longest window (``_bucket``; the same padding rules as
++``GLM53_TF_BATCH_PAD``), so a round's key is (slots, bucket, modes, parities) instead of one row count a slot: with
++every slot flipping its KDA parity each round, 4 decoding slots meet ~2 keys a bucket and nearly every round replays a
++graph. ``GLM53_TF_BATCH_PAD_TIE`` (auto: on with buckets) makes a padded row route as its window's last real row
++(``Buffers.route_src``: the row's router logits replaced by that row's before top-k), so padded rows add no expert
++reads (the ~6 ms a row of a real row); padded rows are never kept, and every real row's bits are unchanged (its own
++logits; row-independent kernels). The depth model keeps pricing the real rows only.
++
+ Kept in step with ``forward.py``: ``compute_multi``'s layer loop, ``_kda`` and ``_dsa`` mirror ``forward.compute``,
+ ``kda_block`` and ``dsa_block`` (and ``latent``'s pieces); a change there must be made here too (the tests compare
+ batched rows with lone ones bit for bit).
+@@ -811,6 +820,9 @@ class Batcher:
+     parity_key = False
+     batch_mtp = False
+     last_kind = "alone"
++    buckets = 0                                   # patches/0280 defaults
++    tie = False
++    src_host = src_dev = None
+ 
+     def __init__(self, g, n: int) -> None:
+         from .engine import GRAPH_ROWS, MAX_ROWS
+@@ -831,18 +843,23 @@ class Batcher:
+         self.pad = batchplan.pad_mask(os.environ.get("GLM53_TF_BATCH_PAD", ""), MAX_ROWS)
+         self.short = max(0, _env_int("GLM53_TF_BATCH_SHORT", 0))
+         self.parity_key = _env_int("GLM53_TF_BATCH_PARITY_KEY", 0) == 1
++        # patches/0280: every window of a multi-slot round padded to one bucket; padded rows routed as real ones
++        self.buckets = batchplan.bucket_mask(os.environ.get("GLM53_TF_BATCH_BUCKETS", ""), MAX_ROWS)
++        tie = os.environ.get("GLM53_TF_BATCH_PAD_TIE", "auto").strip().lower()
++        self.tie = bool(self.buckets) if tie in ("", "auto") else tie not in ("0", "false", "no", "off")
+         self.batch_mtp = _env_int("GLM53_TF_BATCH_MTP", 0) == 1 and g.w.mtp is not None
+         self.row_ms = float(os.environ.get("GLM53_TF_BATCH_ROW_MS", "") or 0.0)
+         self.last_rows: list[int] = []                 # the rows each slot had in the last ``_forward`` (padded)
+         both = g._gather_ints([n, int(self.use_graphs), self.graph_rows, self.max_graphs, self.piece,
+                                self.sightings.after, self.pad, self.short, int(self.parity_key),
+-                               int(self.batch_mtp), int(round(self.row_ms * 1000))])
++                               int(self.batch_mtp), int(round(self.row_ms * 1000)), self.buckets, int(self.tie)])
+         if both[0] != both[1]:
+             raise RuntimeError(f"the two ranks were started with different batch settings: rank 0 {both[0]}, "
+                                f"rank 1 {both[1]} (GLM53_TF_BATCH, GLM53_TF_BATCH_GRAPHS, GLM53_TF_BATCH_GRAPH_ROWS, "
+                                "GLM53_TF_BATCH_MAX_GRAPHS, GLM53_TF_BATCH_PIECE, GLM53_TF_BATCH_CAPTURE_AFTER, "
+                                "GLM53_TF_BATCH_PAD, GLM53_TF_BATCH_SHORT, GLM53_TF_BATCH_PARITY_KEY, "
+-                               "GLM53_TF_BATCH_MTP, GLM53_TF_BATCH_ROW_MS)")
++                               "GLM53_TF_BATCH_MTP, GLM53_TF_BATCH_ROW_MS, GLM53_TF_BATCH_BUCKETS, "
++                               "GLM53_TF_BATCH_PAD_TIE)")
+         # rank 0 only: scheduling (its decisions travel in the round plans)
+         self.fair = batchplan.Fairness(float(os.environ.get("GLM53_TF_BATCH_PREFILL_SHARE", "") or 0.5))
+         # memory kept free: at load, for the slots (prefill transients, lazily captured graphs); at admission, while
+@@ -893,6 +910,11 @@ class Batcher:
+         self.f_taps = [torch.zeros((BACKLOG, len(b.taps) * w.cfg.hidden), dtype=torch.bfloat16, device=w.device)
+                        if b.taps else None for _ in range(n)]
+         self.pool = torch.cuda.graph_pool_handle() if self.use_graphs else None
++        # patches/0280: the route sources of a padded round (host staging + the device table graphs read)
++        self.src_host = self.src_dev = None
++        if self.tie:
++            self.src_host = torch.zeros((rows,), dtype=torch.int64).pin_memory()
++            self.src_dev = torch.arange(rows, dtype=torch.int64, device=w.device)
+         self.multi: dict[tuple, torch.cuda.CUDAGraph] = {}
+         self.counts = collections.Counter()                        # graph / capture / eager rounds, pieces
+         self.caches: list[list] = [[] for _ in range(n)]           # decode.Snapshot entries per slot
+@@ -1518,15 +1540,37 @@ class Batcher:
+         for st, win, m in zip(sts, windows, modes):
+             R = len(win)
+             Rp = batchplan.padded(R, self.pad)
+-            if Rp > R and m is not None and Rp <= self.graph_rows and Rp <= st.proj.shape[1] \
+-                    and st.pos + Rp <= st.capacity and (st.index is not None or st.pos + Rp <= c.dense_limit) \
+-                    and self._mode(st, Rp) == m:
++            if self._can_pad(st, R, Rp, m):
+                 win = list(win) + [win[-1]] * (Rp - R)
+                 self.counts["pad_rows"] += Rp - R
+             out_w.append(win)
+             out_m.append(m)
+         return out_w, out_m
+ 
++    def _can_pad(self, st: State, R: int, Rp: int, m) -> bool:
++        """A window of R rows may run as Rp: it stays in the cache, in the slot's window rows, under the graph rows and
++        in the same context mode (patches/0200's rule for GLM53_TF_BATCH_PAD, also 0280's buckets)."""
++
++        c = self.g.w.cfg
++        return Rp > R and m is not None and Rp <= self.graph_rows and Rp <= st.proj.shape[1] \
++            and st.pos + Rp <= st.capacity and (st.index is not None or st.pos + Rp <= c.dense_limit) \
++            and self._mode(st, Rp) == m
++
++    def _bucket(self, sts: Sequence[State], windows: list[list[int]], modes: list) -> list[list[int]]:
++        """patches/0280 (GLM53_TF_BATCH_BUCKETS): every window padded with its last token to the round's bucket
++        (``batchplan.bucket_rows``) where ``_can_pad`` allows; a window that cannot stays as it is (its own key)."""
++
++        Rp = batchplan.bucket_rows([len(x) for x in windows], self.buckets)
++        out = []
++        for st, win, m in zip(sts, windows, modes):
++            R = len(win)
++            if self._can_pad(st, R, Rp, m):
++                win = list(win) + [win[-1]] * (Rp - R)
++                self.counts["pad_rows"] += Rp - R
++                self.counts["bucket_rows"] += Rp - R
++            out.append(win)
++        return out
++
+     def _forward(self, active: list[int], windows: list[list[int]]) -> torch.Tensor:
+         """One forward over the active slots' windows -> their logits rows. ``last_rows``: the rows each slot had in
+         it (its window's length, or more with GLM53_TF_BATCH_PAD: its rows start at the running sum of these)."""
+@@ -1541,12 +1585,20 @@ class Batcher:
+                 self.last_kind = "alone"
+                 return e.forward(windows[0])    # the engine's own graphs
+         sts = [self.states[s] for s in active]
++        real = [len(x) for x in windows]
+         modes = [self._mode(st, len(x)) for st, x in zip(sts, windows)]
+         if self.pad and self.use_graphs and all(m is not None for m in modes):
+             windows, modes = self._pad(sts, windows, modes)
++        if self.buckets and self.use_graphs and len(active) > 1 and all(m is not None for m in modes):
++            windows = self._bucket(sts, windows, modes)          # patches/0280
+         self.last_rows = [len(x) for x in windows]
+         T = stage_multi(w, sts, b, windows)
+         Rs = [len(x) for x in windows]
++        src = None
++        if self.tie:                            # patches/0280: padded rows route as their window's last real row
++            self.src_host[:T].numpy()[:] = batchplan.route_sources(real, Rs)
++            self.src_dev[:T].copy_(self.src_host[:T], non_blocking=True)
++            src = self.src_dev
+         if self.use_graphs and all(m is not None for m in modes) and max(Rs) <= self.graph_rows:
+             if self.parity_key:                 # patches/0200: the parities in the key, no state copies
+                 key = (tuple(active), tuple(Rs), tuple(modes), tuple(st.cur[0] if st.cur else 0 for st in sts))
+@@ -1562,7 +1614,11 @@ class Batcher:
+                 return b.logits[:T]
+ 
+             def run() -> None:
+-                compute_multi(w, sts, b, Rs, npbs=modes)
++                b.route_src = src               # patches/0280 (None: off); a graph holds the table's address
++                try:
++                    compute_multi(w, sts, b, Rs, npbs=modes)
++                finally:
++                    b.route_src = None
+ 
+             run()                               # the round's result, through the code the graph holds
+             self.counts["eager"] += 1
+@@ -1598,7 +1654,9 @@ class Batcher:
+         self.last_rows = [len(x) for x in windows]
+         logits = self._forward(active, windows)
+         ran = list(self.last_rows)              # patches/0200: rows per slot in the forward (padded or not)
+-        parts = [(a, n, st_, bl) for (a, _, st_, bl), n in zip((q.stepper.part() for q in seqs), ran)]
++        # patches/0280: tied padded rows read no experts of their own; the depth model prices the real rows
++        priced = [len(x) for x in windows] if self.tie else ran
++        parts = [(a, n, st_, bl) for (a, _, st_, bl), n in zip((q.stepper.part() for q in seqs), priced)]
+         torch.cuda.synchronize()
+         specs, off = [], 0
+         for s, q, win, n in zip(active, seqs, windows, ran):
+diff --git i/src/tensorfold/families/glm5_next/cuda/batchplan.py w/src/tensorfold/families/glm5_next/cuda/batchplan.py
+index b492f55..2c4ac33 100644
+--- i/src/tensorfold/families/glm5_next/cuda/batchplan.py
++++ w/src/tensorfold/families/glm5_next/cuda/batchplan.py
+@@ -213,6 +213,37 @@ def pad_mask(spec: str, most: int) -> int:
+     return mask
+ 
+ 
++def bucket_mask(spec: str, most: int) -> int:
++    """patches/0280: GLM53_TF_BATCH_BUCKETS ("4,8"; "" / "0": off) as a bit mask of window sizes, as ``pad_mask``."""
++
++    try:
++        return pad_mask(spec, most)
++    except ValueError:
++        raise ValueError(f"GLM53_TF_BATCH_BUCKETS={spec!r}: window sizes are 1..{most}") from None
++
++
++def bucket_rows(Rs: Sequence[int], mask: int) -> int:
++    """patches/0280: the rows every window of a round is padded to: the smallest listed size >= the round's longest
++    window (that window's length when none is)."""
++
++    return padded(max(Rs), mask) if Rs else 0
++
++
++def route_sources(real: Sequence[int], ran: Sequence[int]) -> list[int]:
++    """patches/0280: for a round whose window i has real[i] rows and ran[i] >= real[i] rows in the forward (back to
++    back), the row each forward row takes its router logits from: itself for a real row, its window's last real row
++    for a padded one."""
++
++    src, off = [], 0
++    for R, n in zip(real, ran):
++        if not 1 <= R <= n:
++            raise ValueError(f"route_sources: a window of {R} real rows ran {n}")
++        src.extend(range(off, off + R))
++        src.extend([off + R - 1] * (n - R))
++        off += n
++    return src
++
++
+ def padded(R: int, mask: int) -> int:
+     """A window of R rows padded up to the next size in ``mask`` (R itself when none is >= R or the mask is 0).
+     Padded rows repeat the window's last token; they are verified like drafts that can never be accepted (the accept
+diff --git i/src/tensorfold/families/glm5_next/cuda/forward.py w/src/tensorfold/families/glm5_next/cuda/forward.py
+index 039f5e4..3774c88 100644
+--- i/src/tensorfold/families/glm5_next/cuda/forward.py
++++ w/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -112,6 +112,10 @@ class Buffers:
+         self.fast = False                # patches/0080: a fast prefill chunk of the main model is running (fastpf)
+         self.part16 = self.gath16 = None     # patches/0080: bf16 partials of fast chunks (allocated on first use)
+         self.defer = None                # patches/0084: a pipelined lean chunk's exchange (``pfoverlap.Pipe``), or None
++        # patches/0280: batched rounds padded to a bucket (GLM53_TF_BATCH_BUCKETS): int64 [rows] on the device, row r's
++        # router logits taken from row src[r] (a padded row routes as its window's last real row: no new expert reads);
++        # None everywhere else
++        self.route_src = None
+         self.sk = torch.empty((8 * rows * 16384,), dtype=f32, device=dev)
+         # final
+         self.hidden = torch.empty((rows, D), dtype=bf, device=dev)
+@@ -452,9 +456,12 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+     c = w.cfg
+     m = layer.moe
+     grp = b.group(R)
+-    if b.fast or not dv2.route(b.normed[:R], m.router, m.bias, b.mlog[:R], b.pick[:R], b.wts[:R], grp, c.top_k,
+-                               c.experts, c.routed_scale, c.norm_topk):     # patches/0130: v2 routes in one kernel
++    src = b.route_src                    # patches/0280: padded rows route as their source rows (None: off)
++    if b.fast or src is not None or not dv2.route(b.normed[:R], m.router, m.bias, b.mlog[:R], b.pick[:R], b.wts[:R],
++                                                  grp, c.top_k, c.experts, c.routed_scale, c.norm_topk):   # patches/0130
+         glue.router(b.normed[:R], m.router, b.mlog[:R])
++        if src is not None:              # identity on real rows: their logits (and bits) are untouched
++            b.mlog[:R].copy_(b.mlog[:R].index_select(0, src[:R]))
+         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], grp.ids, grp.count, grp.members, c.top_k, c.experts,
+                     c.routed_scale, c.norm_topk)
+     if profile.ON:

@@ -1,0 +1,1042 @@
+diff --git c/THIRD_PARTY_NOTICES.md i/THIRD_PARTY_NOTICES.md
+index 5755abd..e0202e6 100644
+--- c/THIRD_PARTY_NOTICES.md
++++ i/THIRD_PARTY_NOTICES.md
+@@ -62,6 +62,17 @@ CuTe DSL, dim-0 only, for any alignment and byte count, with a wall-clock timeou
+ and wrap-safe failure flag; setup, GID detection, HCA pairing by subnet, the NCCL probe and fallback, and the
+ engine integration are new.
+ 
++GLM-5.3-Flash's b12x-derived fast-prefill kernels (`families/glm5_next/cuda/b12x_kda.py`, `b12x_mhc.py`,
++`b12x_attn.py`, switched by `b12xpf.py`; glm53-tensorfold-spark patch 0240) re-implement, in Triton, algorithms of
++b12x's `sequence.kda_prefill` (`b12x/sequence/_shared/delta_prefill`: the 16-token tile, its operands and
++Neumann-product inverse, the fp32 state held on chip while a program walks its tiles), `norm.mhc` (hc_post fused with
++the next pre's mixing dots over column blocks of all four streams) and `attention.sparse_mla` (one program and one
++online softmax per query row over its whole selected-token list), same copyright and license as above. No b12x code
++is copied (b12x's kernels are CuTe DSL). Changes: tf32 / fp32 operands instead of bf16 (b12x's bf16 policy is an
++option of the KDA kernel), this engine's conv / gate / norm prologue fused into the KDA program with no workspace or
++window pipeline, tiles at absolute positions, GLM-5.3's hyper-connection math (not b12x's Gram-matrix square sum),
++bf16 queries and probabilities in the sparse softmax (not b12x's FP8), and the engine integration.
++
+ ## Vendored code
+ 
+ - `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is
+diff --git c/src/tensorfold/families/glm5_next/cuda/b12x_attn.py i/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
+new file mode 100644
+index 0000000..b1fa1fb
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
+@@ -0,0 +1,92 @@
++"""One-pass sparse latent attention for fast-prefill chunks (patches/0240, ``tf_knobs.b12x`` bit 4).
++
++The structure follows b12x's sparse MLA prefill (https://github.com/local-inference-lab/b12x,
++``b12x/attention/sparse_mla``, Apache License 2.0, Copyright Luke Alonso and the b12x contributors): one program per
++query row holding all of the row's local heads, one online softmax over the row's whole selected-token list in list
++order, the normalized latent written directly -- no split of the ~2,051 selected tokens into 512-token chunks, so no
++fp32 chunk partials ([5, R, H, 512], ~335 MB written and read back a 1,024-row call) and no merge kernel. Re-implemented
++in Triton on this engine's latent tiles (``latent._lrows`` / ``latent._ltile``: bf16 or FP8 rows dequantized exactly,
++bf16 tensor-core scores and weighted sums, fp32 online softmax); b12x's FP8 query quantization and FP8 P.V are NOT
++taken (they change the arithmetic much more).
++
++Arithmetic: ``latent.sparse_latent``'s tile steps in the same list order, the same scale and masks, the running
++(m, l, o) carried across what were chunk boundaries instead of being merged at the end: the result differs from the
++chunked kernel's in the last fp32 bits of u (the merge's exp(m_c - m) rescaling is gone). Deterministic, one program
++per (row, head tile) whatever the call's rows (row-independent); fast chunks only (decode, verify, the MTP head and
++exact prefill keep the chunked kernels); new arithmetic, so its fast snapshots carry their own tag (``b12xpf``).
++"""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++from .latent import CHUNK, KT, SCALE_AT, _lrows, _ltile, _views
++
++BM = 32           # (row, head) queries a program: all 32 local heads of a row (one gather of its latent rows)
++STAGES = 1        # software pipelining of the key loop (no effect on bits); 2 needs ~64 KB more shared memory
++WARPS = 8
++
++
++@triton.jit
++def _lsparse_one(QA, LC, LCS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, L: tl.constexpr, KTS: tl.constexpr,
++                 SCALE: tl.constexpr, BMQ: tl.constexpr, FP8: tl.constexpr = False, RB: tl.constexpr = 0,
++                 SB: tl.constexpr = 0, SA: tl.constexpr = 0):
++    """Program (row r, head tile): the row's n selected tokens in list order, one online softmax, OUT = o / l."""
++
++    r = tl.program_id(0)
++    hb = tl.program_id(1)
++    n = tl.load(CNT + r)
++    if n > 0:
++        h = hb * BMQ + tl.arange(0, BMQ)
++        hok = h < H
++        d = tl.arange(0, L)
++        m = tl.full((BMQ,), float("-inf"), tl.float32)
++        l = tl.zeros((BMQ,), tl.float32)
++        o = tl.zeros((BMQ, L), tl.float32)
++        q = tl.load(QA + (r * H + h[:, None]) * L + d[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++        for t in range(0, tl.cdiv(n, KTS)):
++            idx = t * KTS + tl.arange(0, KTS)
++            ok = idx < n
++            tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
++            kv = _lrows(LC, LCS, tok, ok, d, FP8, RB, SB, SA)
++            valid = ok[None, :] & hok[:, None]
++            m, l, o = _ltile(q, kv, m, l, o, valid, SCALE)
++        tl.store(OUT + (r * H + h[:, None]).to(tl.int64) * L + d[None, :], o / l[:, None], mask=hok[:, None])
++
++
++def sparse_latent_one(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
++                      out: torch.Tensor, scale: float, *, bm: int | None = None, stages: int | None = None) -> None:
++    """``latent.sparse_latent``'s contract (rows with counts > 0 written into ``out`` [R, H, L] fp32, other rows
++    untouched), in one pass a row."""
++
++    R, H, L = qa.shape
++    if R == 0:
++        return
++    W = tokens.shape[1]
++    if not qa.is_contiguous() or not tokens.is_contiguous() or out.shape != (R, H, L) or not out.is_contiguous():
++        raise ValueError("sparse_latent_one: contiguous qa [R, H, L], tokens [R, W] and out [R, H, L] expected")
++    bm = (BM if H >= BM else 16) if bm is None else int(bm)
++    lcv, lcs, f8, rb, sb = _views(lc, L)
++    _lsparse_one[(R, triton.cdiv(H, bm))](qa, lcv, lcs, tokens, counts, out, W=W, H=H, L=L, KTS=KT, SCALE=scale,
++                                          BMQ=bm, FP8=f8, RB=rb, SB=sb, SA=SCALE_AT // 4, num_warps=WARPS,
++                                          num_stages=STAGES if stages is None else int(stages))
++
++
++def reference(qa: torch.Tensor, lat: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, scale: float):
++    """float64 softmax attention of every (row, head) over its selected latent rows (tests): [R, H, L]."""
++
++    R, H, L = qa.shape
++    out = torch.zeros((R, H, L), dtype=torch.float64, device=qa.device)
++    for r in range(R):
++        n = int(counts[r])
++        if n == 0:
++            continue
++        kv = lat[tokens[r, :n].long()].double()
++        s = qa[r].double() @ kv.T * scale
++        out[r] = torch.softmax(s, dim=-1) @ kv
++    return out
++
++
++assert CHUNK % KT == 0
+diff --git c/src/tensorfold/families/glm5_next/cuda/b12x_kda.py i/src/tensorfold/families/glm5_next/cuda/b12x_kda.py
+new file mode 100644
+index 0000000..048dcde
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/b12x_kda.py
+@@ -0,0 +1,261 @@
++"""KDA prefill in 16-row tiles, one fused program per (head, block of value rows) (patches/0240, ``tf_knobs.b12x`` bit 2).
++
++Derived from the chunked lower-bounded KDA prefill of b12x (https://github.com/local-inference-lab/b12x,
++``b12x/sequence/kda_prefill`` and ``b12x/sequence/_shared/delta_prefill``, Apache License 2.0, Copyright Luke Alonso
++and the b12x contributors): its 16-token chunk, its per-tile operands (q~ = q e^G, k~ = k e^G, k_inv = k e^-G,
++k_r = k e^(G_C - G), lambda_C = e^G_C, the strictly lower L = beta k~ k_inv^T, the Neumann-product inverse (I + L)^-1
++and the causal q~ k_inv^T) and its recurrence with the fp32 state held on chip while a program walks its tiles.
++Re-implemented in Triton for this engine (no b12x code is used): the prologue (conv + SiLU, L2 norms, decay, beta) is
++this engine's (``fast_kda``), the tile preparation runs inside the recurrence program (no workspace, no second
++kernel, no window pipeline), the operands of the large products are fp32 at tf32 precision by default (b12x rounds
++them and a shadow of the state to bf16; ``PREC`` = "bf16" does that), and tiles sit at ABSOLUTE multiples of 16.
++
++Per tile of 16 rows at absolute positions T .. T + 15 (rows past the call's end are identity steps: k = q = v = 0,
++beta = 0, decay 1), per head, with G the in-tile cumulative log decay (per key channel; G_t <= 0, > 16 lower):
++
++    L    = strict_lower(beta_t k~_t . k_inv_s)                    [16, 16]   (fp32 FMA dots, "ieee")
++    Minv = (I - L)(I + L^2)(I + L^4)(I + L^8) = (I + L)^-1        (L is nilpotent of index <= 16)
++    Mqk  = lower_incl(q~_t . k_inv_s)                             [16, 16]
++    V'   = beta (V - k~ S^T)                                      [16, BV]   (S: [BV value rows, 128 keys], fp32)
++    U    = Minv V'                                                [16, BV]
++    O    = q~ S^T + Mqk U  -> bf16 (then the gated RMSNorm, ``fast_kda._kda_norm``)
++    S   <- S diag(lambda_C) + U^T k_r
++
++which is the delta rule S'_t = S_{t-1} diag(e^{gl_t}), e_t = beta_t (v_t - S'_t k_t), S_t = S'_t + e_t k_t^T,
++o_t = S_t q_t unrolled over the tile (``fast_kda``'s derivation with a 16-row chunk; U is its E).
++
++Magnitudes: k_inv carries e^{-G} <= e^{16 |lower|}, so the tile is safe in fp32 / tf32 / bf16 exponents for
++|lower| <= ``MAX_ABS_LOWER`` (GLM-5.3: 5.0, e^80 ~ 5.5e34 and every product of the dots stays below e^75); other
++models fall back to ``fast_kda``.
++
++Exactness rules (patches/0085): deterministic (fixed shapes, fixed reduction orders, no atomics); a row's bits depend
++only on its 16-row tile's rows and the fp32 state entering the tile (the triangular structure: a valid row t reads
++rows <= t of its tile, and padded rows contribute exact zeros), and every fast call starts at a multiple of 64, so
++the only partial tile is a prompt's last one, the same in every schedule; the state handed between calls is the
++fp32 value the program keeps. NOT bit-identical to ``fast_kda`` (64-row blocks, other factorization) nor to the
++serial chain: new arithmetic, so its fast snapshots carry their own tag (``b12xpf``).
++
++Cost model (per 1024 rows x 32 heads, estimated, not measured): no workspace (``fast_kda`` writes and re-reads ~94 MB
++of fp32 scratch a call, which is what bounds it at ~1.8 ms); the inputs (~48 KB a row) are read once from DRAM and
++re-read from L2 by the 128 / BV value blocks of a head; 64 sequential tile steps a program.
++"""
++
++from __future__ import annotations
++
++import math
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++from .fast_kda import _conv_act, _kda_norm
++
++DK = DV = 128
++TILE = 16
++MAX_ABS_LOWER = 5.3                   # e^{16 |lower|} stays < 2^127 with the 128-term dot sums (see the docstring)
++PREC = os.environ.get("GLM53_TF_B12X_KDA_PREC", "tf32").strip().lower() or "tf32"   # "tf32" | "tf32x3" | "ieee" | "bf16"
++BV = int(os.environ.get("GLM53_TF_B12X_KDA_BV", "64") or 64)      # value rows of the state a program holds
++WARPS = int(os.environ.get("GLM53_TF_B12X_KDA_WARPS", "4") or 4)    # 255 registers: 2 programs an SM at 4 warps
++STAGES = int(os.environ.get("GLM53_TF_B12X_KDA_STAGES", "1") or 1)
++
++
++def settings() -> list[int]:
++    """What decides this kernel's bits, for the load-time check that both ranks agree (``b12xpf.load_settings``): the
++    precision, the value block and the warps (Triton's layouts, hence the order of the norms' and the scan's sums,
++    follow the shapes and the warp count)."""
++
++    return [("tf32", "tf32x3", "ieee", "bf16").index(PREC) if PREC in ("tf32", "tf32x3", "ieee", "bf16") else -1, BV,
++            WARPS]
++
++
++@triton.jit
++def _k16(P, p_stride, b_off, A, a_stride, CS, CW, A_LOG, DT_BIAS, S_IN, S_OUT, OUT, lower, R, off, NT,
++         H: tl.constexpr, BV: tl.constexpr, PREC: tl.constexpr, B16: tl.constexpr):
++    """Program (head h, value block jb): the call's 16-row tiles in order, state rows j = jb BV .. + BV - 1 on chip."""
++
++    h = tl.program_id(0)
++    jb = tl.program_id(1)
++    C: tl.constexpr = 3 * H * 128
++    l = tl.arange(0, 16)
++    i = tl.arange(0, 128)
++    j = jb * BV + tl.arange(0, BV)
++    decay_rate = tl.exp(tl.load(A_LOG + h))
++    dtb = tl.load(DT_BIAS + h * 128 + i)
++    sptr = h.to(tl.int64) * (128 * 128) + j[:, None] * 128 + i[None, :]
++    s = tl.load(S_IN + sptr)                                             # [BV, 128] fp32: s[h, value j, key i]
++    strict = l[None, :] < l[:, None]                                     # [t, s]: s < t
++    incl = l[None, :] <= l[:, None]
++    eye = tl.where(l[:, None] == l[None, :], 1.0, 0.0)
++    last = l == 15
++    for t in range(NT):
++        row = t * 16 - off + l
++        valid = (row >= 0) & (row < R)
++        rowc = tl.where(valid, row, 0).to(tl.int64)
++        # -- the rows' inputs (``fast_kda._kda_prep``'s prologue: the chain kernel's arithmetic) -------------------
++        qa = _conv_act(P, p_stride, CS, CW, row, valid, h * 128 + i, C)
++        ka = _conv_act(P, p_stride, CS, CW, row, valid, H * 128 + h * 128 + i, C)
++        va = _conv_act(P, p_stride, CS, CW, row, valid, 2 * H * 128 + h * 128 + j, C)     # this block's values only
++        qinv = 1.0 / tl.sqrt(tl.sum(qa * qa, axis=1) + 1e-6)
++        kinv = 1.0 / tl.sqrt(tl.sum(ka * ka, axis=1) + 1e-6)
++        q = tl.where(valid[:, None], (qa * qinv[:, None]) * (1.0 / tl.sqrt(128.0)), 0.0)
++        k = tl.where(valid[:, None], ka * kinv[:, None], 0.0)
++        v = tl.where(valid[:, None], va, 0.0)
++        araw = tl.load(A + rowc[:, None] * a_stride + h * 128 + i[None, :], mask=valid[:, None], other=0.0)
++        z = decay_rate * (araw.to(tl.float32) + dtb[None, :])
++        gl = tl.where(valid[:, None], lower * (1.0 / (1.0 + tl.exp(-z))), 0.0)
++        braw = tl.load(P + rowc * p_stride + b_off + h, mask=valid, other=0.0).to(tl.float32)
++        beta = tl.where(valid, (1.0 / (1.0 + tl.exp(-braw))).to(tl.bfloat16).to(tl.float32), 0.0)
++        # -- the tile's operands (b12x's preparation) ----------------------------------------------------------------
++        g = tl.cumsum(gl, axis=0)                                        # [16, 128], G_t (<= 0)
++        gc = tl.sum(tl.where(last[:, None], g, 0.0), axis=0)             # G_C (the tile's last row; padding adds 0)
++        kt = k * tl.exp(g)                                               # k~
++        kv = k * tl.exp(-g)                                              # k_inv
++        qt = q * tl.exp(g)                                               # q~ (the 128^-0.5 is in q)
++        kr = k * tl.exp(gc[None, :] - g)                                 # k_r
++        lam = tl.exp(gc)                                                 # lambda_C
++        lm = tl.dot(kt, tl.trans(kv), input_precision="ieee")
++        lm = tl.where(strict, lm * beta[:, None], 0.0)
++        mqk = tl.dot(qt, tl.trans(kv), input_precision="ieee")
++        mqk = tl.where(incl, mqk, 0.0)
++        minv = eye - lm
++        pw = tl.dot(lm, lm, input_precision="ieee")
++        minv = minv + tl.dot(minv, pw, input_precision="ieee")
++        pw = tl.dot(pw, pw, input_precision="ieee")
++        minv = minv + tl.dot(minv, pw, input_precision="ieee")
++        pw = tl.dot(pw, pw, input_precision="ieee")
++        minv = minv + tl.dot(minv, pw, input_precision="ieee")
++        # -- the recurrence ------------------------------------------------------------------------------------------
++        if B16:                                                          # b12x's policy: bf16 operands, fp32 master
++            sb = s.to(tl.bfloat16)
++            ks = tl.dot(kt.to(tl.bfloat16), tl.trans(sb))
++            vp = (v - ks) * beta[:, None]
++            u = tl.dot(minv.to(tl.bfloat16), vp.to(tl.bfloat16))
++            ub = u.to(tl.bfloat16)
++            o = tl.dot(qt.to(tl.bfloat16), tl.trans(sb)) + tl.dot(mqk.to(tl.bfloat16), ub)
++            upd = tl.dot(tl.trans(ub), kr.to(tl.bfloat16))
++        else:
++            ks = tl.dot(kt, tl.trans(s), input_precision=PREC)
++            vp = (v - ks) * beta[:, None]
++            u = tl.dot(minv, vp, input_precision="ieee")
++            o = tl.dot(qt, tl.trans(s), input_precision=PREC) + tl.dot(mqk, u, input_precision="ieee")
++            upd = tl.dot(tl.trans(u), kr, input_precision=PREC)
++        tl.store(OUT + rowc[:, None] * (H * 128) + h * 128 + j[None, :], o.to(tl.bfloat16), mask=valid[:, None])
++        s = s * lam[None, :] + upd
++    tl.store(S_OUT + sptr, s)
++
++
++def supported(lower: float, heads: int | None = None) -> bool:
++    """The 16-row tile is safe in fp32 for this lower bound (GLM-5.3: -5.0) and the value blocks divide 128."""
++
++    return math.isfinite(lower) and abs(lower) <= MAX_ABS_LOWER and DV % BV == 0 and BV >= 16
++
++
++def kda_prefill16(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
++                  conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
++                  norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch=None,
++                  state_out: torch.Tensor | None = None, *, pos: int, out: torch.Tensor | None = None,
++                  bv: int | None = None, prec: str | None = None, num_warps: int | None = None,
++                  num_stages: int | None = None) -> torch.Tensor:
++    """``kda.chain``'s contract (``fast_kda.kda_prefill_chunked``'s arguments), 16-row tiles at absolute multiples of 16
++    of ``pos``. Writes the gated-RMSNorm rows (``scratch.out[:rows]``, ``out`` or a new [rows, H*128] bf16 tensor) and
++    the fp32 state after the last row into ``state_out`` (required; may be ``state_in``). The conv state is not
++    advanced (``forward.commit`` does it, as for ``kda.chain``); no replay inputs are written (a fast prefill keeps
++    every row). ``bv`` / ``prec`` / warps / stages: tests and the micro-benchmark (the defaults decide the bits)."""
++
++    H = int(a_log.numel())
++    bv = BV if bv is None else int(bv)
++    prec = PREC if prec is None else prec
++    if state_out is None:
++        raise ValueError("kda_prefill16: state_out is required")
++    if not (math.isfinite(lower) and abs(lower) <= MAX_ABS_LOWER):
++        raise ValueError(f"kda_prefill16: |lower| = {abs(lower)} > {MAX_ABS_LOWER} (use fast_kda)")
++    if bv not in (16, 32, 64, 128):
++        raise ValueError("kda_prefill16: bv must be 16, 32, 64 or 128")
++    if prec not in ("tf32", "tf32x3", "ieee", "bf16"):
++        raise ValueError(f"kda_prefill16: precision {prec!r}")
++    if rows < 1 or p.shape[0] < rows or a.shape[0] < rows or g.shape[0] < rows:
++        raise ValueError("kda_prefill16: rows")
++    if p.stride(1) != 1 or a.stride(1) != 1 or g.stride(1) != 1:
++        raise ValueError("kda_prefill16: unit column strides expected")
++    if p.dtype != torch.bfloat16 or a.dtype != torch.bfloat16 or g.dtype != torch.bfloat16:
++        raise ValueError("kda_prefill16: bf16 projection/gate rows expected")
++    if not (conv_state.is_contiguous() and conv_w.is_contiguous() and state_in.is_contiguous()
++            and state_out.is_contiguous()):
++        raise ValueError("kda_prefill16: conv state, conv weight and states must be contiguous")
++    if state_in.numel() != H * DK * DV or state_out.numel() != H * DK * DV or state_in.dtype != torch.float32:
++        raise ValueError("kda_prefill16: states must be fp32 [H, 128, 128]")
++    if conv_w.shape[0] != 3 * H * DK or conv_w.shape[1] != 4:
++        raise ValueError("kda_prefill16: conv weight [3*H*128, 4] expected")
++    if scratch is not None:
++        o = scratch.out[:rows]
++    elif out is not None:
++        o = out[:rows]
++    else:
++        o = torch.empty((rows, H * DV), dtype=torch.bfloat16, device=p.device)
++    if o.shape != (rows, H * DV) or not o.is_contiguous():
++        raise ValueError("kda_prefill16: out must be a contiguous [rows, H*128] bf16")
++    off = int(pos) % TILE
++    nt = -(-(off + rows) // TILE)
++    b16 = prec == "bf16"
++    _k16[(H, DV // bv)](p, p.stride(0), int(b_off), a, a.stride(0), conv_state, conv_w, a_log, dt_bias, state_in,
++                        state_out, o, float(lower), int(rows), off, nt, H=H, BV=bv,
++                        PREC="tf32" if b16 else prec, B16=b16,
++                        num_warps=WARPS if num_warps is None else num_warps,
++                        num_stages=STAGES if num_stages is None else num_stages)
++    _kda_norm[(triton.cdiv(rows, 32), H)](o, g, g.stride(0), norm_w, float(eps), int(rows), H=H, BR=32, num_warps=4)
++    return o
++
++
++# -- reference (tests): the tile algorithm in torch fp64 / fp32 -----------------------------------------------------
++def tile_reference(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows, pos,
++                   dtype=torch.float64):
++    """The same 16-row tile algorithm in torch (``dtype`` math, the kernel's bf16 roundings of conv activations, beta
++    and the raw outputs kept): returns (out [rows, H*128] bf16, state [H, 128, 128] fp32). A host-side model of
++    ``_k16`` for the tests (the float64 variant bounds the kernel's rounding)."""
++
++    H = int(a_log.numel())
++    C = 3 * H * DK
++    f = dtype
++    dev = p.device
++    x = torch.cat([conv_state.to(torch.float32), p[:rows, :C].to(torch.float32)], 0)
++    w = conv_w.to(torch.float32)
++    acc = sum(w[:, tap] * x[tap:tap + rows] for tap in range(4))
++    act = (acc / (1.0 + torch.exp(-acc))).to(torch.bfloat16).to(f)
++    qa = act[:, :H * DK].view(rows, H, DK)
++    ka = act[:, H * DK:2 * H * DK].view(rows, H, DK)
++    va = act[:, 2 * H * DK:].view(rows, H, DV)
++    q = qa / torch.sqrt((qa * qa).sum(-1, keepdim=True) + 1e-6) * (1.0 / math.sqrt(DK))
++    k = ka / torch.sqrt((ka * ka).sum(-1, keepdim=True) + 1e-6)
++    rate = torch.exp(a_log.to(f))[None, :, None]
++    z = rate * (a[:rows, :H * DK].to(f).view(rows, H, DK) + dt_bias.to(f).view(1, H, DK))
++    gl = lower * torch.sigmoid(z)
++    beta = torch.sigmoid(p[:rows, b_off:b_off + H].to(torch.float32)).to(torch.bfloat16).to(f)
++    s = state_in.to(f).clone().view(H, DV, DK)
++    raw = torch.empty((rows, H, DV), dtype=torch.bfloat16, device=dev)
++    off = pos % TILE
++    starts = [0] + list(range(TILE - off if off else TILE, rows, TILE))
++    for t0 in starts:
++        t1 = min(rows, t0 + (TILE - off if t0 == 0 and off else TILE))
++        n = t1 - t0
++        G = torch.cumsum(gl[t0:t1], 0)                                   # [n, H, K]
++        GC = G[-1]
++        kt = k[t0:t1] * torch.exp(G)
++        kv = k[t0:t1] * torch.exp(-G)
++        qt = q[t0:t1] * torch.exp(G)
++        kr = k[t0:t1] * torch.exp(GC[None] - G)
++        bt = beta[t0:t1]                                                 # [n, H]
++        for h in range(H):
++            L = torch.tril((kt[:, h] @ kv[:, h].T) * bt[:, h, None], -1)
++            Minv = torch.linalg.inv(torch.eye(n, dtype=f, device=dev) + L)
++            Mqk = torch.tril(qt[:, h] @ kv[:, h].T)
++            Vp = (va[t0:t1, h] - kt[:, h] @ s[h].T) * bt[:, h, None]
++            U = Minv @ Vp
++            O = qt[:, h] @ s[h].T + Mqk @ U
++            raw[t0:t1, h] = O.to(torch.bfloat16)
++            s[h] = s[h] * torch.exp(GC[h])[None, :] + U.T @ kr[:, h]
++    o = raw.to(torch.float32)
++    rinv = 1.0 / torch.sqrt((o * o).mean(-1, keepdim=True) + eps)
++    gate = g[:rows, :H * DV].to(torch.float32).view(rows, H, DV)
++    out = ((norm_w.to(torch.float32) * (o * rinv)) * torch.sigmoid(gate)).reshape(rows, -1).to(torch.bfloat16)
++    return out, s.to(torch.float32)
+diff --git c/src/tensorfold/families/glm5_next/cuda/b12x_mhc.py i/src/tensorfold/families/glm5_next/cuda/b12x_mhc.py
+new file mode 100644
+index 0000000..d9e07ca
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/b12x_mhc.py
+@@ -0,0 +1,205 @@
++"""Hyper-connection mixing dots for fast-prefill chunks, fused with hc_post (patches/0240, ``tf_knobs.b12x`` bit 1).
++
++The idea comes from b12x's fused mHC (https://github.com/local-inference-lab/b12x, ``b12x/norm/mhc``, Apache License
++2.0, Copyright Luke Alonso and the b12x contributors): hc_post's new streams X' feed the next hc_pre's 24 mixing dots
++and square sums from registers, one launch per site instead of two, and the K split of those dots is laid out over
++column blocks of ALL FOUR streams (a program owns columns [c CB, (c + 1) CB) of every stream, which is exactly the
++data hc_post needs for them), so the fused kernel has as many programs as the unfused one. Re-implemented in Triton
++for this engine; the model math is GLM-5.3's (``glue``'s docstring), not b12x's variant of it (b12x rounds the collapse
++once and takes its square sum from a Gram matrix; here nothing but the K split changes):
++
++- X'_s = bf16(post_s * branch + (((c0s X0 + c1s X1) + c2s X2) + c3s X3)), ``glue._hc_post``'s expression, element for
++  element (the same bits as ``glue.hc_post``);
++- partial block c (c = 0 .. NB - 1): for the column steps t of the block, for s = 0 .. 3: the 24 dots of X'_s's
++  bf16 tile with fn's tile of stream s and the square sums, both on tensor cores into fp32 accumulators (the square
++  sums as the diagonal of X'_s X'_s^T, so their bits do not depend on how Triton lays a row over threads: every
++  number here is an mma chain fixed by the column order, hence the same for any row tile, warp count or step width);
++- the finish (mixes = the NB partials summed in order, Sinkhorn, collapse, RMSNorm) is ``glue._hc_finish_u``
++  unchanged.
++
++Against the current fast path (``fast_qmm.hc_partial``: 16 blocks of 1,024 contiguous flattened columns, i.e. a
++quarter of ONE stream a block, and square sums reduced in a Triton layout) only the summation order of the 24 mixes
++and the square sum changes: mixes differ in the last fp32 bits, so pre / post / comb and everything after them do too.
++New arithmetic for fast chunks (own snapshot tag, ``b12xpf``); deterministic; row-independent (each row is one row of
++the mma tiles; masked rows are zeros). ``partial`` (a site whose streams are already written: the first hc_pre after
++the embedding, and the unpipelined lean / non-lean chunks, which run ``glue.hc_post`` first) and ``post_partial`` (the
++pipelined slabs of patches/0084) give the same bits, by the construction above (tested on the GPU).
++"""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++BM = 32          # rows a program (no effect on bits)
++BK = 64          # columns a dot step (no effect on bits: the mma chains run in column order whatever the step)
++BKP = 16         # columns a step of the fused kernel's hc_post phase (no effect on bits: elementwise)
++WARPS = 4
++STAGES = 2
++_BROKEN = ""     # set when the fused kernel cannot launch here: ``post_partial`` then runs the two kernels (same bits)
++
++
++@triton.jit
++def _mhc_step(vb, FN, fcol, m, acc, sq, WIDE: tl.constexpr):
++    """One stream tile's contribution: acc += vb fn_tile^T (the 24 mixes), sq += vb vb^T (its diagonal: the squares)."""
++
++    w = tl.load(FN + m[:, None] * WIDE + fcol[None, :], mask=m[:, None] < 24, other=0.0)
++    acc = tl.dot(vb, tl.trans(w), acc)
++    sq = tl.dot(vb, tl.trans(vb), sq)
++    return acc, sq
++
++
++@triton.jit
++def _mhc_part(X, XOUT, G, POST, COMB, FN, PART, RS, R, D: tl.constexpr, WORLD: tl.constexpr, NB: tl.constexpr,
++              BM: tl.constexpr, BK: tl.constexpr, BKP: tl.constexpr, POST_ON: tl.constexpr):
++    """Program (row tile, column block c): columns [c CB, (c + 1) CB) of the four streams (CB = D / NB). POST_ON: first
++    the new streams from X and the gathered partials G (``glue._hc_post``'s expression, BKP columns a step), stored to
++    XOUT; then (both variants, the same code) the block's 24 mixes and square sum from XOUT's bf16 values, stream by
++    stream, BK columns a step, every product an mma into fp32 accumulators in column order (so neither BM, BK nor BKP
++    changes a bit). PART[r, c, 0:24] the mixes, PART[r, c, 24] the square sum."""
++
++    pid = tl.program_id(0)
++    c = tl.program_id(1)
++    WIDE: tl.constexpr = 4 * D
++    CB: tl.constexpr = D // NB
++    rows = pid * BM + tl.arange(0, BM)
++    ok = rows < R
++    rr = tl.where(ok, rows, 0).to(tl.int64)
++    m = tl.arange(0, 32)
++    off = rr[:, None] * WIDE
++    if POST_ON:
++        kp = tl.arange(0, BKP)
++        cb = COMB + rr * 16
++        c00 = tl.load(cb + 0, mask=ok, other=0.0)
++        c10 = tl.load(cb + 4, mask=ok, other=0.0)
++        c20 = tl.load(cb + 8, mask=ok, other=0.0)
++        c30 = tl.load(cb + 12, mask=ok, other=0.0)
++        c01 = tl.load(cb + 1, mask=ok, other=0.0)
++        c11 = tl.load(cb + 5, mask=ok, other=0.0)
++        c21 = tl.load(cb + 9, mask=ok, other=0.0)
++        c31 = tl.load(cb + 13, mask=ok, other=0.0)
++        c02 = tl.load(cb + 2, mask=ok, other=0.0)
++        c12 = tl.load(cb + 6, mask=ok, other=0.0)
++        c22 = tl.load(cb + 10, mask=ok, other=0.0)
++        c32 = tl.load(cb + 14, mask=ok, other=0.0)
++        c03 = tl.load(cb + 3, mask=ok, other=0.0)
++        c13 = tl.load(cb + 7, mask=ok, other=0.0)
++        c23 = tl.load(cb + 11, mask=ok, other=0.0)
++        c33 = tl.load(cb + 15, mask=ok, other=0.0)
++        p0 = tl.load(POST + rr * 4 + 0, mask=ok, other=0.0)
++        p1 = tl.load(POST + rr * 4 + 1, mask=ok, other=0.0)
++        p2 = tl.load(POST + rr * 4 + 2, mask=ok, other=0.0)
++        p3 = tl.load(POST + rr * 4 + 3, mask=ok, other=0.0)
++        for t in range(CB // BKP):
++            d = c * CB + t * BKP + kp
++            gv = tl.load(G + rr[:, None] * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++            for kk in tl.static_range(1, WORLD):
++                gv = gv + tl.load(G + kk * RS + rr[:, None] * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++            branch = gv.to(tl.bfloat16).to(tl.float32)
++            x0 = tl.load(X + off + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++            x1 = tl.load(X + off + D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++            x2 = tl.load(X + off + 2 * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++            x3 = tl.load(X + off + 3 * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++            # glue._hc_post's expression, operand for operand
++            v0 = p0[:, None] * branch + (((c00[:, None] * x0 + c10[:, None] * x1) + c20[:, None] * x2) + c30[:, None] * x3)
++            v1 = p1[:, None] * branch + (((c01[:, None] * x0 + c11[:, None] * x1) + c21[:, None] * x2) + c31[:, None] * x3)
++            v2 = p2[:, None] * branch + (((c02[:, None] * x0 + c12[:, None] * x1) + c22[:, None] * x2) + c32[:, None] * x3)
++            v3 = p3[:, None] * branch + (((c03[:, None] * x0 + c13[:, None] * x1) + c23[:, None] * x2) + c33[:, None] * x3)
++            tl.store(XOUT + off + d[None, :], v0.to(tl.bfloat16), mask=ok[:, None])
++            tl.store(XOUT + off + D + d[None, :], v1.to(tl.bfloat16), mask=ok[:, None])
++            tl.store(XOUT + off + 2 * D + d[None, :], v2.to(tl.bfloat16), mask=ok[:, None])
++            tl.store(XOUT + off + 3 * D + d[None, :], v3.to(tl.bfloat16), mask=ok[:, None])
++        # the dots read the block back (this CTA's own stores, L1 / L2, visible after the barrier) rather than taking it
++        # from registers: the unfused kernel's code from here on (hence its bits), and Triton does not re-materialize the
++        # post in each consumer's layout (that took 255 registers and spilled)
++        tl.debug_barrier()
++    k = tl.arange(0, BK)
++    acc = tl.zeros((BM, 32), dtype=tl.float32)
++    sq = tl.zeros((BM, BM), dtype=tl.float32)
++    for s in tl.static_range(4):
++        for t in range(CB // BK):
++            d = c * CB + t * BK + k
++            u = tl.load(XOUT + off + s * D + d[None, :], mask=ok[:, None], other=0.0)
++            acc, sq = _mhc_step(u, FN, s * D + d, m, acc, sq, WIDE)
++    i = tl.arange(0, BM)
++    ss = tl.sum(tl.where(i[:, None] == i[None, :], sq, 0.0), axis=1)       # the diagonal (one term a row: exact)
++    pm = ok[:, None] & (m[None, :] < 24)
++    tl.store(PART + (rr[:, None] * NB + c) * 32 + m[None, :], acc, mask=pm)
++    tl.store(PART + (rr * NB + c) * 32 + 24, ss, mask=ok)
++
++
++def step(d: int, nb: int, bk: int | None = None) -> int:
++    """Columns a step: ``BK`` (or ``bk``), or the whole block when it is narrower (any width gives the same bits)."""
++
++    return min(BK if bk is None else bk, d // nb)
++
++
++def fits(d: int, nb: int) -> bool:
++    """The kernel's shape rule: D splits into NB column blocks of a multiple of 16 columns."""
++
++    cb = d // nb
++    return d % nb == 0 and cb % 16 == 0 and cb % step(d, nb) == 0 and cb % step(d, nb, BKP) == 0
++
++
++def _check(x: torch.Tensor, fn: torch.Tensor, part: torch.Tensor, nb: int) -> tuple[int, int]:
++    rows, wide = x.shape
++    d = wide // 4
++    if wide != 4 * d or x.stride(1) != 1 or x.stride(0) != wide or not fn.is_contiguous() or fn.shape[1] != wide:
++        raise ValueError("b12x_mhc: contiguous [R, 4 D] streams and fn [24, 4 D] expected")
++    if not fits(d, nb) or part.shape[0] < rows or part.shape[1] != nb or part.shape[2] < 25:
++        raise ValueError("b12x_mhc: D / NB must be a multiple of 16 columns, part [R, NB, 32]")
++    return rows, d
++
++
++def partial(x: torch.Tensor, fn: torch.Tensor, part: torch.Tensor, nb: int) -> None:
++    """The mixes' partials of streams already in ``x`` [R, 4 D] bf16 (``fast_qmm.hc_partial``'s contract, this
++    module's K split)."""
++
++    rows, d = _check(x, fn, part, nb)
++    if rows == 0:
++        return
++    _mhc_part[(triton.cdiv(rows, BM), nb)](x, x, x, x, x, fn, part, 0, rows, D=d, WORLD=1, NB=nb, BM=BM,
++                                            BK=step(d, nb), BKP=step(d, nb, BKP), POST_ON=False, num_warps=WARPS, num_stages=STAGES)
++
++
++def post_partial(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
++                 fn: torch.Tensor, part: torch.Tensor, nb: int) -> bool:
++    """``glue.hc_post(x, xout, gathered, post, comb)`` then ``partial(xout, fn, part, nb)`` in one pass. False
++    (nothing written) when the kernel cannot launch here; the caller then runs the two (same bits)."""
++
++    global _BROKEN
++    rows, d = _check(xout, fn, part, nb)
++    world = gathered.shape[0]
++    if gathered.stride(2) != 1 or gathered.stride(1) != d or gathered.shape[1] < rows:
++        raise ValueError("b12x_mhc: the gathered partials' rows must be contiguous")
++    if _BROKEN:
++        return False
++    if rows == 0:
++        return True
++    try:
++        _mhc_part[(triton.cdiv(rows, BM), nb)](x, xout, gathered, post, comb, fn, part, gathered.stride(0), rows, D=d,
++                                                WORLD=world, NB=nb, BM=BM, BK=step(d, nb), BKP=step(d, nb, BKP), POST_ON=True, num_warps=WARPS,
++                                                num_stages=STAGES)
++        return True
++    except Exception as exc:                            # noqa: BLE001 - triton.runtime.errors.OutOfResources et al.
++        if type(exc).__name__ not in ("OutOfResources", "CompilationError"):
++            raise
++        _BROKEN = f"{type(exc).__name__}: {exc}"
++        print(f"[tensorfold] b12x mhc: the fused kernel cannot run here ({_BROKEN}); post + partial kernels",
++              flush=True)
++        return False
++
++
++# -- reference (tests) ------------------------------------------------------------------------------------------------
++def partial_reference(x: torch.Tensor, fn: torch.Tensor, nb: int) -> torch.Tensor:
++    """float64 partials of this module's K split: [R, nb, 25] (24 mixes, the square sum)."""
++
++    rows, wide = x.shape
++    d = wide // 4
++    cb = d // nb
++    xs = x.double().view(rows, 4, nb, cb)
++    f = fn.double().view(24, 4, nb, cb)
++    mix = torch.einsum("rsbk,msbk->rbm", xs, f)
++    sq = (xs * xs).sum(dim=(1, 3))
++    return torch.cat([mix, sq[:, :, None]], 2)
+diff --git c/src/tensorfold/families/glm5_next/cuda/b12xpf.py i/src/tensorfold/families/glm5_next/cuda/b12xpf.py
+new file mode 100644
+index 0000000..11421e4
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/b12xpf.py
+@@ -0,0 +1,110 @@
++"""b12x-derived fast-prefill kernels for GLM-5.3-Flash (patches/0240): the switch, its snapshot tag bits, its load checks.
++
++Three kernels ported from the ideas of b12x (https://github.com/local-inference-lab/b12x, Apache License 2.0,
++Copyright Luke Alonso and the b12x contributors; see NOTICE), each re-implemented in Triton for this engine and each
++behind one bit of ``tf_knobs.b12x`` (default: GLM53_TF_B12X, 0 = off):
++
++    bit 1  ``b12x_mhc``   hyper-connections: the next hc_pre's 24 mixing dots and square sums split by column blocks
++                          of all four streams, on tensor cores, and in patches/0084's slabs fused with hc_post (one
++                          launch and one read of the new streams less a site)
++    bit 2  ``b12x_kda``   KDA: 16-row tiles, the tile preparation and the recurrence in one program per (head, block
++                          of value rows), fp32 state on chip, no workspace (``fast_kda`` writes and re-reads ~94 MB of
++                          fp32 scratch a 1,024-row call)
++    bit 4  ``b12x_attn``  sparse latent attention: one online softmax over a row's whole token list (no 512-token
++                          chunk partials, no merge); latent KV engines only
++
++Every bit is NEW ARITHMETIC for fast chunks only (decode, verify, the MTP head, DFlash2 and exact prefill never run
++them), deterministic and row-independent (patches/0085's rules: fixed shapes and reduction orders, no atomics, the KDA
++tiles at absolute multiples of 16 inside the 64-aligned fast calls), so drafted == serial and resumed == fresh hold
++within each setting. A fast prefill's snapshot tag gets 4 x (the effective bits) (``pfgrid.tag``), so a request only
++resumes snapshots made with the same kernels; fast requests with other bits, exact requests, FP8 and
++GLM53_TF_LATENT_TC snapshots never mix with them.
++
++Per request through patches/0090's header (``tf_knobs.b12x``, both ranks set it from rank 0's header). What decides the
++kernels' bits beyond the bits themselves (``b12x_kda.PREC`` / ``BV`` / ``WARPS``: GLM53_TF_B12X_KDA_PREC, _BV, _WARPS) is
++load-time and checked equal on both ranks (``load_settings``). Nothing here imports torch.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++
++ENV = "GLM53_TF_B12X"
++MHC, KDA, ATTN = 1, 2, 4
++ALL = MHC | KDA | ATTN
++
++# what the next prefill runs (engine._set_knobs switches it per request)
++BITS = 0
++
++
++def default() -> int:
++    raw = os.environ.get(ENV, "").strip()
++    if not raw:
++        return 0
++    try:
++        v = int(raw)
++    except ValueError:
++        raise ValueError(f"{ENV}={raw!r}: expected 0 to {ALL}") from None
++    if not 0 <= v <= ALL:
++        raise ValueError(f"{ENV}={raw!r}: expected 0 to {ALL} (1 hyper-connections, 2 KDA, 4 sparse attention)")
++    return v
++
++
++def _mod(name: str):
++    return sys.modules.get(f"{__package__}.{name}") if __package__ else None
++
++
++def set_bits(v: int) -> None:
++    """Switch the kernels for the next prefills (both ranks do it from the header's value)."""
++
++    global BITS
++    v = int(v)
++    if not 0 <= v <= ALL:
++        raise ValueError(f"tf_knobs.b12x={v}: expected 0 to {ALL}")
++    BITS = v
++    for name, attr, bit in (("glue", "MHC", MHC), ("latent", "SPARSE_ONE", ATTN)):
++        mod = _mod(name)
++        if mod is None and v & bit:
++            try:
++                import importlib
++
++                mod = importlib.import_module(f"{__package__}.{name}")
++            except Exception:            # noqa: BLE001 - host fakes without torch / triton: nothing to switch
++                mod = None
++        if mod is not None:
++            setattr(mod, attr, bool(v & bit))
++
++
++def kda_on() -> bool:
++    return bool(BITS & KDA)
++
++
++def effective(bits: int, w=None) -> int:
++    """The bits that change a fast prefill on this engine: the sparse kernel only runs on the latent cache (host
++    fakes without ``w.meta`` keep every bit)."""
++
++    meta = getattr(w, "meta", None)
++    if isinstance(meta, dict) and not meta.get("latent_kv"):
++        bits &= ~ATTN
++    return bits & ALL
++
++
++def tag_bits(w=None, bits: int | None = None) -> int:
++    return effective(BITS if bits is None else int(bits), w)
++
++
++def load_settings() -> list[int]:
++    """What both ranks must agree on at load (the KDA kernel's precision and value block decide its bits)."""
++
++    try:
++        from . import b12x_kda
++    except Exception:                    # noqa: BLE001 - host fakes without torch / triton
++        return [-1, -1, -1]
++    return b12x_kda.settings()
++
++
++def describe(v: int | None = None) -> str:
++    v = BITS if v is None else v
++    parts = [n for b, n in ((MHC, "hc"), (KDA, "kda"), (ATTN, "sparse")) if v & b]
++    return ",".join(parts) or "off"
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py i/src/tensorfold/families/glm5_next/cuda/batch.py
+index 18fffdd..176aeb6 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ i/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -1290,7 +1290,8 @@ class Batcher:
+         return best
+ 
+     def _grid(self, values: dict) -> int:
+-        return self.g._grid(bool(values["fast_prefill"]), int(values["prefill_rows"]), bool(values["fp8_prefill"]))
++        return self.g._grid(bool(values["fast_prefill"]), int(values["prefill_rows"]), bool(values["fp8_prefill"]),
++                            int(values.get("b12x", 0)))                  # patches/0240
+ 
+     def _place(self, job: Job, free: list[int]) -> tuple[int, int]:
+         """(slot, resume length): the free slot resuming the longest prefix; else the least recently admitted one
+@@ -1445,8 +1446,12 @@ class Batcher:
+         job.stats.update(prefill_s=round(time.perf_counter() - seq.t0, 4), pieces=seq.pieces)
+         if tag:
+             job.stats["fast_prefill"] = tag - tag % 64
+-            if tag % 64:
++            from . import pfgrid
++
++            if pfgrid.is_fp8(tag):                                  # patches/0240: not every offset is FP8
+                 job.stats["fp8_prefill"] = 1
++            if tag % 64 // pfgrid.B12X:
++                job.stats["b12x"] = tag % 64 // pfgrid.B12X
+         self._emit(seq, [first])
+         seq.stepper = Stepper(self, slot, job, first, last_hidden)
+         if seq.stepper.done(self.eos):
+diff --git c/src/tensorfold/families/glm5_next/cuda/decode.py i/src/tensorfold/families/glm5_next/cuda/decode.py
+index 5b6d774..a500ad2 100644
+--- c/src/tensorfold/families/glm5_next/cuda/decode.py
++++ i/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -411,7 +411,9 @@ def _prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp
+     # patches/0085: tagged by mode (exact 0, fast G, FP8 G + 1), not by the chunk size
+     grid = getattr(e, "snap_grid", None) or pfgrid.snapshot_grid()
+     # patches/0190: + pfgrid.TC for GLM53_TF_LATENT_TC's arithmetic
+-    tag = pfgrid.tag(fast, fp8pf.ON, grid, pfglue.latent_tc(getattr(e, "w", None)))
++    from . import b12xpf                  # patches/0240: + 4 x tf_knobs.b12x's effective bits
++
++    tag = pfgrid.tag(fast, fp8pf.ON, grid, pfglue.latent_tc(getattr(e, "w", None)), b12xpf.tag_bits(getattr(e, "w", None)))
+     cap = lean.rows if lean is not None else e.rows
+     # patches/0190 (``tf_knobs.mtp_window``): the MTP head absorbs positions from ``mtp_lo`` on (a function of the
+     # prompt length only); below it its caches are zeroed. Drafts only: replies never read the head
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py i/src/tensorfold/families/glm5_next/cuda/engine.py
+index 6b9c78c..43fdaaf 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ i/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -370,6 +370,18 @@ class GlmEngine:
+             raise RuntimeError(f"the two ranks were started with different GLM53_TF_LATENT_TC / "
+                                f"GLM53_TF_MTP_PREFILL_CACHE: {tc_both[0]}, {tc_both[1]}")
+         pfglue.MTP_CACHE = pfglue.mtp_cache_default()   # prefill's MTP rows: cache writes only (same bits)
++        # patches/0240: the b12x-derived fast-prefill kernels (per request: tf_knobs.b12x; new arithmetic, own snapshot
++        # tag bits); the KDA kernel's load-time precision / value block decide its bits: both ranks must agree
++        from . import b12xpf
++
++        b12xpf.set_bits(b12xpf.default())
++        bx_both = self._gather_ints(b12xpf.load_settings())
++        if bx_both[0] != bx_both[1]:
++            raise RuntimeError(f"the two ranks were started with different GLM53_TF_B12X_KDA_PREC / _BV / _WARPS: {bx_both[0]}, "
++                               f"{bx_both[1]}")
++        if rank == 0 and b12xpf.BITS:
++            print(f"[tensorfold] b12x fast-prefill kernels (patches/0240): {b12xpf.describe()} by default (new "
++                  "arithmetic in fast chunks, own snapshot tag)", flush=True)
+         if rank == 0 and pfglue.MTP_CACHE:
+             print("[tensorfold] MTP prefill rows: head cache writes only (patches/0190, GLM53_TF_MTP_PREFILL_CACHE=1)"
+                   + ("" if latent.on(w) else "; inactive: GLM53_TF_LATENT_KV=0"), flush=True)
+@@ -450,7 +462,7 @@ class GlmEngine:
+     def _knob_state(self) -> dict[str, int]:
+         """This rank's current value of every knob in the header (the load-time defaults between requests)."""
+ 
+-        from . import exl3_mm, glue, latent, pfglue, pfoverlap, profile
++        from . import b12xpf, exl3_mm, glue, latent, pfglue, pfoverlap, profile
+ 
+         return {"expert_loop": int(bool(exl3_mm.LOOP)), "prefill_rows": int(self.e.prefill_rows),
+                 "longctx_graphs": int(bool(self.e.longctx)), "profile": int(bool(profile.ON)),
+@@ -462,7 +474,8 @@ class GlmEngine:
+                 "moe_glue": pfglue.moe_glue(glue),                       # patches/0190
+                 "mtp_window": int(pfglue.MTP_WINDOW),
+                 "hc_fused": int(glue.HC_FUSED),
+-                "attn_bm32": int(bool(latent.BF16_BM32))}
++                "attn_bm32": int(bool(latent.BF16_BM32)),
++                "b12x": int(b12xpf.BITS)}                                # patches/0240
+ 
+     def _set_knobs(self, values: dict[str, int]) -> None:
+         """Set the knobs whose value differs from the current one (the others are left exactly as they are)."""
+@@ -516,6 +529,10 @@ class GlmEngine:
+             from . import latent
+ 
+             latent.BF16_BM32 = bool(changed["attn_bm32"])
++        if "b12x" in changed:                   # patches/0240: new arithmetic in fast chunks (the tag carries it)
++            from . import b12xpf
++
++            b12xpf.set_bits(changed["b12x"])
+ 
+     def _knobs(self, values: dict[str, int]):
+         """Context: the request's knobs on this rank, then this rank's previous values again (also on errors)."""
+@@ -747,7 +764,8 @@ class GlmEngine:
+         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
+         return auto, auto or not dflash, dflash
+ 
+-    def _grid(self, fast: bool | None = None, rows: int | None = None, fp8: bool | None = None) -> int:
++    def _grid(self, fast: bool | None = None, rows: int | None = None, fp8: bool | None = None,
++              b12x: int | None = None) -> int:
+         """patches/0080: the snapshot tag a request uses: 0 (exact prefill), or a fast one (patches/0083: + 1 for an
+         FP8 fast prefill). patches/0085: by mode only (``pfgrid.tag``: the snapshot grid G, G + 1), never by the
+         request's chunk size, so fast requests of any ``prefill_rows`` share their snapshots (``rows`` is ignored)."""
+@@ -758,8 +776,11 @@ class GlmEngine:
+         fp8 = bool(getattr(self.e, "fp8_prefill", False)) if fp8 is None else fp8
+         from . import pfglue
+ 
++        from . import b12xpf
++
+         return pfgrid.tag(bool(fast), fp8, getattr(self.e, "snap_grid", None),
+-                          pfglue.latent_tc(getattr(self, "w", None)))          # patches/0190: GLM53_TF_LATENT_TC
++                          pfglue.latent_tc(getattr(self, "w", None)),          # patches/0190: GLM53_TF_LATENT_TC
++                          b12xpf.tag_bits(getattr(self, "w", None), b12x))     # patches/0240: tf_knobs.b12x
+ 
+     def _resume(self, prompt: list[int], code: list[int], grid: int | None = None):
+         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters (and,
+@@ -821,8 +842,12 @@ class GlmEngine:
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
+         if grid:
+             stats["fast_prefill"] = grid - grid % 64            # patches/0083: the chunk grid C of the tag
+-            if grid % 64:
++            from . import pfgrid
++
++            if pfgrid.is_fp8(grid):                              # patches/0240: not every offset is FP8
+                 stats["fp8_prefill"] = 1
++            if grid % 64 // pfgrid.B12X:
++                stats["b12x"] = grid % 64 // pfgrid.B12X             # patches/0240: the b12x kernels it ran
+             stats["fast_prefill"] = getattr(self.e, "fast_rows", 0) or stats["fast_prefill"]   # patches/0085: its C
+         on_tokens([first])
+         if max_tokens <= 1 or (stop_eos and first in self.eos):
+diff --git c/src/tensorfold/families/glm5_next/cuda/fastpf.py i/src/tensorfold/families/glm5_next/cuda/fastpf.py
+index 61df490..a669a64 100644
+--- c/src/tensorfold/families/glm5_next/cuda/fastpf.py
++++ i/src/tensorfold/families/glm5_next/cuda/fastpf.py
+@@ -270,6 +270,14 @@ def kda_chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm
+ 
+     if pos % GRID:
+         raise ValueError(f"fast KDA at position {pos}: fast calls start at multiples of {GRID} (patches/0085)")
++    from . import b12xpf
++
++    if b12xpf.kda_on():                  # patches/0240 (tf_knobs.b12x bit 2): 16-row tiles, one fused program
++        from . import b12x_kda
++
++        if b12x_kda.supported(lower):
++            return b12x_kda.kda_prefill16(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps,
++                                          lower, rows, scratch, state_out, pos=pos)
+     if fast_kda is not None:
+         return fast_kda.kda_prefill_chunked(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps,
+                                             lower, rows, scratch, state_out, pos=pos)
+diff --git c/src/tensorfold/families/glm5_next/cuda/glue.py i/src/tensorfold/families/glm5_next/cuda/glue.py
+index 1d46199..d9e8f50 100644
+--- c/src/tensorfold/families/glm5_next/cuda/glue.py
++++ i/src/tensorfold/families/glm5_next/cuda/glue.py
+@@ -28,6 +28,17 @@ HC_BLOCKS = 16
+ # ``fastpf.chunk`` only while a fast chunk of the main model runs; None everywhere else
+ FAST_HC = None
+ 
++# patches/0240 (``tf_knobs.b12x`` bit 1, ``b12xpf``): in fast chunks, the mixing dots through ``b12x_mhc`` (column blocks
++# of all four streams, square sums on tensor cores; new arithmetic, own snapshot tag) and, in patches/0084's slabs,
++# hc_post fused with them. False everywhere else (decode, verify, exact prefill never see it)
++MHC = False
++
++
++def _mhc_fits(d: int) -> bool:
++    from . import b12x_mhc
++
++    return b12x_mhc.fits(d, HC_BLOCKS)
++
+ 
+ # -- embedding ----------------------------------------------------------------------------------------------
+ @triton.jit
+@@ -187,12 +198,16 @@ def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.T
+     rows, wide = x.shape
+     d = norm_w.shape[0]
+     s = wide // d
+-    if FAST_HC is not None:            # patches/0080: a fast-prefill chunk (row tiles share fn; not these bits)
++    if FAST_HC is not None and MHC and wide == 4 * d and _mhc_fits(d):     # patches/0240: the b12x-style K split
++        from . import b12x_mhc
++
++        b12x_mhc.partial(x, fn, part, HC_BLOCKS)
++    elif FAST_HC is not None:          # patches/0080: a fast-prefill chunk (row tiles share fn; not these bits)
+         FAST_HC(x, fn, part, HC_BLOCKS)
+     else:
+         _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
+     # patches/0190: in fast chunks only (decode / graphs keep _hc_finish), the same bits with the loads in flight
+-    fin = _hc_finish_u if (HC_FUSED & 2 and FAST_HC is not None) else _hc_finish
++    fin = _hc_finish_u if ((HC_FUSED & 2 or MHC) and FAST_HC is not None) else _hc_finish      # patches/0240
+     fin[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,
+                  ITERS=iters, BLOCK=d, num_warps=8)
+ 
+@@ -409,6 +424,12 @@ def hc_fused_ok(x: torch.Tensor, gathered: torch.Tensor, fn: torch.Tensor) -> bo
+     """The fused post + partial kernel applies: a fast chunk (hc_pre's partial is ``fast_qmm.hc_partial``), 4
+     contiguous streams, fn contiguous, K blocks that split every stream evenly into 64-wide steps."""
+ 
++    if MHC and FAST_HC is not None:     # patches/0240: b12x_mhc.post_partial
++        from . import b12x_mhc
++
++        world, rows, d = gathered.shape
++        return (x.is_cuda and x.shape[1] == 4 * d and x.stride(1) == 1 and x.stride(0) == 4 * d and fn.is_contiguous()
++                and gathered.stride(2) == 1 and gathered.stride(1) == d and b12x_mhc.fits(d, HC_BLOCKS))
+     if not (HC_FUSED & 1) or _HC_FUSED_BROKEN or FAST_HC is None or getattr(FAST_HC, "__name__", "") != "hc_partial":
+         return False
+     world, rows, d = gathered.shape
+@@ -440,6 +461,10 @@ def try_hc_post_part(x, xout, gathered, post, comb, fn, part) -> bool:
+     the separate kernels, which give the same bits."""
+ 
+     global _HC_FUSED_BROKEN
++    if MHC and FAST_HC is not None:     # patches/0240
++        from . import b12x_mhc
++
++        return b12x_mhc.post_partial(x, xout, gathered, post, comb, fn, part, HC_BLOCKS)
+     try:
+         hc_post_part(x, xout, gathered, post, comb, fn, part)
+         return True
+@@ -459,7 +484,7 @@ def hc_finish(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torc
+ 
+     rows, wide = x.shape
+     d = norm_w.shape[0]
+-    fin = _hc_finish_u if (HC_FUSED & 2 and FAST_HC is not None) else _hc_finish
++    fin = _hc_finish_u if ((HC_FUSED & 2 or MHC) and FAST_HC is not None) else _hc_finish      # patches/0240: unrolled
+     fin[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=wide // d, NB=HC_BLOCKS,
+                  ITERS=iters, BLOCK=d, num_warps=8)
+ 
+diff --git c/src/tensorfold/families/glm5_next/cuda/knobs.py i/src/tensorfold/families/glm5_next/cuda/knobs.py
+index 4a87e5e..dfb5d2a 100644
+--- c/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ i/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -45,6 +45,10 @@ its snapshots are tagged C + 1 and resume FP8 fast requests of the same grid onl
+                                                                             (fast pipelined chunks; same bits)
+     attn_bm32       0 | 1                    GLM53_TF_ATTN_BM32 (0)         patches/0190: 32-query latent attention
+                                                                             tiles in bf16 fast chunks (same bits)
++    b12x            0 .. 7                   GLM53_TF_B12X (0)              patches/0240, bits: 1 hc mixing dots
++                                                                            fused with hc_post, 2 KDA in 16-row
++                                                                            tiles, 4 one-pass sparse attention (fast
++                                                                            chunks; NEW arithmetic, own snapshot tag)
+ 
+ Knobs fixed at load (``LOAD_ONLY``) are refused with the reason. Rank 0 validates a request's knobs
+ (``parse``), resolves every knob to the value the request runs with, and sends the integers rank 1 needs in the
+@@ -76,13 +80,15 @@ RANGES: dict[str, tuple[int, int | None]] = {
+     "mtp_window": (0, 1 << 30),          # patches/0190
+     "hc_fused": (0, 3),                  # patches/0190
+     "attn_bm32": (0, 1),                 # patches/0190
++    "b12x": (0, 7),                      # patches/0240
+ }
+ PER_REQUEST = tuple(RANGES) + ("depth",)
+ 
+ # the knobs rank 1 applies itself, in header order (lookup / lookup_min travel in the policy code, depth as
+ # patches/0071's cost flag, calib_online as rank 0's cost table)
+ HEADER = ("expert_loop", "prefill_rows", "longctx_graphs", "profile", "auto_fdrafts", "calib_online", "fast_prefill",
+-          "fp8_prefill", "prefill_overlap", "fat_experts", "moe_glue", "mtp_window", "hc_fused", "attn_bm32")
++          "fp8_prefill", "prefill_overlap", "fat_experts", "moe_glue", "mtp_window", "hc_fused", "attn_bm32",
++          "b12x")                                                        # patches/0240
+ 
+ LOAD_ONLY: dict[str, str] = {
+     "nonexpert": "GLM53_TF_NONEXPERT is the stored weight format, quantized once at load",
+diff --git c/src/tensorfold/families/glm5_next/cuda/latent.py i/src/tensorfold/families/glm5_next/cuda/latent.py
+index 28fa2ad..3a8952d 100644
+--- c/src/tensorfold/families/glm5_next/cuda/latent.py
++++ i/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -78,6 +78,9 @@ BF16_BM32 = False
+ # snapshots carry their own tag (``pfgrid.TC``) so they never resume a prefill of the other arithmetic.
+ BF16_TC = False
+ TC_ROWS = 64
++# patches/0240 (``tf_knobs.b12x`` bit 4, ``b12xpf``): fast chunks' sparse rows through ``b12x_attn.sparse_latent_one``
++# (one online softmax over a row's whole token list; new arithmetic, own snapshot tag). False everywhere else
++SPARSE_ONE = False
+ # patches/0220: the FP8 latent row (GLM53_TF_KV_DTYPE=fp8): 512 e4m3 bytes, the fp32 scale at byte 512, padded to 528
+ ROW8 = 528
+ SCALE_AT = 512
+@@ -732,7 +735,12 @@ def _attend(layer, w, lc, pos_dev, b, o: int, R: int, nch, index, host_pos, npb=
+                                                   np_max, pos_dev)
+         if profile.ON:
+             profile.lap("dsa.indexer")
+-        sparse_latent(s.qa[o:o + R], lc, tokens, counts, u, scale, s.sparse_part(R), **tile)
++        if SPARSE_ONE and bool(getattr(b, "fast", False)):          # patches/0240: one pass a row, no partials
++            from . import b12x_attn
++
++            b12x_attn.sparse_latent_one(s.qa[o:o + R], lc, tokens, counts, u, scale)
++        else:
++            sparse_latent(s.qa[o:o + R], lc, tokens, counts, u, scale, s.sparse_part(R), **tile)
+         if profile.ON:
+             profile.lap("dsa.sparse_attn")
+ 
+diff --git c/src/tensorfold/families/glm5_next/cuda/pfgrid.py i/src/tensorfold/families/glm5_next/cuda/pfgrid.py
+index 547200e..8ca0683 100644
+--- c/src/tensorfold/families/glm5_next/cuda/pfgrid.py
++++ i/src/tensorfold/families/glm5_next/cuda/pfgrid.py
+@@ -66,6 +66,7 @@ ALIGN = 64                      # fast_kda's block: fast calls, cuts and fast sn
+ AUTO = 0                        # prefill_rows "auto": the chunk size chosen per request (``chunk_rows``)
+ FP8 = 1                         # added to the grid in an FP8 fast prefill's tag (fp8pf.TAG)
+ TC = 2                          # patches/0190: added for a bf16 fast prefill with GLM53_TF_LATENT_TC (other bits)
++B12X = 4                        # patches/0240: + B12X x the b12x kernels' bits (1-7): offsets up to 2 + 28 < ALIGN
+ GRID_ENV = "GLM53_TF_SNAPSHOT_GRID"
+ TAIL_ENV = "GLM53_TF_SNAPSHOT_TAIL"
+ DEFAULT_GRID = 64
+@@ -101,14 +102,17 @@ def settings() -> list[int]:
+ 
+ 
+ # -- tags -----------------------------------------------------------------------------------------------------------
+-def tag(fast: bool, fp8: bool = False, grid: int | None = None, tc: bool = False) -> int:
++def tag(fast: bool, fp8: bool = False, grid: int | None = None, tc: bool = False, b12x: int = 0) -> int:
+     """A prefill's snapshot tag: 0 (exact), G (fast), G + 1 (FP8 fast), G + 2 (patches/0190: bf16 fast with the
+-    tensor-core latent absorb / expand; FP8 fast chunks use those anyway). Not the chunk size."""
++    tensor-core latent absorb / expand; FP8 fast chunks use those anyway); patches/0240: + 4 x the b12x kernels' bits
++    (1-7, ``b12xpf``), each a different arithmetic. Always below G + 64. Not the chunk size."""
+ 
+     if not fast:
+         return 0
+     g = snapshot_grid() if grid is None else int(grid)
+-    return g + FP8 if fp8 else g + TC if tc else g
++    if not 0 <= int(b12x) <= 7:
++        raise ValueError(f"snapshot tag: b12x bits {b12x}")
++    return (g + FP8 if fp8 else g + TC if tc else g) + B12X * int(b12x)
+ 
+ 
+ def grid_of(t: int) -> int:
+@@ -119,7 +123,7 @@ def grid_of(t: int) -> int:
+ 
+ 
+ def is_fp8(t: int) -> bool:
+-    return bool(t) and t % ALIGN == FP8
++    return bool(t) and t % ALIGN % B12X == FP8          # patches/0240: the b12x bits sit above the FP8 / TC offset
+ 
+ 
+ def resumable(snap_tag: int, req_tag: int, pos: int) -> bool:

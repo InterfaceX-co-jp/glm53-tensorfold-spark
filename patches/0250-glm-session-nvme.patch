@@ -1,0 +1,1850 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py i/src/tensorfold/families/glm5_next/cuda/batch.py
+index 176aeb6..6b03ac9 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ i/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -63,7 +63,10 @@ checks the digest and applies the decisions. The store's budget is set aside at
+ reserve AND the budget stay free) and at admission (``batchplan.admit_free``). A fork point is also a prefix shared
+ with a prompt in flight (running or admitted in the same round): sessions admitted together see no stored entry of
+ each other. Which side of a save decision a batcher is on is its role (``follow`` = rank 1), never ``g.rank``, as
+-for every other message of a round.
++for every other message of a round. patches/0250 (GLM53_TF_SESSION_DISK): an admission may resume from an entry on
++disk instead; it is read into the chosen slot from the moment the plan is known (rank 0 in ``_plan``, rank 1 in
++``follow``, when the slot is idle) and finished in ``_admit``, where both ranks agree on the outcome (a failed read on
++either: both prefill the prompt from scratch).
+ 
+ Batched parallelism (patches/0200; each knob off by default, the ranks must agree):
+ ``GLM53_TF_BATCH_CAPTURE_AFTER=N`` captures a multi-sequence graph key on its N-th sighting (``batchplan.Sightings``;
+@@ -942,13 +945,24 @@ class Batcher:
+         sess = self.store.plan(job.prompt, self._grid(job.values), need_mtp, need_f and g.drafter is not None,
+                                cached, job.draft, others)
+         job.sess = sess
+-        if sess.entry is None:
++        e = sess.entry if sess.entry is not None else sess.disk     # patches/0250: or an entry on disk
++        if e is None:
+             return slot, cached
+-        e = sess.entry
+         slot = batchplan.place_entry(free, {s: self.store.overlap(e, s) for s in free},
+                                      {s: self.used[s] for s in free})
++        if sess.disk is not None:
++            self._prefetch(slot, sess)
+         return slot, len(e.ids)
+ 
++    def _prefetch(self, slot: int, sess) -> None:
++        """patches/0250: start reading a disk entry into ``slot`` when the slot is idle (a slot freed by a cancel in
++        this round is read in ``_admit`` instead); its own snapshots no longer match its caches."""
++
++        if self.seqs[slot] is None:
++            self.caches[slot] = []
++            with self.store.on(slot):
++                self.store.prefetch(sess)
++
+     def _save(self, slot: int, snaps: list) -> None:
+         """Store snapshots of ``slot``'s live state (both ranks, in the round's order: rank 0 decides and sends its
+         decisions, the follower applies them). The side is the batcher's role (``follow``), as for the round plans,
+@@ -1192,6 +1206,8 @@ class Batcher:
+                     job = self._job_from(header, self.g._share(None))
+                     if self.store is not None:          # patches/0180: rank 0's session plan, after its digest check
+                         job.sess = self.store.follow(self.g._share(None))
++                        if job.sess.disk is not None:   # patches/0250: rank 1's read starts now
++                            self._prefetch(slot, job.sess)
+                     jobs.append((slot, cached, job))
+                 self._execute(cancels, jobs, pieces)
+ 
+@@ -1361,6 +1377,19 @@ class Batcher:
+             with self.store.on(slot):
+                 hit = self.store.restore(entry, self.drafters[slot] if use_dflash else None)
+             self.caches[slot] = []              # the slot's own snapshots no longer match its caches
++        elif sess is not None and sess.disk is not None:        # patches/0250: read from disk into this slot
++            if len(sess.disk.ids) != cached or job.prompt[:cached] != sess.disk.ids:
++                raise RuntimeError(f"session disk entry {sess.disk.id} does not hold the {cached} tokens slot {slot} "
++                                   "resumes from")
++            _, _, use_dflash = self.g._drafters(job.code)
++            self.caches[slot] = []
++            with self.store.on(slot):
++                hit = self.store.restore_disk(sess, self.drafters[slot] if use_dflash else None)
++            job.stats["disk"] = dict(self.store.disk.last)
++            if hit is None:                     # a rank failed to read it: both prefill from scratch
++                cached = 0
++            else:
++                job.stats["restored_disk"] = sess.disk.id
+         elif cached:
+             hit = next((c for c in self.caches[slot] if len(c.ids) == cached and job.prompt[:cached] == c.ids), None)
+             if hit is None:
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py i/src/tensorfold/families/glm5_next/cuda/engine.py
+index 48341bc..da3df71 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ i/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -19,7 +19,9 @@ Sessions (patches/0110, GLM53_TF_SESSION_GIB > 0, ``sessions.py``): besides thos
+ sessions' snapshots and attention rows (paged, shared prefixes stored once, least recently used evicted) that a
+ request resumes from by copying them into the live caches, when that resumes more of its prompt; rank 0 decides and
+ sends the plan after the prompt. ``cached`` in the stats (``usage.prompt_tokens_details.cached_tokens``) is the
+-prompt prefix a request resumed from either.
++prompt prefix a request resumed from either. patches/0250 (GLM53_TF_SESSION_DISK, ``sessdisk.py``): the store's entries
++also on local NVMe, restored from there (read straight into the live caches) when the RAM store no longer holds
++them, also after a restart; ``stats["disk"]`` reports the read.
+ 
+ A request's draft policy is a spec (the engine's default, or the request's through ``app.GlmApp``):
+ 
+@@ -428,6 +430,9 @@ class GlmEngine:
+         store = sessions.SessionStore(self.e, self.drafter, sessions.budget_bytes())
+         if self.batch is not None:          # patches/0180: every slot's caches, one index / budget / slab pool
+             self.batch.attach_store(store)
++        from . import sessdisk              # patches/0250: the NVMe tier (GLM53_TF_SESSION_DISK), both ranks
++
++        sessdisk.attach(self, store)
+         if self.rank == 0:
+             ix = store.index
+             print(f"[tensorfold] session store: {ix.budget / 2 ** 30:.1f} GiB, pages of {sessions.PAGE} tokens "
+@@ -814,6 +819,10 @@ class GlmEngine:
+             # a stored session into the live caches; the live snapshots no longer match them
+             hit = store.restore(sess.entry, drafter)
+             self.cache = []
++        elif store is not None and sess is not None and sess.disk is not None:
++            # patches/0250: a session read from disk into the live caches (None: a rank failed, both prefill cold)
++            hit = store.restore_disk(sess, drafter)
++            self.cache = []
+         # a request writes the attention caches from its resume point on: every longer snapshot is overwritten
+         cut = len(hit.ids) if hit is not None else 0
+         self.cache = [c for c in self.cache if len(c.ids) <= cut]
+@@ -840,6 +849,8 @@ class GlmEngine:
+         if store is not None:
+             self._store_save(saves)                 # patches/0110
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
++        if store is not None and sess is not None and sess.disk is not None:
++            stats["disk"] = dict(store.disk.last)   # patches/0250: the read (bytes, s, GB/s, pages read / skipped)
+         if grid:
+             stats["fast_prefill"] = grid - grid % 64            # patches/0083: the chunk grid C of the tag
+             from . import pfgrid
+@@ -960,10 +971,16 @@ class GlmEngine:
+                                    len(hit.ids) if hit is not None else 0, draft)
+             if sess.entry is not None:
+                 hit = sess.entry.payload[0]
++            elif sess.disk is not None:     # patches/0250: from disk; the read starts now, before the header travels
++                hit = None
++                self.cache = []
++                self.store.prefetch(sess)
+         # patches/0070: frozen for the request; patches/0090: only while its calib_online is on
+         table = self.online.table() if self.online is not None and values["calib_online"] else []
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+-        header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
++        resumed = len(hit.ids) if hit is not None else (len(sess.disk.ids) if sess is not None and sess.disk is not None
++                                                        else 0)                         # patches/0250
++        header = [max_tokens, int(stop_eos), int(draft), resumed,
+                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
+                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
+                   *_f64_ints(sampling.top_p if sampling else 1.0), len(table), *table, cost,
+@@ -1011,6 +1028,11 @@ class GlmEngine:
+                 hit = sess.entry.payload[0]
+                 if len(hit.ids) != cached or prompt[:cached] != hit.ids:
+                     raise RuntimeError(f"rank 1's session entry does not hold the {cached} tokens rank 0 resumes from")
++            elif cached and sess is not None and sess.disk is not None:        # patches/0250: read it from disk
++                if len(sess.disk.ids) != cached or prompt[:cached] != sess.disk.ids:
++                    raise RuntimeError(f"rank 1's disk entry does not hold the {cached} tokens rank 0 resumes from")
++                self.cache = []
++                self.store.prefetch(sess)
+             elif cached:
+                 hit = next((c for c in self.cache if len(c.ids) == cached and prompt[:cached] == c.ids), None)
+                 if hit is None:
+diff --git c/src/tensorfold/families/glm5_next/cuda/sessdisk.py i/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+new file mode 100644
+index 0000000..31dc828
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+@@ -0,0 +1,1520 @@
++"""NVMe tier behind the session store (patches/0250, GLM53_TF_SESSION_DISK=<dir>).
++
++patches/0110 / 0180 keep sessions in device memory within GLM53_TF_SESSION_GIB (2 GiB a rank in the 4 x 256k batch
++production): a sixth 40k-token session evicts the oldest, and coming back to it costs a cold prefill (35-45 s). A
++restart loses every session. This module writes the store's entries to a local NVMe directory and reads them back
++into a live slot: a 40k entry is ~0.40 GB a rank (FP8 latent rows + a ~94 MB KDA / conv / drafter snapshot), a few
++tenths of a second at NVMe speed.
++
++On disk (one directory a rank; nothing is shared between ranks, each stores its own shard)::
++
++    <GLM53_TF_SESSION_DISK>/<compat hash>/rank<R>/
++        compat.json                     what the hash covers (for humans)
++        pages/<hh>/<page key>.tfp       one 256-token page: every cache tensor's rows of the page, back to back
++        entries/<entry key>.tfs         header (manifest) + the rows past the full pages + the snapshot tensors
++
++- *Pages* are keyed exactly as in the RAM store (``sessions.page_keys``: the tokens that determine their bits, the
++  snapshot tag, the KV format, MTP validity), so a page shared by many sessions (a system prompt) is one file, and a
++  new turn writes only its new pages and its snapshot.
++- *Entries* are keyed by ``sessions.ids_key`` (tag, tokens, MTP / drafter validity, KV format). The header is JSON
++  (the token ids, every page key with its SHA-256, the segment table, a SHA-256 per 8 MiB chunk of the data region)
++  and is written in place last; a file is written under a temporary name and renamed, so an entry file is complete
++  or absent.
++- *Compat hash*: the image (GLM53_TF_IMAGE_ID, else the engine's source), the checkpoint and drafter (revision, file
++  names and sizes, config.json), every GLM53_TF_* knob except the ones that cannot change a stored bit (sessions,
++  batching, calibration, health, paths, ...), the KV format, the cache layout, the snapshot's fields and torch. A
++  change is a new directory: stale state is never read. Other directories of the same rank beyond the 2 newest are
++  removed at load.
++
++Writes (``GLM53_TF_SESSION_DISK_WRITE``): ``save`` (default) writes every entry of at least
++GLM53_TF_SESSION_DISK_MIN tokens when the RAM store saves it (write-through; a crash or a watchdog restart loses
++at most the writes in flight), also entries the RAM store skipped (too large for its budget); ``evict`` writes an
++entry only when the RAM store evicts it (less NVMe traffic; a restart loses what was still in RAM). The rows are
++packed page-major into a device buffer on the serving thread (one strided copy per run of pages and cache tensor,
++the snapshot tensors are referenced as they are: immutable copies), then a background thread copies them to a
++pinned buffer, hashes and writes them (O_DIRECT where the filesystem takes it). The queue is bounded
++(GLM53_TF_SESSION_DISK_QUEUE_GIB); an entry larger than the bound is written synchronously, a group of pages at a
++time.
++
++Restore = read into the live slot: pages the slot's caches already hold (the store's live map) are skipped; the
++others are read by GLM53_TF_SESSION_DISK_THREADS threads (a group of consecutive pages, or an 8 MiB chunk of the entry,
++into a pinned buffer: SHA-256 checked, one copy to a device buffer, one strided copy per cache tensor into the slot);
++the snapshot tensors are allocated first and read the same way. Rank 0 starts the read when it plans the request
++(before the header travels), rank 1 when it receives the plan, and both finish it where the RAM restore would have
++copied. Then both ranks exchange an ok flag: if either read failed (missing file, checksum, short read, a failed
++write), both drop the entry and prefill the prompt from scratch. So a restored state holds exactly the bytes that
++were saved, which are the bytes the RAM store would have restored: resumed == fresh holds as for 0110.
++
++Both ranks: the disk index (entries, pages, reference counts, LRU, budget) is a deterministic function of the save
++and eviction decisions rank 0 already ships (0110's forced saves), so both ranks hold the same index; its digest
++travels in every plan and rank 1 fails loudly on a difference, as for the RAM store. Rank 0 picks the entry to
++restore (RAM first; a disk entry only when it resumes GLM53_TF_SESSION_DISK_GAIN more tokens) and ships it in the
++plan; each rank reads its own files. At load each rank scans its directory (headers, compat, page files present),
++rank 0 shares its list (oldest first), rank 1 answers which it holds too, and both index the intersection in rank
++0's order; the rest is deleted. Sessions from before a restart resume.
++
++This module imports no torch at load: settings, keys, the index and the header format are tested on the host.
++"""
++
++from __future__ import annotations
++
++import base64
++import dataclasses
++import hashlib
++import json
++import os
++import shutil
++import threading
++import time
++import zlib
++from collections import deque
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Callable, Sequence
++
++from . import sessions
++from .sessions import PAGE, SessionIndex, chain, ids_key, page_count, page_keys
++
++FORMAT = 1
++MAGIC = b"TFSESS\x00\x01"
++ALIGN = 4096                     # O_DIRECT: offsets, lengths and buffers
++CHUNK = 8 << 20                  # entry data: read / checksum chunk; the pinned stage buffers' size
++ADDED, PRESENT, SKIPPED = 1, 2, 0
++POLICIES = ("save", "evict")
++SNAP_FIELDS = ("ids", "rec", "conv", "pending", "mtp_len", "drafter_end", "grid", "window", "kv")
++_OFF = ("", "0", "off", "no", "false")
++_ZERO_SHA = "0" * 64
++
++
++def _align(n: int) -> int:
++    return -(-int(n) // ALIGN) * ALIGN
++
++
++# -- settings -------------------------------------------------------------------------------------------------------
++def root() -> Path | None:
++    """GLM53_TF_SESSION_DISK: the tier's directory (unset / empty / 0 / off: no disk tier, the default)."""
++
++    v = os.environ.get("GLM53_TF_SESSION_DISK", "").strip()
++    return None if v.lower() in _OFF else Path(v)
++
++
++def budget_bytes() -> int:
++    """GLM53_TF_SESSION_DISK_GIB (default 64): bytes a rank may keep on disk (entries and pages)."""
++
++    gib = float(os.environ.get("GLM53_TF_SESSION_DISK_GIB", "") or 64)
++    if gib <= 0:
++        raise ValueError(f"GLM53_TF_SESSION_DISK_GIB={gib}: expected > 0")
++    return int(gib * 2 ** 30)
++
++
++def policy() -> str:
++    """GLM53_TF_SESSION_DISK_WRITE: ``save`` (default: write-through, restart-safe) or ``evict``."""
++
++    v = os.environ.get("GLM53_TF_SESSION_DISK_WRITE", "").strip().lower() or "save"
++    if v not in POLICIES:
++        raise ValueError(f"GLM53_TF_SESSION_DISK_WRITE={v!r}: expected save or evict")
++    return v
++
++
++def _int_env(name: str, default: int, least: int) -> int:
++    n = int(os.environ.get(name, "") or default)
++    if n < least:
++        raise ValueError(f"{name}={n}: expected >= {least}")
++    return n
++
++
++def min_tokens() -> int:
++    """GLM53_TF_SESSION_DISK_MIN (default 1024): shorter entries are not written (a cold prefill is cheap)."""
++
++    return _int_env("GLM53_TF_SESSION_DISK_MIN", 1024, 1)
++
++
++def gain_tokens() -> int:
++    """GLM53_TF_SESSION_DISK_GAIN (default 256, rank 0): a disk entry is restored only when it resumes at least this
++    many more tokens than the RAM store or the live snapshots (a short prefill beats a read)."""
++
++    return _int_env("GLM53_TF_SESSION_DISK_GAIN", 256, 0)
++
++
++def threads() -> int:
++    """GLM53_TF_SESSION_DISK_THREADS (default 8): read threads (each with two 8 MiB pinned buffers, kept)."""
++
++    return _int_env("GLM53_TF_SESSION_DISK_THREADS", 8, 1)
++
++
++def queue_bytes() -> int:
++    """GLM53_TF_SESSION_DISK_QUEUE_GIB (default 1): device bytes packed for writing at most; beyond, writes wait."""
++
++    gib = float(os.environ.get("GLM53_TF_SESSION_DISK_QUEUE_GIB", "") or 1)
++    if gib < 0:
++        raise ValueError(f"GLM53_TF_SESSION_DISK_QUEUE_GIB={gib}: expected >= 0")
++    return int(gib * 2 ** 30)
++
++
++def verify_reads() -> bool:
++    """GLM53_TF_SESSION_DISK_VERIFY: ``full`` (default, every page and chunk read is checked) or ``off``."""
++
++    v = os.environ.get("GLM53_TF_SESSION_DISK_VERIFY", "").strip().lower() or "full"
++    if v not in ("full", "off"):
++        raise ValueError(f"GLM53_TF_SESSION_DISK_VERIFY={v!r}: expected full or off")
++    return v == "full"
++
++
++def direct_io() -> bool:
++    return os.environ.get("GLM53_TF_SESSION_DISK_DIRECT", "1").strip() != "0"
++
++
++def settings() -> list[int]:
++    """What both ranks must agree on (they decide the disk index): on, budget MiB, write policy, minimum tokens."""
++
++    if root() is None:
++        return [0, 0, 0, 0]
++    return [1, budget_bytes() >> 20, POLICIES.index(policy()), min_tokens()]
++
++
++# -- compatibility ---------------------------------------------------------------------------------------------------
++# knobs that cannot change a stored bit (paths, scheduling, the store's own sizes, reporting); every other
++# GLM53_TF_* knob is in the hash, so a new knob is conservative by default (it only costs a cold start)
++KNOB_SKIP_PREFIX = ("GLM53_TF_SESSION_", "GLM53_TF_BATCH", "GLM53_TF_CALIB", "GLM53_TF_PREPARED", "GLM53_TF_STALL",
++                    "GLM53_TF_TOKCACHE")
++KNOB_SKIP = {"GLM53_TF_T0", "GLM53_TF_LAUNCH_T0", "GLM53_TF_IMAGE_ID", "GLM53_TF_CLOCK_CAP", "GLM53_TF_BOOT_WARMUP",
++             "GLM53_TF_HEALTH", "GLM53_TF_EFFORT_FIELD", "GLM53_TF_DEFAULT_EFFORT", "GLM53_TF_PROFILE",
++             "GLM53_TF_DEPTH", "GLM53_TF_LOOKUP", "GLM53_TF_LOOKUP_MIN", "GLM53_TF_AUTO_FDRAFTS",
++             "GLM53_TF_PREFILL_ROWS", "GLM53_TF_PREFILL_ROWS_MAX"}
++
++
++def knobs(env: dict | None = None) -> dict:
++    env = os.environ if env is None else env
++    return {k: v for k, v in sorted(env.items()) if k.startswith("GLM53_TF_") and k not in KNOB_SKIP
++            and not k.startswith(KNOB_SKIP_PREFIX)}
++
++
++def layout_sig(comps) -> list:
++    """The cache tensors a page / tail holds: rows a page, MTP or not, dtype, a row's shape."""
++
++    return [[int(c.per), int(c.mtp), str(c.live.dtype), [int(x) for x in c.live.shape[1:]]] for c in comps]
++
++
++def compat_ident(*, model_dir=None, drafter_dir=None, layout: Sequence = (), extra: dict | None = None) -> dict:
++    """Everything the stored bits depend on besides the key of each entry / page (no rank: both ranks compare it)."""
++
++    from . import fastboot
++
++    ident: dict[str, Any] = {"format": FORMAT, "image": os.environ.get("GLM53_TF_IMAGE_ID", "").strip()
++                             or fastboot.code_digest(), "knobs": knobs(), "kv": sessions.KV_TAG.decode(),
++                             "layout": [list(x) for x in layout], "snapshot": list(SNAP_FIELDS),
++                             "page": PAGE}
++    if model_dir:
++        ident["model"] = [fastboot.model_rev(model_dir), fastboot.files_ident(model_dir)]
++    if drafter_dir:
++        ident["drafter"] = [fastboot.model_rev(drafter_dir), fastboot.files_ident(drafter_dir)]
++    try:
++        import torch
++
++        ident["torch"] = torch.__version__
++    except ImportError:
++        pass
++    ident.update(extra or {})
++    return ident
++
++
++def compat_hash(ident: dict) -> str:
++    return hashlib.sha256(json.dumps(ident, sort_keys=True, default=str).encode()).hexdigest()
++
++
++def ident_ints(ident: dict) -> list[int]:
++    raw = bytes.fromhex(compat_hash(ident))
++    return [int.from_bytes(raw[i:i + 4], "little", signed=True) for i in range(0, 32, 4)]
++
++
++def key_ints(key: bytes) -> list[int]:
++    return [int.from_bytes(key[i:i + 4], "little", signed=True) for i in range(0, 16, 4)]
++
++
++def ints_key(v: Sequence[int]) -> bytes:
++    return b"".join(int(x).to_bytes(4, "little", signed=True) for x in v)
++
++
++# -- header ---------------------------------------------------------------------------------------------------------
++def ids_b64(ids: Sequence[int]) -> str:
++    return base64.b64encode(sessions._bytes(ids)).decode()
++
++
++def b64_ids(s: str) -> list[int]:
++    from array import array
++
++    a = array("i")
++    a.frombytes(base64.b64decode(s))
++    return a.tolist()
++
++
++def encode_header(meta: dict) -> bytes:
++    j = json.dumps(meta, separators=(",", ":"), sort_keys=True).encode()
++    return MAGIC + len(j).to_bytes(8, "little") + j
++
++
++def place_header(meta: dict) -> int:
++    """Set ``meta["data_off"]`` to the aligned header size (the header holds its own offset); returns it."""
++
++    meta["data_off"] = 0
++    while True:
++        h = _align(len(encode_header(meta)))
++        if h == meta["data_off"]:
++            return h
++        meta["data_off"] = h
++
++
++def read_header(path: Path) -> dict:
++    with open(path, "rb") as f:
++        head = f.read(16)
++        if len(head) != 16 or head[:8] != MAGIC:
++            raise ValueError(f"{path}: not a session entry")
++        n = int.from_bytes(head[8:16], "little")
++        if n > 256 << 20:
++            raise ValueError(f"{path}: header of {n} bytes")
++        body = f.read(n)
++    if len(body) != n:
++        raise ValueError(f"{path}: truncated header")
++    return json.loads(body)
++
++
++def chunk_plan(segs: Sequence[tuple[int, int]], size: int, chunk: int = CHUNK) -> list[list[tuple[int, int, int, int]]]:
++    """Per chunk k of a data region of ``size`` bytes ([k chunk, (k + 1) chunk)): (segment, byte offset in it, offset
++    in the chunk, bytes); segment -1 is padding (zeros). ``segs``: (offset, bytes) in the region, ascending."""
++
++    plan: list[list[tuple[int, int, int, int]]] = [[] for _ in range(-(-size // chunk))]
++    pos = 0
++
++    def put(seg: int, a: int, n: int, at: int) -> None:
++        done = 0
++        while done < n:
++            k, within = divmod(at + done, chunk)
++            m = min(n - done, chunk - within)
++            plan[k].append((seg, a + done, within, m))
++            done += m
++
++    for i, (off, n) in enumerate(segs):
++        if off > pos:
++            put(-1, 0, off - pos, pos)
++        put(i, 0, n, off)
++        pos = off + n
++    if size > pos:
++        put(-1, 0, size - pos, pos)
++    return plan
++
++
++# -- the index (host only, the same on both ranks) -------------------------------------------------------------------
++@dataclass
++class DiskEntry:
++    id: int
++    key: bytes
++    tag: int
++    ids: list[int]
++    mtp_len: int
++    drafter: bool
++    chain: list[bytes]
++    pages: list[bytes]
++    nbytes: int
++    used: int
++    kind: str = "turn"
++
++    @property
++    def has_mtp(self) -> bool:
++        return self.mtp_len >= 0
++
++
++@dataclass
++class Added:
++    status: int
++    entry: DiskEntry | None = None
++    evicted: list[DiskEntry] = field(default_factory=list)
++    freed: list[bytes] = field(default_factory=list)          # page keys no entry references any more
++    new: list[int] = field(default_factory=list)              # page indices (in the entry) not on disk before
++
++
++class DiskIndex:
++    """Entries and pages on disk, their reference counts, the LRU and the budget; no files, no tensors.
++    Deterministic: the same calls give the same state (rank 1 replays rank 0's saves / evictions)."""
++
++    find = SessionIndex.find             # the longest stored strict prefix of the request's tag whose caches fit
++    _prefix = SessionIndex._prefix
++    lcp = SessionIndex.lcp
++
++    def __init__(self, budget: int, page_bytes: Callable[[bool], int]) -> None:
++        self.budget = int(budget)
++        self.page_bytes = page_bytes
++        self.entries: dict[int, DiskEntry] = {}
++        self.by_key: dict[bytes, int] = {}
++        self.pages: dict[bytes, list[int]] = {}      # key -> [references, bytes]
++        self.bytes = 0
++        self.clock = 0
++        self.next_id = 1
++        self.counters = {"added": 0, "present": 0, "skipped": 0, "evicted": 0, "dropped": 0}
++
++    @property
++    def used(self) -> int:
++        return self.bytes
++
++    def touch(self, e: DiskEntry) -> None:
++        self.clock += 1
++        e.used = self.clock
++
++    def has(self, tag: int, ids: Sequence[int], has_mtp: bool, drafter: bool) -> DiskEntry | None:
++        i = self.by_key.get(ids_key(tag, ids, has_mtp, drafter))
++        return self.entries.get(i) if i is not None else None
++
++    def digest(self) -> int:
++        items = sorted((e.id, e.tag, len(e.ids), e.mtp_len, int(e.drafter), len(e.pages), e.nbytes)
++                       for e in self.entries.values())
++        text = repr((items, len(self.pages), self.bytes, self.next_id))
++        return zlib.crc32(text.encode()) & 0x7FFFFFFF
++
++    def evict(self, entry_id: int, reason: str = "evicted") -> tuple[DiskEntry, list[bytes]]:
++        e = self.entries.pop(entry_id)
++        self.by_key.pop(e.key, None)
++        self.bytes -= e.nbytes
++        freed = []
++        for k in e.pages:
++            rec = self.pages[k]
++            rec[0] -= 1
++            if not rec[0]:
++                del self.pages[k]
++                self.bytes -= rec[1]
++                freed.append(k)
++        self.counters[reason] += 1
++        return e, freed
++
++    def add(self, *, tag: int, ids: Sequence[int], mtp_len: int, drafter: bool, entry_bytes: int,
++            kind: str = "turn") -> Added:
++        """Put an entry on disk (evicting the least recently used first), or find it there already."""
++
++        ids = [int(t) for t in ids]
++        has_mtp = mtp_len >= 0
++        key = ids_key(tag, ids, has_mtp, drafter)
++        i = self.by_key.get(key)
++        if i is not None:
++            e = self.entries[i]
++            self.touch(e)
++            self.counters["present"] += 1
++            return Added(PRESENT, e)
++        blocks = chain(ids)
++        count = page_count(tag, len(ids), mtp_len)
++        keys = page_keys(tag, ids, blocks, count, has_mtp)
++        pb = int(self.page_bytes(has_mtp))
++        if entry_bytes + len(keys) * pb > self.budget:            # would not fit with every other entry gone
++            self.counters["skipped"] += 1
++            return Added(SKIPPED)
++        new = [p for p, k in enumerate(keys) if k not in self.pages]
++        shared = [k for k in keys if k in self.pages]
++        for k in shared:                                        # pinned: evictions below must not free them
++            self.pages[k][0] += 1
++        need = entry_bytes + len(new) * pb
++        evicted, freed = [], []
++        while self.bytes + need > self.budget and self.entries:
++            v = min(self.entries.values(), key=lambda x: (x.used, x.id))
++            ev, fr = self.evict(v.id)
++            evicted.append(ev)
++            freed += fr
++        for p in new:
++            self.pages[keys[p]] = [1, pb]
++            self.bytes += pb
++        self.clock += 1
++        e = DiskEntry(self.next_id, key, int(tag), ids, int(mtp_len), bool(drafter), blocks, keys, int(entry_bytes),
++                      self.clock, kind)
++        self.next_id += 1
++        self.entries[e.id] = e
++        self.by_key[key] = e.id
++        self.bytes += e.nbytes
++        self.counters["added"] += 1
++        return Added(ADDED, e, evicted, freed, new)
++
++
++# -- files -----------------------------------------------------------------------------------------------------------
++def _open_r(path: Path, direct: bool) -> tuple[int, bool]:
++    if direct and hasattr(os, "O_DIRECT"):
++        try:
++            return os.open(path, os.O_RDONLY | os.O_DIRECT), True
++        except OSError:
++            pass
++    return os.open(path, os.O_RDONLY), False
++
++
++def _pread_all(fd: int, mv, off: int, direct: bool, path) -> None:
++    got, want = 0, len(mv)
++    while got < want:
++        r = os.preadv(fd, [mv[got:]], off + got)
++        if r <= 0:
++            raise OSError(f"{path}: short read at {off + got}")
++        got += r
++    if not direct and hasattr(os, "posix_fadvise"):         # no page cache (GPU memory on GB10)
++        os.posix_fadvise(fd, off, want, os.POSIX_FADV_DONTNEED)
++
++
++def _pwrite_all(fd: int, mv, off: int) -> None:
++    done = 0
++    while done < len(mv):
++        done += os.pwrite(fd, mv[done:], off + done)
++
++
++def _write_file(path: Path, mv, direct: bool) -> None:
++    """``mv`` (ALIGN-aligned buffer, ALIGN-multiple length) as ``path``: a temporary name, then renamed."""
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
++    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
++    fd = -1
++    try:
++        if direct and hasattr(os, "O_DIRECT"):
++            try:
++                fd = os.open(tmp, flags | os.O_DIRECT, 0o644)
++                _pwrite_all(fd, mv, 0)
++            except OSError:
++                if fd >= 0:
++                    os.close(fd)
++                fd = -1
++        if fd < 0:
++            fd = os.open(tmp, flags, 0o644)
++            _pwrite_all(fd, mv, 0)
++        os.close(fd)
++        fd = -1
++        os.replace(tmp, path)
++    finally:
++        if fd >= 0:
++            os.close(fd)
++        if tmp.exists():
++            tmp.unlink(missing_ok=True)
++
++
++class LoadError(RuntimeError):
++    pass
++
++
++# -- the tier (tensors and files) ------------------------------------------------------------------------------------
++@dataclass
++class _Job:
++    """What a writer writes for one entry: new pages ([k, stride] groups, or callables packing one), the rows past
++    the full pages, the snapshot tensors, the header; ``event``: the stream point after the packing."""
++
++    key: bytes
++    groups: list                 # [(page keys, tensor [k, stride] | callable -> tensor)]
++    segs: list                   # [(segment meta, tensor)]
++    meta: dict
++    event: Any
++    nbytes: int
++    keys: list = field(default_factory=list)       # every key the job writes (pending until it is done)
++
++
++class _Writer:
++    """One background thread; file operations run in submission order (a delete after a write of the same key)."""
++
++    def __init__(self, tier: "DiskTier") -> None:
++        self.tier = tier
++        self.q: deque = deque()
++        self.cv = threading.Condition()
++        self.pending: dict[bytes, int] = {}
++        self.queued = 0
++        self.busy = False
++        self.thread: threading.Thread | None = None
++        self.stream = None
++
++    def _mark(self, keys, d: int) -> None:
++        for k in keys:
++            n = self.pending.get(k, 0) + d
++            if n:
++                self.pending[k] = n
++            else:
++                self.pending.pop(k, None)
++
++    def _put(self, item, keys, nbytes: int = 0) -> None:
++        with self.cv:
++            if self.thread is None:
++                self.thread = threading.Thread(target=self._loop, name="tf-session-disk", daemon=True)
++                self.thread.start()
++            self._mark(keys, 1)
++            self.queued += nbytes
++            self.q.append((item, keys, nbytes))
++            self.cv.notify_all()
++
++    def submit(self, job: _Job) -> None:
++        cap = self.tier.queue_cap
++        with self.cv:
++            while self.queued and self.queued + job.nbytes > cap:
++                self.cv.wait()
++        self._put(("job", job), job.keys, job.nbytes)
++
++    def op(self, kind: str, arg) -> None:
++        self._put((kind, arg), [arg] if isinstance(arg, bytes) else [])
++
++    def inline(self, job: _Job) -> None:
++        """Run a job on the calling thread, after everything queued before it."""
++
++        self.drain()
++        with self.cv:
++            self._mark(job.keys, 1)
++        try:
++            self.tier._run_job(job, stream=None)
++        finally:
++            with self.cv:
++                self._mark(job.keys, -1)
++                self.cv.notify_all()
++
++    def wait_keys(self, keys) -> None:
++        with self.cv:
++            while any(k in self.pending for k in keys):
++                self.cv.wait()
++
++    def drain(self) -> None:
++        with self.cv:
++            while self.q or self.busy:
++                self.cv.wait()
++
++    def _loop(self) -> None:
++        while True:
++            with self.cv:
++                while not self.q:
++                    self.cv.wait()
++                item, keys, nbytes = self.q.popleft()
++                self.busy = True
++            try:
++                self._do(item)
++            except Exception as exc:  # noqa: BLE001 - a disk problem never stops serving; the read fails later
++                self.tier._log(f"write failed: {exc!r}")
++            finally:
++                with self.cv:
++                    self.busy = False
++                    self.queued -= nbytes
++                    self._mark(keys, -1)
++                    self.cv.notify_all()
++
++    def _do(self, item) -> None:
++        kind, arg = item
++        t = self.tier
++        if kind == "job":
++            if t.cuda and self.stream is None:
++                import torch
++
++                self.stream = torch.cuda.Stream(device=t.device)
++            t._run_job(arg, stream=self.stream)
++        elif kind == "del_entry":
++            t._entry_path(arg).unlink(missing_ok=True)
++        elif kind == "del_page":
++            t._page_path(arg).unlink(missing_ok=True)
++        elif kind == "touch":
++            try:
++                os.utime(t._entry_path(arg))
++            except OSError:
++                pass
++        elif kind == "unlink":
++            Path(arg).unlink(missing_ok=True)
++        elif kind == "rmtree":
++            shutil.rmtree(arg, ignore_errors=True)
++
++
++class DiskTier:
++    """One rank's NVMe tier: the index, the directory, the writer and the reader (``SessionStore.attach_disk``)."""
++
++    def __init__(self, store, root_dir, rank: int, ident: dict, *, budget: int | None = None,
++                 write: str | None = None, min_tok: int | None = None, gain: int | None = None,
++                 n_threads: int | None = None, queue: int | None = None, verify: bool | None = None,
++                 direct: bool | None = None, agree: Callable[[bool], bool] | None = None, quiet: bool = False) -> None:
++        self.store = store
++        self.rank = int(rank)
++        self.ident = ident
++        self.hash = compat_hash(ident)
++        self.root = Path(root_dir)
++        self.dir = self.root / self.hash[:16] / f"rank{self.rank}"
++        (self.dir / "entries").mkdir(parents=True, exist_ok=True)
++        (self.dir / "pages").mkdir(parents=True, exist_ok=True)
++        cj = self.dir / "compat.json"
++        if not cj.exists():
++            tmp = cj.with_name(f".compat.json.tmp-{os.getpid()}")
++            tmp.write_text(json.dumps({"hash": self.hash, "ident": ident}, indent=1, sort_keys=True, default=str))
++            os.replace(tmp, cj)
++        self.policy = policy() if write is None else write
++        self.min_tokens = min_tokens() if min_tok is None else int(min_tok)
++        self.gain = gain_tokens() if gain is None else int(gain)
++        self.n_threads = threads() if n_threads is None else int(n_threads)
++        self.queue_cap = queue_bytes() if queue is None else int(queue)
++        self.verify = verify_reads() if verify is None else bool(verify)
++        self.direct = direct_io() if direct is None else bool(direct)
++        self.agree = agree or (lambda ok: bool(ok))
++        self.quiet = quiet
++        comps = store.comps
++        for c in comps:
++            if not c.live.is_contiguous():
++                raise ValueError("a cache tensor is not contiguous: the disk tier copies rows as flat bytes")
++        self.device = comps[0].live.device if comps else None
++        self.cuda = self.device is not None and self.device.type == "cuda"
++        self.rb = [sessions._nbytes(c.live[0]) for c in comps]
++        self.lay = {m: self._layout(m) for m in (True, False)}
++        self.index = DiskIndex(budget_bytes() if budget is None else budget, lambda m: self.lay[m][1])
++        self.page_sha: dict[bytes, str] = {}           # rank-local: this rank's bytes
++        self.bad: set[bytes] = set()                   # rank-local: keys whose write failed
++        self.writer = _Writer(self)
++        self.stats = {"writes": 0, "write_bytes": 0, "write_s": 0.0, "pages_written": 0, "loads": 0, "load_bytes": 0,
++                      "load_s": 0.0, "pages_read": 0, "pages_skipped": 0, "failed_loads": 0}
++        self.last: dict = {}
++        self._stages: list = []
++        self._stage_lock = threading.Lock()
++        self._warned: set[str] = set()
++        try:                                    # the class restored snapshots are built as (imported once, here)
++            from .decode import Snapshot as snap_cls
++        except ImportError:
++            from types import SimpleNamespace as snap_cls
++        self.snap_cls = snap_cls
++
++    # -- layout --------------------------------------------------------------------------------------------------
++    def _layout(self, has_mtp: bool) -> tuple[list[tuple[int, int, int]], int]:
++        """A page file: every cache tensor's rows of the page (MTP ones only for MTP-valid pages), back to back."""
++
++        out, off = [], 0
++        for i, c in enumerate(self.store.comps):
++            if c.mtp and not has_mtp:
++                continue
++            nb = c.per * self.rb[i]
++            out.append((i, off, nb))
++            off += nb
++        return out, _align(off)
++
++    def _entry_path(self, key: bytes) -> Path:
++        return self.dir / "entries" / f"{key.hex()}.tfs"
++
++    def _page_path(self, key: bytes) -> Path:
++        h = key.hex()
++        return self.dir / "pages" / h[:2] / f"{h}.tfp"
++
++    def _log(self, msg: str, once: str | None = None) -> None:
++        if once is not None:
++            if once in self._warned:
++                return
++            self._warned.add(once)
++        if not self.quiet:
++            print(f"[tensorfold] session disk (rank {self.rank}): {msg}", flush=True)
++
++    def _tails(self, n: int, mtp_len: int, npages: int) -> list[tuple[int, int, int]]:
++        """(cache tensor, first row, end row) of the rows past the full pages (the private tail)."""
++
++        lo = PAGE * npages
++        out = []
++        for i, c in enumerate(self.store.comps):
++            if c.mtp and mtp_len < 0:
++                continue
++            end = n if not c.mtp else mtp_len
++            a, b = c.rows(lo), c.rows(end)
++            if b > a:
++                out.append((i, a, b))
++        return out
++
++    @staticmethod
++    def _snap_tensors(snap) -> list[tuple[str, Any]]:
++        out = [("rec", snap.rec), ("conv", snap.conv)]
++        if getattr(snap, "pending", None) is not None:
++            out.append(("pending", snap.pending))
++        win = getattr(snap, "window", None)
++        if win is not None and win.get("k") is not None:
++            out += [("win.k", win["k"]), ("win.v", win["v"])]
++        return out
++
++    def _entry_bytes(self, n: int, npages: int, tails, snap_nbytes: Sequence[int]) -> int:
++        """An entry file's size for the budget: a function of sizes only (the same on both ranks)."""
++
++        data = sum(_align((b - a) * self.rb[i]) for i, a, b in tails) + sum(_align(x) for x in snap_nbytes)
++        return data + _align(4096 + 6 * n + 160 * npages)
++
++    def _snap_ok(self, snap) -> bool:
++        names = [f.name for f in dataclasses.fields(snap)] if dataclasses.is_dataclass(snap) else list(vars(snap))
++        extra = set(names) - set(SNAP_FIELDS) - {"session_entry"}
++        if extra:           # a field this format does not store: never write a state it cannot give back
++            self._log(f"snapshot fields {sorted(extra)} are not stored by format {FORMAT}: not writing", once="fields")
++            return False
++        return True
++
++    # -- saving (both ranks, in the order rank 0's decisions arrive) ------------------------------------------------
++    def on_save(self, snap, drafter: bool) -> Added | None:
++        """GLM53_TF_SESSION_DISK_WRITE=save: the RAM store saved (or skipped, or found) a snapshot of the live
++        caches; write it through."""
++
++        if self.policy != "save":
++            return None
++        return self._put(snap, drafter, None)
++
++    def on_evict(self, entry) -> Added | None:
++        """GLM53_TF_SESSION_DISK_WRITE=evict: the RAM store is evicting ``entry`` (its pages still in the slabs)."""
++
++        if self.policy != "evict" or entry.payload is None:
++            return None
++        return self._put(entry.payload[0], entry.drafter, entry)
++
++    def _put(self, snap, drafter: bool, src) -> Added | None:
++        ids = list(snap.ids)
++        n = len(ids)
++        if n < self.min_tokens or not self._snap_ok(snap):
++            return None
++        tag, mtp_len = int(snap.grid), int(snap.mtp_len)
++        npages = page_count(tag, n, mtp_len)
++        tails = self._tails(n, mtp_len, npages)
++        snaps = self._snap_tensors(snap)
++        eb = self._entry_bytes(n, npages, tails, [sessions._nbytes(t) for _, t in snaps])
++        res = self.index.add(tag=tag, ids=ids, mtp_len=mtp_len, drafter=drafter, entry_bytes=eb,
++                             kind=getattr(src, "kind", "turn"))
++        self._forget(res.evicted, res.freed)
++        if res.status == PRESENT:
++            self.writer.op("touch", res.entry.key)
++        elif res.status == ADDED:
++            try:
++                self._write(res.entry, res.new, tails, snaps, snap, src)
++            except Exception as exc:  # noqa: BLE001 - e.g. no device memory to pack: the entry's read fails later
++                self.bad.add(res.entry.key)
++                self._log(f"cannot write entry {res.entry.id}: {exc!r}")
++        return res
++
++    def _forget(self, evicted, freed) -> None:
++        for e in evicted:
++            self.writer.op("del_entry", e.key)
++        for k in freed:
++            self.writer.op("del_page", k)
++            self.page_sha.pop(k, None)
++
++    def _pack(self, e: DiskEntry, new: list[int], src) -> Any:
++        """The entry's pages ``new`` (ascending, indices in the entry) as one [len(new), stride] uint8 tensor, from
++        the live caches (``src`` None) or from the RAM store's slabs (``src``: the entry being evicted)."""
++
++        import torch
++
++        lay, stride = self.lay[e.has_mtp]
++        comps = self.store.comps
++        out = torch.empty((len(new), stride), dtype=torch.uint8, device=self.device)
++        used = lay[-1][1] + lay[-1][2] if lay else 0
++        if stride > used:
++            out[:, used:].zero_()
++        runs: list[list[int]] = []                  # [first row in out, first page, pages, extent, slot]
++        for i, p in enumerate(new):
++            ext = slot = 0
++            if src is not None:
++                ext, slot = divmod(self.store.index.pages[src.pages[p]].phys, self.store.index.extent)
++            r = runs[-1] if runs else None
++            if r is not None and r[1] + r[2] == p and r[0] + r[2] == i and (src is None or (r[3] == ext
++                                                                                             and r[4] + r[2] == slot)):
++                r[2] += 1
++            else:
++                runs.append([i, p, 1, ext, slot])
++        for i0, p0, k, ext, slot in runs:
++            for ci, off, nb in lay:
++                c = comps[ci]
++                if src is None:
++                    rows = c.live[p0 * c.per:(p0 + k) * c.per]
++                else:
++                    rows = self.store.slabs[ext][ci][slot * c.per:(slot + k) * c.per]
++                out[i0:i0 + k, off:off + nb].copy_(_u8(rows).view(k, nb))
++        return out
++
++    def _write(self, e: DiskEntry, new: list[int], tails, snaps, snap, src) -> None:
++        import torch
++
++        lay, stride = self.lay[e.has_mtp]
++        comps = self.store.comps
++        segs, metas, off = [], [], 0
++        payload_tail = src.payload[1] if src is not None else None
++        for ci, a, b in tails:
++            if payload_tail is not None:
++                t = payload_tail[ci]
++                if t is None or t.shape[0] != b - a:
++                    raise LoadError(f"entry {src.id}: its tail does not match the page rule")
++            else:
++                t = comps[ci].live[a:b]
++            m = {"name": f"tail.{ci}", "comp": ci, "rows": [a, b], "dtype": _dt(t), "shape": list(t.shape),
++                 "off": off, "nbytes": sessions._nbytes(t)}
++            segs.append([m, t])
++            off += _align(m["nbytes"])
++        for name, t in snaps:
++            m = {"name": name, "dtype": _dt(t), "shape": list(t.shape), "off": off, "nbytes": sessions._nbytes(t)}
++            segs.append([m, t])
++            off += _align(m["nbytes"])
++        win = getattr(snap, "window", None)
++        meta = {"format": FORMAT, "compat": self.hash, "rank": self.rank, "key": e.key.hex(), "kind": e.kind,
++                "tag": e.tag, "n": len(e.ids), "ids": ids_b64(e.ids), "mtp_len": e.mtp_len, "drafter": int(e.drafter),
++                "stride": stride, "pages": [k.hex() for k in e.pages], "page_sha": [],
++                "snap": {"mtp_len": int(snap.mtp_len), "drafter_end": int(snap.drafter_end), "grid": int(snap.grid),
++                         "kv": int(getattr(snap, "kv", 0) or 0),
++                         "window": None if win is None else {"end": int(win["end"]), "lo": int(win["lo"])}},
++                "segments": [m for m, _ in segs], "data_bytes": off, "chunk": CHUNK}
++        new_keys = [e.pages[p] for p in new]
++        page_bytes = len(new) * stride
++        total = page_bytes + sum(m["nbytes"] for m, _ in segs)
++        keys = [e.key] + new_keys
++        if total <= self.queue_cap:
++            groups = []
++            if new:
++                pack = self._pack(e, new, src)
++                g = self._group()
++                for i in range(0, len(new), g):
++                    groups.append((new_keys[i:i + g], pack[i:i + g]))
++            for s in segs:
++                if src is None and s[0]["name"].startswith("tail."):
++                    s[1] = s[1].clone()                 # the live rows change after this; the rest are copies
++            ev = None
++            if self.cuda:
++                ev = torch.cuda.Event()
++                ev.record(torch.cuda.current_stream(self.device))
++            self.writer.submit(_Job(e.key, groups, segs, meta, ev, total, keys))
++        else:                                           # larger than the queue: now, a group of pages at a time
++            g = self._group()
++            groups = [(new_keys[i:i + g], (lambda part=new[i:i + g]: self._pack(e, part, src)))
++                      for i in range(0, len(new), g)]
++            self.writer.inline(_Job(e.key, groups, segs, meta, None, total, keys))
++
++    def _group(self) -> int:
++        return max(1, CHUNK // max(self.lay[True][1], 1))
++
++    # -- the writer's side ---------------------------------------------------------------------------------------------
++    def _stage_get(self):
++        with self._stage_lock:
++            if self._stages:
++                return self._stages.pop()
++        import torch
++
++        if self.cuda:           # pinned (cudaHostAlloc: page aligned): async DMA, O_DIRECT-aligned
++            return torch.empty(CHUNK, dtype=torch.uint8, pin_memory=True)
++        import mmap
++
++        mp = mmap.mmap(-1, CHUNK)                        # page aligned for O_DIRECT
++        t = torch.frombuffer(mp, dtype=torch.uint8)
++        t._tf_map = mp
++        return t
++
++    def _stage_put(self, buf) -> None:
++        with self._stage_lock:
++            self._stages.append(buf)
++
++    def _run_job(self, job: _Job, stream) -> None:
++        import torch
++
++        t0 = time.perf_counter()
++        stage = self._stage_get()
++        mv = memoryview(stage.numpy())
++        written = 0
++        try:
++            ctx = torch.cuda.stream(stream) if (self.cuda and stream is not None) else _null()
++            with ctx:
++                if self.cuda and stream is not None and job.event is not None:
++                    stream.wait_event(job.event)
++                sync = (lambda: (stream or torch.cuda.current_stream(self.device)).synchronize()) if self.cuda \
++                    else (lambda: None)
++                stride = int(job.meta["stride"])
++                for keys, src in job.groups:
++                    t = src() if callable(src) else src
++                    nb = len(keys) * stride
++                    stage[:nb].copy_(t.reshape(-1), non_blocking=self.cuda)
++                    sync()
++                    for j, key in enumerate(keys):
++                        part = mv[j * stride:(j + 1) * stride]
++                        sha = hashlib.sha256(part).hexdigest()
++                        _write_file(self._page_path(key), part, self.direct)
++                        self.page_sha[key] = sha
++                        self.bad.discard(key)
++                    written += nb
++                    self.stats["pages_written"] += len(keys)
++                meta = job.meta
++                missing = [k for k in (bytes.fromhex(h) for h in meta["pages"])
++                           if k not in self.page_sha or k in self.bad]
++                if missing:
++                    raise LoadError(f"entry {meta['key'][:12]}: {len(missing)} of its pages were not written")
++                meta["page_sha"] = [self.page_sha[bytes.fromhex(h)] for h in meta["pages"]]
++                size = int(meta["data_bytes"])
++                plan = chunk_plan([(m["off"], m["nbytes"]) for m, _ in job.segs], size)
++                meta["sums"] = [_ZERO_SHA] * len(plan)
++                h = place_header(meta)
++                path = self._entry_path(job.key)
++                tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
++                flat = [_u8(t) for _, t in job.segs]
++                fd, direct = -1, False
++                try:
++                    if self.direct and hasattr(os, "O_DIRECT"):
++                        try:
++                            fd, direct = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT, 0o644), True
++                        except OSError:
++                            fd = -1
++                    if fd < 0:
++                        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
++                    for k, pieces in enumerate(plan):
++                        want = min(CHUNK, size - k * CHUNK)
++                        for seg, a, s, n in pieces:
++                            if seg < 0:
++                                stage[s:s + n].zero_()
++                            else:
++                                stage[s:s + n].copy_(flat[seg][a:a + n], non_blocking=self.cuda)
++                        sync()
++                        meta["sums"][k] = hashlib.sha256(mv[:want]).hexdigest()
++                        try:
++                            _pwrite_all(fd, mv[:want], h + k * CHUNK)
++                        except OSError:
++                            if not direct:
++                                raise
++                            os.close(fd)                # O_DIRECT refused mid-way: buffered from here on
++                            fd, direct = os.open(tmp, os.O_WRONLY), False
++                            _pwrite_all(fd, mv[:want], h + k * CHUNK)
++                        written += want
++                    head = encode_header(meta)
++                    if place_header(dict(meta)) != h:
++                        raise LoadError("header size changed")
++                    with open(tmp, "r+b") as f:        # buffered: the header's pages are not the data's
++                        f.write(head + bytes(h - len(head)))
++                    if size == 0:
++                        os.truncate(tmp, h)
++                    os.close(fd)
++                    fd = -1
++                    os.replace(tmp, path)
++                finally:
++                    if fd >= 0:
++                        os.close(fd)
++                    tmp.unlink(missing_ok=True)
++                written += h
++            self.bad.discard(job.key)
++            self.stats["writes"] += 1
++            self.stats["write_bytes"] += written
++            self.stats["write_s"] += time.perf_counter() - t0
++        except BaseException:
++            self.bad.add(job.key)
++            raise
++        finally:
++            self._stage_put(stage)
++            job.groups = job.segs = []                  # the packed rows and snapshot references go now
++
++    # -- rank 0: lookup ------------------------------------------------------------------------------------------------
++    def lookup(self, prompt, tag: int, need_mtp: bool, need_drafter: bool, blocks, have: int) -> DiskEntry | None:
++        e = self.index.find(prompt, tag, need_mtp, need_drafter, blocks)
++        if e is None or len(e.ids) < have + max(self.gain, 1) or e.key in self.bad:
++            return None
++        return e
++
++    # -- restore (both ranks) ---------------------------------------------------------------------------------------
++    def start_load(self, entry: DiskEntry, comps, live: dict) -> "_Load":
++        return _Load(self, entry, list(comps), dict(live))
++
++    def finish_load(self, load: "_Load"):
++        """The snapshot (every byte read and checked into the live slot and fresh tensors) or None (this rank)."""
++
++        snap = load.result()
++        dt = time.perf_counter() - load.t0
++        self.last = {"entry": load.entry.id, "tokens": len(load.entry.ids), "ok": snap is not None,
++                     "bytes": load.bytes, "s": round(dt, 4), "gbps": round(load.bytes / 1e9 / max(dt, 1e-9), 2),
++                     "pages_read": load.pages_read, "pages_skipped": load.pages_skipped, "threads": load.n_threads}
++        if snap is None:
++            self.last["error"] = load.error
++            self.stats["failed_loads"] += 1
++            self._log(f"entry {load.entry.id} ({len(load.entry.ids)} tokens) not restored: {load.error}")
++        else:
++            self.stats["loads"] += 1
++            self.stats["load_bytes"] += load.bytes
++            self.stats["load_s"] += dt
++            self.stats["pages_read"] += load.pages_read
++            self.stats["pages_skipped"] += load.pages_skipped
++        return snap
++
++    def drop(self, entry: DiskEntry) -> None:
++        """Both ranks, after a failed restore on either: the entry goes (its files are not trusted)."""
++
++        if self.index.entries.get(entry.id) is entry:
++            e, freed = self.index.evict(entry.id, "dropped")
++            self._forget([e], freed)
++
++    def touch(self, entry: DiskEntry) -> None:
++        if self.index.entries.get(entry.id) is entry:
++            self.index.touch(entry)
++            self.writer.op("touch", entry.key)
++
++    # -- load: index what is on disk --------------------------------------------------------------------------------
++    def _check(self, meta: dict, path: Path, sizes: dict) -> tuple[bytes, dict]:
++        if meta.get("format") != FORMAT or meta.get("compat") != self.hash or meta.get("rank") != self.rank:
++            raise ValueError("format, compat or rank differs")
++        ids = b64_ids(meta["ids"])
++        tag, mtp_len, drafter = int(meta["tag"]), int(meta["mtp_len"]), bool(meta["drafter"])
++        key = ids_key(tag, ids, mtp_len >= 0, drafter)
++        if key.hex() != meta["key"] or path.name != f"{key.hex()}.tfs" or len(ids) != int(meta["n"]):
++            raise ValueError("key differs")
++        keys = page_keys(tag, ids, chain(ids), page_count(tag, len(ids), mtp_len), mtp_len >= 0)
++        if [k.hex() for k in keys] != meta["pages"] or len(meta["page_sha"]) != len(keys):
++            raise ValueError("page keys differ")
++        stride = self.lay[mtp_len >= 0][1]
++        if int(meta["stride"]) != stride:
++            raise ValueError("page layout differs")
++        tails = self._tails(len(ids), mtp_len, len(keys))
++        segs = meta["segments"]
++        tail_segs = [s for s in segs if s["name"].startswith("tail.")]
++        if [(int(s["comp"]), int(s["rows"][0]), int(s["rows"][1])) for s in tail_segs] != tails:
++            raise ValueError("tail rows differ")
++        if path.stat().st_size != int(meta["data_off"]) + int(meta["data_bytes"]):
++            raise ValueError("truncated")
++        for k in keys:
++            if k not in sizes:
++                p = self._page_path(k)
++                sizes[k] = p.stat().st_size if p.exists() else -1
++            if sizes[k] != stride:
++                raise ValueError("a page file is missing or truncated")
++        meta["_ids"] = ids
++        meta["_keys"] = keys
++        meta["_tails"] = tails
++        return key, meta
++
++    def scan(self) -> list[tuple[float, bytes, dict]]:
++        """This rank's valid entries, least recently used first (removes temporary and invalid files)."""
++
++        for d in (self.dir / "entries", self.dir / "pages"):
++            for p in d.rglob(".*.tmp-*"):
++                p.unlink(missing_ok=True)
++        out, sizes = [], {}
++        for p in sorted((self.dir / "entries").glob("*.tfs")):
++            try:
++                key, meta = self._check(read_header(p), p, sizes)
++                out.append((p.stat().st_mtime, key, meta))
++            except (OSError, ValueError, KeyError, TypeError) as exc:
++                self._log(f"ignoring {p.name}: {exc}")
++                p.unlink(missing_ok=True)
++        out.sort(key=lambda x: (x[0], x[1]))
++        return out
++
++    def reconcile(self, share: Callable | None = None, gather: Callable | None = None) -> int:
++        """Index the entries both ranks hold (rank 0's order); delete the rest. ``share`` / ``gather``: the engine's
++        ``_share`` / ``_gather_ints`` (None: this rank alone). Returns the entries indexed."""
++
++        cands = self.scan()
++        local = {k: m for _, k, m in cands}
++        if share is None:
++            keys = [k for _, k, _ in cands]
++        else:
++            flat = [x for _, k, _ in cands for x in key_ints(k)] if self.rank == 0 else None
++            got = share(flat)
++            keys = [ints_key(got[i:i + 4]) for i in range(0, len(got), 4)]
++        have = [int(k in local) for k in keys]
++        both = gather(have) if gather is not None else [have, have]
++        for i, k in enumerate(keys):
++            if not (both[0][i] and both[1][i]):
++                continue
++            m = local[k]
++            snaps = [s["nbytes"] for s in m["segments"] if not s["name"].startswith("tail.")]
++            eb = self._entry_bytes(len(m["_ids"]), len(m["_keys"]), m["_tails"], snaps)
++            res = self.index.add(tag=int(m["tag"]), ids=m["_ids"], mtp_len=int(m["mtp_len"]),
++                                 drafter=bool(m["drafter"]), entry_bytes=eb, kind=m.get("kind", "turn"))
++            self._forget(res.evicted, res.freed)
++            if res.status == ADDED:
++                for pk, sha in zip(m["_keys"], m["page_sha"]):
++                    self.page_sha.setdefault(pk, sha)
++        kept = set(self.index.by_key)
++        for k in local:
++            if k not in kept:
++                self.writer.op("del_entry", k)
++        referenced = set(self.index.pages)
++        for p in (self.dir / "pages").rglob("*.tfp"):
++            try:
++                k = bytes.fromhex(p.stem)
++            except ValueError:
++                k = b""
++            if k not in referenced:
++                self.writer.op("unlink", p)
++        self._prune()
++        return len(self.index.entries)
++
++    def _prune(self, keep: int = 2) -> None:
++        """Other compat directories of this rank beyond the ``keep`` newest go (another image / knob set)."""
++
++        others = []
++        for d in self.root.iterdir() if self.root.is_dir() else ():
++            r = d / f"rank{self.rank}"
++            if d.name != self.hash[:16] and r.is_dir():
++                others.append((r.stat().st_mtime, r))
++        for _, r in sorted(others, reverse=True)[keep:]:
++            self.writer.op("rmtree", r)
++
++    def digest(self) -> int:
++        return self.index.digest()
++
++    def describe(self) -> str:
++        ix = self.index
++        return (f"disk {len(ix.entries)} entries, {len(ix.pages)} pages, {ix.used / 2 ** 30:.2f} of "
++                f"{ix.budget / 2 ** 30:.1f} GiB")
++
++
++def _dt(t) -> str:
++    return str(t.dtype).removeprefix("torch.")
++
++
++def _u8(t):
++    """A contiguous tensor's bytes as a flat uint8 view."""
++
++    import torch
++
++    flat = t.reshape(-1)
++    return flat if flat.dtype == torch.uint8 else flat.view(torch.uint8)
++
++
++class _null:
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *a):
++        return False
++
++
++class _Load:
++    """One entry read into a slot: started on the calling thread (header, destination tensors, threads), finished by
++    ``result`` (joins; this rank's verdict). Rows go straight into the slot's caches."""
++
++    def __init__(self, tier: DiskTier, entry: DiskEntry, comps: list, live: dict) -> None:
++        self.tier, self.entry, self.comps = tier, entry, comps
++        self.t0 = time.perf_counter()
++        self.error: str | None = None
++        self.bytes = self.pages_read = self.pages_skipped = 0
++        self.n_threads = 0
++        self.workers: list[threading.Thread] = []
++        self.dest: dict[str, Any] = {}
++        self.meta: dict = {}
++        self._lock = threading.Lock()
++        try:
++            self._start(live)
++        except Exception as exc:  # noqa: BLE001 - any failure: this rank says no, both ranks prefill cold
++            self.error = f"{type(exc).__name__}: {exc}"
++
++    def _start(self, live: dict) -> None:
++        import torch
++
++        t, e = self.tier, self.entry
++        t.writer.wait_keys([e.key] + list(e.pages))
++        if e.key in t.bad or any(k in t.bad for k in e.pages):
++            raise LoadError("its write failed")
++        path = t._entry_path(e.key)
++        meta = read_header(path)
++        if meta.get("format") != FORMAT or meta.get("compat") != t.hash or meta.get("key") != e.key.hex() \
++                or meta.get("pages") != [k.hex() for k in e.pages] or int(meta.get("n", -1)) != len(e.ids) \
++                or int(meta.get("mtp_len", -2)) != e.mtp_len:
++            raise LoadError("header does not match the index")
++        if b64_ids(meta["ids"]) != e.ids:
++            raise LoadError("token ids differ")
++        lay, stride = t.lay[e.has_mtp]
++        if int(meta["stride"]) != stride:
++            raise LoadError("page layout differs")
++        size = int(meta["data_bytes"])
++        if path.stat().st_size != int(meta["data_off"]) + size:
++            raise LoadError("entry file truncated")
++        self.meta = meta
++        dev = t.device
++        want_tails = t._tails(len(e.ids), e.mtp_len, len(e.pages))
++        flat, tail_i = [], 0
++        st = getattr(getattr(t.store, "e", None), "st", None)
++        for s in meta["segments"]:
++            name = s["name"]
++            if name.startswith("tail."):
++                ci, (a, b) = int(s["comp"]), s["rows"]
++                if tail_i >= len(want_tails) or tuple(want_tails[tail_i]) != (ci, a, b):
++                    raise LoadError("tail rows differ")
++                tail_i += 1
++                c = self.comps[ci]
++                if _dt(c.live) != s["dtype"] or (b - a) * t.rb[ci] != int(s["nbytes"]):
++                    raise LoadError(f"tail {ci} differs")
++                flat.append(_u8(c.live[a:b]))
++            else:
++                x = torch.empty(s["shape"], dtype=getattr(torch, s["dtype"]), device=dev)
++                if sessions._nbytes(x) != int(s["nbytes"]):
++                    raise LoadError(f"{name}: size differs")
++                ref = getattr(st, name, None) if name in ("rec", "conv") else None
++                if ref is not None and hasattr(ref, "shape"):
++                    ref = ref[0] if name == "rec" else ref          # rec: [2 buffers, ...]; a snapshot holds one
++                    if tuple(ref.shape) != tuple(x.shape) or ref.dtype != x.dtype:
++                        raise LoadError(f"{name}: shape differs from this engine's")
++                self.dest[name] = x
++                flat.append(_u8(x))
++        if tail_i != len(want_tails):
++            raise LoadError("tail rows differ")
++        plan = chunk_plan([(int(s["off"]), int(s["nbytes"])) for s in meta["segments"]], size)
++        if len(meta.get("sums", ())) != len(plan) or len(meta.get("page_sha", ())) != len(e.pages):
++            raise LoadError("checksums missing")
++        need = [p for p, k in enumerate(e.pages) if live.get(p) != k]
++        self.pages_skipped = len(e.pages) - len(need)
++        g = t._group()
++        items: list[tuple] = []
++        run: list[int] = []
++        for p in need:
++            if run and (p != run[-1] + 1 or len(run) == g):
++                items.append(("pages", run[0], len(run)))
++                run = []
++            run.append(p)
++        if run:
++            items.append(("pages", run[0], len(run)))
++        items += [("chunk", k) for k in range(len(plan))]
++        self.plan, self.flat, self.size, self.path = plan, flat, size, path
++        self.stride, self.lay = stride, lay
++        self.items = deque(items)
++        event = None
++        if t.cuda:                                      # after everything queued so far on the serving stream
++            event = torch.cuda.Event()
++            event.record(torch.cuda.current_stream(dev))
++        self.n_threads = min(t.n_threads, max(1, len(items)))
++        self.workers = [threading.Thread(target=self._work, args=(event,), name=f"tf-session-read-{i}", daemon=True)
++                        for i in range(self.n_threads)]
++        for w in self.workers:
++            w.start()
++
++    def _fail(self, msg: str) -> None:
++        with self._lock:
++            if self.error is None:
++                self.error = msg
++
++    def _work(self, event) -> None:
++        import torch
++
++        t, e = self.tier, self.entry
++        cuda = t.cuda
++        stages = [t._stage_get(), t._stage_get()]
++        events: list = [None, None]
++        which = 0
++        stream = torch.cuda.Stream(device=t.device) if cuda else None
++        dstage = None
++        fd = -1
++        try:
++            ctx = torch.cuda.stream(stream) if cuda else _null()
++            with ctx:
++                if cuda:
++                    stream.wait_event(event)
++                fd, direct = _open_r(self.path, t.direct)
++                while True:
++                    with self._lock:
++                        if self.error is not None or not self.items:
++                            break
++                        item = self.items.popleft()
++                    if events[which] is not None:
++                        events[which].synchronize()            # this buffer's last copies are done
++                    buf = stages[which]
++                    mv = memoryview(buf.numpy())
++                    if item[0] == "pages":
++                        _, p0, k = item
++                        for j in range(k):
++                            key = e.pages[p0 + j]
++                            part = mv[j * self.stride:(j + 1) * self.stride]
++                            pfd, pdirect = _open_r(t._page_path(key), t.direct)
++                            try:
++                                _pread_all(pfd, part, 0, pdirect, key.hex())
++                            finally:
++                                os.close(pfd)
++                            if t.verify and hashlib.sha256(part).hexdigest() != self.meta["page_sha"][p0 + j]:
++                                raise LoadError(f"page {p0 + j} checksum mismatch")
++                        n = k * self.stride
++                        if cuda:
++                            if dstage is None:
++                                dstage = torch.empty(CHUNK, dtype=torch.uint8, device=t.device)
++                            dstage[:n].copy_(buf[:n], non_blocking=True)
++                            src = dstage
++                        else:
++                            src = buf
++                        ev = torch.cuda.Event() if cuda else None
++                        if cuda:
++                            ev.record(stream)                   # the pinned buffer is free after this copy
++                        rows = src[:n].view(k, self.stride)
++                        for ci, off, nb in self.lay:
++                            c = self.comps[ci]
++                            _u8(c.live[p0 * c.per:(p0 + k) * c.per]).view(k, nb).copy_(rows[:, off:off + nb],
++                                                                                       non_blocking=cuda)
++                        with self._lock:
++                            self.pages_read += k
++                            self.bytes += n
++                    else:
++                        _, ck = item
++                        want = min(CHUNK, self.size - ck * CHUNK)
++                        _pread_all(fd, mv[:want], int(self.meta["data_off"]) + ck * CHUNK, direct, self.path)
++                        if t.verify and hashlib.sha256(mv[:want]).hexdigest() != self.meta["sums"][ck]:
++                            raise LoadError(f"entry chunk {ck} checksum mismatch")
++                        for seg, a, s, n in self.plan[ck]:
++                            if seg >= 0:
++                                self.flat[seg][a:a + n].copy_(buf[s:s + n], non_blocking=cuda)
++                        ev = None
++                        if cuda:
++                            ev = torch.cuda.Event()
++                            ev.record(stream)
++                        with self._lock:
++                            self.bytes += want
++                    events[which] = ev
++                    which ^= 1
++                if cuda:
++                    stream.synchronize()
++        except Exception as exc:  # noqa: BLE001
++            self._fail(f"{type(exc).__name__}: {exc}")
++            if cuda and stream is not None:
++                stream.synchronize()
++        finally:
++            if fd >= 0:
++                os.close(fd)
++            for b in stages:
++                t._stage_put(b)
++
++    def result(self):
++        for w in self.workers:
++            w.join()
++        self.workers = []
++        if self.error is not None:
++            return None
++        m = self.meta["snap"]
++        win = None
++        if m["window"] is not None:
++            win = {"end": int(m["window"]["end"]), "lo": int(m["window"]["lo"]), "k": self.dest.get("win.k"),
++                   "v": self.dest.get("win.v")}
++        fields = dict(ids=list(self.entry.ids), rec=self.dest["rec"], conv=self.dest["conv"],
++                      pending=self.dest.get("pending"), mtp_len=int(m["mtp_len"]), drafter_end=int(m["drafter_end"]),
++                      grid=int(m["grid"]), window=win, kv=int(m["kv"]))
++        return self.tier.snap_cls(**fields)
++
++
++# -- the engine's side -------------------------------------------------------------------------------------------------
++def attach(g, store) -> DiskTier | None:
++    """At load, both ranks (``GlmEngine._sessions``): agree on the settings and the compat hash, build this rank's
++    tier, index what both ranks hold on disk, attach it to the store. None when off."""
++
++    mine = settings()
++    both = g._gather_ints(mine)
++    if both[0] != both[1]:
++        raise RuntimeError("the two ranks were started with different session disk settings (GLM53_TF_SESSION_DISK, "
++                           f"GLM53_TF_SESSION_DISK_GIB / _WRITE / _MIN): {both[0]}, {both[1]}")
++    if not mine[0]:
++        return None
++    engine = getattr(g, "_calib_engine", None) or {}
++    ok = all(c.live.is_contiguous() for c in store.comps)
++    ident = compat_ident(model_dir=getattr(g, "model_dir", None), drafter_dir=engine.get("drafter") or None,
++                         layout=layout_sig(store.comps))
++    got = g._gather_ints(ident_ints(ident) + [int(ok)])
++    if got[0] != got[1] or not ok:
++        if g.rank == 0:
++            print("[tensorfold] session disk: OFF (the ranks' engines differ, or a cache tensor is not contiguous)",
++                  flush=True)
++        return None
++    tier, err = None, ""
++    try:
++        tier = DiskTier(store, root(), g.rank, ident,
++                        agree=lambda ok_: all(v[0] for v in g._gather_ints([int(ok_)])))
++    except (OSError, ValueError) as exc:
++        err = repr(exc)
++    ok_all = g._gather_ints([int(tier is not None)])
++    if not (ok_all[0][0] and ok_all[1][0]):
++        print(f"[tensorfold] session disk (rank {g.rank}): OFF ({err or 'the other rank could not open its tier'})",
++              flush=True)
++        return None
++    t0 = time.perf_counter()
++    n = tier.reconcile(g._share, g._gather_ints)
++    store.attach_disk(tier)
++    if g.rank == 0:
++        ix = tier.index
++        print(f"[tensorfold] session disk: {tier.dir} ({tier.policy} writes, entries >= {tier.min_tokens} tokens, "
++              f"{ix.budget / 2 ** 30:g} GiB): {n} sessions from before this start "
++              f"({ix.used / 2 ** 30:.2f} GiB), indexed in {time.perf_counter() - t0:.1f}s", flush=True)
++    return tier
++
++
++# -- command line: status, verify, bench -------------------------------------------------------------------------------
++def _status(root_dir: Path) -> int:
++    for rank_dir in sorted(root_dir.glob("*/rank*")):
++        entries = list((rank_dir / "entries").glob("*.tfs"))
++        pages = list((rank_dir / "pages").rglob("*.tfp"))
++        size = sum(p.stat().st_size for p in entries + pages)
++        print(f"{rank_dir}: {len(entries)} entries, {len(pages)} pages, {size / 2 ** 30:.2f} GiB")
++    return 0
++
++
++def _verify(root_dir: Path) -> int:
++    bad = 0
++    for rank_dir in sorted(root_dir.glob("*/rank*")):
++        for p in sorted((rank_dir / "entries").glob("*.tfs")):
++            try:
++                m = read_header(p)
++                with open(p, "rb") as f:
++                    for k, sha in enumerate(m["sums"]):
++                        f.seek(int(m["data_off"]) + k * CHUNK)
++                        if hashlib.sha256(f.read(min(CHUNK, int(m["data_bytes"]) - k * CHUNK))).hexdigest() != sha:
++                            raise ValueError(f"chunk {k}")
++                for h, sha in zip(m["pages"], m["page_sha"]):
++                    pp = rank_dir / "pages" / h[:2] / f"{h}.tfp"
++                    if hashlib.sha256(pp.read_bytes()).hexdigest() != sha:
++                        raise ValueError(f"page {h[:12]}")
++            except (OSError, ValueError, KeyError) as exc:
++                bad += 1
++                print(f"BAD {p}: {exc}")
++    print("ok" if not bad else f"{bad} bad entries")
++    return 1 if bad else 0
++
++
++def bench(root_dir: Path, tokens: int = 40960, kv: str = "fp8", device: str | None = None,
++          n_threads: int | None = None) -> dict:
++    """Write and read back one synthetic entry of ``tokens`` tokens shaped like the real store's (per rank: 12
++    latent caches of 528 (fp8) or 1,024 (bf16) B a token, the MTP layer's index keys / gates, pool keys; a 71.3 MB
++    KDA state, a 2.6 MB conv window, a 20 MB drafter window) through the tier's own writer and reader."""
++
++    import torch
++    from types import SimpleNamespace
++
++    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
++    cap = tokens + PAGE
++    rowb = 528 if kv == "fp8" else 1024
++    comps = [sessions.Comp(torch.randint(0, 255, (cap, rowb), dtype=torch.uint8, device=dev), PAGE, False)
++             for _ in range(11)]
++    comps += [sessions.Comp(torch.randn((cap // 4 + 2, 128), device=dev).to(torch.bfloat16), PAGE // 4, False)
++              for _ in range(11)]
++    comps += [sessions.Comp(torch.randint(0, 255, (cap, rowb), dtype=torch.uint8, device=dev), PAGE, True),
++              sessions.Comp(torch.randn((cap, 128), device=dev).to(torch.bfloat16), PAGE, True),
++              sessions.Comp(torch.randn((cap, 128), device=dev).to(torch.bfloat16), PAGE, True),
++              sessions.Comp(torch.randn((cap // 4 + 2, 128), device=dev).to(torch.bfloat16), PAGE // 4, True)]
++    store = SimpleNamespace(comps=comps, index=None, slabs={})
++    tier = DiskTier(store, root_dir, 0, {"bench": kv, "tokens": tokens}, budget=1 << 50, min_tok=1, gain=0,
++                    n_threads=n_threads, queue=1 << 40, quiet=True)
++    ids = [i % 50000 for i in range(tokens)]
++    bf = lambda *shape: torch.randn(shape, device=dev).to(torch.bfloat16)          # noqa: E731
++    snap = SimpleNamespace(ids=ids, rec=torch.randn((34, 32, 128, 128), device=dev), conv=bf(34, 3, 12288),
++                           pending=bf(1, 6144), mtp_len=tokens - 1, drafter_end=tokens, grid=0, kv=int(kv == "fp8"),
++                           window={"end": tokens, "lo": tokens - 2047, "k": bf(5, 4, 2047, 128),
++                                   "v": bf(5, 4, 2047, 128)})
++    if dev.type == "cuda":
++        torch.cuda.synchronize()
++    t0 = time.perf_counter()
++    res = tier.on_save(snap, True)
++    tier.writer.drain()
++    tw = time.perf_counter() - t0
++    e = res.entry
++    ends = [c.rows(snap.mtp_len if c.mtp else tokens) for c in comps]
++    before = [c.live[:n].clone() for c, n in zip(comps, ends)]
++    for c in comps:
++        c.live.zero_()
++    t0 = time.perf_counter()
++    got = tier.finish_load(tier.start_load(e, comps, {}))
++    if dev.type == "cuda":
++        torch.cuda.synchronize()
++    tr = time.perf_counter() - t0
++    same = got is not None and all(torch.equal(b, c.live[:n]) for b, c, n in zip(before, comps, ends)) and \
++        torch.equal(got.rec, snap.rec) and torch.equal(got.window["k"], snap.window["k"])
++    nbytes = tier.stats["write_bytes"]
++    out = {"tokens": tokens, "kv": kv, "device": str(dev), "bytes": nbytes, "write_s": round(tw, 3),
++           "write_gbps": round(nbytes / 1e9 / tw, 2), "read_s": round(tr, 3),
++           "read_gbps": round(tier.last.get("bytes", 0) / 1e9 / tr, 2), "exact": bool(same), "threads": tier.n_threads}
++    shutil.rmtree(tier.dir.parent, ignore_errors=True)
++    return out
++
++
++def main(argv: list[str] | None = None) -> int:
++    import argparse
++
++    ap = argparse.ArgumentParser(prog="python -m tensorfold.families.glm5_next.cuda.sessdisk",
++                                 description="The session store's NVMe tier (patches/0250)")
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    for name in ("status", "verify"):
++        sub.add_parser(name).add_argument("dir", type=Path)
++    b = sub.add_parser("bench", help="write + read one synthetic entry through the tier (throughput, exactness)")
++    b.add_argument("dir", type=Path)
++    b.add_argument("--tokens", type=int, nargs="+", default=[40960, 102400])
++    b.add_argument("--kv", default="fp8", choices=("fp8", "bf16"))
++    b.add_argument("--device", default=None)
++    b.add_argument("--threads", type=int, default=None)
++    a = ap.parse_args(argv)
++    if a.cmd == "status":
++        return _status(a.dir)
++    if a.cmd == "verify":
++        return _verify(a.dir)
++    for n in a.tokens:
++        print(json.dumps(bench(a.dir, n, a.kv, a.device, a.threads)), flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git c/src/tensorfold/families/glm5_next/cuda/sessions.py i/src/tensorfold/families/glm5_next/cuda/sessions.py
+index 063e899..a035785 100644
+--- c/src/tensorfold/families/glm5_next/cuda/sessions.py
++++ i/src/tensorfold/families/glm5_next/cuda/sessions.py
+@@ -73,6 +73,10 @@ admitted together cannot see each other's entries (none is stored yet), so rank
+ a prompt in flight (running or admitted in the same round) as a fork point (``plan(others=...)``): N sessions over
+ one system prompt submitted at once still leave a fork mark for the next one.
+ 
++NVMe tier (patches/0250, GLM53_TF_SESSION_DISK=<dir>, ``sessdisk.py``): entries are also written to a local
++directory (every save, or on eviction), looked up after the RAM store, and read back straight into the live slot;
++the plan carries the disk entry and the disk index's digest; sessions survive restarts.
++
+ This module imports no torch at load: ``SessionIndex`` (keys, lookup, LRU, reference counts, budget) is plain
+ Python and tested on the host; ``SessionStore`` moves the tensors.
+ """
+@@ -299,6 +303,7 @@ class SessionIndex:
+         self.clock = 0
+         self.next_id = 1
+         self.counters = {"saved": 0, "skipped": 0, "duplicate": 0, "evicted": 0}
++        self.on_evict = None                     # patches/0250: called with an entry before its pages go
+ 
+     # -- accounting ------------------------------------------------------------------------------------------------
+     @property
+@@ -413,6 +418,8 @@ class SessionIndex:
+         return min(self.entries.values(), key=lambda e: (e.used, e.id), default=None)
+ 
+     def evict(self, entry_id: int) -> Entry:
++        if self.on_evict is not None and entry_id in self.entries:     # patches/0250 (its rows are still there)
++            self.on_evict(self.entries[entry_id])
+         e = self.entries.pop(entry_id)
+         self.by_key.pop(e.key, None)
+         self.private -= e.private
+@@ -516,10 +523,14 @@ class SessionIndex:
+ class Plan:
+     entry: Entry | None
+     marks: list[int]
++    disk: Any = None             # patches/0250: a ``sessdisk.DiskEntry`` to read into the slot instead
++    disk_digest: int = 0         # patches/0250: rank 0's disk index digest (rank 1 checks it)
++    load: Any = None             # patches/0250: the read in flight (this rank's; never sent)
+ 
+     def encode(self, digest: int) -> list[int]:
+-        e = self.entry
+-        return [int(e is not None), e.id if e else 0, len(e.ids) if e else 0, len(self.marks), *self.marks, digest]
++        e, d = self.entry, self.disk
++        return [int(e is not None), e.id if e else 0, len(e.ids) if e else 0, len(self.marks), *self.marks, digest,
++                int(d is not None), d.id if d else 0, len(d.ids) if d else 0, self.disk_digest]
+ 
+ 
+ def decode_saves(flat: list[int], count: int) -> list[tuple[int, list[int]]]:
+@@ -649,6 +660,7 @@ class SessionStore:
+         self.cur = 0
+         self.slot_comps: list[list[Comp]] = [self.comps]
+         self.slot_live: list[dict[int, bytes]] = [self.live]
++        self.disk = None                         # patches/0250: ``sessdisk.DiskTier`` (``attach_disk``)
+         if drafter is not None:
+             e.snap_window = capture_window       # ``decode.take_snapshot`` keeps the drafter's window
+ 
+@@ -691,6 +703,14 @@ class SessionStore:
+             self.slot_live[slot] = self.live
+             self.cur, self.comps, self.live = prev, self.slot_comps[prev], self.slot_live[prev]
+ 
++    def attach_disk(self, tier) -> None:
++        """patches/0250: an NVMe tier behind the store (``sessdisk.attach``); with GLM53_TF_SESSION_DISK_WRITE=evict
++        the entries the index evicts are written first."""
++
++        self.disk = tier
++        if tier is not None and tier.policy == "evict":
++            self.index.on_evict = tier.on_evict
++
+     def live_of(self, slot: int) -> dict[int, bytes]:
+         return self.live if slot == self.cur else self.slot_live[slot]
+ 
+@@ -721,14 +741,25 @@ class SessionStore:
+         a prefix shared with one of them is a fork point too (its entry may not be stored yet)."""
+ 
+         if not draft:
+-            return Plan(None, [])
++            disk = getattr(self, "disk", None)
++            return Plan(None, [], None, disk.digest() if disk is not None else 0)
+         blocks = chain(prompt)
+         best = self.index.find(prompt, tag, need_mtp, need_drafter, blocks)
+         entry = best if best is not None and len(best.ids) > cached else None
+         resume = max(cached, len(entry.ids) if entry is not None else 0)
+-        marks = self.index.marks(prompt, tag, resume, has_mtp=need_mtp and self.e.w.mtp is not None,
+-                                 drafter=need_drafter, every=self.every, fork_min=self.fork_min, blocks=blocks,
+-                                 others=others)
++        disk = getattr(self, "disk", None)
++        found = None
++        if disk is not None:                    # patches/0250: after RAM, the disk (when it resumes enough more)
++            found = disk.lookup(prompt, tag, need_mtp, need_drafter, blocks, resume)
++            if found is not None:
++                entry, resume = None, len(found.ids)
++            others = list(others) + [prompt[:disk.index.lcp(prompt, blocks)]]     # fork points on disk too
++        has_mtp = need_mtp and self.e.w.mtp is not None
++        marks = self.index.marks(prompt, tag, resume, has_mtp=has_mtp, drafter=need_drafter, every=self.every,
++                                 fork_min=self.fork_min, blocks=blocks, others=others)
++        if disk is not None:
++            marks = [m for m in marks if disk.index.has(tag, prompt[:m], has_mtp, need_drafter) is None]
++            return Plan(entry, marks, found, disk.digest())
+         return Plan(entry, marks)
+ 
+     def follow(self, msg: list[int]) -> Plan:
+@@ -744,7 +775,19 @@ class SessionStore:
+             entry = self.index.entries.get(entry_id)
+             if entry is None or len(entry.ids) != length:
+                 raise RuntimeError(f"rank 1 has no session entry {entry_id} of {length} tokens")
+-        return Plan(entry, list(marks))
++        plan = Plan(entry, list(marks))
++        dsrc, did, dlen, ddigest = (rest[n + 1:n + 5] + [0, 0, 0, 0])[:4]      # patches/0250
++        disk = getattr(self, "disk", None)
++        if disk is not None:
++            if disk.digest() != ddigest:
++                raise RuntimeError(f"session disk indexes diverged: rank 0 digest {ddigest}, rank 1 {disk.digest()}")
++            plan.disk_digest = ddigest
++        if dsrc:
++            d = disk.index.entries.get(did) if disk is not None else None
++            if d is None or len(d.ids) != dlen:
++                raise RuntimeError(f"rank 1 has no session disk entry {did} of {dlen} tokens")
++            plan.disk = d
++        return plan
+ 
+     def _can_grow(self, n: int) -> bool:
+         import torch
+@@ -817,6 +860,8 @@ class SessionStore:
+                               snap_bytes=snap_bytes(snap), kind=kind, forced=forced,
+                               can_grow=self._can_grow if forced is None else None)
+         self._sync_slabs()
++        if getattr(self, "disk", None) is not None:     # patches/0250: write-through (the live caches hold the rows)
++            self.disk.on_save(snap, drafter)
+         if res.status != SAVED:
+             if res.status == DUPLICATE:
+                 snap.session_entry = res.entry.id     # entry ids are never reused
+@@ -859,6 +904,36 @@ class SessionStore:
+         self.index.touch(entry)
+         return snap
+ 
++    # -- patches/0250: the disk tier ---------------------------------------------------------------------------------
++    def prefetch(self, plan: Plan) -> None:
++        """Start reading ``plan.disk`` into the current slot's caches (both ranks, as soon as they know the plan);
++        the live caches hold nothing the store knows of from here on."""
++
++        if plan is None or plan.disk is None or plan.load is not None:
++            return
++        plan.load = self.disk.start_load(plan.disk, self.comps, self.live)
++        self.live = {}
++
++    def restore_disk(self, plan: Plan, drafter=None):
++        """Finish ``plan.disk``'s read (both ranks, where a RAM restore would copy); both ranks agree on the outcome.
++        Returns its snapshot for ``decode.prefill(resume=...)``, or None: either rank failed, the entry is dropped
++        on both and the request prefills from scratch."""
++
++        self.prefetch(plan)
++        snap = self.disk.finish_load(plan.load)
++        plan.load = None
++        if not self.disk.agree(snap is not None):
++            self.disk.drop(plan.disk)
++            self.live = {}
++            self.stats["disk_fallbacks"] = self.stats.get("disk_fallbacks", 0) + 1
++            return None
++        self.live = {p: k for p, k in enumerate(plan.disk.pages)}
++        if drafter is not None and snap.window is not None:
++            restore_window(drafter, snap.window)
++        self.disk.touch(plan.disk)
++        self.stats["disk_restores"] = self.stats.get("disk_restores", 0) + 1
++        return snap
++
+     def entry_of(self, snap) -> Entry | None:
+         """The stored entry of a snapshot (saved, or found a duplicate of one), if it is still stored."""
+ 
+@@ -867,5 +942,6 @@ class SessionStore:
+ 
+     def describe(self) -> str:
+         ix = self.index
++        disk = getattr(self, "disk", None)
+         return (f"{len(ix.entries)} entries, {len(ix.pages)} pages, {ix.used / 2 ** 30:.2f} of "
+-                f"{ix.budget / 2 ** 30:.2f} GiB")
++                f"{ix.budget / 2 ** 30:.2f} GiB" + (f"; {disk.describe()}" if disk is not None else ""))

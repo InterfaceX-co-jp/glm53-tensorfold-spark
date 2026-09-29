@@ -1,0 +1,11 @@
+826 requests, 385896 reply tokens; deep row 4.7 ms, host 3.9 ms a round, 3 seeds
+  8      57.6 tok/s  3.53 tok/round  lookup rounds 5.9%, lookup-kept tokens 7.4%, rounds keeping 9+ 0.0%
+  16     58.0 tok/s  3.59 tok/round  lookup rounds 4.9%, lookup-kept tokens 8.3%, rounds keeping 9+ 1.7%  gain +0.6% (median request +0.0%, requests >= +5%: 8%)
+  8g     57.6 tok/s  3.53 tok/round  lookup rounds 6.1%, lookup-kept tokens 7.4%, rounds keeping 9+ 0.0%, global hits 3099  gain -0.0% (median request +0.0%, requests >= +5%: 1%)
+  16g    58.0 tok/s  3.59 tok/round  lookup rounds 5.1%, lookup-kept tokens 8.5%, rounds keeping 9+ 1.7%, global hits 3068  gain +0.6% (median request +0.0%, requests >= +5%: 9%)
+  gate-free copy potential (request index; share of reply tokens):
+    code         202599 tokens  committed by lookup rounds  61.4%  of them in rounds of 9+ tokens  40.6% (5752 rounds)
+    prose        183297 tokens  committed by lookup rounds  14.9%  of them in rounds of 9+ tokens   4.3% (612 rounds)
+  gate-free copy potential (request + global index; share of reply tokens):
+    code         202599 tokens  committed by lookup rounds  63.4%  of them in rounds of 9+ tokens  41.1% (5834 rounds)
+    prose        183297 tokens  committed by lookup rounds  15.5%  of them in rounds of 9+ tokens   4.3% (610 rounds)

@@ -1,0 +1,1580 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/b12x_attn.py i/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
+index b1fa1fb..0ac42b3 100644
+--- c/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
++++ i/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
+@@ -22,7 +22,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from .latent import CHUNK, KT, SCALE_AT, _lrows, _ltile, _views
++from .latent import CHUNK, KT, SCALE_AT, _lrows, _ltile, _paging, _views
+ 
+ BM = 32           # (row, head) queries a program: all 32 local heads of a row (one gather of its latent rows)
+ STAGES = 1        # software pipelining of the key loop (no effect on bits); 2 needs ~64 KB more shared memory
+@@ -32,7 +32,7 @@ WARPS = 8
+ @triton.jit
+ def _lsparse_one(QA, LC, LCS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, L: tl.constexpr, KTS: tl.constexpr,
+                  SCALE: tl.constexpr, BMQ: tl.constexpr, FP8: tl.constexpr = False, RB: tl.constexpr = 0,
+-                 SB: tl.constexpr = 0, SA: tl.constexpr = 0):
++                 SB: tl.constexpr = 0, SA: tl.constexpr = 0, PT=None, PSH: tl.constexpr = 0):
+     """Program (row r, head tile): the row's n selected tokens in list order, one online softmax, OUT = o / l."""
+ 
+     r = tl.program_id(0)
+@@ -50,7 +50,7 @@ def _lsparse_one(QA, LC, LCS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, L
+             idx = t * KTS + tl.arange(0, KTS)
+             ok = idx < n
+             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
+-            kv = _lrows(LC, LCS, tok, ok, d, FP8, RB, SB, SA)
++            kv = _lrows(LC, LCS, tok, ok, d, FP8, RB, SB, SA, PT, PSH)          # patches/0290: paged rows too
+             valid = ok[None, :] & hok[:, None]
+             m, l, o = _ltile(q, kv, m, l, o, valid, SCALE)
+         tl.store(OUT + (r * H + h[:, None]).to(tl.int64) * L + d[None, :], o / l[:, None], mask=hok[:, None])
+@@ -71,7 +71,7 @@ def sparse_latent_one(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor,
+     lcv, lcs, f8, rb, sb = _views(lc, L)
+     _lsparse_one[(R, triton.cdiv(H, bm))](qa, lcv, lcs, tokens, counts, out, W=W, H=H, L=L, KTS=KT, SCALE=scale,
+                                           BMQ=bm, FP8=f8, RB=rb, SB=sb, SA=SCALE_AT // 4, num_warps=WARPS,
+-                                          num_stages=STAGES if stages is None else int(stages))
++                                          num_stages=STAGES if stages is None else int(stages), **_paging(lc))
+ 
+ 
+ def reference(qa: torch.Tensor, lat: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, scale: float):
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py i/src/tensorfold/families/glm5_next/cuda/batch.py
+index 2997df6..4a0e795 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ i/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -122,7 +122,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, choose_rows
+ 
+-from . import batchplan, comm as comm_mod, decode_v2 as dv2, glue, kda as kda_mod, latent, qmm, sparse
++from . import batchplan, comm as comm_mod, decode_v2 as dv2, glue, kda as kda_mod, kvpool, latent, qmm, sparse
+ from .attention import attention, kv_write
+ from .forward import State, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+ 
+@@ -823,6 +823,9 @@ class Batcher:
+     buckets = 0                                   # patches/0280 defaults
+     tie = False
+     src_host = src_dev = None
++    kvp = None                                    # patches/0290: the KV page pool (None: every slot owns its caches)
++    pool_check = False
++    _spills: Sequence[int] = ()                   # patches/0290: this round's spilled slots (rank 0's plan)
+ 
+     def __init__(self, g, n: int) -> None:
+         from .engine import GRAPH_ROWS, MAX_ROWS
+@@ -900,6 +903,15 @@ class Batcher:
+                   "slots)" + (f" and the session store's {self.store_budget / 2**30:g} GiB (GLM53_TF_SESSION_GIB)"
+                               if self.store_budget else "") + "; serving that many", flush=True)
+         self.n = n = fit
++        # patches/0290: with the KV pool, slots hold pages only while (and after) a request uses them; admission
++        # reserves a request's pages (``_plan``), so every slot starts empty and unreserved
++        self.kvp = w.meta.get("kv_pool")
++        self.pool_check = self.kvp is not None and kvpool.check_on()
++        self._spills = []
++        if self.kvp is not None:
++            for st in self.states:
++                st.pages.truncate(0)
++                st.pages.reserve(0)
+         kda_layers = [l for l in w.layers if l.kind == "kda"]
+         rows = min(b.rows, n * MAX_ROWS)
+         if kda_layers:
+@@ -935,6 +947,12 @@ class Batcher:
+             print(f"[tensorfold] batching {n} requests: {n - 1} extra sequence(s), {extra:.2f} GB on this rank "
+                   f"({e.st.capacity} cache slots each; prefill pieces of {self.piece} tokens, at most "
+                   f"{self.fair.share:g} of the time while others decode)", flush=True)
++            if self.kvp is not None:
++                kp = self.kvp
++                print(f"[tensorfold] KV pool (patches/0290): {kp.npages * kp.page} tokens in {kp.npages} pages of "
++                      f"{kp.page}, {kp.nbytes() / 2**30:.2f} GiB on this rank, shared by the {n} slots (each up to "
++                      f"{e.st.capacity} tokens); a request reserves prompt + max_tokens + {kp.slack} tokens of "
++                      "pages at admission, idle slots' pages are spilled when short, else it waits", flush=True)
+         self.cv = threading.Condition()
+         self.stopping = False
+         self.queue: collections.deque[Job] = collections.deque()
+@@ -972,8 +990,8 @@ class Batcher:
+             return slot, cached
+         slot = batchplan.place_entry(free, {s: self.store.overlap(e, s) for s in free},
+                                      {s: self.used[s] for s in free})
+-        if sess.disk is not None:
+-            self._prefetch(slot, sess)
++        if sess.disk is not None and self.kvp is None:  # patches/0290: with the pool the read starts in ``_admit``
++            self._prefetch(slot, sess)                  # (after this round's spills and the slot's reservation)
+         return slot, len(e.ids)
+ 
+     def _prefetch(self, slot: int, sess) -> None:
+@@ -1022,6 +1040,8 @@ class Batcher:
+         if st.index is not None:
+             tensors += [t for trio in st.index for t in trio]
+         for t in tensors:
++            if kvpool.is_paged(t):              # patches/0290: in the pool, allocated once for every slot
++                continue
+             if t.data_ptr() not in seen:
+                 seen.add(t.data_ptr())
+                 total += t.numel() * t.element_size()
+@@ -1223,12 +1243,15 @@ class Batcher:
+         with torch.no_grad():
+             while True:
+                 cancels, admits, pieces = batchplan.parse_plan(self.g._share(None))
++                if self.kvp is not None:                # patches/0290: the slots rank 0 spills this round
++                    got = self.g._share(None)
++                    self._spills = list(got[1:1 + got[0]])
+                 jobs = []
+                 for slot, cached, header in admits:
+                     job = self._job_from(header, self.g._share(None))
+                     if self.store is not None:          # patches/0180: rank 0's session plan, after its digest check
+                         job.sess = self.store.follow(self.g._share(None))
+-                        if job.sess.disk is not None:   # patches/0250: rank 1's read starts now
++                        if job.sess.disk is not None and self.kvp is None:   # patches/0250: rank 1's read starts now
+                             self._prefetch(slot, job.sess)
+                     jobs.append((slot, cached, job))
+                 self._execute(cancels, jobs, pieces)
+@@ -1256,6 +1279,8 @@ class Batcher:
+                 free.append(v)
+                 requeue.append(self.seqs[v].job)
+             admits: list[tuple[int, int, Job]] = []
++            spills: list[int] = []                     # patches/0290: idle slots whose pages go back to the pool
++            avail = self.kvp.available() if self.kvp is not None else 0
+             others = any(s is not None and i not in cancels for i, s in enumerate(self.seqs))
+             # patches/0180: the prompts in flight (fork partners whose entries are not stored yet)
+             flying = [s.job.prompt for i, s in enumerate(self.seqs) if s is not None and i not in cancels]
+@@ -1267,7 +1292,26 @@ class Batcher:
+                 if (others or admits) and batchplan.admit_free(self._free(), self._headroom()) < self.admit_min:
+                     self.counts["deferred"] += 1               # short of memory: it waits for a request to end
+                     break
+-                slot, cached = self._place(job, free)
++                slot, cached = self._place(job, free, spills)
++                if self.kvp is not None:                       # patches/0290: its pages, reserved now
++                    need = self._need_pages(job)
++                    if need > self.kvp.npages:                 # more than the whole pool: it can never run
++                        self.queue.remove(job)
++                        self.counts["pool_refused"] += 1
++                        if job.out is not None:
++                            job.out.put(ValueError(
++                                f"prompt ({len(job.prompt)}) + max_tokens ({job.max_tokens}) needs {need} KV pages of "
++                                f"{self.kvp.page} tokens; the pool (GLM53_TF_KV_POOL_TOKENS) has {self.kvp.npages}"))
++                        continue
++                    got = batchplan.pool_spills(need, avail, [(s, self.states[s].pages.held, self.used[s])
++                                                              for s in free if s not in spills], prefer=slot)
++                    if got is None:                            # short even with every idle slot's pages: it waits
++                        self.counts["pool_wait"] += 1
++                        break
++                    spills += got
++                    avail += sum(self.states[s].pages.held for s in got) - need
++                    if slot in got:                            # its own kept prefix went with its pages
++                        slot, cached = self._place(job, free, spills)
+                 if self.store is not None:                     # patches/0180: a stored session may resume more
+                     slot, cached = self._session_plan(job, slot, cached, free,
+                                                       flying + [j.prompt for _, _, j in admits])
+@@ -1291,6 +1335,9 @@ class Batcher:
+         plan = batchplan.encode_plan(cancels, [(slot, cached, self._header(job)) for slot, cached, job in admits],
+                                      pieces)
+         self.g._share(plan)
++        if self.kvp is not None:                        # patches/0290: this round's spills, before the admissions
++            self._spills = list(spills)
++            self.g._share([len(spills), *spills])
+         for _, _, job in admits:
+             self.g._share(job.prompt)
+             if self.store is not None:                  # patches/0180: the plan, with rank 0's store digest
+@@ -1331,14 +1378,17 @@ class Batcher:
+         return self.g._grid(bool(values["fast_prefill"]), int(values["prefill_rows"]), bool(values["fp8_prefill"]),
+                             int(values.get("b12x", 0)))                  # patches/0240
+ 
+-    def _place(self, job: Job, free: list[int]) -> tuple[int, int]:
++    def _place(self, job: Job, free: list[int], spilled: Sequence[int] = ()) -> tuple[int, int]:
+         """(slot, resume length): the free slot resuming the longest prefix; else the least recently admitted one
+-        (its kept states are the likeliest to be stale)."""
++        (its kept states are the likeliest to be stale). ``spilled`` (patches/0290): slots whose pages go back to the
++        pool this round (their kept snapshots with them)."""
+ 
+         best, length = None, 0
+         if job.draft:
+             grid = self._grid(job.values)
+             for s in free:
++                if s in spilled:
++                    continue
+                 snap = self._resume(s, job.prompt, job.code, grid)
+                 if snap is not None and len(snap.ids) > length:
+                     best, length = s, len(snap.ids)
+@@ -1346,6 +1396,40 @@ class Batcher:
+             best = min(free, key=lambda s: (self.used[s], s))
+         return best, length
+ 
++    # -- patches/0290: the KV page pool -------------------------------------------------------------------------------
++    def _need_pages(self, job: Job) -> int:
++        """Pages a request may write (prompt + max_tokens + the pool's slack, at most a slot's capacity): what its
++        admission reserves, so it can always finish."""
++
++        kp = self.kvp
++        return kvpool.pages_for(kvpool.need_tokens(len(job.prompt), job.max_tokens, self.states[0].capacity,
++                                                   kp.slack), kp.page)
++
++    def _spill(self, slot: int) -> None:
++        """An idle slot's pages back to the pool (both ranks, in the round's order). Its sessions are in the session
++        store already (0180 saves every prompt, mark and reply snapshot when it is made; with 0250's write-through tier
++        also on NVMe), so a later turn resumes from there; its own kept snapshots and live map go with the pages."""
++
++        if self.seqs[slot] is not None:
++            raise RuntimeError(f"KV pool: slot {slot} is busy, it cannot be spilled")
++        self.caches[slot] = []
++        if self.store is not None:
++            self.store.forget(slot)
++        st = self.states[slot]
++        self.counts["pool_spilled_pages"] += st.pages.truncate(0)
++        self.counts["pool_spills"] += 1
++        st.set_pos(0)                           # it holds nothing now (the next request resets or restores it)
++        st.set_mtp_len(0)
++
++    def _release(self, slot: int, keep: int) -> None:
++        """A request left the slot: pages past ``keep`` go back, its reservation ends (the slot is idle)."""
++
++        if self.kvp is None:
++            return
++        sp = self.states[slot].pages
++        sp.truncate(keep)
++        sp.reserve(0)
++
+     def _remember(self, slot: int, snap) -> None:
+         cache = [c for c in self.caches[slot] if len(c.ids) < len(snap.ids) and snap.ids[:len(c.ids)] == c.ids]
+         self.caches[slot] = cache[-1:] + [snap]
+@@ -1370,6 +1454,9 @@ class Batcher:
+         for s in cancels:
+             if self.seqs[s] is not None:
+                 self._finish(s, cancelled=True)
++        spills, self._spills = list(self._spills), []
++        for s in spills:                        # patches/0290: before the admissions that need their pages
++            self._spill(s)
+         for slot, cached, job in admits:
+             self._admit(slot, cached, job)
+         waiting = [q for q in self.seqs if q is not None and q.stepper is not None] if pieces else []
+@@ -1384,10 +1471,17 @@ class Batcher:
+         if active:
+             self.last_verify = True
+             self._verify(active)
++        if self.pool_check and not self.kvp.null_clean():     # patches/0290, GLM53_TF_KV_POOL_CHECK=1
++            raise RuntimeError(f"KV pool: the null page was written in round {self.round} (an unmapped row)")
+ 
+     def _admit(self, slot: int, cached: int, job: Job) -> None:
+         if self.seqs[slot] is not None:
+             raise RuntimeError(f"slot {slot} is busy")
++        if self.kvp is not None:                # patches/0290: the request's reservation; rows past its resume are dead
++            sp = self.states[slot].pages
++            sp.reserve(self._need_pages(job))
++            sp.truncate(cached)
++            job.stats["kv_pages"] = sp.quota
+         hit = None
+         sess = job.sess if self.store is not None else None
+         entry = sess.entry if sess is not None else None
+@@ -1491,6 +1585,7 @@ class Batcher:
+             self.caches[slot] = []
+             if self.store is not None:
+                 self.store.forget(slot)
++            self._release(slot, 0)                  # patches/0290
+             if job.out is not None:
+                 job.out.put(exc)
+             return
+@@ -1726,6 +1821,8 @@ class Batcher:
+                     self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= len(job.prompt)]
+         else:
+             self.caches[slot] = [c for c in self.caches[slot] if len(c.ids) <= len(job.prompt)]
++        # patches/0290: the slot keeps its committed rows (its snapshots' and the store's live pages), not the rest
++        self._release(slot, self.states[slot].pos)
+         tokens = st.out[:job.max_tokens] if st is not None else []
+         sha = hashlib.sha256(json.dumps(tokens).encode()).hexdigest()[:16]
+         self.log.append(dict(slot=slot, sha256=sha, tokens=len(tokens), keeps=list(st.keeps) if st else [],
+diff --git c/src/tensorfold/families/glm5_next/cuda/batchplan.py i/src/tensorfold/families/glm5_next/cuda/batchplan.py
+index 2c4ac33..4187b53 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batchplan.py
++++ i/src/tensorfold/families/glm5_next/cuda/batchplan.py
+@@ -302,6 +302,24 @@ def place_entry(free: Sequence[int], overlap: dict[int, int], used: dict[int, in
+     return min(free, key=lambda s: (-overlap.get(s, 0), used.get(s, 0), s))
+ 
+ 
++def pool_spills(need: int, avail: int, idle: Sequence[tuple[int, int, int]],
++                prefer: int | None = None) -> list[int] | None:
++    """patches/0290 (GLM53_TF_KV_POOL_TOKENS): the idle slots whose pages a new request's ``need`` pages take when
++    only ``avail`` are free and unreserved. ``idle``: (slot, pages it holds, round of its last admission). The least
++    recently admitted go first, ``prefer`` (the slot the request would resume in) last; [] when ``avail`` covers it,
++    None when even every idle slot's pages do not (the request waits for a running one to end)."""
++
++    if need <= avail:
++        return []
++    out: list[int] = []
++    for slot, held, _ in sorted([x for x in idle if x[1] > 0], key=lambda x: (x[0] == prefer, x[2], x[0])):
++        out.append(slot)
++        avail += held
++        if need <= avail:
++            return out
++    return None
++
++
+ def admit_free(free: int, store_headroom: int) -> int:
+     """patches/0180: device memory a new request may count on: what is free less what the session store may still
+     take within its budget (the store is budgeted at load alongside the slots, so admission leaves it that room)."""
+diff --git c/src/tensorfold/families/glm5_next/cuda/decode.py i/src/tensorfold/families/glm5_next/cuda/decode.py
+index a500ad2..6bd64d4 100644
+--- c/src/tensorfold/families/glm5_next/cuda/decode.py
++++ i/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -122,6 +122,10 @@ class Engine:
+                 if bb is not None:
+                     bb.lc = LongScratch(max_rows, capacity, c.heads // w.world, c.qk_dim, w.device)
+         self.long_rows = tuple(range(1, max_rows + 1)) if self.longctx else ()
++        # patches/0290 (GLM53_TF_KV_POOL_TOKENS, default off): every State's capacity-sized caches on one page pool
++        from . import kvpool
++
++        w.meta["kv_pool"] = kvpool.build(w, capacity)
+         self.st = State(w, capacity, rows)
+         self.lean = lean_mod.LeanBuffers(w, lean_rows, rows, len(taps)) if lean_rows > rows else None
+         self.rows_from = None            # the lean set when the last main-model forward was a lean chunk
+@@ -145,8 +149,14 @@ class Engine:
+ 
+             per = kv_bytes_per_token(self.st)
+             kvd = "fp8" if w.meta.get("kv_fp8") else "bf16"          # patches/0220
+-            print(f"[tensorfold] latent KV cache ({kvd} rows): {per / 1024:.1f} KB a token a rank ({capacity} slots, "
+-                  f"{per * capacity / 2**30:.2f} GB)", flush=True)
++            kp = w.meta.get("kv_pool")
++            if kp is not None:                                        # patches/0290: one pool for every slot
++                print(f"[tensorfold] latent KV cache ({kvd} rows): {per / 1024:.1f} KB a token a rank, in the KV pool: "
++                      f"{kp.npages * kp.page} tokens in pages of {kp.page} ({kp.nbytes() / 2**30:.2f} GB, every slot "
++                      f"up to {capacity})", flush=True)
++            else:
++                print(f"[tensorfold] latent KV cache ({kvd} rows): {per / 1024:.1f} KB a token a rank "
++                      f"({capacity} slots, {per * capacity / 2**30:.2f} GB)", flush=True)
+         self.last_hidden: torch.Tensor | None = None
+         self.draft_n = w.head.n
+         self.graphs = None
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py i/src/tensorfold/families/glm5_next/cuda/engine.py
+index d946e80..ca85ff5 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ i/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -307,6 +307,21 @@ class GlmEngine:
+         if pfoverlap.DEFAULT.pipe and rank == 0:
+             note = "" if lean_mod.enabled() else " (inactive without GLM53_TF_LEAN_PREFILL=1)"
+             print(f"[tensorfold] prefill overlap: {pfoverlap.describe(pfoverlap.DEFAULT)}{note}", flush=True)
++        # patches/0290: GLM53_TF_KV_POOL_TOKENS / _PAGE / _SLACK decide where rows live and the admission policy (rank
++        # 0 plans, rank 1 follows it with a pool of its own): both ranks must agree
++        from . import kvpool
++
++        kp = kvpool.settings()
++        kp_both = self._gather_ints(list(kp))
++        if kp_both[0] != kp_both[1]:
++            raise RuntimeError("the two ranks were started with different KV pool settings (GLM53_TF_KV_POOL_TOKENS, "
++                               f"GLM53_TF_KV_POOL_PAGE, GLM53_TF_KV_POOL_SLACK): {kp_both[0]}, {kp_both[1]}")
++        if kp[0] and rank == 0:
++            per_slot = kvpool.pages_for(capacity, kp[1])
++            print(f"[tensorfold] KV pool (patches/0290): {kp[0]} tokens in pages of {kp[1]} shared by every slot; a "
++                  f"slot grows to {capacity} tokens ({per_slot} pages)"
++                  + ("" if kp[0] >= capacity else f"; one request alone cannot reach it (the pool holds {kp[0]})"),
++                  flush=True)
+         self.drafter = None
+         if drafter is not None:
+             from .dflash2 import Drafter
+diff --git c/src/tensorfold/families/glm5_next/cuda/forward.py i/src/tensorfold/families/glm5_next/cuda/forward.py
+index 3774c88..833de7b 100644
+--- c/src/tensorfold/families/glm5_next/cuda/forward.py
++++ i/src/tensorfold/families/glm5_next/cuda/forward.py
+@@ -183,6 +183,12 @@ class State:
+         self.proj = torch.zeros((n, rows, width), dtype=torch.bfloat16, device=dev)
+         self.scratch_set = kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None
+         self.scratch = self.scratch_set.views if n else []
++        # patches/0290 (GLM53_TF_KV_POOL_TOKENS): the capacity-sized caches as views of the engine's shared page pool
++        self.pages = None
++        pool = w.meta.get("kv_pool")
++        if pool is not None:
++            self._paged(w, pool, capacity, rows, dsa_layers)
++            return
+         if latent.on(w):
+             # GLM53_TF_LATENT_KV=1 (patches/0060): one kv_lora-wide latent row a token, keys = values (the same tensor)
+             self.kc = latent.caches(w, capacity, len(dsa_layers))
+@@ -206,6 +212,41 @@ class State:
+             self.index = [(mk(capacity), mk(capacity), mk(capacity // 4 + 2)) for _ in range(n_idx)]
+             self._index_ring(w, capacity, rows, len(dsa_layers))
+ 
++    def _paged(self, w: Weights, pool, capacity: int, rows: int, dsa_layers) -> None:
++        """patches/0290: this slot's latent caches, MTP latent cache and capacity-sized indexer caches on the pool's
++        pages (``kvpool.Paged``; nothing capacity-sized is allocated here), its own page table, rows mapped as
++        positions are written (``check_room``). The index rings (patches/0065) are decided first, so a ring layer's
++        full keys / gates are never allocated."""
++
++        if not latent.on(w):
++            raise ValueError("GLM53_TF_KV_POOL_TOKENS pages the latent KV cache: it needs GLM53_TF_LATENT_KV=1")
++        c = w.cfg
++        dev = w.device
++        self.pages = sp = pool.new_slot(capacity)
++        self.kc = pool.latent(sp, len(dsa_layers))
++        self.vc = self.kc
++        self.mtp_len = 0
++        self.mtp_drafted = 0
++        if w.mtp is not None:
++            self.mtp_kc = self.mtp_vc = pool.mtp_latent(sp)
++        self.index = None
++        self.index_ring = 0
++        if not w.meta.get("long_context"):
++            return
++        n = len(dsa_layers)
++        n_idx = n + (1 if w.mtp is not None else 0)
++        ring = sparse.INDEX_RING and n > 0 and sparse.index_ring_rows(rows) < capacity
++        empty = lambda: torch.zeros((0, c.index_dim), dtype=torch.bfloat16, device=dev)   # noqa: E731
++        self.index = []
++        for i in range(n_idx):
++            if ring and i < n:                   # replaced by the ring's views in ``_index_ring``
++                ik, ig = empty(), empty()
++            else:
++                ik, ig = pool.index_rows(sp, i, "k"), pool.index_rows(sp, i, "g")
++            self.index.append((ik, ig, pool.pool_keys(sp, i)))
++        if ring:
++            self._index_ring(w, capacity, rows, n)
++
+     def _index_ring(self, w: Weights, capacity: int, rows: int, n: int) -> None:
+         """patches/0065 (GLM53_TF_INDEX_RING, default 1): the model layers' index keys and gates in a ring of
+         ``sparse.index_ring_rows(rows)`` rows instead of ``capacity`` (1 KB a token for 11 layers: 1 GB per 1M
+@@ -293,6 +334,8 @@ class State:
+     def clone(self) -> "State":
+         import copy
+ 
++        if self.pages is not None:
++            raise TypeError("a State on the KV pool cannot be cloned (patches/0290: its rows are the pool's pages)")
+         other = copy.copy(self)
+         other.conv = self.conv.clone()
+         other.rec = self.rec.clone()
+@@ -545,6 +588,8 @@ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
+                          "contexts (DSA's sparse top-k)")
+     if pos + R > st.capacity:
+         raise ValueError("context past the cache capacity")
++    if getattr(st, "pages", None) is not None:      # patches/0290: map the pages the window writes (a no-op mostly)
++        st.pages.ensure(pos + R)
+ 
+ 
+ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+diff --git c/src/tensorfold/families/glm5_next/cuda/graphs.py i/src/tensorfold/families/glm5_next/cuda/graphs.py
+index 833626f..d4e028d 100644
+--- c/src/tensorfold/families/glm5_next/cuda/graphs.py
++++ i/src/tensorfold/families/glm5_next/cuda/graphs.py
+@@ -32,6 +32,11 @@ class Graphs:
+         self.long: dict[tuple, torch.cuda.CUDAGraph] = {}
+         self.long_max = int(os.environ.get("GLM53_TF_LONGCTX_MAX_GRAPHS", "256"))
+         w, st = e.w, e.st
++        # patches/0290: the warm-up / capture steps below write the window's rows at position 0 (and the head's at its
++        # length 0) without ``stage``: map those pages first (no-op without the KV pool)
++        from . import kvpool
++
++        kvpool.ensure(st, max((*main_rows, *mtp_rows, 1)) + max(st.pos, st.mtp_len))
+         saved = list(st.cur)
+         parities = (0, 1) if st.cur else (0,)
+         with torch.no_grad():
+diff --git c/src/tensorfold/families/glm5_next/cuda/kvpool.py i/src/tensorfold/families/glm5_next/cuda/kvpool.py
+new file mode 100644
+index 0000000..c2f5a8e
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/kvpool.py
+@@ -0,0 +1,489 @@
++"""patches/0290: one paged pool of latent KV rows shared by every batch slot (GLM53_TF_KV_POOL_TOKENS, default off).
++
++Without it every ``forward.State`` reserves its whole capacity at load: the 11 DSA layers' latent rows, the MTP head's
++latent rows, the MTP head's index keys and gates and the 12 pool-key caches (7,616 B a token a rank with FP8 rows,
++docs/MEMORY-4x256k.md), so 4 slots of 262k cost 7.45 GiB a node whether they hold 1k or 262k tokens each. With the
++pool, those caches of every slot live in one set of tensors of ``tokens`` rows cut into pages of ``page`` tokens, and
++each slot maps its logical pages (position // page) to physical ones through a page table: any one slot can grow to
++the engine's capacity (CONTEXT, e.g. 1,048,576) as long as the pages of all slots fit in the pool.
++
++Bits: a kernel reads and writes the same row values at other addresses. Every reader and writer of these caches
++translates a logical row r to ``table[r >> shift] << shift | (r & (rows a page - 1))`` (``latent._prow``) before its
++load or store, under the same masks, so what it computes is what it computed on the contiguous cache: outputs are
++byte-identical to the unpaged path (tests: ``tests/test_kvpool_interpreter.py``,
++``tests/cuda/test_kv_pool_patches.py``).
++With the knob off nothing here is built and every kernel gets PT=None / PSH=0: the paged branch is pruned at compile
++time, the same loads and stores as before.
++
++What is paged (per slot, a logical view ``Paged`` of a shared physical tensor):
++- ``State.kc`` (11 latent caches, [capacity, 528] uint8 FP8 rows or [capacity, 512] bf16) and ``State.mtp_kc``;
++- ``State.index``'s capacity-sized tensors: the MTP head's index keys and gates (and the model layers' when
++  GLM53_TF_INDEX_RING=0) and all 12 pool-key caches ([capacity / 4 + 2, 128]; page / 4 rows a page).
++Per slot as before: patches/0065's index rings (window-sized), the KDA state, conv windows, DFlash2's ring.
++
++Pages: ``page`` tokens, a multiple of the session store's 256-token page (``sessions.PAGE``), so every stored page the
++store and the NVMe tier copy lies inside one physical page and stays a plain tensor view; runs of stored pages are
++copied a page at a time, and an entry's tail (the rows past its last full page; with a fast grid it may cover several
++pages) is gathered / written page by page (``Paged.gather`` / ``write``; the disk tier stages it and writes it after the
++read is checked). The pool has one more page than it hands out, the
++null page: unmapped table entries point at it (all zeros), so a stray read reads zeros and never another slot's rows;
++``KvPool.null_clean`` checks nothing ever wrote it (GLM53_TF_KV_POOL_CHECK=1 checks after every batched round).
++
++Allocation (both ranks do the same operations in the same order, so their pools stay identical; the lowest free page
++first): ``SlotPages.ensure(end)`` maps pages up to position ``end`` (called by ``forward.check_room`` before every
++forward / MTP / lean chunk, and before a session restore or disk read); ``truncate(keep)`` returns the pages past
++``keep``. The admission policy (``batch.Batcher``, docs/KV-POOL.md) reserves a request's pages up front as a quota, so
++an admitted request can always finish.
++"""
++
++from __future__ import annotations
++
++import heapq
++import os
++from typing import Any
++
++POOL_ENV = "GLM53_TF_KV_POOL_TOKENS"
++PAGE_ENV = "GLM53_TF_KV_POOL_PAGE"
++SLACK_ENV = "GLM53_TF_KV_POOL_SLACK"
++CHECK_ENV = "GLM53_TF_KV_POOL_CHECK"
++STORE_PAGE = 256             # ``sessions.PAGE`` (not imported: this module is imported by the kernels' modules)
++DEFAULT_PAGE = 256
++DEFAULT_SLACK = 64           # tokens past prompt + max_tokens a request may write (verify / pad windows, MTP drafts)
++
++
++class PoolExhausted(ValueError):
++    """No free page for a slot that needs one. Raised instead of writing anywhere else (never a silent overwrite)."""
++
++
++def _int_env(name: str, default: int) -> int:
++    v = os.environ.get(name, "").strip()
++    if not v:
++        return default
++    try:
++        return int(v)
++    except ValueError:
++        raise ValueError(f"{name} must be an integer, not {v!r}") from None
++
++
++def settings() -> tuple[int, int, int]:
++    """(pool tokens, page tokens, slack tokens) from the environment; pool tokens 0 = off (the default).
++    Load-time; both ranks must agree (``engine.GlmEngine`` checks)."""
++
++    tokens = _int_env(POOL_ENV, 0)
++    page = _int_env(PAGE_ENV, DEFAULT_PAGE)
++    slack = _int_env(SLACK_ENV, DEFAULT_SLACK)
++    if tokens < 0:
++        raise ValueError(f"{POOL_ENV}={tokens}: expected >= 0 (0 = off)")
++    if page < STORE_PAGE or page & (page - 1):
++        raise ValueError(f"{PAGE_ENV}={page}: expected a power of two >= {STORE_PAGE} (the session store's page, so a "
++                         "stored page is never split across pool pages)")
++    if slack < 0:
++        raise ValueError(f"{SLACK_ENV}={slack}: expected >= 0")
++    if tokens:
++        tokens = -(-tokens // page) * page
++    return tokens, page, slack
++
++
++def enabled() -> bool:
++    return settings()[0] > 0
++
++
++def check_on() -> bool:
++    return os.environ.get(CHECK_ENV, "0").strip() not in ("", "0")
++
++
++def pages_for(tokens: int, page: int) -> int:
++    return -(-max(int(tokens), 0) // page)
++
++
++def need_tokens(prompt: int, max_tokens: int, capacity: int, slack: int = DEFAULT_SLACK) -> int:
++    """Positions a request may write: its prompt, its reply, the windows past the committed end; at most the slot's
++    capacity (``check_room`` refuses more)."""
++
++    return min(int(prompt) + max(int(max_tokens), 0) + int(slack), int(capacity))
++
++
++# -- host bookkeeping (no torch) --------------------------------------------------------------------------------------
++class PageAlloc:
++    """Free physical pages 0 .. n - 1, handed out lowest first (deterministic: both ranks, same operations, same
++    pages)."""
++
++    def __init__(self, n: int) -> None:
++        self.n = int(n)
++        self.heap = list(range(self.n))
++        self.used = 0
++
++    @property
++    def n_free(self) -> int:
++        return len(self.heap)
++
++    def take(self, k: int) -> list[int]:
++        if k > len(self.heap):
++            raise PoolExhausted(f"KV pool: {k} pages asked, {len(self.heap)} free of {self.n}")
++        out = [heapq.heappop(self.heap) for _ in range(k)]
++        self.used += k
++        return out
++
++    def give(self, pages) -> None:
++        for p in pages:
++            heapq.heappush(self.heap, int(p))
++        self.used -= len(pages)
++
++
++class SlotPages:
++    """One slot's page table: logical page i -> physical page ``pages[i]`` (host list) and the device table the
++    kernels read (int32 [max_pages], unmapped entries = the null page). ``quota``: pages the batcher reserved for the
++    slot's request (None: no admission control, the lone engine)."""
++
++    def __init__(self, pool: "PoolBook", capacity: int, table: Any = None) -> None:
++        self.pool = pool
++        self.page = pool.page
++        self.capacity = int(capacity)
++        self.max_pages = pages_for(capacity, pool.page)
++        self.pages: list[int] = []
++        self.quota: int | None = None
++        self.table = table                       # torch int32 [max_pages] (None: host-only tests)
++        self.over = 0                            # pages taken past the quota (from pages nobody had reserved)
++
++    @property
++    def held(self) -> int:
++        return len(self.pages)
++
++    @property
++    def outstanding(self) -> int:
++        """Reserved pages not mapped yet (the admission promise still to keep)."""
++
++        return max(0, (self.quota or 0) - len(self.pages))
++
++    def tokens(self) -> int:
++        return len(self.pages) * self.page
++
++    def _write(self, i0: int, values: list[int]) -> None:
++        if self.table is None or not values:
++            return
++        import torch
++
++        self.table[i0:i0 + len(values)].copy_(torch.tensor(values, dtype=torch.int32))
++
++    def ensure(self, end: int) -> None:
++        """Map every page holding positions < ``end`` (a no-op when mapped already: the common case)."""
++
++        need = pages_for(end, self.page)
++        have = len(self.pages)
++        if need <= have:
++            return
++        if need > self.max_pages:
++            raise ValueError("context past the cache capacity")
++        k = need - have
++        if self.quota is not None and need > self.quota:
++            # past the admission's reservation: only pages nobody else reserved (never another request's promise)
++            spare = self.pool.alloc.n_free - self.pool.outstanding(exclude=self)
++            extra = need - max(self.quota, have)
++            if extra > spare:
++                raise PoolExhausted(f"KV pool: slot needs {need} pages, reserved {self.quota}, {spare} unreserved free "
++                                    "(GLM53_TF_KV_POOL_TOKENS)")
++            self.over += extra
++        new = self.pool.alloc.take(k)
++        self.pages.extend(new)
++        self._write(have, new)
++
++    def truncate(self, keep: int) -> int:
++        """Return the pages past position ``keep`` (their rows are dead: nothing reads a slot past its kept length);
++        -> pages returned."""
++
++        k = pages_for(keep, self.page)
++        if k >= len(self.pages):
++            return 0
++        drop = self.pages[k:]
++        del self.pages[k:]
++        self.pool.alloc.give(drop)
++        self._write(k, [self.pool.null] * len(drop))
++        return len(drop)
++
++    def reserve(self, pages: int | None) -> None:
++        self.quota = None if pages is None else int(pages)
++
++
++class PoolBook:
++    """The pool's host side: the free list, the page size and every slot's table (for the reservations)."""
++
++    def __init__(self, npages: int, page: int) -> None:
++        self.npages = int(npages)
++        self.page = int(page)
++        self.shift = page.bit_length() - 1
++        self.null = self.npages                  # the extra all-zero page unmapped entries point at
++        self.alloc = PageAlloc(npages)
++        self.slots: list[SlotPages] = []
++
++    def outstanding(self, exclude: SlotPages | None = None) -> int:
++        return sum(s.outstanding for s in self.slots if s is not exclude)
++
++    def available(self) -> int:
++        """Free pages no admitted request has reserved: what a new admission may count on."""
++
++        return self.alloc.n_free - self.outstanding()
++
++    def describe(self) -> str:
++        return (f"{self.alloc.n_free} of {self.npages} pages free, {self.outstanding()} reserved, "
++                f"{self.npages - self.alloc.n_free} mapped")
++
++
++# -- the logical view of a pool tensor ------------------------------------------------------------------------------
++class Paged:
++    """A slot's cache as the rest of the engine sees it: ``shape[0]`` is the slot's logical rows (its capacity, or
++    capacity / 4 + 2 pool keys), rows live on the slot's pages of ``phys`` ([(npages + 1) x per, ...]).
++
++    Kernels take ``phys``, the slot's device ``pt`` and ``shift`` (log2 of ``per``, rows a page). Host code (the session
++    store, the NVMe tier, snapshots' tails) slices it: a slice inside one page (``[a:b]`` with a // per == (b - 1) //
++    per) is a view of those physical rows, as a slice of the contiguous cache is; a slice across pages raises (use
++    ``segments``); an int index reads a row (the null page's row where unmapped: shape / size queries only)."""
++
++    is_paged = True
++
++    def __init__(self, phys, slot: SlotPages, per: int, rows: int) -> None:
++        self.phys = phys
++        self.slot = slot
++        self.per = int(per)
++        self.shift = self.per.bit_length() - 1
++        if 1 << self.shift != self.per:
++            raise ValueError(f"paged cache: {per} rows a page is not a power of two")
++        self.rows = int(rows)
++
++    # tensor-like attributes the engine reads
++    @property
++    def shape(self):
++        return (self.rows, *self.phys.shape[1:])
++
++    @property
++    def dtype(self):
++        return self.phys.dtype
++
++    @property
++    def device(self):
++        return self.phys.device
++
++    @property
++    def is_cuda(self) -> bool:
++        return self.phys.is_cuda
++
++    @property
++    def pt(self):
++        return self.slot.table
++
++    def is_contiguous(self) -> bool:
++        return True              # rows within a page are; every slice handed out lies within one page
++
++    def data_ptr(self) -> int:
++        return self.phys.data_ptr()
++
++    def element_size(self) -> int:
++        return self.phys.element_size()
++
++    def dim(self) -> int:
++        return self.phys.dim()
++
++    def row_bytes(self) -> int:
++        return int(self.phys[0].numel() * self.phys.element_size())
++
++    def view_rows(self, dtype):
++        raise TypeError("a paged cache has no flat view: copy it page by page (segments)")
++
++    def clone(self):
++        raise TypeError("a paged State cannot be cloned (its rows live in the shared KV pool, patches/0290)")
++
++    # rows
++    def _loc(self, r: int, *, write: bool = False) -> int:
++        if not 0 <= r < self.rows:
++            raise IndexError(f"row {r} outside the paged cache's {self.rows}")
++        p, o = divmod(r, self.per)
++        if p >= len(self.slot.pages):
++            if write:
++                raise IndexError(f"row {r} is on page {p}, which this slot has not mapped (KV pool)")
++            return self.slot.pool.null * self.per + o
++        return self.slot.pages[p] * self.per + o
++
++    def _range(self, key: slice) -> tuple[int, int]:
++        a, b, step = key.indices(self.rows)
++        if step != 1:
++            raise IndexError("paged cache: slices must be contiguous")
++        return a, max(a, b)
++
++    def __getitem__(self, key):
++        if isinstance(key, int):
++            return self.phys[self._loc(key)]
++        if isinstance(key, slice):
++            a, b = self._range(key)
++            if b == a:
++                return self.phys[0:0]
++            if a // self.per != (b - 1) // self.per:
++                raise IndexError(f"paged cache: rows {a}..{b} span pages; copy them page by page (segments)")
++            base = self._loc(a, write=True)
++            return self.phys[base:base + (b - a)]
++        raise TypeError(f"paged cache: index {key!r} (an int or a slice of rows)")
++
++    def __setitem__(self, key, value) -> None:
++        if isinstance(key, int):
++            self.phys[self._loc(key, write=True)] = value
++            return
++        view = self[key]
++        if hasattr(value, "shape"):
++            view.copy_(value)
++        else:
++            view.fill_(value)
++
++    def segments(self, a: int, b: int) -> list[tuple[int, int, Any]]:
++        """Logical rows [a, b) as (first row, end row, physical view) pieces, one a page."""
++
++        out = []
++        r = a
++        while r < b:
++            end = min(b, (r // self.per + 1) * self.per)
++            base = self._loc(r, write=True)
++            out.append((r, end, self.phys[base:base + (end - r)]))
++            r = end
++        return out
++
++    def gather(self, a: int, b: int):
++        """Logical rows [a, b) as a new contiguous tensor (host checks, tests)."""
++
++        import torch
++
++        segs = self.segments(a, b)
++        if not segs:
++            return self.phys[0:0].clone()
++        return torch.cat([v for _, _, v in segs]).clone()
++
++    def write(self, a: int, src) -> None:
++        """``src`` into logical rows a .. a + len(src) (mapped already)."""
++
++        for lo, hi, view in self.segments(a, a + src.shape[0]):
++            view.copy_(src[lo - a:hi - a])
++
++    def zero_rows(self, a: int, b: int) -> None:
++        for _, _, view in self.segments(a, b):
++            view.zero_()
++
++
++def is_paged(t) -> bool:
++    return bool(getattr(t, "is_paged", False))
++
++
++def kernel_args(t):
++    """(tensor, page table, shift) a kernel takes for cache ``t``: (t, None, 0) for a plain tensor."""
++
++    if is_paged(t):
++        return t.phys, t.pt, t.shift
++    return t, None, 0
++
++
++def slot_of(st) -> SlotPages | None:
++    return getattr(st, "pages", None)
++
++
++def ensure(st, end: int) -> None:
++    """Map a State's pages up to position ``end`` (nothing without the pool)."""
++
++    sp = getattr(st, "pages", None)
++    if sp is not None:
++        sp.ensure(end)
++
++
++def ensure_comps(comps, end: int) -> None:
++    """The session store's view: map the pages of whichever slot ``comps`` (``sessions.Comp`` list) belong to."""
++
++    for c in comps:
++        if is_paged(c.live):
++            c.live.slot.ensure(end)
++            return
++
++
++# -- the device side ------------------------------------------------------------------------------------------------
++class KvPool(PoolBook):
++    """The physical tensors (built lazily per cache family: every slot uses the same families) and the tables."""
++
++    def __init__(self, w, tokens: int, page: int, slack: int = DEFAULT_SLACK) -> None:
++        import torch
++
++        super().__init__(tokens // page, page)
++        self.w = w
++        self.slack = int(slack)
++        self.device = w.device
++        self.rows = (self.npages + 1) * page         # + the null page
++        self.t: dict[tuple, Any] = {}
++        self._torch = torch
++
++    def _family(self, key: tuple, make):
++        t = self.t.get(key)
++        if t is None:
++            t = make()
++            self.t[key] = t
++        return t
++
++    def new_slot(self, capacity: int) -> SlotPages:
++        torch = self._torch
++        mp = pages_for(capacity, self.page)
++        table = torch.full((mp,), self.null, dtype=torch.int32, device=self.device)
++        sp = SlotPages(self, capacity, table)
++        self.slots.append(sp)
++        return sp
++
++    def latent(self, sp: SlotPages, n: int) -> list[Paged]:
++        """The DSA layers' latent caches of a slot (``latent.caches`` rows: FP8 528 B or bf16)."""
++
++        from . import latent
++
++        phys = self._family(("latent", n), lambda: latent.caches(self.w, self.rows, n))
++        return [Paged(t, sp, self.page, sp.capacity) for t in phys]
++
++    def mtp_latent(self, sp: SlotPages) -> Paged:
++        from . import latent
++
++        phys = self._family(("mtp",), lambda: latent.caches(self.w, self.rows, 1)[0])
++        return Paged(phys, sp, self.page, sp.capacity)
++
++    def index_rows(self, sp: SlotPages, i: int, which: str) -> Paged:
++        """Index layer i's keys (``which`` "k") or gates ("g"), [capacity, index_dim] bf16, one row a token."""
++
++        torch = self._torch
++        d = self.w.cfg.index_dim
++        phys = self._family(("index", which, i),
++                            lambda: torch.zeros((self.rows, d), dtype=torch.bfloat16, device=self.device))
++        return Paged(phys, sp, self.page, sp.capacity)
++
++    def pool_keys(self, sp: SlotPages, i: int) -> Paged:
++        """Index layer i's pool keys, [capacity / 4 + 2, index_dim] bf16 logically (one row a complete pool of 4)."""
++
++        torch = self._torch
++        d = self.w.cfg.index_dim
++        per = self.page // 4
++        phys = self._family(("pk", i), lambda: torch.zeros(((self.npages + 1) * per, d), dtype=torch.bfloat16,
++                                                           device=self.device))
++        return Paged(phys, sp, per, sp.capacity // 4 + 2)
++
++    def nbytes(self) -> int:
++        return sum(int(t.numel() * t.element_size()) for v in self.t.values()
++                   for t in (v if isinstance(v, list) else [v]))
++
++    def token_bytes(self) -> int:
++        return self.nbytes() // max(self.rows, 1)
++
++    def null_clean(self) -> bool:
++        """The null page is still all zeros in every tensor (nothing wrote an unmapped row)."""
++
++        for key, v in self.t.items():
++            per = self.page // 4 if key[0] == "pk" else self.page
++            for t in (v if isinstance(v, list) else [v]):
++                if bool(t[self.null * per:(self.null + 1) * per].ne(0).any()):
++                    return False
++        return True
++
++
++def build(w, capacity: int) -> KvPool | None:
++    """The engine's pool (``decode.Engine``, before any State), or None when GLM53_TF_KV_POOL_TOKENS is unset / 0."""
++
++    tokens, page, slack = settings()
++    if not tokens:
++        return None
++    if not w.meta.get("latent_kv"):
++        raise ValueError(f"{POOL_ENV} pages the latent KV cache: it needs GLM53_TF_LATENT_KV=1")
++    return KvPool(w, tokens, page, slack)
+diff --git c/src/tensorfold/families/glm5_next/cuda/latent.py i/src/tensorfold/families/glm5_next/cuda/latent.py
+index 3a8952d..9e5d483 100644
+--- c/src/tensorfold/families/glm5_next/cuda/latent.py
++++ i/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -41,6 +41,11 @@ guarantee (row independence, verify == serial, chunk size, resumed == fresh) hol
+ the same reasons. New arithmetic against bf16 KV (the stored latent is rounded to 4 mantissa bits): replies differ;
+ snapshots carry the dtype (``decode.Snapshot.kv``) and the session store's keys include it. Pool keys and the
+ indexer's keys and gates stay bf16 (they decide the token selection).
++
++patches/0290, GLM53_TF_KV_POOL_TOKENS (``kvpool``): a latent cache may be a ``kvpool.Paged`` view of a pool shared by
++the batch slots. Every kernel below that reads or writes latent rows maps a logical row to its physical row through
++the slot's page table first (``_prow``; PT / PSH, PSH = log2 rows a page, 0 = a contiguous cache: the branch is pruned
++at compile time), under the same masks: the same values at other addresses, the same bits.
+ """
+ 
+ from __future__ import annotations
+@@ -51,7 +56,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from . import fp8pf, glue, profile, qmm, sparse
++from . import fp8pf, glue, kvpool, profile, qmm, sparse
+ from .qmm import B16, Q4
+ 
+ CHUNK = 512              # keys a program visits (the expanded kernel's chunk: the same chunk counts serve both)
+@@ -152,8 +157,11 @@ def caches(w, capacity: int, n: int) -> list[torch.Tensor]:
+ 
+ 
+ def _views(lc: torch.Tensor, L: int):
+-    """Kernel arguments of a latent cache: (rows, scales, FP8, row stride in elements, scale stride in fp32s)."""
++    """Kernel arguments of a latent cache: (rows, scales, FP8, row stride in elements, scale stride in fp32s).
++    patches/0290: a paged cache gives its physical tensor (the page table: ``_paging``)."""
+ 
++    if kvpool.is_paged(lc):
++        lc = lc.phys
+     if is_fp8(lc):
+         if lc.shape[1] != ROW8 or L != SCALE_AT or not lc.is_contiguous():
+             raise ValueError("FP8 latent cache: expected contiguous [capacity, 528] uint8 rows of a 512-wide latent")
+@@ -163,6 +171,14 @@ def _views(lc: torch.Tensor, L: int):
+     return lc, lc, False, L, 0
+ 
+ 
++def _paging(lc) -> dict:
++    """patches/0290: the page-table arguments of a kernel on cache ``lc``: PT (the slot's device table, None for a
++    contiguous cache) and PSH (log2 rows a page; 0 prunes the paged branch)."""
++
++    _, pt, shift = kvpool.kernel_args(lc)
++    return dict(PT=pt, PSH=shift)
++
++
+ def dequantize_rows(lc: torch.Tensor) -> torch.Tensor:
+     """patches/0220 (tests, host checks): an FP8 latent cache's rows as bf16 [n, 512] (exact: e4m3 x 2^k); a bf16
+     cache is returned as is."""
+@@ -204,6 +220,9 @@ def kv_bytes_per_token(st) -> int:
+         if t.data_ptr() in seen:
+             return
+         seen.add(t.data_ptr())
++        if kvpool.is_paged(t):                                # patches/0290: a row of the pool tensor
++            total += int(t.row_bytes() * per)
++            return
+         total += int(t[0].numel() * t.element_size() * per)
+ 
+     for t in list(st.kc) + list(st.vc):
+@@ -424,15 +443,31 @@ def expand_tc(u: torch.Tensor, kv_v: Q4 | B16, out: torch.Tensor) -> torch.Tenso
+ 
+ # -- the latent cache ---------------------------------------------------------------------------------------------
+ @triton.jit
+-def _lwrite(LAT, LC, POS, L: tl.constexpr):
+-    r = tl.program_id(0)
+-    P = tl.load(POS).to(tl.int64)
+-    d = tl.arange(0, L)
+-    tl.store(LC + (P + r) * L + d, tl.load(LAT + r * L + d))
++def _prow(rows, PT, PSH: tl.constexpr, ok):
++    """patches/0290: logical rows (int64) -> physical rows through a slot's page table (PSH = log2 rows a page);
++    PSH = 0: a contiguous cache, rows unchanged (the branch is not compiled). Masked like the access it serves."""
++
++    if PSH > 0:
++        if ok is None:                                    # a scalar row (writers): always mapped
++            pg = tl.load(PT + (rows >> PSH)).to(tl.int64)
++        else:
++            pg = tl.load(PT + (rows >> PSH), mask=ok, other=0).to(tl.int64)
++        rows = (pg << PSH) + (rows & ((1 << PSH) - 1))
++    return rows
+ 
+ 
+ @triton.jit
+-def _lwrite8(LAT, LC, LCS, POS, L: tl.constexpr, RB: tl.constexpr, SB: tl.constexpr, SA: tl.constexpr):
++def _lwrite(LAT, LC, POS, L: tl.constexpr, PT=None, PSH: tl.constexpr = 0):
++    r = tl.program_id(0)
++    P = tl.load(POS).to(tl.int64)
++    d = tl.arange(0, L)
++    row = _prow(P + r, PT, PSH, None)
++    tl.store(LC + row * L + d, tl.load(LAT + r * L + d))
++
++
++@triton.jit
++def _lwrite8(LAT, LC, LCS, POS, L: tl.constexpr, RB: tl.constexpr, SB: tl.constexpr, SA: tl.constexpr, PT=None,
++             PSH: tl.constexpr = 0):
+     """patches/0220: row r quantized on its own: s = 2^e, the smallest power of two with amax / s <= 448 (448 =
+     1.75 x 2^8, so e = E - 135, + 1 when amax's mantissa exceeds 1.75), values x / s (exact) rounded to nearest-even
+     e4m3 (never saturating: |x / s| <= 448); an all-zero row stores zeros and s = 1. torch's float8_e4m3fn
+@@ -460,9 +495,9 @@ def _lwrite8(LAT, LC, LCS, POS, L: tl.constexpr, RB: tl.constexpr, SB: tl.conste
+     small = (small.to(tl.int32, bitcast=True) | (yb & -2147483648)).to(tl.float32, bitcast=True)   # y's sign (-0 too)
+     y = tl.where(a < 0.015625, small, near)
+     q = y.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+-    row = (P + r) * RB
+-    tl.store(LC + row + d, q)
+-    tl.store(LCS + (P + r) * SB + SA, scale)
++    pr = _prow(P + r, PT, PSH, None)                     # patches/0290: the row's physical slot
++    tl.store(LC + pr * RB + d, q)
++    tl.store(LCS + pr * SB + SA, scale)
+ 
+ 
+ def latent_write(lat: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor) -> None:
+@@ -473,18 +508,22 @@ def latent_write(lat: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor) -> None
+     if not lat.is_contiguous():
+         raise ValueError("latent_write: rows must be contiguous and as wide as the cache")
+     lcv, lcs, f8, rb, sb = _views(lc, L)
++    pg = _paging(lc)                                        # patches/0290
+     if f8:
+-        _lwrite8[(R,)](lat, lcv, lcs, pos, L=L, RB=rb, SB=sb, SA=SCALE_AT // 4, num_warps=4)
++        _lwrite8[(R,)](lat, lcv, lcs, pos, L=L, RB=rb, SB=sb, SA=SCALE_AT // 4, num_warps=4, **pg)
+         return
+-    _lwrite[(R,)](lat, lc, pos, L=L, num_warps=4)
++    _lwrite[(R,)](lat, lcv, pos, L=L, num_warps=4, **pg)
+ 
+ 
+ # -- attention in latent space ------------------------------------------------------------------------------------
+ @triton.jit
+-def _lrows(LC, LCS, rows, ok, d, FP8: tl.constexpr, RB: tl.constexpr, SB: tl.constexpr, SA: tl.constexpr):
++def _lrows(LC, LCS, rows, ok, d, FP8: tl.constexpr, RB: tl.constexpr, SB: tl.constexpr, SA: tl.constexpr, PT,
++           PSH: tl.constexpr):
+     """Latent rows ``rows`` (int64, masked by ``ok``) as bf16 [n, L]. patches/0220: FP8 rows dequantized, e4m3 x 2^k
+-    (exact in bf16: the bf16 kernels' inputs are the dequantized rows, bit for bit)."""
++    (exact in bf16: the bf16 kernels' inputs are the dequantized rows, bit for bit). patches/0290: logical rows of a
++    paged cache mapped first (PSH 0: unchanged)."""
+ 
++    rows = _prow(rows, PT, PSH, ok)
+     if FP8:
+         v = tl.load(LC + rows[:, None] * RB + d[None, :], mask=ok[:, None], other=0)
+         s = tl.load(LCS + rows * SB + SA, mask=ok, other=0.0)
+@@ -512,7 +551,7 @@ def _ltile(q, kv, m, l, o, valid, SCALE: tl.constexpr):
+ @triton.jit
+ def _lchunks(QA, LC, LCS, POS, PO, PM, PL, R, H: tl.constexpr, L: tl.constexpr, CH: tl.constexpr, KTS: tl.constexpr,
+              SCALE: tl.constexpr, BMQ: tl.constexpr, FP8: tl.constexpr = False, RB: tl.constexpr = 0,
+-             SB: tl.constexpr = 0, SA: tl.constexpr = 0):
++             SB: tl.constexpr = 0, SA: tl.constexpr = 0, PT=None, PSH: tl.constexpr = 0):
+     """Program (query tile, chunk c): queries i = (row r, head h) flattened as r H + h, 16 to a tile; keys
+     c CH .. c CH + CH - 1 of the latent cache, row r seeing keys up to pos + r."""
+ 
+@@ -533,7 +572,7 @@ def _lchunks(QA, LC, LCS, POS, PO, PM, PL, R, H: tl.constexpr, L: tl.constexpr,
+         for t in range(CH // KTS):
+             ki = start + t * KTS + tl.arange(0, KTS)
+             inside = ki < P + R
+-            kv = _lrows(LC, LCS, ki.to(tl.int64), inside, d, FP8, RB, SB, SA)
++            kv = _lrows(LC, LCS, ki.to(tl.int64), inside, d, FP8, RB, SB, SA, PT, PSH)
+             valid = (ki[None, :] <= limit[:, None]) & iok[:, None]
+             m, l, o = _ltile(q, kv, m, l, o, valid, SCALE)
+     base = c * (R * H) + i
+@@ -588,7 +627,7 @@ def attention_latent(qa: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor, scra
+     lcv, lcs, f8, rb, sb = _views(lc, L)                    # patches/0220: FP8 rows or bf16 rows
+     _lchunks[(triton.cdiv(RH, bm), nch)](qa, lcv, lcs, pos, po, pm, pl, R, H=H, L=L, CH=CHUNK, KTS=KT, SCALE=scale,
+                                          BMQ=bm, FP8=f8, RB=rb, SB=sb, SA=SCALE_AT // 4,
+-                                         num_warps=ATTN_WARPS, num_stages=stages)
++                                         num_warps=ATTN_WARPS, num_stages=stages, **_paging(lc))    # patches/0290
+     if out is None:
+         out = scratch.u[:R]
+     elif out.shape != (R, H, L) or out.dtype != torch.float32 or not out.is_contiguous():
+@@ -600,7 +639,8 @@ def attention_latent(qa: torch.Tensor, lc: torch.Tensor, pos: torch.Tensor, scra
+ @triton.jit
+ def _lsparse_chunks(QA, LC, LCS, TOK, CNT, PO, PM, PL, RS, W: tl.constexpr, H: tl.constexpr, L: tl.constexpr,
+                     CH: tl.constexpr, KTS: tl.constexpr, SCALE: tl.constexpr, BMQ: tl.constexpr,
+-                    FP8: tl.constexpr = False, RB: tl.constexpr = 0, SB: tl.constexpr = 0, SA: tl.constexpr = 0):
++                    FP8: tl.constexpr = False, RB: tl.constexpr = 0, SB: tl.constexpr = 0, SA: tl.constexpr = 0,
++                    PT=None, PSH: tl.constexpr = 0):
+     """Program (row r, head tile, chunk c): the row's selected tokens [c CH, (c + 1) CH) in list order for 16 of its
+     heads at once (the tile's latent rows are read once for all of them)."""
+ 
+@@ -620,7 +660,7 @@ def _lsparse_chunks(QA, LC, LCS, TOK, CNT, PO, PM, PL, RS, W: tl.constexpr, H: t
+             idx = c * CH + t * KTS + tl.arange(0, KTS)
+             ok = idx < n
+             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
+-            kv = _lrows(LC, LCS, tok, ok, d, FP8, RB, SB, SA)
++            kv = _lrows(LC, LCS, tok, ok, d, FP8, RB, SB, SA, PT, PSH)
+             valid = ok[None, :] & hok[:, None]
+             m, l, o = _ltile(q, kv, m, l, o, valid, SCALE)
+     base = (c * RS + r) * H + h
+@@ -673,7 +713,8 @@ def sparse_latent(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, coun
+     lcv, lcs, f8, rb, sb = _views(lc, L)                    # patches/0220: FP8 rows or bf16 rows
+     _lsparse_chunks[(R, triton.cdiv(H, bm), nch)](qa, lcv, lcs, tokens, counts, po, pm, pl, R, W=W, H=H, L=L, CH=CHUNK,
+                                                   KTS=KT, SCALE=scale, BMQ=bm, FP8=f8, RB=rb, SB=sb, SA=SCALE_AT // 4,
+-                                                  num_warps=ATTN_WARPS, num_stages=stages)
++                                                  num_warps=ATTN_WARPS, num_stages=stages,
++                                                  **_paging(lc))                             # patches/0290
+     _lsparse_merge[(R, H)](po, pm, pl, out, counts, R, H=H, L=L, NCH=nch, CH=CHUNK, num_warps=4)
+ 
+ 
+diff --git c/src/tensorfold/families/glm5_next/cuda/pfglue.py i/src/tensorfold/families/glm5_next/cuda/pfglue.py
+index 3ff754f..0b3c02b 100644
+--- c/src/tensorfold/families/glm5_next/cuda/pfglue.py
++++ i/src/tensorfold/families/glm5_next/cuda/pfglue.py
+@@ -156,18 +156,28 @@ def zero_mtp_rows(st, s: int, e: int) -> None:
+     kc = getattr(st, "mtp_kc", None)
+     if kc is None:
+         return
+-    kc[s:e].zero_()
++    pages = getattr(st, "pages", None)
++    if pages is not None:                        # patches/0290: paged caches, zeroed page by page (mapped first)
++        pages.ensure(e)
++
++    def zero(t, a: int, b: int) -> None:
++        if getattr(t, "is_paged", False):
++            t.zero_rows(a, b)
++        else:
++            t[a:b].zero_()
++
++    zero(kc, s, e)
+     vc = getattr(st, "mtp_vc", None)
+     if vc is not None and vc is not kc:
+-        vc[s:e].zero_()
++        zero(vc, s, e)
+     index = getattr(st, "index", None)
+     if index is not None:
+         ik, ig, pk = index[-1]
+-        ik[s:e].zero_()
+-        ig[s:e].zero_()
++        zero(ik, s, e)
++        zero(ig, s, e)
+         p0, p1 = s // 4, e // 4
+         if p1 > p0:
+-            pk[p0:p1].zero_()
++            zero(pk, p0, p1)
+ 
+ 
+ def absorb(e, hidden, next_tokens: Sequence[int], p0: int, lo: int, absorb_fn):
+diff --git c/src/tensorfold/families/glm5_next/cuda/sessdisk.py i/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+index 31dc828..860542f 100644
+--- c/src/tensorfold/families/glm5_next/cuda/sessdisk.py
++++ i/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+@@ -176,7 +176,7 @@ def settings() -> list[int]:
+ # knobs that cannot change a stored bit (paths, scheduling, the store's own sizes, reporting); every other
+ # GLM53_TF_* knob is in the hash, so a new knob is conservative by default (it only costs a cold start)
+ KNOB_SKIP_PREFIX = ("GLM53_TF_SESSION_", "GLM53_TF_BATCH", "GLM53_TF_CALIB", "GLM53_TF_PREPARED", "GLM53_TF_STALL",
+-                    "GLM53_TF_TOKCACHE")
++                    "GLM53_TF_TOKCACHE", "GLM53_TF_KV_POOL")      # patches/0290: where rows live, never their bits
+ KNOB_SKIP = {"GLM53_TF_T0", "GLM53_TF_LAUNCH_T0", "GLM53_TF_IMAGE_ID", "GLM53_TF_CLOCK_CAP", "GLM53_TF_BOOT_WARMUP",
+              "GLM53_TF_HEALTH", "GLM53_TF_EFFORT_FIELD", "GLM53_TF_DEFAULT_EFFORT", "GLM53_TF_PROFILE",
+              "GLM53_TF_DEPTH", "GLM53_TF_LOOKUP", "GLM53_TF_LOOKUP_MIN", "GLM53_TF_AUTO_FDRAFTS",
+@@ -801,6 +801,11 @@ class DiskTier:
+         for i0, p0, k, ext, slot in runs:
+             for ci, off, nb in lay:
+                 c = comps[ci]
++                if src is None and getattr(c.live, "is_paged", False):     # patches/0290: one pool page a copy
++                    for j in range(k):
++                        rows = c.live[(p0 + j) * c.per:(p0 + j + 1) * c.per]
++                        out[i0 + j:i0 + j + 1, off:off + nb].copy_(_u8(rows).view(1, nb))
++                    continue
+                 if src is None:
+                     rows = c.live[p0 * c.per:(p0 + k) * c.per]
+                 else:
+@@ -820,6 +825,8 @@ class DiskTier:
+                 t = payload_tail[ci]
+                 if t is None or t.shape[0] != b - a:
+                     raise LoadError(f"entry {src.id}: its tail does not match the page rule")
++            elif getattr(comps[ci].live, "is_paged", False):         # patches/0290: a copy, page by page
++                t = comps[ci].live.gather(a, b)
+             else:
+                 t = comps[ci].live[a:b]
+             m = {"name": f"tail.{ci}", "comp": ci, "rows": [a, b], "dtype": _dt(t), "shape": list(t.shape),
+@@ -1168,6 +1175,7 @@ class _Load:
+         self.workers: list[threading.Thread] = []
+         self.dest: dict[str, Any] = {}
+         self.meta: dict = {}
++        self.scatter: list[tuple] = []      # patches/0290: (paged cache, first row, staged rows) written in ``result``
+         self._lock = threading.Lock()
+         try:
+             self._start(live)
+@@ -1210,6 +1218,11 @@ class _Load:
+                 c = self.comps[ci]
+                 if _dt(c.live) != s["dtype"] or (b - a) * t.rb[ci] != int(s["nbytes"]):
+                     raise LoadError(f"tail {ci} differs")
++                if getattr(c.live, "is_paged", False):             # patches/0290: staged, then copied page by page
++                    x = torch.empty((b - a, *c.live.shape[1:]), dtype=c.live.dtype, device=dev)
++                    self.scatter.append((c.live, a, x))
++                    flat.append(_u8(x))
++                    continue
+                 flat.append(_u8(c.live[a:b]))
+             else:
+                 x = torch.empty(s["shape"], dtype=getattr(torch, s["dtype"]), device=dev)
+@@ -1310,6 +1323,11 @@ class _Load:
+                         rows = src[:n].view(k, self.stride)
+                         for ci, off, nb in self.lay:
+                             c = self.comps[ci]
++                            if getattr(c.live, "is_paged", False):         # patches/0290: one pool page a copy
++                                for j in range(k):
++                                    _u8(c.live[(p0 + j) * c.per:(p0 + j + 1) * c.per]).view(1, nb).copy_(
++                                        rows[j:j + 1, off:off + nb], non_blocking=cuda)
++                                continue
+                             _u8(c.live[p0 * c.per:(p0 + k) * c.per]).view(k, nb).copy_(rows[:, off:off + nb],
+                                                                                        non_blocking=cuda)
+                         with self._lock:
+@@ -1350,6 +1368,9 @@ class _Load:
+         self.workers = []
+         if self.error is not None:
+             return None
++        for live, a, x in self.scatter:         # patches/0290: the staged tails into the slot's pages (read, checked)
++            live.write(a, x)
++        self.scatter = []
+         m = self.meta["snap"]
+         win = None
+         if m["window"] is not None:
+diff --git c/src/tensorfold/families/glm5_next/cuda/sessions.py i/src/tensorfold/families/glm5_next/cuda/sessions.py
+index a035785..4374fed 100644
+--- c/src/tensorfold/families/glm5_next/cuda/sessions.py
++++ i/src/tensorfold/families/glm5_next/cuda/sessions.py
+@@ -586,9 +586,21 @@ def layout(st) -> list[Comp]:
+ 
+ 
+ def _nbytes(t) -> int:
++    if getattr(t, "is_paged", False):             # patches/0290: never asked of a whole paged cache
++        raise TypeError("_nbytes of a paged cache: take a row of it")
+     return int(t.numel() * t.element_size()) if t is not None else 0
+ 
+ 
++def _ensure_live(comps, n: int) -> None:
++    """patches/0290: map the slot's pool pages for positions < n before rows are copied into them (a no-op for
++    contiguous caches)."""
++
++    for c in comps:
++        if getattr(c.live, "is_paged", False):
++            c.live.slot.ensure(n)
++            return
++
++
+ def row_bytes(comps: list[Comp]) -> tuple[int, int, int, int]:
+     out = [0, 0, 0, 0]
+     for c in comps:
+@@ -827,13 +839,45 @@ class SessionStore:
+     def _copy(self, pairs: list[tuple[int, int]], has_mtp: bool, to_live: bool) -> None:
+         for p, ext, slot, k in self._runs(pairs):
+             slabs = self.slabs[ext]
++            idx = None
+             for c, slab in zip(self.comps, slabs):
+                 if c.mtp and not has_mtp:
+                     continue
++                if getattr(c.live, "is_paged", False):
++                    idx = self._copy_paged(c, slab, p, slot, k, to_live, idx)
++                    continue
+                 live = c.live[p * c.per:(p + k) * c.per]
+                 kept = slab[slot * c.per:(slot + k) * c.per]
+                 (live if to_live else kept).copy_(kept if to_live else live)
+ 
++    @staticmethod
++    def _copy_paged(c: Comp, slab, p: int, slot: int, k: int, to_live: bool, idx):
++        """patches/0290: store pages p .. p + k - 1 <-> a paged live cache, whose logical pages are not consecutive
++        rows. Pool pages as large as store pages: one gather / scatter over the run's physical pages (``idx``, built
++        once a run and shared by every cache of the slot); larger pool pages: a copy a store page (each lies inside
++        one pool page). Byte copies either way."""
++
++        import torch
++
++        live, kept = c.live, slab[slot * c.per:(slot + k) * c.per]
++        if live.per != c.per:
++            for j in range(k):
++                a = live[(p + j) * c.per:(p + j + 1) * c.per]
++                b = kept[j * c.per:(j + 1) * c.per]
++                (a if to_live else b).copy_(b if to_live else a)
++            return idx
++        if p + k > len(live.slot.pages):             # restore maps them first (``_ensure_live``); a save reads them
++            raise IndexError(f"session copy: store pages {p}..{p + k - 1} are not all mapped in this slot (KV pool)")
++        if idx is None:
++            idx = torch.tensor(live.slot.pages[p:p + k], dtype=torch.long).to(live.device, non_blocking=True)
++        pv = live.phys.view(-1, c.per, *live.phys.shape[1:])
++        kv = kept.view(k, c.per, *kept.shape[1:])
++        if to_live:
++            pv.index_copy_(0, idx, kv)
++        else:
++            torch.index_select(pv, 0, idx, out=kv)
++        return idx
++
+     def _sync_slabs(self) -> None:
+         import torch
+ 
+@@ -873,6 +917,9 @@ class SessionStore:
+         for c in self.comps:
+             end = len(e.ids) if not c.mtp else (e.mtp_len if e.has_mtp else -1)
+             a, b = c.rows(lo), c.rows(end) if end >= 0 else 0
++            if b > a and getattr(c.live, "is_paged", False):     # patches/0290: a tail may run over several pages
++                tail.append(c.live.gather(a, b))
++                continue
+             tail.append(c.live[a:b].clone() if b > a else None)
+         e.payload = (snap, tail)
+         snap.session_entry = e.id
+@@ -885,6 +932,7 @@ class SessionStore:
+         window when the request drafts with it); returns its snapshot for ``decode.prefill(resume=...)``."""
+ 
+         snap, tail = entry.payload
++        _ensure_live(self.comps, len(entry.ids))         # patches/0290: the slot's pages for the entry's rows
+         todo = []
+         for p, k in enumerate(entry.pages):
+             if self.live.get(p) != k:
+@@ -894,6 +942,9 @@ class SessionStore:
+         for c, t in zip(self.comps, tail):
+             if t is not None:
+                 a = c.rows(lo)
++                if getattr(c.live, "is_paged", False):             # patches/0290: page by page
++                    c.live.write(a, t)
++                    continue
+                 c.live[a:a + t.shape[0]].copy_(t)
+         self.stats["copied"] += len(todo)
+         self.stats["skipped"] += len(entry.pages) - len(todo)
+@@ -911,6 +962,7 @@ class SessionStore:
+ 
+         if plan is None or plan.disk is None or plan.load is not None:
+             return
++        _ensure_live(self.comps, len(plan.disk.ids))     # patches/0290: pages to read into
+         plan.load = self.disk.start_load(plan.disk, self.comps, self.live)
+         self.live = {}
+ 
+diff --git c/src/tensorfold/families/glm5_next/cuda/sparse.py i/src/tensorfold/families/glm5_next/cuda/sparse.py
+index 9cc4b2b..c1e0952 100644
+--- c/src/tensorfold/families/glm5_next/cuda/sparse.py
++++ i/src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -12,6 +12,11 @@ attends to those tokens only. While a row has at most 512 complete pools (q < 20
+ dense causal attention (``attention.attention``). A row's selection and its attention depend only on that row,
+ so a window row gets the bits of the serial step at its position. Attention visits the selected tokens in
+ ascending position, 512 at a time, and merges the chunks in order.
++
++patches/0290 (GLM53_TF_KV_POOL_TOKENS, ``kvpool``): the index keys / gates of a full-capacity index cache (the MTP
++head's) and every pool-key cache may be ``kvpool.Paged`` views of the shared pool; the kernels below map a logical
++row (a position, or a pool index) to its physical row through the slot's page table (``_prow``: PT / PSH, pruned when
++PSH = 0) under the same masks. Same values, other addresses: the same bits.
+ """
+ 
+ from __future__ import annotations
+@@ -23,6 +28,8 @@ import torch
+ import triton
+ import triton.language as tl
+ 
++from . import kvpool
++
+ POOL = 4
+ TOPK_POOLS = 512
+ BR = 16
+@@ -32,6 +39,19 @@ BR = 16
+ INDEX_RING = os.environ.get("GLM53_TF_INDEX_RING", "1").strip() != "0"
+ 
+ 
++@triton.jit
++def _prow(rows, PT, PSH: tl.constexpr, ok):
++    """patches/0290: ``latent._prow`` (logical rows -> physical rows through a page table; PSH 0: unchanged)."""
++
++    if PSH > 0:
++        if ok is None:                                    # a scalar row (writers): always mapped
++            pg = tl.load(PT + (rows >> PSH)).to(tl.int64)
++        else:
++            pg = tl.load(PT + (rows >> PSH), mask=ok, other=0).to(tl.int64)
++        rows = (pg << PSH) + (rows & ((1 << PSH) - 1))
++    return rows
++
++
+ def index_ring_rows(rows: int) -> int:
+     """Ring rows for windows of up to ``rows`` rows: a power of two >= rows + 64 (a window and the 3 rows of its
+     first incomplete pool fit with room to spare)."""
+@@ -40,7 +60,7 @@ def index_ring_rows(rows: int) -> int:
+ 
+ 
+ @triton.jit
+-def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, NR, eps, D: tl.constexpr):
++def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, NR, eps, D: tl.constexpr, PT=None, PSH: tl.constexpr = 0):
+     """Row r: LayerNorm(k_raw) -> bf16 into IK[pos + r]; the gate row (fp32) -> bf16 into IG[pos + r].
+     patches/0065: rows live at (position mod NR), NR the caches' rows (the capacity, or a ring)."""
+ 
+@@ -52,15 +72,17 @@ def _index_write(KR, k_stride, GR, LNW, LNB, IK, IG, POS, NR, eps, D: tl.constex
+     xc = x - mean
+     var = tl.sum(xc * xc, axis=0) / D
+     y = xc / tl.sqrt(var + eps) * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
+-    slot = (P + r) % NR
++    slot = _prow((P + r) % NR, PT, PSH, None)                 # patches/0290: a paged (full) cache's physical row
+     tl.store(IK + slot * D + d, y.to(tl.bfloat16))
+     tl.store(IG + slot * D + d, tl.load(GR + r * D + d).to(tl.bfloat16))
+ 
+ 
+ @triton.jit
+-def _pool_keys(IK, IG, APE, PK, POS, R, NR, D: tl.constexpr):
++def _pool_keys(IK, IG, APE, PK, POS, R, NR, D: tl.constexpr, PTI=None, PSHI: tl.constexpr = 0, PTP=None,
++               PSHP: tl.constexpr = 0):
+     """Program i: pool p = pos // 4 + i if it is complete within the window (ends at or before pos + R - 1).
+-    patches/0065: the pool's rows at (position mod NR)."""
++    patches/0065: the pool's rows at (position mod NR). patches/0290: keys / gates and the pool key through their page
++    tables (PTI / PSHI for a paged key cache, PTP / PSHP for the paged pool keys; 0: contiguous)."""
+ 
+     i = tl.program_id(0)
+     P = tl.load(POS).to(tl.int64)
+@@ -68,10 +90,10 @@ def _pool_keys(IK, IG, APE, PK, POS, R, NR, D: tl.constexpr):
+     if 4 * p + 3 > P + R - 1:
+         return
+     d = tl.arange(0, D)
+-    s0 = (4 * p + 0) % NR
+-    s1 = (4 * p + 1) % NR
+-    s2 = (4 * p + 2) % NR
+-    s3 = (4 * p + 3) % NR
++    s0 = _prow((4 * p + 0) % NR, PTI, PSHI, None)
++    s1 = _prow((4 * p + 1) % NR, PTI, PSHI, None)
++    s2 = _prow((4 * p + 2) % NR, PTI, PSHI, None)
++    s3 = _prow((4 * p + 3) % NR, PTI, PSHI, None)
+     l0 = tl.load(IG + s0 * D + d).to(tl.float32) + tl.load(APE + 0 * D + d).to(tl.float32)
+     l1 = tl.load(IG + s1 * D + d).to(tl.float32) + tl.load(APE + 1 * D + d).to(tl.float32)
+     l2 = tl.load(IG + s2 * D + d).to(tl.float32) + tl.load(APE + 2 * D + d).to(tl.float32)
+@@ -90,7 +112,7 @@ def _pool_keys(IK, IG, APE, PK, POS, R, NR, D: tl.constexpr):
+     t1 = ((e1 / s).to(tl.bfloat16).to(tl.float32) * k1).to(tl.bfloat16).to(tl.float32)
+     t2 = ((e2 / s).to(tl.bfloat16).to(tl.float32) * k2).to(tl.bfloat16).to(tl.float32)
+     t3 = ((e3 / s).to(tl.bfloat16).to(tl.float32) * k3).to(tl.bfloat16).to(tl.float32)
+-    tl.store(PK + p * D + d, (((t0 + t1) + t2) + t3).to(tl.bfloat16))
++    tl.store(PK + _prow(p, PTP, PSHP, None) * D + d, (((t0 + t1) + t2) + t3).to(tl.bfloat16))
+ 
+ 
+ def index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, ape: torch.Tensor,
+@@ -103,13 +125,20 @@ def index_update(k_raw: torch.Tensor, gate: torch.Tensor, ln_w: torch.Tensor, ln
+     NR = ik.shape[0]
+     if ig.shape[0] != NR or R + POOL - 1 > NR:
+         raise ValueError(f"index_update: a {R}-row window in index caches of {NR} / {ig.shape[0]} rows")
+-    _index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ik, ig, pos, NR, 1e-6, D=128, num_warps=1)
+-    _pool_keys[(R // 4 + 2,)](ik, ig, ape, pk, pos, R, NR, D=128, num_warps=1)
++    if kvpool.is_paged(ik) != kvpool.is_paged(ig):
++        raise ValueError("index_update: keys and gates must both be paged or both contiguous")
++    ikt, pti, pshi = kvpool.kernel_args(ik)                   # patches/0290 (keys and gates share the slot's table)
++    igt, _, _ = kvpool.kernel_args(ig)
++    pkt, ptp, pshp = kvpool.kernel_args(pk)
++    _index_write[(R,)](k_raw, k_raw.stride(0), gate, ln_w, ln_b, ikt, igt, pos, NR, 1e-6, D=128, num_warps=1,
++                       PT=pti, PSH=pshi)
++    _pool_keys[(R // 4 + 2,)](ikt, igt, ape, pkt, pos, R, NR, D=128, num_warps=1, PTI=pti, PSHI=pshi, PTP=ptp,
++                              PSHP=pshp)
+ 
+ 
+ @triton.jit
+ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, H: tl.constexpr, D: tl.constexpr, BP: tl.constexpr,
+-            NH: tl.constexpr = 32, WS: tl.constexpr = 1.0 / 5.656854249492381):
++            NH: tl.constexpr = 32, WS: tl.constexpr = 1.0 / 5.656854249492381, PT=None, PSH: tl.constexpr = 0):
+     """Program (r, pool block): s_p = sum_h w_h relu(scale * qi_h . pool_p) for pools p ending at or before
+     pos + r (-inf after). patches/0050: ``NH`` the indexer's heads (rows of NH x D), ``H`` >= NH the tile's
+     (padded to 16 for tl.dot; the padded heads load 0 and weigh 0), ``WS`` = NH ** -0.5. GLM-5.3 (NH = H = 32)
+@@ -131,7 +160,8 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, H: tl.constexpr, D: tl.
+         hm = hh < NH
+         q = tl.load(QI + (r * NH + hh[:, None]) * D + d[None, :], mask=hm[:, None], other=0.0).to(tl.bfloat16)
+         w = tl.load(W + r * w_stride + hh, mask=hm, other=0.0).to(tl.float32) * WS
+-    k = tl.load(PK + p[:, None] * D + d[None, :], mask=(p < npool)[:, None], other=0.0).to(tl.bfloat16)  # [BP, D]
++    pr = _prow(p, PT, PSH, p < npool)                               # patches/0290 (PSH 0: pr is p)
++    k = tl.load(PK + pr[:, None] * D + d[None, :], mask=(p < npool)[:, None], other=0.0).to(tl.bfloat16)  # [BP, D]
+     dots = tl.dot(q, tl.trans(k))                                                     # [H, BP] fp32
+     s = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
+     s = tl.where(p < npool, s, float("-inf"))
+@@ -141,6 +171,13 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, H: tl.constexpr, D: tl.
+ _SCORES = _scores
+ 
+ 
++def _pk_paging(pt, psh: int) -> dict:
++    """patches/0290: the page-table kwargs of a scoring kernel; none for a contiguous pool-key cache (so a test's
++    stand-in for ``_scores`` with upstream's signature still runs)."""
++
++    return dict(PT=pt, PSH=psh) if pt is not None else {}
++
++
+ def _heads(qi: torch.Tensor, wts: torch.Tensor) -> dict:
+     """patches/0050: ``_scores``' head arguments from the tensors (qi [R, NH x D], wts [R, NH])."""
+ 
+@@ -165,8 +202,9 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
+         pools = select_pools_blocked(qi, wts, pk, pos, R, np_max, pos_dev)
+         return _tokens(pools, pos, R, qi.device)
+     scores = torch.empty((R, np_max), dtype=torch.float32, device=qi.device)
+-    _scores[(R, triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, np_max, 128 ** -0.5,
+-                                         BP=64, num_warps=4, **_heads(qi, wts))
++    pkt, pt, psh = kvpool.kernel_args(pk)                                              # patches/0290
++    _scores[(R, triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), pkt, scores, pos_dev, R, np_max, 128 ** -0.5,
++                                         BP=64, num_warps=4, **_heads(qi, wts), **_pk_paging(pt, psh))
+     order = torch.sort(scores, dim=1, descending=True, stable=True).indices[:, :TOPK_POOLS]
+     pools = torch.sort(order, dim=1).values                                            # ascending pool index
+     return _tokens(pools, pos, R, qi.device)
+@@ -294,8 +332,9 @@ def select_tokens_dev(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos
+     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
+         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
+     scores = sc.scores[:R * np_].view(R, np_)
+-    _scores[(R, triton.cdiv(np_, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, np_, 128 ** -0.5, BP=64,
+-                                      num_warps=4, **_heads(qi, wts))
++    pkt, pt, psh = kvpool.kernel_args(pk)                                              # patches/0290
++    _scores[(R, triton.cdiv(np_, 64))](qi, wts, wts.stride(0), pkt, scores, pos_dev, R, np_, 128 ** -0.5, BP=64,
++                                      num_warps=4, **_heads(qi, wts), **_pk_paging(pt, psh))
+     keys = sc.keys[:R * np_].view(R, np_)
+     _keys[(R, triton.cdiv(np_, 1024))](scores, keys, np_, BLOCK=1024, num_warps=4)
+     torch.topk(keys, TOPK_POOLS, dim=1, largest=True, sorted=False, out=(sc.top_v[:R], sc.top_i[:R]))
+@@ -346,7 +385,8 @@ def _score_key(s):
+ @triton.jit
+ def _scores_rows(QI, W, w_stride, PK, OUT, POS, R, NP, row0, scale, H: tl.constexpr, D: tl.constexpr,
+                  BP: tl.constexpr, BRB: tl.constexpr, NH: tl.constexpr = 32,
+-                 WS: tl.constexpr = 1.0 / 5.656854249492381, KEYS: tl.constexpr = True):
++                 WS: tl.constexpr = 1.0 / 5.656854249492381, KEYS: tl.constexpr = True, PT=None,
++                 PSH: tl.constexpr = 0):
+     """Program (row block, pool block): rows row0 + rb BRB .. (< R) of the window, each exactly as ``_scores``
+     program (r, pb) computes it, against one pool tile loaded for all of them; row r's result goes to row
+     r - row0 of OUT [*, NP] (int32 keys, or with KEYS=False the fp32 scores, for the check)."""
+@@ -361,7 +401,8 @@ def _scores_rows(QI, W, w_stride, PK, OUT, POS, R, NP, row0, scale, H: tl.conste
+     r_last = tl.minimum(r_first + BRB, R) - 1
+     nmax = (P + r_last + 1) // 4
+     # pools past a row's own count score -inf below, so loading up to the block's last row changes no kept score
+-    k = tl.load(PK + p[:, None] * D + d[None, :], mask=(p < nmax)[:, None], other=0.0).to(tl.bfloat16)  # [BP, D]
++    pr = _prow(p, PT, PSH, p < nmax)                                # patches/0290 (PSH 0: pr is p)
++    k = tl.load(PK + pr[:, None] * D + d[None, :], mask=(p < nmax)[:, None], other=0.0).to(tl.bfloat16)  # [BP, D]
+     for i in range(BRB):
+         r = r_first + i
+         if r < R:
+@@ -407,9 +448,10 @@ def _gather_sel(KEYS, T, NEED, OUT, NP, K: tl.constexpr, BLOCK: tl.constexpr):
+ 
+ 
+ def _launch_rows(qi, wts, pk, out, pos_dev, R, NP, row0, n, keys: bool = True) -> None:
+-    _scores_rows[(triton.cdiv(n, BRB), triton.cdiv(NP, 64))](qi, wts, wts.stride(0), pk, out, pos_dev, row0 + n, NP,
++    pkt, pt, psh = kvpool.kernel_args(pk)                                              # patches/0290
++    _scores_rows[(triton.cdiv(n, BRB), triton.cdiv(NP, 64))](qi, wts, wts.stride(0), pkt, out, pos_dev, row0 + n, NP,
+                                                             row0, 128 ** -0.5, BP=64, BRB=BRB, KEYS=keys,
+-                                                            num_warps=4, **_heads(qi, wts))
++                                                            num_warps=4, **_heads(qi, wts), **_pk_paging(pt, psh))
+ 
+ 
+ def block_rows(R: int, np_max: int) -> int:

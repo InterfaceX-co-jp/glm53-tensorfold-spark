@@ -1,0 +1,17 @@
+      4         PCI_WR_ORDERING                             per_mkey(0)         
+-rw-r--r-- 1 root root 491 Sep 28 09:59 /cache/roce-failed
+19:26:56 unit rc=0 85s :: 25 passed in 81.80s (0:01:21)
+19:27:01 sizes rc=0 5s :: VERDICT TRANSPORT MISMATCH
+19:27:06 loopback rc=0 5s :: rank 0 stats: {"doorbell": 21044, "completed": 21044, "failed": 0, "err_seq": 0, "err_peer": 0, "err_hca": 0, "gpu_seen": 0, "flags": {"1/0/0": 21044, "1/0/1": 21044, "1/1/0": 21043, "1/1/1": 21043}, 
+19:27:11 loopback-hcas1 rc=0 5s :: rank 0 stats: {"doorbell": 21044, "completed": 21044, "failed": 0, "err_seq": 0, "err_peer": 0, "err_hca": 0, "gpu_seen": 0, "flags": {"1/0/0": 21044, "1/1/0": 21043}, "ops": 2324, "watch": {"state": 
+19:27:16 loopback-f0 rc=0 5s :: rank 0 stats: {"doorbell": 21044, "completed": 21044, "failed": 0, "err_seq": 0, "err_peer": 0, "err_hca": 0, "gpu_seen": 0, "flags": {"1/0/0": 21044, "1/1/0": 21043}, "ops": 2324, "watch": {"state": 
+19:27:21 loopback-f1 rc=0 5s :: rank 0 stats: {"doorbell": 21044, "completed": 21044, "failed": 0, "err_seq": 0, "err_peer": 0, "err_hca": 0, "gpu_seen": 0, "flags": {"1/0/0": 21044, "1/1/0": 21043}, "ops": 2324, "watch": {"state": 
+19:27:35 stress-both rc=1 14s :: tensorfold.families.glm5_next.cuda.roce.RoceError: RoCE all-gather on rank 0 timed out after 10 s waiting for rank 1 on roceP2p1s0f1 at sequence 1: the flag arrived 12.371 ms AFTER the wait failed (th
+STOP
+19:29:10 stress-both rc=0 23s :: stress ok
+19:29:33 stress-f0 rc=0 23s :: stress ok
+19:29:57 stress-f1 rc=0 24s :: stress ok
+19:30:11 stress-256k rc=0 14s :: stress ok
+19:30:17 sizes-sync rc=0 6s :: VERDICT transport clean with synced inputs
+19:30:21 sizes-race2 rc=0 4s :: VERDICT transport clean with synced inputs
+roce single-node (b) done 19:30:21

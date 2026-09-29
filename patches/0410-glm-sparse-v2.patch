@@ -1,0 +1,418 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/b12x_attn.py i/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
+index 03032ea..abde7b8 100644
+--- c/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
++++ i/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
+@@ -95,14 +95,46 @@ def _lsparse_one(QA, LC, LCS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, L
+         tl.store(OUT + (r * H + h[:, None]).to(tl.int64) * L + d[None, :], o / l[:, None], mask=hok[:, None])
+ 
+ 
++# patches/0410 (GLM53_TF_SPARSE_V2=1, load-time; default 0): ``sparse_latent_one`` runs ``sparse_v2._lsparse_v2``, a
++# Gluon kernel with THIS kernel's bits (the same tile order, the same mma chains, the reductions on the same #mma
++# layout) and pipelined cp.async gathers, no redundant QK work. Same bits, so the same snapshots (bit 4's tag) and no
++# rank check. ``V2`` is the sparse_v2 module when on (``enable_v2``; the engine calls it at load).
++V2 = None
++
++
++def enable_v2() -> bool:
++    """Read GLM53_TF_SPARSE_V2 (and its CFG) now, so a bad value or a Triton without Gluon fails at load."""
++
++    global V2
++    import importlib
++
++    sv = importlib.import_module(f"{__package__}.sparse_v2")
++    if not sv.mode():
++        V2 = None
++        return False
++    sv.config(True)
++    sv.config(False)
++    V2 = sv
++    return True
++
++
+ def sparse_latent_one(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
+-                      out: torch.Tensor, scale: float, *, bm: int | None = None, stages: int | None = None) -> None:
++                      out: torch.Tensor, scale: float, *, bm: int | None = None, stages: int | None = None,
++                      v2: bool | None = None) -> None:
+     """``latent.sparse_latent``'s contract (rows with counts > 0 written into ``out`` [R, H, L] fp32, other rows
+-    untouched), in one pass a row."""
++    untouched), in one pass a row. patches/0410: ``v2`` None follows GLM53_TF_SPARSE_V2 (``V2``), True / False force
++    it (benches, tests); v2 serves the production shape (32 local heads, 512-wide latent, default tile) only."""
+ 
+     R, H, L = qa.shape
+     if R == 0:
+         return
++    use = (V2 is not None) if v2 is None else bool(v2)
++    if use and bm is None and stages is None and not _INTERPRETED:
++        from . import sparse_v2
++
++        if H == sparse_v2.HEADS and L == SCALE_AT:
++            sparse_v2.sparse_latent_v2(qa, lc, tokens, counts, out, scale)
++            return
+     W = tokens.shape[1]
+     if not qa.is_contiguous() or not tokens.is_contiguous() or out.shape != (R, H, L) or not out.is_contiguous():
+         raise ValueError("sparse_latent_one: contiguous qa [R, H, L], tokens [R, W] and out [R, H, L] expected")
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py i/src/tensorfold/families/glm5_next/cuda/engine.py
+index 43720da..8a5ce64 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ i/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -291,6 +291,17 @@ class GlmEngine:
+             if rank == 0:
+                 print(f"[tensorfold] KDA recurrence v2 ({'split' if kmode == 1 else 'fused'}, fast_kda's bits): "
+                       + ", ".join(f"{k} {v}" for k, v in kcfg.items()) + " (patches/0400)", flush=True)
++        # patches/0410: GLM53_TF_SPARSE_V2 (b12x bit 4's one-pass sparse attention through the Gluon v2 kernel, same
++        # bits: speed only, so the ranks need not agree); parsed and compiled-module-imported here, not at the first
++        # prefill
++        if os.environ.get("GLM53_TF_SPARSE_V2", "").strip() not in ("", "0", "off"):
++            from . import b12x_attn
++
++            if b12x_attn.enable_v2() and rank == 0:
++                st, qkl, qreg = b12x_attn.V2.config(True)
++                print(f"[tensorfold] sparse latent attention v2 for b12x bit 4 (the one-pass kernel's bits): FP8 "
++                      f"stages {st}, QK layout {'[2, 4]' if qkl else '[1, 8]'}, "
++                      f"q {'half in registers' if qreg else 'in shared memory'} (patches/0410)", flush=True)
+         # patches/0170: GLM53_TF_KDA_PROJ_BF16=1: a bf16 copy of each KDA input projection (the 4-bit weights'
+         # values, rounded once) for fast chunks; checked equal on both ranks by fastpf.settings() above
+         if fastpf.kda_bf16():
+diff --git c/src/tensorfold/families/glm5_next/cuda/sessdisk.py i/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+index 601dff3..a46a58b 100644
+--- c/src/tensorfold/families/glm5_next/cuda/sessdisk.py
++++ i/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+@@ -199,6 +199,9 @@ KNOB_SKIP_PREFIX = KNOB_SKIP_PREFIX + ("GLM53_TF_REQUEST_LOG",)
+ # patches/0400: the KDA recurrence v2 computes fast_kda's bits (speed settings only)
+ KNOB_SKIP_PREFIX = KNOB_SKIP_PREFIX + ("GLM53_TF_KDA_V2",)
+ 
++# patches/0410: the sparse attention v2 computes the one-pass kernel's bits (speed settings only)
++KNOB_SKIP_PREFIX = KNOB_SKIP_PREFIX + ("GLM53_TF_SPARSE_V2",)
++
+ 
+ def layout_sig(comps) -> list:
+     """The cache tensors a page / tail holds: rows a page, MTP or not, dtype, a row's shape."""
+diff --git c/src/tensorfold/families/glm5_next/cuda/sparse_v2.py i/src/tensorfold/families/glm5_next/cuda/sparse_v2.py
+new file mode 100644
+index 0000000..6434c35
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/sparse_v2.py
+@@ -0,0 +1,323 @@
++"""Sparse latent attention v2 (patches/0410, ``GLM53_TF_SPARSE_V2=1``): the one-pass kernel's bits, faster.
++
++Same arithmetic as ``b12x_attn._lsparse_one`` (patches/0240 / 0360, ``tf_knobs.b12x`` bit 4, production's fast-prefill
++sparse attention since W9), per row, per head, bit for bit; only the data movement and the schedule change. Written in
++Gluon (Triton's explicit-layout dialect, ``triton.experimental.gluon``: 3.7.1 in the image, 3.8 checked too), because the
++bits of the one-pass kernel are pinned to the register layouts Triton picked for it, and Gluon states layouts instead of
++leaving them to heuristics.
++
++What the one-pass kernel computes (its compiled TTGIR, Triton 3.7.1 and 3.8, sm_121) and what v2 keeps
++-------------------------------------------------------------------------------------------------------------------
++Program (row r, all H = 32 local heads), the row's n selected tokens in list order in KT = 32-token tiles, one online
++softmax. Per tile, on ``#mma = nvidia_mma<{version 2.0, warpsPerCTA [1, 8], instrShape [16, 8]}>`` (8 warps):
++
++1. scores = mma(q [32, 512] bf16, kv^T [512, 32] bf16, c = 0) -- operands ``dot_op<kWidth = 2>`` -- then x SCALE;
++2. masked to -inf past n; tile max (``tt.reduce`` maxnumf, axis 1); next_m, alpha = exp(m - next_m) (selects as in
++   ``latent._ltile``); p = exp(scores - next_m) (masked);
++3. o = mma(bf16(p), kv [32, 512], c = o * alpha)   (Triton's Combine pass folds ``o * alpha + dot`` into the dot's c);
++4. l = l * alpha + sum(p, axis 1)   (``tt.reduce`` addf on ``#mma``);
++end: o / l (``arith.divf``), stored fp32.
++
++What decides the bits, and how v2 keeps each:
++
++- each mma output element: the chain of m16n8k16 steps over K in ascending k16 blocks from the dot's c, with the
++  operands' K elements placed by ``kWidth`` 2 (Triton's MMAv2 lowering: ``for k: for m: for n: mma``; the chain does not
++  depend on the warp layout). v2 feeds every dot ``kWidth`` 2 operands of the same values in the same K order from the
++  same c, so each element's chain is the reference's: scores, and o's PV steps;
++- the two reductions (max: exact whatever the order; sum: NOT associative in fp32) run on the reference's ``#mma``
++  [1, 8] layout, so ``ReduceOpToLLVM`` emits the same in-thread / shuffle / cross-warp tree;
++- every element-wise op (scale, selects, maxnumf, exp, the alpha rescale, l's mul + add, the final divf, the FP8
++  dequantization e4m3 -> f32 x 2^k -> bf16) is the same op on the same value; the online-softmax state (m, l, o) lives on
++  the same layout (so LLVM sees the same mul / add pairs to contract).
++
++``tests/test_sparse_v2_compile.py`` checks all of this on the compiled IR (the reference's layouts and v2's, the
++arithmetic op sequence of the key loop, kWidth, the chains, PTX instruction classes) under 3.7.1 and 3.8;
++``tests/test_sparse_v2_emulator.py`` runs v2's own source on a CPU model of its Gluon ops (cp.async groups landing at
++wait_group, shared memory as bytes with the ring's aliasing, and a barrier / hazard model: a wrong slot, a missing wait
++or a missing barrier fails) against the reference in Triton's interpreter, bit for bit, with an order-sensitive
++tensor-core model.
++
++What v2 changes (data movement only)
++-------------------------------------
++- **Pipelined gathers.** The selected rows (FP8: 512 e4m3 bytes + the fp32 scale; bf16: 1 KB) are gathered with
++  ``cp.async`` (16-byte vectors, masked lanes zero-filled like the reference's ``other=0``) into a ring of ``STAGES``
++  shared-memory slots, STAGES - 1 tiles ahead, through the page table (patches/0290) with the token ids loaded a tile
++  earlier still; the
++  reference loads each tile synchronously (``ld.global`` -> use) with one CTA an SM, so every tile waits a full DRAM /
++  L2 round trip (its time does not move with context: latency-, not bandwidth-bound).
++- **Dequantized once into shared memory.** The FP8 tile is dequantized once per tile into a bf16 tile both dots read
++  (the reference did the same through a ``local_alloc``; v2 reads the raw tile from its ring slot, 16 B a thread).
++- **No redundant QK work** (``QKL`` 1). On the reference's [1, 8] layout the [32, 32] scores tile is narrower than the
++  8 warps' 64 columns, so warps 4-7 recompute warps 0-3's scores and every warp reads all of q (32 KB) from shared
++  memory each tile: 96 mma a warp a tile of which 32 are duplicates. v2 computes the scores on [2, 4] (one m16n8 tile a
++  warp: 64 mma a warp a tile, half the q reads) and moves the 4 KB tile to the [1, 8] layout for the softmax (through the
++  tile's ring slot, already consumed: no extra shared memory). Same chain per element (layout-independent), same
++  reduction layout.
++- The p tile's layout change (the reference's ``local_alloc`` / ``local_load``) also goes through the consumed slot.
++- **Half of q in registers** (``QREG`` 1, needs QKL 1). q is the same for every tile of a row; K 0-255 of each warp's
++  A operand stays in registers (64 a thread), K 256-511 is read from shared memory. The QK chain is then two dots, the
++  second continuing the first's result: the same 32 k16 steps from 0 (MMAv2's lowering chains K through the dot's c).
++  A quarter less shared-memory traffic a tile, 16 KB less shared memory, so 3 ring slots fit.
++
++Per tile and CTA (loop PTX, Triton 3.7.1): the reference issues 768 mma and moves ~430 KB through shared memory
++(387 KB of ldmatrix: q 256 KB); v2 default (STAGES 3, QKL 1, QREG 1) 512 mma and ~286 KB (219 KB read). Shared memory
++FP8: q 16 KB + bf16 tile 32 KB + ring 3 x 16.1 KB + 0.5 KB = 99,200 B of GB10's 101,376; 246-255 registers, no spills
++(3.7.1 and 3.8); one CTA of 8 warps an SM, as the reference. Barriers a tile: 5 explicit (tile landed, after the new
++copies -- where Triton's own analysis would put one anyway, placed before every operand load -- bf16 tile written,
++scores moved, p moved) plus the reductions' own.
++
++Row independence: grid (R,), program r reads only row r's query, count, token list; the tile sequence and every
++shape are fixed by n and the constants, never by R or the other rows. Not a per-request knob: v2 gives the one-pass
++kernel's bits, so it shares its snapshots (tag of b12x bit 4) and needs no rank check or new tag.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++from triton.experimental import gluon
++from triton.experimental.gluon import language as gl
++from triton.experimental.gluon.language.nvidia.ampere import async_copy as cp
++from triton.experimental.gluon.language.nvidia.ampere import mma_v2
++
++from .latent import KT, ROW8, SCALE_AT, _paging, _views
++
++ENV = "GLM53_TF_SPARSE_V2"
++CFG_ENV = "GLM53_TF_SPARSE_V2_CFG"        # "stages,qkl[,qreg]" (speed only; every setting gives the same bits)
++WARPS = 8                                 # the reference's: its #mma [1, 8] layout (the sum's tree) needs 8 warps
++HEADS = 32                                # one program holds all 32 local heads of a row (the reference's BM)
++SMEM_MAX = 101376                         # GB10 (sm_121): 99 KB of shared memory a block
++
++
++def mode() -> bool:
++    """GLM53_TF_SPARSE_V2: ``0`` (default; also empty / off) or ``1`` (this kernel for ``b12x_attn.sparse_latent_one``)."""
++
++    v = os.environ.get(ENV, "0").strip().lower()
++    if v in ("", "0", "off", "false", "no"):
++        return False
++    if v in ("1", "on", "true", "yes", "v2"):
++        return True
++    raise ValueError(f"{ENV} must be 0 or 1, not {v!r}")
++
++
++def config(fp8: bool) -> tuple[int, int, int]:
++    """(STAGES, QKL, QREG) for a cache format: GLM53_TF_SPARSE_V2_CFG="stages,qkl[,qreg]" or the defaults (FP8: 2, 1, 0;
++    bf16: 2, 0, 0 -- a bf16 ring slot is the dots' operand, so there is no consumed slot for the scores' layout change
++    and [1, 8] QK is what fits in 99 KB). QREG 1 (FP8 with QKL 1 only): the first half of q's K held in registers for
++    the whole row (64 more registers a thread, 16 KB less shared memory and a quarter less shared-memory traffic a tile;
++    3 stages then fit). Speed only: every setting gives the same bits (tests/test_sparse_v2_*)."""
++
++    raw = os.environ.get(CFG_ENV, "").strip()
++    if raw:
++        try:
++            vals = [int(x) for x in raw.split(",")]
++            if len(vals) == 2:
++                vals.append(0)
++            st, qkl, qreg = vals
++        except ValueError:
++            raise ValueError(f"{CFG_ENV}={raw!r}: expected 'stages,qkl[,qreg]', e.g. '2,1' or '3,1,1'") from None
++    else:
++        st, qkl, qreg = (3, 1, 1) if fp8 else (2, 0, 0)
++    if not fp8:
++        qkl = qreg = 0
++    if st < 2 or qkl not in (0, 1) or qreg not in (0, 1) or (qreg and not qkl):
++        raise ValueError(f"{CFG_ENV}: stages >= 2, qkl 0 / 1, qreg 0 / 1 (qreg needs qkl 1), not {st},{qkl},{qreg}")
++    if smem_need(fp8, st, qkl, qreg) > SMEM_MAX:
++        raise ValueError(f"{CFG_ENV}={st},{qkl},{qreg}: {smem_need(fp8, st, qkl, qreg)} B of shared memory "
++                         f"({'FP8' if fp8 else 'bf16'} rows), a GB10 block has {SMEM_MAX}")
++    return st, qkl, qreg
++
++
++@gluon.jit
++def _rows(TOK, r, W, idx, ok, PT, PSH: gl.constexpr):
++    """Physical cache rows of the row's tokens idx (masked by ok): ``latent._prow`` on the token ids (patches/0290)."""
++
++    tok = gl.load(TOK + r * W + idx, mask=ok, other=0).to(gl.int64)
++    if PSH > 0:
++        pg = gl.load(PT + (tok >> PSH), mask=ok, other=0).to(gl.int64)
++        tok = (pg << PSH) + (tok & ((1 << PSH) - 1))
++    return tok
++
++
++@gluon.jit
++def _issue(ring, sring, slot, LC, LCS, rows, ok, db, RB: gl.constexpr, SB: gl.constexpr, SA: gl.constexpr,
++           FP8: gl.constexpr):
++    """Gather a tile's rows into ring slot ``slot`` (cp.async, 16 B vectors; masked rows zero-filled) as one group."""
++
++    cp.async_copy_global_to_shared(ring.index(slot), LC + rows[:, None] * RB + db[None, :], mask=ok[:, None])
++    if FP8:
++        cp.async_copy_global_to_shared(sring.index(slot), LCS + rows * SB + SA, mask=ok)
++    cp.commit_group()
++
++
++@gluon.jit
++def _lsparse_v2(QA, LC, LCS, TOK, CNT, OUT, PT, W, H: gl.constexpr, L: gl.constexpr, KTS: gl.constexpr,
++                SCALE: gl.constexpr, FP8: gl.constexpr, RB: gl.constexpr, SB: gl.constexpr, SA: gl.constexpr,
++                PSH: gl.constexpr, STAGES: gl.constexpr, QKL: gl.constexpr, QREG: gl.constexpr = 0):
++    """Program r: row r's n selected tokens in list order, one online softmax, OUT[r] = o / l (fp32); nothing when
++    n == 0 (the reference leaves such rows untouched too)."""
++
++    # the reference's layouts (tests/test_sparse_v2_compile.py compares them with its compiled TTGIR)
++    MMA_S: gl.constexpr = gl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[1, 8], instr_shape=[16, 8])
++    if QKL:
++        MMA_Q: gl.constexpr = gl.NVMMADistributedLayout(version=[2, 0], warps_per_cta=[2, 4], instr_shape=[16, 8])
++    else:
++        MMA_Q: gl.constexpr = MMA_S
++    DQA: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MMA_Q, k_width=2)
++    DQB: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MMA_Q, k_width=2)
++    DPA: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MMA_S, k_width=2)
++    DPB: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MMA_S, k_width=2)
++    if FP8:
++        LB: gl.constexpr = gl.BlockedLayout([1, 16], [1, 32], [8, 1], [1, 0])     # 16 e4m3 bytes a thread
++    else:
++        LB: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [8, 1], [1, 0])      # 8 bf16 a thread
++    LQ: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [8, 1], [1, 0])
++    LO: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [2, 4], [1, 0])
++    ROWL: gl.constexpr = gl.SliceLayout(1, LB)
++    SH: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 8, [1, 0])                  # the reference's tile layout
++    SP: gl.constexpr = gl.SwizzledSharedLayout(8, 2, 4, [1, 0])                  # the reference's p layout
++    SF: gl.constexpr = gl.SwizzledSharedLayout(2, 1, 8, [1, 0])
++    SS: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
++    if FP8:
++        SR: gl.constexpr = gl.SwizzledSharedLayout(16, 1, 1, [1, 0])             # raw rows, 16 B chunks in order
++    else:
++        SR: gl.constexpr = SH                                                    # bf16 slots are the dots' operand
++
++    r = gl.program_id(0)
++    n = gl.load(CNT + r)
++    if n > 0:
++        hq = gl.arange(0, H, layout=gl.SliceLayout(1, LQ))
++        dq = gl.arange(0, L, layout=gl.SliceLayout(0, LQ))
++        LH: gl.constexpr = L // 2
++        if QREG:                        # K 0 .. 255 of q as the QK dot's A operand in registers, K 256 .. 511 in smem
++            ha = gl.arange(0, H, layout=gl.SliceLayout(1, DQA))
++            da = gl.arange(0, LH, layout=gl.SliceLayout(0, DQA))
++            q_lo = gl.load(QA + (r * H + ha[:, None]) * L + da[None, :])
++            dh = gl.arange(0, LH, layout=gl.SliceLayout(0, LQ))
++            q_s = gl.allocate_shared_memory(gl.bfloat16, [H, LH], SH,
++                                            gl.load(QA + (r * H + hq[:, None]) * L + LH + dh[None, :]))
++        else:
++            q_s = gl.allocate_shared_memory(gl.bfloat16, [H, L], SH,
++                                            gl.load(QA + (r * H + hq[:, None]) * L + dq[None, :]))
++        if FP8:
++            ring = gl.allocate_shared_memory(gl.uint8, [STAGES, KTS, L], SR)
++            sring = gl.allocate_shared_memory(gl.float32, [STAGES, KTS], SS)
++            kv_s = gl.allocate_shared_memory(gl.bfloat16, [KTS, L], SH)
++        else:
++            ring = gl.allocate_shared_memory(gl.bfloat16, [STAGES, KTS, L], SR)
++            sring = ring
++        kk = gl.arange(0, KTS, layout=ROWL)
++        db = gl.arange(0, L, layout=gl.SliceLayout(0, LB))
++        kq = gl.arange(0, KTS, layout=gl.SliceLayout(0, MMA_S))
++        # prologue: tiles 0 .. STAGES - 2 in flight, tile STAGES - 1's rows known
++        for i in gl.static_range(STAGES - 1):
++            ok = i * KTS + kk < n
++            _issue(ring, sring, i, LC, LCS, _rows(TOK, r, W, i * KTS + kk, ok, PT, PSH), ok, db, RB, SB, SA, FP8)
++        nx = (STAGES - 1) * KTS + kk
++        rows_nx = _rows(TOK, r, W, nx, nx < n, PT, PSH)
++        m = gl.full([H], float("-inf"), gl.float32, gl.SliceLayout(1, MMA_S))
++        l = gl.zeros([H], gl.float32, gl.SliceLayout(1, MMA_S))
++        o = gl.zeros([H, L], gl.float32, MMA_S)
++        for t in range(0, gl.cdiv(n, KTS)):
++            slot = t % STAGES
++            # tile t landed (this thread's groups), then everyone's: tile t visible, iteration t - 1 finished by
++            # every warp (so slot (t - 1) % STAGES, the scratch in it and the bf16 tile are free)
++            cp.wait_group(STAGES - 2)
++            gl.barrier()
++            j = t + STAGES - 1
++            _issue(ring, sring, j % STAGES, LC, LCS, rows_nx, j * KTS + kk < n, db, RB, SB, SA, FP8)
++            nx = (j + 1) * KTS + kk
++            rows_nx = _rows(TOK, r, W, nx, nx < n, PT, PSH)       # the token ids two tiles ahead
++            # Triton's barrier analysis cannot tell ring slots apart (the slot index is dynamic): it would put a
++            # barrier between the new copies and the first read of the ring anyway, and where it lands decides what
++            # ptxas can overlap (after q's operand loads: 256 live registers and spills in the bf16 kernel). Here,
++            # every operand load follows it.
++            gl.barrier()
++            if FP8:
++                v = ring.index(slot).load(LB)
++                s = sring.index(slot).load(ROWL)
++                # latent._lrows: e4m3 -> f32, x the row's power-of-two scale, -> bf16 (exact)
++                kv_s.store((v.to(gl.float8e4nv, bitcast=True).to(gl.float32) * s[:, None]).to(gl.bfloat16))
++                gl.barrier()
++                kvt = kv_s
++            else:
++                kvt = ring.index(slot)
++            # latent._ltile, op for op, on the reference's #mma [1, 8]
++            if QREG:                    # one chain over K: 16 k16 steps from 0, then 16 more from there
++                kt = kvt.permute([1, 0])
++                sc = mma_v2(q_lo, kt.slice(0, LH, dim=0).load(DQB), gl.zeros([H, KTS], gl.float32, MMA_Q),
++                            input_precision="tf32")
++                sc = mma_v2(q_s.load(DQA), kt.slice(LH, LH, dim=0).load(DQB), sc, input_precision="tf32")
++            else:
++                sc = mma_v2(q_s.load(DQA), kvt.permute([1, 0]).load(DQB), gl.zeros([H, KTS], gl.float32, MMA_Q),
++                            input_precision="tf32")
++            if QKL:                     # [2, 4] -> [1, 8] through the consumed raw slot (FP8 only)
++                scr = ring.index(slot)._reinterpret(gl.float32, [4, H, KTS], SF).index(0)
++                scr.store(sc)
++                gl.barrier()
++                sc = scr.load(MMA_S)
++            scores = sc * SCALE
++            valid = gl.broadcast(gl.expand_dims(t * KTS + kq < n, 0), scores)[0]
++            scores = gl.where(valid, scores, float("-inf"))
++            tile_m = gl.max(scores, 1)
++            active = tile_m != float("-inf")
++            next_m = gl.where(active, gl.maximum(m, tile_m), m)
++            alpha = gl.where(active, gl.where(m == float("-inf"), 0.0, gl.exp(m - next_m)), 1.0)
++            p = gl.where(valid & active[:, None], gl.exp(scores - next_m[:, None]), 0.0)
++            oa = o * alpha[:, None]                                   # before p's cast, as the reference orders them
++            if QKL:
++                psm = ring.index(slot)._reinterpret(gl.bfloat16, [8, H, KTS], SP).index(2)
++                psm.store(p.to(gl.bfloat16))
++                gl.barrier()
++                pa = psm.load(DPA)
++            else:
++                pa = gl.convert_layout(p.to(gl.bfloat16), DPA)
++            o = mma_v2(pa, kvt.load(DPB), oa, input_precision="tf32")
++            l = l * alpha + gl.sum(p, 1)
++            m = next_m
++        cp.wait_group(0)
++        out = gl.convert_layout(o / l[:, None], LO)
++        ho = gl.arange(0, H, layout=gl.SliceLayout(1, LO))
++        do = gl.arange(0, L, layout=gl.SliceLayout(0, LO))
++        gl.store(OUT + (r * H + ho[:, None]).to(gl.int64) * L + do[None, :], out)
++
++
++def smem_need(fp8: bool, stages: int, qkl: int, qreg: int = 0) -> int:
++    """Shared memory a program of v2 uses (Triton 3.7.1 and 3.8 allocate exactly this, tests/test_sparse_v2_compile.py):
++    q (32 KB; 16 KB with QREG) and the bf16 tile (32 KB), the ring (FP8: 16 KB of values + 128 B of scales a slot;
++    bf16: 32 KB a slot), plus Triton's scratch: 512 B for the two reductions (the layout changes go through the
++    consumed slot) with QKL 1, 2 KB for p's layout change with QKL 0."""
++
++    tile = KT * 512 * 2
++    if fp8:
++        return (tile // 2 if qreg else tile) + tile + stages * (KT * 512 + KT * 4) + (512 if qkl else 2048)
++    return tile + stages * tile + 2048
++
++
++def sparse_latent_v2(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
++                     out: torch.Tensor, scale: float, *, stages: int | None = None, qkl: int | None = None,
++                     qreg: int | None = None) -> None:
++    """``b12x_attn.sparse_latent_one``'s contract and bits: rows with counts > 0 written into ``out`` [R, H, L] fp32
++    (other rows untouched), one pass a row."""
++
++    R, H, L = qa.shape
++    if R == 0:
++        return
++    W = tokens.shape[1]
++    if H != HEADS or L != SCALE_AT:
++        raise ValueError(f"sparse_latent_v2: built for {HEADS} local heads of a 512-wide latent, not {H} x {L}")
++    if not qa.is_contiguous() or not tokens.is_contiguous() or out.shape != (R, H, L) or not out.is_contiguous():
++        raise ValueError("sparse_latent_v2: contiguous qa [R, H, L], tokens [R, W] and out [R, H, L] expected")
++    lcv, lcs, f8, rb, sb = _views(lc, L)
++    st, k, qr = config(f8)
++    st = st if stages is None else int(stages)
++    k = (k if qkl is None else int(qkl)) if f8 else 0
++    qr = (qr if qreg is None else int(qreg)) if f8 and k else 0
++    pg = _paging(lc)
++    _lsparse_v2[(R,)](qa, lcv, lcs, tokens, counts, out, pg["PT"], W, H=H, L=L, KTS=KT, SCALE=scale, FP8=f8, RB=rb,
++                      SB=sb, SA=SCALE_AT // 4, PSH=pg["PSH"], STAGES=st, QKL=k, QREG=qr, num_warps=WARPS)
++
++
++assert ROW8 % 16 == 0 and KT == 32

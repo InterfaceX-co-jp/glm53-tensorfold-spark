@@ -1,0 +1,121 @@
+{
+ "args": {
+  "base": "http://127.0.0.1:8000",
+  "model": "GLM-5.3-Flash-EXL3",
+  "system": 12000,
+  "user": 1500,
+  "sessions": 3,
+  "burst": 4,
+  "tokens": 48,
+  "modes": "sequential,burst,exact",
+  "extra": "{}",
+  "out": "results/W8/prefixB-12k.json"
+ },
+ "sequential": [
+  {
+   "name": "session 1",
+   "prompt_tokens": 20234,
+   "cached_tokens": 0,
+   "ttft_s": 16.84814159400412,
+   "prefill_s": 16.7999,
+   "restored": null,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 2,
+   "queued_s": 0.01,
+   "text": "This document is a collection of 94 numbered lines (Q741556839-0-00000 through Q741556839-0-00093), each containing a sequence of six nature-themed words (such"
+  },
+  {
+   "name": "session 2",
+   "prompt_tokens": 20246,
+   "cached_tokens": 17920,
+   "ttft_s": 2.236411855003098,
+   "prefill_s": 2.2228,
+   "restored": 22,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 0,
+   "queued_s": 0.007,
+   "text": "This document is a collection of 94 numbered lines (Q741556839-1-00000 through Q741556839-1-00093), each containing a sequence of six nature-themed words (such"
+  },
+  {
+   "name": "session 3",
+   "prompt_tokens": 20246,
+   "cached_tokens": 17920,
+   "ttft_s": 2.2233889600029215,
+   "prefill_s": 2.203,
+   "restored": 22,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 0,
+   "queued_s": 0.007,
+   "text": "This document is a numbered list of 94 short lines (Q741556839-2-00000 through Q741556839-2-00093), each consisting of a sequence of six nature-themed words"
+  }
+ ],
+ "burst": {
+  "rows": [
+   {
+    "name": "burst 1",
+    "prompt_tokens": 20258,
+    "cached_tokens": 17920,
+    "ttft_s": 26.97927652200451,
+    "prefill_s": 11.1843,
+    "restored": 28,
+    "restored_disk": null,
+    "prefix_wait": 8,
+    "marks": 0,
+    "queued_s": 15.729,
+    "text": "This document (B741556839-0) is a 94-line sequence of numbered entries, each containing six random words drawn from a fixed vocabulary of nature- and color-themed terms (e.g., harbor, willow"
+   },
+   {
+    "name": "burst 2",
+    "prompt_tokens": 20254,
+    "cached_tokens": 17920,
+    "ttft_s": 23.258389747003093,
+    "prefill_s": 7.4701,
+    "restored": 28,
+    "restored_disk": null,
+    "prefix_wait": 9,
+    "marks": 0,
+    "queued_s": 15.735,
+    "text": "This document (B741556839-1) is a collection of 94 numbered lines, each containing a sequence of six color/nature-themed words (such as cedar, orchid, delta, pepper, ember, quartz"
+   },
+   {
+    "name": "burst 3",
+    "prompt_tokens": 20281,
+    "cached_tokens": 0,
+    "ttft_s": 17.608001428001444,
+    "prefill_s": 17.5305,
+    "restored": null,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 3,
+    "queued_s": 0.023,
+    "text": "This document (B741556839-2) is a collection of 94 numbered lines, each containing a sequence of six color/nature-themed words (such as xenon, juniper, yarrow, kelp,"
+   },
+   {
+    "name": "burst 4",
+    "prompt_tokens": 20248,
+    "cached_tokens": 17920,
+    "ttft_s": 20.980091446996084,
+    "prefill_s": 5.1849,
+    "restored": 28,
+    "restored_disk": null,
+    "prefix_wait": 8,
+    "marks": 0,
+    "queued_s": 15.728,
+    "text": "This document (B741556839-3) is a collection of 94 numbered lines, each containing a sequence of six color/nature-themed words (such as nectar, zephyr, orchid, amber,"
+   }
+  ],
+  "wall_s": 28.239438550997875
+ },
+ "exact": [
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true
+ ]
+}

@@ -1,0 +1,295 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/adapt.py i/src/tensorfold/families/glm5_next/cuda/adapt.py
+new file mode 100644
+index 0000000..8ac3dc3
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/adapt.py
+@@ -0,0 +1,158 @@
++"""patches/0340 (GLM53_TF_BATCH_ADAPT=1, off by default): each slot's drafter in SHARED batched rounds chosen by
++what its drafts are worth to the whole round, with a serial round (no drafter pass, one row) as a third choice.
++
++Why. In a round shared by several sequences (``batch.py``) the weights are read once for everyone; what one slot
++adds is its rows (~6.5 ms each past the verify table, mostly the routed experts a row reads: rows of different
++sequences share few of 288) and its drafter pass (a DFlash2 block per slot, or its share of the batched MTP chain).
++Today each slot's drafter is picked by ``decode.DrafterChoice`` from its tokens per LONE-model ms (a whole verify
++window with its ~30 ms of weight reads, which a shared round pays once), so the two drafters look alike and the
++choice flips (W1/W5 logs: ~half the rounds each for the slow streams), and a slot always drafts. Priced at the
++margin, a slow stream's drafted round (~2.2 tokens for ~2-3 rows plus a drafter pass) and a serial row (1 token for
++~6.5 ms) are worth about the same, while a fast stream's 8-row DFlash2 round is worth far more than anything else.
++
++The rule. The round's aggregate rate lambda (``batchplan.RoundCosts.rate``: committed tokens per model ms of the last
++shared rounds, the rate ``BatchDepth`` already prices rows with) values a drafted round of arm a by its SURPLUS over
++a serial round
++
++    s_a = (keep - 1) - lambda x extra_ms
++
++where ``extra_ms`` is what the round cost beyond a serial row: its rows 2..R at the slot's table past the other
++slots' rows (``RoundCosts.table``, i.e. ``GLM53_TF_BATCH_ROW_MS``) plus its drafter pass (``lookup.round_ms``'s
++drafter terms: MTP steps and catch-up rows, or the DFlash2 block and its taps). Each arm keeps the realized surplus
++of its last ``WINDOW`` shared rounds, re-priced at the current lambda (the rows' ms are stored, not the surplus).
++A slot runs the arm with the highest mean surplus, serial when none is positive; every ``EVERY`` rounds the arm it
++has not run for longest runs once so its evidence stays current (the probe also keeps ``depth.Calibration`` fed).
++Within a drafted round nothing changes: ``BatchDepth`` still picks the depth draft by draft.
++
++Alone (one decoding slot), and for requests without cost-derived depths, the slot's own ``DrafterChoice`` decides
++exactly as before (single-stream decoding is unchanged). Every input is the same on both ranks (committed tokens,
++the load-time cost table, the windows of the round): nothing here reads a clock.
++
++Exactness. The choice only decides which drafts a window carries (none for a serial round); the keyed sampler and
++the accept rule decide every token from the slot's own logit rows, which never depend on their window-mates or on
++the window's length (row-independent kernels, ``forward.py``). So replies stay byte-identical to serial decoding
++and to the request served alone, whatever the choices.
++
++No torch here: the unit tests and ``bench/draftsim.py`` run anywhere.
++"""
++
++from __future__ import annotations
++
++import collections
++import os
++from typing import Sequence
++
++WINDOW = 8                # shared rounds of an arm in its running surplus
++EVERY = 8                 # a drafting arm not run for this many shared rounds runs once (probe)
++SERIAL = "s"
++
++
++def env_on() -> bool:
++    """GLM53_TF_BATCH_ADAPT: 1 = on (both ranks must agree: ``batch.Batcher`` compares it at load)."""
++
++    v = os.environ.get("GLM53_TF_BATCH_ADAPT", "0").strip() or "0"
++    if v not in ("0", "1"):
++        raise ValueError(f"GLM53_TF_BATCH_ADAPT={v!r}: expected 0 or 1")
++    return v == "1"
++
++
++def env_serial() -> bool:
++    """GLM53_TF_BATCH_ADAPT_SERIAL=1: a serial round (no drafts) is a choice too (default 0: see
++    docs/ADAPTIVE-DRAFT.md, it lowers the concurrent bench's aggregate and the slow streams' speed)."""
++
++    return (os.environ.get("GLM53_TF_BATCH_ADAPT_SERIAL", "0").strip() or "0") == "1"
++
++
++def env_every() -> int:
++    return max(0, int(os.environ.get("GLM53_TF_BATCH_ADAPT_EVERY", "") or EVERY))
++
++
++def env_window() -> int:
++    return max(1, int(os.environ.get("GLM53_TF_BATCH_ADAPT_WINDOW", "") or WINDOW))
++
++
++def drafter_ms(costs: dict, arm: str, rows: int, steps: int, backlog: int) -> float:
++    """Model ms of a round's drafter work (``lookup.round_ms`` less its verify window): 0 for serial / lookup."""
++
++    if arm == "m":
++        return (costs.get("mtp", 0.0) + costs.get("mtp_step", 0.0) * max(steps - 1, 0)
++                + costs.get("mtp_row", 0.0) * max(backlog - 1, 0))
++    if arm == "f":
++        return costs.get("block", 0.0) + costs.get("taps_row", 0.0) * backlog
++    return 0.0
++
++
++def extra_ms(costs: dict, table: Sequence[float], arm: str, rows: int, steps: int, backlog: int) -> float:
++    """What a round of ``rows`` rows of ``arm`` costs beyond a serial row: rows 2..R on ``table`` (the slot's window
++    costs past the other slots' rows) plus the drafter's work."""
++
++    table = list(table)
++    r = max(1, min(int(rows), len(table)))
++    return float(table[r - 1] - table[0]) + drafter_ms(costs, arm, rows, steps, backlog)
++
++
++class SlotChoice:
++    """One slot's arm (``"m"``, ``"f"`` or serial ``"s"``) in shared rounds; ``base`` (a ``decode.DrafterChoice``, a
++    ``batch.Always`` or None) decides alone. ``arms``: the drafting arms the request may use ("mf", "m" or "f")."""
++
++    def __init__(self, costs: dict, arms: str, base=None, *, every: int = EVERY, window: int = WINDOW,
++                 serial: bool = True, margin: float = 0.0) -> None:
++        self.costs = costs
++        self.allow_serial = bool(serial)
++        self.margin = float(margin)
++        self.arms = "".join(a for a in "mf" if a in arms)
++        self.base = base
++        self.every, self.window = int(every), max(1, int(window))
++        self.hist = {a: collections.deque(maxlen=self.window) for a in self.arms}   # (keep - 1, extra ms)
++        self.since = {a: 0 for a in self.arms}          # shared rounds since the arm last ran
++        self.serial = self.probes = 0                   # stats: serial rounds, probe rounds
++
++    # -- the choice ----------------------------------------------------------------------------------------------
++    def surplus(self, arm: str, rate: float) -> float | None:
++        """The arm's mean surplus over a serial round at ``rate`` (None: no shared round of it yet)."""
++
++        h = self.hist.get(arm)
++        if not h:
++            return None
++        return sum(g for g, _ in h) / len(h) - rate * sum(ms for _, ms in h) / len(h)
++
++    def pick(self, rate: float | None) -> str:
++        """The next round's arm. ``rate``: the shared rounds' aggregate rate, None when the slot decodes alone (the
++        base choice decides, as without this patch)."""
++
++        if rate is None or not self.arms:
++            return self.base.pick() if self.base is not None else (self.arms[:1] or "m")
++        vals = {a: self.surplus(a, rate) for a in self.arms}
++        unseen = [a for a in self.arms if vals[a] is None]
++        if unseen:                                      # every arm runs once before it can be judged
++            return unseen[0]
++        best, best_v = (SERIAL, -self.margin) if self.allow_serial else (self.arms[0], vals[self.arms[0]])
++        for a in self.arms:
++            if vals[a] > best_v + 1e-12:
++                best, best_v = a, vals[a]
++        if self.every:
++            stale = [a for a in self.arms if a != best and self.since[a] >= self.every]
++            if stale:
++                self.probes += 1
++                return max(stale, key=lambda a: (self.since[a], a == "f"))
++        return best
++
++    def record(self, arm: str, rows: int, steps: int, backlog: int, keep: int, table: Sequence[float] | None,
++               shared: bool) -> None:
++        """After a verified round: ``table`` the window costs the slot's depths were priced with (its row costs
++        past the other slots' rows). Only shared rounds build the surplus; the base choice records drafted rounds
++        as before (its rates stay current for when the slot decodes alone)."""
++
++        if arm in ("m", "f") and self.base is not None:
++            self.base.record(arm, rows, steps, backlog, keep)
++        if not shared:
++            return
++        for a in self.arms:
++            self.since[a] += 1
++        if arm == SERIAL:
++            self.serial += 1
++            return
++        if arm in self.hist:
++            self.since[arm] = 0
++            if table is not None:
++                self.hist[arm].append((keep - 1, extra_ms(self.costs, table, arm, rows, steps, backlog)))
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py i/src/tensorfold/families/glm5_next/cuda/batch.py
+index 4a0e795..41b315e 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ i/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -95,6 +95,12 @@ graph. ``GLM53_TF_BATCH_PAD_TIE`` (auto: on with buckets) makes a padded row rou
+ reads (the ~6 ms a row of a real row); padded rows are never kept, and every real row's bits are unchanged (its own
+ logits; row-independent kernels). The depth model keeps pricing the real rows only.
+ 
++Per-slot drafter choice in shared rounds (patches/0340, off by default): ``GLM53_TF_BATCH_ADAPT=1`` makes each slot of
++a request with cost-derived depths pick its round's drafter (MTP, DFlash2, or none: a one-row serial round with
++``GLM53_TF_BATCH_ADAPT_SERIAL=1``) by the drafts' surplus at the SHARED rounds' rate and marginal row costs
++(``adapt.SlotChoice``) instead of ``decode.DrafterChoice``'s tokens per lone-model ms; ``BatchDepth`` still picks the
++depth. Alone, a slot's own choice decides as before. Drafts only: replies unchanged.
++
+ Kept in step with ``forward.py``: ``compute_multi``'s layer loop, ``_kda`` and ``_dsa`` mirror ``forward.compute``,
+ ``kda_block`` and ``dsa_block`` (and ``latent``'s pieces); a change there must be made here too (the tests compare
+ batched rows with lone ones bit for bit).
+@@ -122,6 +128,7 @@ import torch
+ 
+ from tensorfold.engine.exact_sampling import MARGIN, choose_rows
+ 
++from . import adapt as adapt_mod                                            # patches/0340
+ from . import batchplan, comm as comm_mod, decode_v2 as dv2, glue, kda as kda_mod, kvpool, latent, qmm, sparse
+ from .attention import attention, kv_write
+ from .forward import State, check_room, chunks_for, commit, mlp_block, moe_block, out_proj
+@@ -646,6 +653,12 @@ class Stepper:
+             self.f_policy = policy
+         else:
+             self.m_policy = policy
++        # patches/0340 (GLM53_TF_BATCH_ADAPT): shared rounds' drafter chosen at the round's margin; alone: ``choice``
++        self.adapt = None
++        if getattr(bat, "adapt", False) and self.opt is not None and policy is not None and code[0] != LOOKUP_KIND:
++            arms = "mf" if isinstance(self.choice, DrafterChoice) else getattr(self.choice, "arm", "m")
++            self.adapt = adapt_mod.SlotChoice(costs, arms, self.choice, every=bat.adapt_every,
++                                              window=bat.adapt_window, serial=bat.adapt_serial)
+         self.out = [first]
+         self.m_rows = bat.m_rows[slot]
+         self.m_next: list[int] = []
+@@ -678,7 +691,15 @@ class Stepper:
+             self.arm, self.drafts, self.steps, self.backlog = "s", [], 0, 0
+             return
+         look = self.lookup.plan(out, room) if self.lookup is not None else None
+-        arm = "l" if look else self.choice.pick() if self.choice is not None else "m"
++        if look:
++            arm = "l"
++        elif self.adapt is not None:            # patches/0340: the shared rounds' rate, None alone
++            arm = self.adapt.pick(self.bat.round_costs.rate())
++        else:
++            arm = self.choice.pick() if self.choice is not None else "m"
++        if arm == adapt_mod.SERIAL:             # patches/0340: a serial round (the pending token alone)
++            self.arm, self.drafts, self.steps, self.backlog = arm, [], 0, 0
++            return
+         if arm == "l":
+             backlog, drafts, steps = 0, look, 0
+         elif arm == "m":
+@@ -744,9 +765,12 @@ class Stepper:
+                 self.f_taps[self.n_f:self.n_f + keep].copy_(torch.cat([t[off:off + keep] for t in b.taps], dim=1))
+                 self.n_f += keep
+             arm = self.arm
+-            if self.choice is not None and arm != "l":
++            if self.adapt is not None:          # patches/0340 (records the base choice's drafted rounds too)
++                if arm != "l":
++                    self.adapt.record(arm, R, self.steps, self.backlog, keep, self.opt.verify, shared)
++            elif self.choice is not None and arm != "l":
+                 self.choice.record(arm, R, self.steps, self.backlog, keep)
+-            if self.lookup is not None:
++            if self.lookup is not None and arm != adapt_mod.SERIAL:
+                 self.lookup.record(arm, R, self.steps, self.backlog, keep)
+             if self.opt is not None:
+                 self.opt.record(arm, R, self.steps, self.backlog, keep)
+@@ -796,6 +820,16 @@ class BatchDepth(_depth_optimizer()):
+         shared = self.round_costs.rate() if self.round_costs is not None else None
+         return shared if shared is not None else super().rate()
+ 
++    def record(self, arm: str, rows: int, steps: int, backlog: int, keep: int) -> None:
++        if arm == adapt_mod.SERIAL:             # patches/0340: a serial round, priced as a one-row window
++            from .depth import RATE_WINDOW
++
++            self.used = []
++            self.rounds.append((keep, float(self.costs["verify"][0])))
++            del self.rounds[:-RATE_WINDOW]
++            return
++        super().record(arm, rows, steps, backlog, keep)
++
+ 
+ @dataclass
+ class Seq:
+@@ -822,6 +856,8 @@ class Batcher:
+     last_kind = "alone"
+     buckets = 0                                   # patches/0280 defaults
+     tie = False
++    adapt = False                                 # patches/0340 defaults
++    adapt_every, adapt_window, adapt_serial = adapt_mod.EVERY, adapt_mod.WINDOW, False
+     src_host = src_dev = None
+     kvp = None                                    # patches/0290: the KV page pool (None: every slot owns its caches)
+     pool_check = False
+@@ -852,17 +888,23 @@ class Batcher:
+         self.tie = bool(self.buckets) if tie in ("", "auto") else tie not in ("0", "false", "no", "off")
+         self.batch_mtp = _env_int("GLM53_TF_BATCH_MTP", 0) == 1 and g.w.mtp is not None
+         self.row_ms = float(os.environ.get("GLM53_TF_BATCH_ROW_MS", "") or 0.0)
++        # patches/0340: shared rounds' drafter per slot at the round's margin (adapt.py), off by default
++        self.adapt = adapt_mod.env_on()
++        self.adapt_every, self.adapt_window = adapt_mod.env_every(), adapt_mod.env_window()
++        self.adapt_serial = adapt_mod.env_serial()
+         self.last_rows: list[int] = []                 # the rows each slot had in the last ``_forward`` (padded)
+         both = g._gather_ints([n, int(self.use_graphs), self.graph_rows, self.max_graphs, self.piece,
+                                self.sightings.after, self.pad, self.short, int(self.parity_key),
+-                               int(self.batch_mtp), int(round(self.row_ms * 1000)), self.buckets, int(self.tie)])
++                               int(self.batch_mtp), int(round(self.row_ms * 1000)), self.buckets, int(self.tie),
++                               int(self.adapt), self.adapt_every, self.adapt_window, int(self.adapt_serial)])
+         if both[0] != both[1]:
+             raise RuntimeError(f"the two ranks were started with different batch settings: rank 0 {both[0]}, "
+                                f"rank 1 {both[1]} (GLM53_TF_BATCH, GLM53_TF_BATCH_GRAPHS, GLM53_TF_BATCH_GRAPH_ROWS, "
+                                "GLM53_TF_BATCH_MAX_GRAPHS, GLM53_TF_BATCH_PIECE, GLM53_TF_BATCH_CAPTURE_AFTER, "
+                                "GLM53_TF_BATCH_PAD, GLM53_TF_BATCH_SHORT, GLM53_TF_BATCH_PARITY_KEY, "
+                                "GLM53_TF_BATCH_MTP, GLM53_TF_BATCH_ROW_MS, GLM53_TF_BATCH_BUCKETS, "
+-                               "GLM53_TF_BATCH_PAD_TIE)")
++                               "GLM53_TF_BATCH_PAD_TIE, GLM53_TF_BATCH_ADAPT, GLM53_TF_BATCH_ADAPT_EVERY, "
++                               "GLM53_TF_BATCH_ADAPT_WINDOW, GLM53_TF_BATCH_ADAPT_SERIAL)")
+         # rank 0 only: scheduling (its decisions travel in the round plans)
+         self.fair = batchplan.Fairness(float(os.environ.get("GLM53_TF_BATCH_PREFILL_SHARE", "") or 0.5))
+         # memory kept free: at load, for the slots (prefill transients, lazily captured graphs); at admission, while
+@@ -1835,6 +1877,8 @@ class Batcher:
+                              batched_rounds=st.shared, min_rows=1 + min(st.depths, default=0),
+                              tokens_per_round=round((len(tokens) - 1) / max(st.rounds, 1), 3), sha256=sha,
+                              keeps=st.keeps, drafters="".join(st.arms), round_kinds={k: round(v, 1) for k, v in q.kinds.items()})
++            if getattr(st, "adapt", None) is not None:  # patches/0340
++                job.stats["adapt"] = dict(serial=st.adapt.serial, probes=st.adapt.probes)
+         job.stats.update(cancelled=cancelled)
+         if self.store is not None:                  # patches/0180
+             job.stats["sessions"] = self.store.describe()

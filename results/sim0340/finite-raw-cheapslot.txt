@@ -1,0 +1,11 @@
+signal=info true row=6.5 ms, slot overhead=1.0 ms, 12 seeds, 512 tokens a stream, finite (makespan)
+
+mean over 11 runs (vs base):
+  base                       82.1 tok/s  +0.0%  (runs +0.0% .. +0.0%)
+  base:row=0                 82.0 tok/s  -0.1%  (runs -0.4% .. +0.2%)
+  base:row=8                 82.3 tok/s  +0.3%  (runs -0.4% .. +0.9%)
+  adapt:serial=0             82.9 tok/s  +0.9%  (runs +0.3% .. +1.4%)
+  adapt:serial=0:every=16    83.0 tok/s  +1.0%  (runs +0.0% .. +2.0%)
+  adapt                      78.3 tok/s  -4.7%  (runs -5.7% .. -3.6%)
+  adapt:margin=5             82.6 tok/s  +0.6%  (runs -0.5% .. +1.4%)
+  oracle                     92.7 tok/s  +12.8%  (runs +9.6% .. +15.3%)

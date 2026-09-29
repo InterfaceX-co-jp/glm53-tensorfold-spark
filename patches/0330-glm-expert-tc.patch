@@ -1,0 +1,720 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/exl3_mm.py b/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+index 5dc5da5..8e5ddab 100644
+--- a/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ b/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -56,7 +56,7 @@ def _env(name: str, default: str) -> str:
+ # an expert's members over the same weight tiles; same bits as fat / fast2). FAT stays the per-request switch
+ # (tf_knobs.fat_experts: 1 = the configured fat-family kernels, 0 = fast2); ONCE picks once within it.
+ # GLM53_TF_ONCE_PAIR=0: every unit is two column blocks of one pass (no shared decode; for A/B timing).
+-FAT = _env("GLM53_TF_FAST_EXPERTS", "fast2") in ("fat", "once", "auto")
++FAT = _env("GLM53_TF_FAST_EXPERTS", "fast2") in ("fat", "once", "auto", "tc")
+ ONCE = _env("GLM53_TF_FAST_EXPERTS", "fast2") == "once"
+ # patches/0270: GLM53_TF_FAST_EXPERTS=auto is a fat-family mode that picks the kernels per fast chunk by its row count:
+ # fast2 for FAST2_ROWS lo <= R < hi (GLM53_TF_FAST2_ROWS="lo,hi"), fat (or once, see ONCE) otherwise. fast2 reads the
+@@ -69,14 +69,28 @@ ONCE_PAIR = _env("GLM53_TF_ONCE_PAIR", "1") not in ("0", "false", "no", "off")
+ # once only for windows of at least this many rows (fat below; the same bits either way, so the switch keeps 0085's
+ # row independence): pairs of passes exist only when experts have > 64 members, i.e. from ~2048-4096-row chunks
+ ONCE_MIN_ROWS = int(_env("GLM53_TF_ONCE_MIN_ROWS", "0"))
++# patches/0330: GLM53_TF_FAST_EXPERTS=tc is a fat-family mode: fast chunks' experts through exl3_tc.cu (a warp-specialized
++# persistent kernel: one producer warp feeds 16 consumer warps through mbarrier-guarded stages, items of 2-4 column
++# blocks or 128 members, the epilogue overlapped with the next item's loads; fat's arithmetic, the same bits). It needs
++# gate and up to share their sign vector (true for the GLM-5.3-Flash EXL3 checkpoints; fat runs otherwise).
++# GLM53_TF_TC_CFG="gu,dn": 0 = by the chunk's rows (the default), 1-3 = exl3_tc.cu's configurations (the same bits);
++# GLM53_TF_TC_TICKET (1: dynamic item claiming; 0: static stride); GLM53_TF_TC_CTAS (0: one CTA every SM; N: at most N
++# CTAs, leaving SMs to the overlapped streams of patches/0084).
++TC = _env("GLM53_TF_FAST_EXPERTS", "fast2") == "tc"
++TC_CFG = tuple(int(v) for v in _env("GLM53_TF_TC_CFG", "0,0").split(","))
++TC_TICKET = _env("GLM53_TF_TC_TICKET", "1") not in ("0", "false", "no", "off")
++TC_CTAS = int(_env("GLM53_TF_TC_CTAS", "0"))
++if len(TC_CFG) != 2 or not all(0 <= v <= 3 for v in TC_CFG) or TC_CTAS < 0:
++    raise ValueError(f"GLM53_TF_TC_CFG={os.environ.get('GLM53_TF_TC_CFG')!r} / GLM53_TF_TC_CTAS="
++                     f"{os.environ.get('GLM53_TF_TC_CTAS')!r}: expected gu,dn in 0-3 and a count >= 0")
+ FAT_STAGES = int(_env("GLM53_TF_FAT_STAGES", "3"))
+ FAT_TICKET = _env("GLM53_TF_FAT_TICKET", "1") not in ("0", "false", "no", "off")
+ FAT_SHARED_X = _env("GLM53_TF_FAT_SHARED_X", "auto") not in ("0", "false", "no", "off")
+ if FAT_STAGES not in (3, 4):
+     raise ValueError(f"GLM53_TF_FAT_STAGES={FAT_STAGES}: expected 3 or 4")
+-if _env("GLM53_TF_FAST_EXPERTS", "fast2") not in ("fast2", "v1", "fat", "once", "auto"):
+-    raise ValueError(f"GLM53_TF_FAST_EXPERTS={os.environ.get('GLM53_TF_FAST_EXPERTS')!r}: expected fast2, v1, fat, once "
+-                     "or auto")
++if _env("GLM53_TF_FAST_EXPERTS", "fast2") not in ("fast2", "v1", "fat", "once", "auto", "tc"):
++    raise ValueError(f"GLM53_TF_FAST_EXPERTS={os.environ.get('GLM53_TF_FAST_EXPERTS')!r}: expected fast2, v1, fat, once, "
++                     "auto or tc")
+ if len(FAST2_ROWS) != 2 or not 0 <= FAST2_ROWS[0] <= FAST2_ROWS[1]:
+     raise ValueError(f"GLM53_TF_FAST2_ROWS={os.environ.get('GLM53_TF_FAST2_ROWS')!r}: expected lo,hi with 0 <= lo <= hi")
+ 
+@@ -140,6 +154,28 @@ def _fast_ext():
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
++@lru_cache(maxsize=1)
++def _tc_ext():
++    """patches/0330: the warp-specialized fast-prefill expert kernels (their own extension, built only when used).
++    Built for this GPU's architecture only: mbarrier / cp.async.bulk need sm_90+, and the base image's
++    TORCH_CUDA_ARCH_LIST ("8.0 8.6 9.0 10.0 11.0 12.0+PTX") also compiles compute_80, which ptxas refuses (W8)."""
++
++    from torch.utils.cpp_extension import load
++
++    here = Path(__file__).parent
++    major, minor = torch.cuda.get_device_capability()
++    saved = os.environ.get("TORCH_CUDA_ARCH_LIST")
++    os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
++    try:
++        return load(name="tensorfold_glm_exl3_tc_v1", sources=[str(here / "exl3_tc.cpp"), str(here / "exl3_tc.cu")],
++                    extra_cuda_cflags=["-O3"], verbose=False)
++    finally:
++        if saved is None:
++            os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
++        else:
++            os.environ["TORCH_CUDA_ARCH_LIST"] = saved
++
++
+ @dataclass
+ class Exl3Experts:
+     """One layer's routed experts on this rank: trellis words [E, K/16, N/16, 32] int32 and scales per expert."""
+@@ -205,6 +241,13 @@ def routed(x: torch.Tensor, pick: torch.Tensor, group, ex: Exl3Experts, s: Scrat
+                       ex.svh_u, ex.suh_d, s.xd, D, NI, slots, float(limit))
+             fx.down(s.xd, ex.dt, group.ids, group.count, group.members, ex.svh_d, y, NI, D, slots)
+             return
++        if TC and shx:                       # patches/0330: the same bits (fat's arithmetic, new data movement)
++            tx = _tc_ext()
++            tx.gateup_tc(s.xg, ex.gt, ex.ut, group.ids, group.count, group.members, ex.svh_g, ex.svh_u, ex.suh_d, s.xd,
++                         D, NI, slots, float(limit), TC_CFG[0], TC_TICKET, TC_CTAS)
++            tx.down_tc(s.xd, ex.dt, group.ids, group.count, group.members, ex.svh_d, y, NI, D, slots, TC_CFG[1],
++                       TC_TICKET, TC_CTAS)
++            return
+         if ONCE and group.members.shape[1] >= ONCE_MIN_ROWS:     # patches/0260: the same bits (3 stages)
+             fx.gateup_once(s.xg, s.xg if shx else s.xu, ex.gt, ex.ut, group.ids, group.count, group.members, ex.svh_g,
+                            ex.svh_u, ex.suh_d, s.xd, D, NI, slots, float(limit), shx, FAT_TICKET, ONCE_PAIR)
+diff --git a/src/tensorfold/families/glm5_next/cuda/exl3_tc.cpp b/src/tensorfold/families/glm5_next/cuda/exl3_tc.cpp
+new file mode 100644
+index 0000000..6a6627e
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/exl3_tc.cpp
+@@ -0,0 +1,67 @@
++// patches/0330: bindings of exl3_tc.cu (GLM53_TF_FAST_EXPERTS=tc: the warp-specialized fast-prefill expert kernels).
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void exl3_tc_gateup_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                         const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, double, int64_t, bool, int64_t,
++                         int64_t);
++void exl3_tc_down_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                       const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, bool,
++                       int64_t, int64_t);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
++                ": expected a contiguous CUDA tensor of the right dtype");
++}
++
++// exl3_fast's ``gateup_fat`` contract with the shared input only (XG feeds gate and up); cfg 0 = by rows, 1-3;
++// ticket: dynamic item claiming; ctas: at most this many CTAs (0 = every SM); probe (timing only): 1 no decode, 2 no mma
++void gateup_tc(const at::Tensor& XG, const at::Tensor& TG, const at::Tensor& TU, const at::Tensor& uids,
++               const at::Tensor& ucount, const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
++               const at::Tensor& suh_d, at::Tensor xd, int64_t K, int64_t N, int64_t slots, double limit, int64_t cfg,
++               bool ticket, int64_t ctas, int64_t probe) {
++    check(XG, at::kHalf, "XG");
++    check(TG, at::kInt, "TG");
++    check(TU, at::kInt, "TU");
++    check(uids, at::kInt, "uids");
++    check(ucount, at::kInt, "ucount");
++    check(members, at::kInt, "members");
++    check(svh_g, at::kHalf, "svh_g");
++    check(svh_u, at::kHalf, "svh_u");
++    check(suh_d, at::kHalf, "suh_d");
++    check(xd, at::kHalf, "xd");
++    TORCH_CHECK(XG.size(-1) == K && xd.size(-1) == N, "gateup_tc: X [P, K], Xd [P, N]");
++    TORCH_CHECK(TG.size(1) * 16 == K && TG.size(2) * 16 == N && TG.sizes() == TU.sizes(), "gateup_tc: trellis shapes");
++    TORCH_CHECK(svh_g.size(-1) == N && svh_u.size(-1) == N && suh_d.size(-1) == N, "gateup_tc: scales [E, N]");
++    c10::cuda::CUDAGuard guard(XG.device());
++    exl3_tc_gateup_cuda(XG, TG, TU, uids, ucount, members, svh_g, svh_u, suh_d, xd, K, N, slots, limit, cfg, ticket,
++                        ctas, probe);
++}
++
++void down_tc(const at::Tensor& XD, const at::Tensor& TD, const at::Tensor& uids, const at::Tensor& ucount,
++             const at::Tensor& members, const at::Tensor& svh_d, at::Tensor y, int64_t K, int64_t N, int64_t slots,
++             int64_t cfg, bool ticket, int64_t ctas, int64_t probe) {
++    check(XD, at::kHalf, "XD");
++    check(TD, at::kInt, "TD");
++    check(uids, at::kInt, "uids");
++    check(ucount, at::kInt, "ucount");
++    check(members, at::kInt, "members");
++    check(svh_d, at::kHalf, "svh_d");
++    check(y, at::kFloat, "y");
++    TORCH_CHECK(XD.size(-1) == K && y.size(-1) == N, "down_tc: Xd [P, K], Y [P, N]");
++    TORCH_CHECK(TD.size(1) * 16 == K && TD.size(2) * 16 == N, "down_tc: trellis shape");
++    TORCH_CHECK(svh_d.size(-1) == N, "down_tc: scales [E, N]");
++    c10::cuda::CUDAGuard guard(XD.device());
++    exl3_tc_down_cuda(XD, TD, uids, ucount, members, svh_d, y, K, N, slots, cfg, ticket, ctas, probe);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("gateup_tc", &gateup_tc, py::arg("XG"), py::arg("TG"), py::arg("TU"), py::arg("uids"), py::arg("ucount"),
++          py::arg("members"), py::arg("svh_g"), py::arg("svh_u"), py::arg("suh_d"), py::arg("xd"), py::arg("K"),
++          py::arg("N"), py::arg("slots"), py::arg("limit"), py::arg("cfg") = 0, py::arg("ticket") = true,
++          py::arg("ctas") = 0, py::arg("probe") = 0);
++    m.def("down_tc", &down_tc, py::arg("XD"), py::arg("TD"), py::arg("uids"), py::arg("ucount"), py::arg("members"),
++          py::arg("svh_d"), py::arg("y"), py::arg("K"), py::arg("N"), py::arg("slots"), py::arg("cfg") = 0,
++          py::arg("ticket") = true, py::arg("ctas") = 0, py::arg("probe") = 0);
++}
+diff --git a/src/tensorfold/families/glm5_next/cuda/exl3_tc.cu b/src/tensorfold/families/glm5_next/cuda/exl3_tc.cu
+new file mode 100644
+index 0000000..43c8ff9
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/exl3_tc.cu
+@@ -0,0 +1,553 @@
++// patches/0330 (GLM53_TF_FAST_EXPERTS=tc): the fast-prefill routed experts as a warp-specialized persistent grouped
++// GEMM. Same arithmetic as exl3_fast.cu's fat / fast2 / v1 (BIT FOR BIT, see "Exactness"), new data movement:
++//
++//   * one PRODUCER warp a CTA claims work items (ticket), gathers the item's member rows into a cp.async ring and
++//     copies the item's trellis words with cp.async.bulk; stage completion is an mbarrier (32 cp.async noinc arrivals
++//     + the bulk bytes), stage reuse another mbarrier (one arrival a consumer warp). No __syncthreads in the K loop:
++//     fat's CTA-wide barrier a stage (all warps wait for the slowest, and nothing loads while they wait) is gone;
++//   * the CONSUMER warps run fat's inner loop unchanged: decode their own trellis tiles into the m16n8k16 A fragment,
++//     ldmatrix the swizzled member rows as B, the same chain of mma over ascending k tiles;
++//   * wider items: an item is (distinct expert u, pass of BM = 64 MH members, NBC adjacent 128-column blocks), one CTA
++//     of 16 consumer warps an SM. NBC = 2 (gate/up) / 4 (down) at <= 2,048-row chunks reads each member row half /
++//     a quarter as often as fat (an expert has ~57 members there: one pass); MH = 2 at 4,096+ rows reads each weight
++//     tile once for 128 members instead of 64;
++//   * the epilogue (fat's: fp32 rows through shared memory, one warp a row, the same transforms and formulas) has its
++//     own shared buffer, so the producer loads the next item's first stages while the consumers finish this one;
++//   * item info (rows, expert, count) goes through a 2-deep mbarrier queue, so the producer runs up to a whole item
++//     ahead.
++//
++// sm_121 (GB10) has no wgmma / tcgen05 (ptxas rejects both for sm_121 and sm_121a), so mma.sync m16n8k16 stays the
++// tensor-core instruction; cp.async, cp.async.bulk (+ mbarrier complete_tx), ldmatrix / stmatrix, elect.sync and
++// griddepcontrol assemble for plain sm_121 (setmaxnreg and block-scaled mma only for sm_121a, which torch's extension
++// build does not target). docs/EXPERT-TC.md has the probe table.
++//
++// Exactness: every output element is the chain of m16n8k16 mma of fat (the same decoded A fragment -- decode_tile is a
++// pure function of the word --, the same fp16 B values -- the stage holds the same rows --, ascending k tiles from a
++// zero accumulator, all of K in one warp), then the same fwht_row butterflies and the same epilogue formulas. The
++// helpers below are verbatim copies of exl3_fast.cu's (tests/cuda/test_expert_tc_patches.py compares the text). What
++// changed only moves data: which CTA / warp runs an element, how many members and column blocks an item holds, the
++// item order, the pipeline depth. So tc == fat == fast2 == v1, row-independent (patches/0085: a pair's outputs depend
++// only on its own row; the member count only decides which B columns are zero-filled and which warps idle) and
++// deterministic (no atomics on data; the ticket only decides which CTA runs an item). Snapshots are shared with fat /
++// fast2 / once / auto.
++
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cstdint>
++
++namespace {
++namespace tc {
++
++constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
++constexpr int NB = 8;                                // n tiles a block: 128 columns, one Hadamard block
++constexpr int MTL = 2, NG = 8, WPM = NB / MTL;       // a consumer warp: 2 column tiles x 64 members (fat's tiling)
++constexpr int MAXU = 1024;
++constexpr int IQ = 2;                                // item queue depth
++
++// ---- verbatim from exl3_fast.cu (BEGIN VERBATIM; the test compares these bodies with the originals) ---------------
++__device__ __forceinline__ uint32_t mcg2(uint32_t s0, uint32_t s1) {
++    uint32_t x0 = s0 * 0xCBAC1FEDu;
++    uint32_t x1 = s1 * 0xCBAC1FEDu;
++    x0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    x1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
++    uint32_t lo = __byte_perm(x0, x1, 0x5410);
++    uint32_t hi = __byte_perm(x0, x1, 0x7632);
++    half2 r = __hadd2(*reinterpret_cast<half2*>(&lo), *reinterpret_cast<half2*>(&hi));
++    return *reinterpret_cast<uint32_t*>(&r);
++}
++
++__device__ __forceinline__ void decode_tile(uint32_t w, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
++    uint32_t p = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
++    uint32_t s = __funnelshift_r(w, p, 20);
++    b0[0] = mcg2((s >> 8) & 0xffffu, (s >> 4) & 0xffffu);
++    b0[1] = mcg2(s & 0xffffu, w >> 16);
++    b1[0] = mcg2((w >> 12) & 0xffffu, (w >> 8) & 0xffffu);
++    b1[1] = mcg2((w >> 4) & 0xffffu, w & 0xffffu);
++}
++
++__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++__device__ __forceinline__ void fwht_row(float (&v)[4], int lane) {
++    float a = v[0], b = v[1];
++    v[0] = a + b; v[1] = a - b;
++    a = v[2]; b = v[3];
++    v[2] = a + b; v[3] = a - b;
++    a = v[0]; b = v[2];
++    v[0] = a + b; v[2] = a - b;
++    a = v[1]; b = v[3];
++    v[1] = a + b; v[3] = a - b;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1)
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++}
++
++template <int CPR>
++__device__ __forceinline__ int swz(int r, int c) {
++    static_assert(CPR == 8 || CPR == 4, "rows of 64 or 32 halves");
++    return CPR == 8 ? (c ^ (r & 7)) : (c ^ ((r >> 1) & 3));
++}
++// ---- END VERBATIM ---------------------------------------------------------------------------------------------------
++
++// -- async copies and mbarriers -----------------------------------------------------------------------------------
++__device__ __forceinline__ uint32_t sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
++
++__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool ok) {
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa(smem)), "l"(gmem), "r"(ok ? 16 : 0)
++                 : "memory");
++}
++// this thread's earlier cp.async operations arrive on the barrier when they complete (counted in its expected
++// arrivals: .noinc)
++__device__ __forceinline__ void cp_async_arrive(uint64_t* bar) {
++    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(sa(bar)) : "memory");
++}
++__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::: "memory"); }
++
++__device__ __forceinline__ void bar_init(uint64_t* bar, int count) {
++    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(sa(bar)), "r"(count) : "memory");
++}
++__device__ __forceinline__ void bar_arrive(uint64_t* bar) {
++    asm volatile("{\n .reg .b64 st;\n mbarrier.arrive.shared::cta.b64 st, [%0];\n}\n" ::"r"(sa(bar)) : "memory");
++}
++__device__ __forceinline__ void bar_arrive_tx(uint64_t* bar, uint32_t bytes) {
++    asm volatile("{\n .reg .b64 st;\n mbarrier.arrive.expect_tx.shared::cta.b64 st, [%0], %1;\n}\n"
++                 ::"r"(sa(bar)), "r"(bytes) : "memory");
++}
++// wait until the phase of parity ``parity`` has completed (a fresh barrier: parity 1 passes at once)
++__device__ __forceinline__ void bar_wait(uint64_t* bar, uint32_t parity) {
++    asm volatile(
++        "{\n"
++        " .reg .pred done;\n"
++        "WAIT_%=:\n"
++        " mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1;\n"
++        " @!done bra WAIT_%=;\n"
++        "}\n" ::"r"(sa(bar)),
++        "r"(parity)
++        : "memory");
++}
++// one bulk global -> shared copy (bytes % 16 == 0, both ends 16-byte aligned) completing on ``bar``'s tx count
++__device__ __forceinline__ void bulk_copy(void* smem, const void* gmem, uint32_t bytes, uint64_t* bar) {
++    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
++                 ::"r"(sa(smem)), "l"(gmem), "r"(bytes), "r"(sa(bar)) : "memory");
++}
++// the consumer warps' own barrier (id 1; id 0 is __syncthreads)
++__device__ __forceinline__ void consumers_sync(int threads) {
++    asm volatile("bar.sync 1, %0;\n" ::"r"(threads) : "memory");
++}
++__device__ __forceinline__ void ldsm4(uint32_t (&a)[4], const void* p) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
++                 : "r"(sa(p)));
++}
++
++// plan[0] = passes in all, plan[1 + u] = the first pass of distinct expert u (plan[1 + maxu] = plan[0]),
++// plan[maxu + 2] = the ticket counter (zeroed by the host). fast2::plan_kernel's code.
++__global__ void plan_kernel(const int* __restrict__ uids, const int* __restrict__ ucount,
++                            const int* __restrict__ members, int maxu, int maxm, int E, int BM, int* __restrict__ plan) {
++    __shared__ int sc[MAXU];
++    const int u = threadIdx.x;
++    int items = 0;
++    if (u < maxu && u < ucount[0] && uids[u] < E) {
++        const int* m = members + (size_t)u * maxm;
++        int lo = 0, hi = maxm;                     // members come first: the count is the first -1
++        while (lo < hi) {
++            const int mid = (lo + hi) >> 1;
++            if (m[mid] >= 0) lo = mid + 1; else hi = mid;
++        }
++        items = (lo + BM - 1) / BM;
++    }
++    sc[u] = items;
++    __syncthreads();
++    for (int d = 1; d < MAXU; d <<= 1) {
++        const int v = u >= d ? sc[u - d] : 0;
++        __syncthreads();
++        sc[u] += v;
++        __syncthreads();
++    }
++    if (u < maxu) plan[2 + u] = sc[u];
++    if (u == 0) {
++        plan[1] = 0;
++        plan[0] = sc[maxu - 1];
++    }
++}
++
++// MATS: 2 = gate/up (both matrices multiply one rotated input: tc needs gate and up to share their sign vector),
++// 1 = down. MH: member groups of 64 an item. NBC: 128-column blocks an item. KS: k tiles a stage. NSA: stages.
++// NGR: n8 groups an epilogue round (ER = 8 NGR rows).
++template <int MATS, int MH, int NBC, int KS, int NSA, int NGR>
++struct Cfg {
++    static constexpr int BM = 64 * MH;                              // members an item
++    static constexpr int CW = MATS * WPM * NBC * MH;                // consumer warps
++    static constexpr int THREADS = (CW + 1) * 32;                   // + one producer warp
++    static constexpr int MINB = CW <= 8 ? 2 : 1;                    // CTAs an SM the registers are capped for
++    // registers a thread: the whole file over MINB CTAs, in steps of 8 (__launch_bounds__ would round the 17 warps up
++    // to 20 and cap at 96, spilling the accumulators; __maxnreg__ states the cap directly: 120 at 544 threads)
++    static constexpr int REGS = (65536 / (THREADS * MINB)) / 8 * 8;
++    static constexpr int CPR = KS * 2;                              // 16-byte chunks of a row in a stage
++    static constexpr int LDA = KS * 16;                             // halves a row (swizzled, no padding)
++    static constexpr int A_BYTES = BM * LDA * 2;
++    static constexpr int W_CHUNK = NB * 32 * 4;                     // one k tile of one 128-column block: 1 KB
++    static constexpr int W_CHUNKS = MATS * NBC * KS;
++    static constexpr int W_BYTES = W_CHUNKS * W_CHUNK;
++    static constexpr int STAGE = A_BYTES + W_BYTES;
++    static constexpr int RING = NSA * STAGE;
++    static constexpr int ER = NGR * 8, LDE = 132, ROUNDS = NG / NGR;
++    static constexpr int EPI = MH * MATS * NBC * ER * LDE * 4;
++    static constexpr int SMEM = RING + EPI;                         // dynamic; barriers and the queue are static
++    static_assert(NG % NGR == 0, "rounds");
++    static_assert(A_BYTES % 128 == 0 && STAGE % 128 == 0, "stage alignment");
++    static_assert(W_CHUNKS <= 32, "one bulk copy a producer lane");
++};
++
++// PROBE (timing only; outputs are garbage): 1 = no trellis decode (the raw words are the A fragment), 2 = no mma
++template <int MATS, int MH, int NBC, int KS, int NSA, int NGR, int PROBE>
++__global__ void __maxnreg__((Cfg<MATS, MH, NBC, KS, NSA, NGR>::REGS)) expert_kernel(
++    const half* __restrict__ X, const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
++    const int* __restrict__ uids, const int* __restrict__ members, const int* __restrict__ plan,
++    int* __restrict__ ticket, int K, int N, int maxm, int slots, int maxu, const half* __restrict__ sv0,
++    const half* __restrict__ sv1, const half* __restrict__ sd, half* __restrict__ xd, float* __restrict__ y,
++    float limit) {
++    using C = Cfg<MATS, MH, NBC, KS, NSA, NGR>;
++    constexpr int BM = C::BM, CW = C::CW, LDA = C::LDA, CPR = C::CPR, ER = C::ER, LDE = C::LDE;
++    extern __shared__ __align__(128) unsigned char smem[];
++    float* ep = reinterpret_cast<float*>(smem + C::RING);   // [MH][MATS][NBC][ER][LDE]
++    __shared__ __align__(8) uint64_t full[NSA], empty[NSA], ifull[IQ], iempty[IQ];
++    __shared__ int rows_sh[IQ][BM];
++    __shared__ int info[IQ][4];                             // valid, expert, first column block, members
++
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    // NBI column-block groups a pass; the last one may hold fewer than NBC blocks (absent blocks: no words, idle warps)
++    const int KT = K >> 4, NTILES = N >> 4, S = KT / KS, NBLK = N / 128, NBI = (NBLK + NBC - 1) / NBC;
++    const int total = plan[0] * NBI;
++
++    if (threadIdx.x == 0) {
++        for (int s = 0; s < NSA; ++s) {
++            bar_init(&full[s], 32 + 1);                     // the producer lanes' cp.async + its bulk arrival
++            bar_init(&empty[s], CW);
++        }
++        for (int q = 0; q < IQ; ++q) {
++            bar_init(&ifull[q], 32);
++            bar_init(&iempty[q], CW);
++        }
++        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
++    }
++    __syncthreads();                                        // the last CTA-wide barrier
++
++    if (warp == CW) {
++        // ------------------------------------------------ producer ------------------------------------------------
++        int u = 0;
++        int next = blockIdx.x;
++        uint32_t g = 0;                                     // stages issued by this CTA
++        for (int j = 0;; ++j) {
++            const int q = j % IQ;
++            bar_wait(&iempty[q], ((j / IQ) & 1) ^ 1);        // the consumers are done with item j - IQ
++            int it = next;
++            if (ticket) {
++                if (lane == 0) it = atomicAdd(ticket, 1);
++                it = __shfl_sync(0xffffffffu, it, 0);
++            }
++            next += gridDim.x;
++            if (it >= total) {
++                info[q][0] = 0;
++                bar_arrive(&ifull[q]);                      // every lane (count 32)
++                break;
++            }
++            const int tt = it / NBI, nbi = it % NBI;
++            while (u + 1 < maxu && __ldg(plan + 2 + u) <= tt) ++u;     // items ascend per CTA: walk u forward
++            const int pass = tt - plan[1 + u], e = uids[u];
++            const int nbn = min(NBC, NBLK - nbi * NBC);        // blocks present in this group
++            int cnt = 0;
++#pragma unroll 1
++            for (int i = lane; i < BM; i += 32) {
++                const int m = pass * BM + i;
++                const int code = m < maxm ? members[(size_t)u * maxm + m] : -1;
++                rows_sh[q][i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
++                cnt += __popc(__ballot_sync(0xffffffffu, code >= 0));   // members come first
++            }
++            if (lane == 0) {
++                info[q][0] = 1;
++                info[q][1] = e;
++                info[q][2] = nbi * NBC;
++                info[q][3] = cnt;
++            }
++            __syncwarp();
++            bar_arrive(&ifull[q]);
++            const uint32_t* w0 = T0 + (size_t)e * KT * NTILES * 32;
++            const uint32_t* w1 = (MATS == 2 ? T1 : T0) + (size_t)e * KT * NTILES * 32;
++#pragma unroll 1
++            for (int s = 0; s < S; ++s, ++g) {
++                const int slot = g % NSA;
++                bar_wait(&empty[slot], ((g / NSA) & 1) ^ 1);
++                unsigned char* st = smem + (size_t)slot * C::STAGE;
++                half* ra = reinterpret_cast<half*>(st);
++                const int k0 = s * KS * 16;
++#pragma unroll 4
++                for (int i = lane; i < BM * CPR; i += 32) {
++                    const int r = i / CPR, c = i % CPR;
++                    const int row = rows_sh[q][r];
++                    const half* src = X + (size_t)(row < 0 ? 0 : row) * K + k0 + c * 8;
++                    cp_async16(ra + r * LDA + swz<CPR>(r, c) * 8, src, row >= 0);   // zero past the last member
++                }
++                if (lane == 0) bar_arrive_tx(&full[slot], (uint32_t)(MATS * nbn * KS * C::W_CHUNK));
++                __syncwarp();
++                if (lane < C::W_CHUNKS && (lane / KS) % NBC < nbn) {
++                    // chunk (m, b, kk): k tile s KS + kk of column tiles (nb0 + b) NB .. + NB - 1 of matrix m, 1 KB
++                    const int kk = lane % KS, b = (lane / KS) % NBC, m = lane / (KS * NBC);
++                    const uint32_t* src = (m ? w1 : w0) + ((size_t)(s * KS + kk) * NTILES + (nbi * NBC + b) * NB) * 32;
++                    uint32_t* dst = reinterpret_cast<uint32_t*>(st + C::A_BYTES) + ((m * NBC + b) * KS + kk) * NB * 32;
++                    bulk_copy(dst, src, C::W_CHUNK, &full[slot]);
++                }
++                cp_async_arrive(&full[slot]);
++            }
++        }
++        cp_async_wait_all();
++        return;
++    }
++
++    // ------------------------------------------------ consumers -----------------------------------------------------
++    // warp = ((mh MATS + mat) NBC + b) WPM + slice: columns slice 16 MTL .. + 16 MTL of block nb0 + b of matrix mat,
++    // members mh 64 .. + 64 of the item
++    const int slice = warp % WPM, b = (warp / WPM) % NBC, mat = (warp / (WPM * NBC)) % MATS;
++    const int mh = warp / (WPM * NBC * MATS);
++    const int g8 = lane >> 2, t4 = lane & 3;
++    const int lr = (lane & 7) + ((lane >> 4) << 3);         // ldmatrix: this lane's row in a 16-row pair of n groups
++    const int lc = (lane >> 3) & 1;
++    uint32_t g = 0;
++    for (int j = 0;; ++j) {
++        const int q = j % IQ;
++        bar_wait(&ifull[q], (j / IQ) & 1);
++        if (!info[q][0]) break;
++        const int e = info[q][1], nb0 = info[q][2], cnt = info[q][3];
++        // members of this warp's group (<= 0: idle, as is a warp of an absent column block)
++        const int cw = nb0 + b < NBLK ? cnt - mh * 64 : 0;
++
++        float acc[MTL][NG][4];
++#pragma unroll
++        for (int l = 0; l < MTL; ++l)
++#pragma unroll
++            for (int n = 0; n < NG; ++n)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[l][n][c] = 0.f;
++
++#pragma unroll 1
++        for (int s = 0; s < S; ++s, ++g) {
++            const int slot = g % NSA;
++            bar_wait(&full[slot], (g / NSA) & 1);
++            const unsigned char* st = smem + (size_t)slot * C::STAGE;
++            const half* A = reinterpret_cast<const half*>(st) + (size_t)mh * 64 * LDA;
++            const uint32_t* Wd = reinterpret_cast<const uint32_t*>(st + C::A_BYTES) +
++                                 (size_t)(mat * NBC + b) * KS * NB * 32 + slice * MTL * 32 + lane;
++            if (cw > 0) {                                   // warp-uniform
++#pragma unroll
++                for (int kk = 0; kk < KS; ++kk) {
++                    uint32_t af[MTL][4];
++#pragma unroll
++                    for (int l = 0; l < MTL; ++l) {
++                        const uint32_t wv = Wd[(kk * NB + l) * 32];
++                        if constexpr (PROBE == 1) {
++                            af[l][0] = wv; af[l][1] = wv ^ 1u; af[l][2] = wv ^ 2u; af[l][3] = wv ^ 3u;
++                        } else {
++                            uint32_t b0[2], b1[2];
++                            decode_tile(wv, lane, b0, b1);
++                            af[l][0] = b0[0]; af[l][1] = b1[0]; af[l][2] = b0[1]; af[l][3] = b1[1];
++                        }
++                    }
++                    const int chunk = swz<CPR>(lr, kk * 2 + lc);
++#pragma unroll
++                    for (int np = 0; np < NG / 2; ++np) {
++                        if (16 * np < cw) {                 // warp-uniform
++                            uint32_t bb[4];
++                            ldsm4(bb, A + (16 * np + lr) * LDA + chunk * 8);
++                            if constexpr (PROBE == 2) {
++#pragma unroll
++                                for (int l = 0; l < MTL; ++l)
++#pragma unroll
++                                    for (int c = 0; c < 4; ++c)
++                                        acc[l][2 * np][c] += __uint_as_float(af[l][c] ^ bb[c]);
++                            } else {
++#pragma unroll
++                                for (int l = 0; l < MTL; ++l) {
++                                    mma16816(acc[l][2 * np], af[l], bb[0], bb[1]);
++                                    mma16816(acc[l][2 * np + 1], af[l], bb[2], bb[3]);
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++            __syncwarp();
++            if (lane == 0) bar_arrive(&empty[slot]);        // this warp no longer reads the stage
++        }
++
++        // epilogue: fat's (ER rows a round: accumulators -> ep fp32, then one warp a row), over MH groups and NBC blocks
++#pragma unroll
++        for (int rd = 0; rd < C::ROUNDS; ++rd) {             // unrolled: acc[.][ng] must stay in registers
++            consumers_sync(CW * 32);                        // the previous round / item is done reading ep
++            if (ER * rd < cw) {
++#pragma unroll
++                for (int n = 0; n < NGR; ++n) {
++                    const int ng = rd * NGR + n;
++                    float* E = ep + ((size_t)((mh * MATS + mat) * NBC + b) * ER + 8 * n + 2 * t4) * LDE +
++                               slice * 16 * MTL + g8;
++#pragma unroll
++                    for (int l = 0; l < MTL; ++l) {
++                        E[l * 16] = acc[l][ng][0];
++                        E[LDE + l * 16] = acc[l][ng][1];
++                        E[l * 16 + 8] = acc[l][ng][2];
++                        E[LDE + l * 16 + 8] = acc[l][ng][3];
++                    }
++                }
++            }
++            consumers_sync(CW * 32);
++#pragma unroll 1
++            for (int task = warp; task < MH * NBC * ER; task += CW) {
++                const int th = task / (NBC * ER), tb = (task / ER) % NBC, r = task % ER;
++                if (ER * rd + r >= cnt - th * 64 || nb0 + tb >= NBLK) continue;
++                const int row = rows_sh[q][th * 64 + ER * rd + r];
++                const int nb = nb0 + tb;
++                const int c0 = 4 * lane;
++                const float* E0 = ep + ((size_t)((th * MATS + 0) * NBC + tb) * ER + r) * LDE + c0;
++                float v[4];
++                *reinterpret_cast<float4*>(v) = *reinterpret_cast<const float4*>(E0);
++                fwht_row(v, lane);
++                if constexpr (MATS == 2) {
++                    const float* E1 = ep + ((size_t)((th * MATS + 1) * NBC + tb) * ER + r) * LDE + c0;
++                    float w[4];
++                    *reinterpret_cast<float4*>(w) = *reinterpret_cast<const float4*>(E1);
++                    fwht_row(w, lane);
++                    const half* sg = sv0 + (size_t)e * N + nb * 128 + c0;
++                    const half* su = sv1 + (size_t)e * N + nb * 128 + c0;
++                    const half* sdd = sd + (size_t)e * N + nb * 128 + c0;
++#pragma unroll
++                    for (int jj = 0; jj < 4; ++jj) {
++                        const float gg = fminf(bf16r(v[jj] * HAD_SCALE * __half2float(sg[jj])), limit);
++                        const float uu2 = fminf(fmaxf(bf16r(w[jj] * HAD_SCALE * __half2float(su[jj])), -limit), limit);
++                        const float a = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu2);
++                        v[jj] = a * __half2float(sdd[jj]);
++                    }
++                    fwht_row(v, lane);
++                    half2* o = reinterpret_cast<half2*>(xd + (size_t)row * N + nb * 128 + c0);
++                    o[0] = __halves2half2(__float2half_rn(v[0] * HAD_SCALE), __float2half_rn(v[1] * HAD_SCALE));
++                    o[1] = __halves2half2(__float2half_rn(v[2] * HAD_SCALE), __float2half_rn(v[3] * HAD_SCALE));
++                } else {
++                    const half* sv = sv0 + (size_t)e * N + nb * 128 + c0;
++                    float4 o;
++                    o.x = v[0] * HAD_SCALE * __half2float(sv[0]);
++                    o.y = v[1] * HAD_SCALE * __half2float(sv[1]);
++                    o.z = v[2] * HAD_SCALE * __half2float(sv[2]);
++                    o.w = v[3] * HAD_SCALE * __half2float(sv[3]);
++                    *reinterpret_cast<float4*>(y + (size_t)row * N + nb * 128 + c0) = o;
++                }
++            }
++        }
++        __syncwarp();
++        if (lane == 0) bar_arrive(&iempty[q]);              // rows_sh / info of slot q are free
++    }
++}
++
++template <int MATS, int MH, int NBC, int KS, int NSA, int NGR, int PROBE>
++void launch(const at::Tensor& X, const at::Tensor& T0, const at::Tensor& T1, const at::Tensor& uids,
++            const at::Tensor& ucount, const at::Tensor& members, const half* sv0, const half* sv1, const half* sd,
++            half* xd, float* y, int K, int N, int slots, float limit, bool ticket, int ctas) {
++    using C = Cfg<MATS, MH, NBC, KS, NSA, NGR>;
++    auto kern = expert_kernel<MATS, MH, NBC, KS, NSA, NGR, PROBE>;
++    static int per_sm = 0;
++    if (per_sm == 0) {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
++        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kern, C::THREADS, C::SMEM));
++        TORCH_CHECK(per_sm > 0, "tc experts: the configuration does not fit an SM");
++    }
++    const int maxu = (int)uids.size(0), maxm = (int)members.size(1);
++    TORCH_CHECK(maxu <= MAXU, "tc experts: too many distinct experts");
++    TORCH_CHECK((K / 16) % KS == 0 && N % 128 == 0, "tc experts: K % (16 KS), N % 128");
++    auto stream = at::cuda::getCurrentCUDAStream();
++    at::Tensor plan = at::zeros({maxu + 3}, uids.options());
++    plan_kernel<<<1, MAXU, 0, stream>>>(uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), maxu,
++                                        maxm, (int)T0.size(0), C::BM, plan.data_ptr<int>());
++    const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++    int grid = sms * per_sm;
++    if (ctas > 0 && ctas < grid) grid = ctas;
++    kern<<<grid, C::THREADS, C::SMEM, stream>>>(
++        reinterpret_cast<const half*>(X.data_ptr()), reinterpret_cast<const uint32_t*>(T0.data_ptr()),
++        reinterpret_cast<const uint32_t*>(T1.data_ptr()), uids.data_ptr<int>(), members.data_ptr<int>(),
++        plan.data_ptr<int>(), ticket ? plan.data_ptr<int>() + maxu + 2 : nullptr, K, N, maxm, slots, maxu, sv0, sv1,
++        sd, xd, y, limit);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// (MH, NBC, KS, NSA, NGR) a configuration; every one has 16 consumer warps (one CTA an SM, 544 threads) and gives the
++// same bits, so the choice is free (by the chunk's rows: ``cfg`` 0).
++//   gate/up  1: 64 members x 2 blocks (<= 2,048-row chunks)   2: 128 members x 1 block (4,096+)
++//   down     1: 64 members x 4 blocks                          2: 128 members x 2 blocks
++//   3 (both): 8 consumer warps, 64 members x 1 block, 2 k tiles x 4 stages: fat's tile, two CTAs an SM (A/B)
++#define TC_GU1 1, 2, 4, 3, 1
++#define TC_GU2 2, 1, 4, 3, 1
++#define TC_GU3 1, 1, 2, 4, 1
++#define TC_DN1 1, 4, 4, 3, 1
++#define TC_DN2 2, 2, 4, 3, 1
++#define TC_DN3 1, 2, 2, 4, 1
++
++}  // namespace tc
++}  // namespace
++
++// cfg 0 = by the chunk's rows (members.size(1) = the window's rows: 1 below 4,096, 2 from there), 1-3 explicit;
++// ticket: dynamic item claiming (0: static stride); ctas: at most this many CTAs (0: every SM); probe: timing only.
++void exl3_tc_gateup_cuda(const at::Tensor& XG, const at::Tensor& TG, const at::Tensor& TU, const at::Tensor& uids,
++                         const at::Tensor& ucount, const at::Tensor& members, const at::Tensor& svh_g,
++                         const at::Tensor& svh_u, const at::Tensor& suh_d, at::Tensor& xd, int64_t K, int64_t N,
++                         int64_t slots, double limit, int64_t cfg, bool ticket, int64_t ctas, int64_t probe) {
++    TORCH_CHECK(N % 128 == 0 && K % 64 == 0, "tc gate/up: N % 128, K % 64");
++    TORCH_CHECK(cfg >= 0 && cfg <= 3 && probe >= 0 && probe <= 2, "tc gate/up: cfg 0-3, probe 0-2");
++    const half* sg = reinterpret_cast<const half*>(svh_g.data_ptr());
++    const half* su = reinterpret_cast<const half*>(svh_u.data_ptr());
++    const half* sd = reinterpret_cast<const half*>(suh_d.data_ptr());
++    half* o = reinterpret_cast<half*>(xd.data_ptr());
++    if (cfg == 0) cfg = members.size(1) >= 4096 ? 2 : 1;
++#define TC_GU(PROBE, ...)                                                                                           \
++    tc::launch<2, __VA_ARGS__, PROBE>(XG, TG, TU, uids, ucount, members, sg, su, sd, o, nullptr, (int)K, (int)N, (int)slots, \
++                              (float)limit, ticket, (int)ctas)
++#define TC_GU_P(...)                                                                                                \
++    do {                                                                                                            \
++        if (probe == 1) TC_GU(1, __VA_ARGS__); else if (probe == 2) TC_GU(2, __VA_ARGS__); else TC_GU(0, __VA_ARGS__);                     \
++    } while (0)
++    if (cfg == 1) TC_GU_P(TC_GU1);
++    else if (cfg == 2) TC_GU_P(TC_GU2);
++    else TC_GU_P(TC_GU3);
++#undef TC_GU_P
++#undef TC_GU
++}
++
++void exl3_tc_down_cuda(const at::Tensor& XD, const at::Tensor& TD, const at::Tensor& uids, const at::Tensor& ucount,
++                       const at::Tensor& members, const at::Tensor& svh_d, at::Tensor& y, int64_t K, int64_t N,
++                       int64_t slots, int64_t cfg, bool ticket, int64_t ctas, int64_t probe) {
++    TORCH_CHECK(N % 128 == 0 && K % 64 == 0, "tc down: N % 128, K % 64");
++    TORCH_CHECK(cfg >= 0 && cfg <= 3 && probe >= 0 && probe <= 2, "tc down: cfg 0-3, probe 0-2");
++    const half* sv = reinterpret_cast<const half*>(svh_d.data_ptr());
++    float* out = y.data_ptr<float>();
++    if (cfg == 0) cfg = members.size(1) >= 4096 ? 2 : 1;
++#define TC_DN(PROBE, ...)                                                                                           \
++    tc::launch<1, __VA_ARGS__, PROBE>(XD, TD, TD, uids, ucount, members, sv, sv, sv, nullptr, out, (int)K, (int)N,         \
++                              (int)slots, 0.f, ticket, (int)ctas)
++#define TC_DN_P(...)                                                                                                \
++    do {                                                                                                            \
++        if (probe == 1) TC_DN(1, __VA_ARGS__); else if (probe == 2) TC_DN(2, __VA_ARGS__); else TC_DN(0, __VA_ARGS__);                     \
++    } while (0)
++    if (cfg == 1) TC_DN_P(TC_DN1);
++    else if (cfg == 2) TC_DN_P(TC_DN2);
++    else TC_DN_P(TC_DN3);
++#undef TC_DN_P
++#undef TC_DN
++}

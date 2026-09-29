@@ -1,0 +1,16 @@
+19:23:30 prefix-1 rc=0 16s :: 31 passed in 13.37s
+19:23:46 prefix-2 rc=0 16s :: 31 passed in 12.64s
+19:24:02 prefix-3 rc=0 16s :: 31 passed in 12.72s
+19:24:18 prefix-4 rc=0 16s :: 31 passed in 12.77s
+19:24:34 prefix-5 rc=0 16s :: 31 passed in 12.80s
+19:24:49 prefix-6 rc=0 15s :: 31 passed in 12.61s
+prefix: 0 of 6 runs failed
+19:25:01 b12x-attn rc=0 12s :: 23 passed in 8.78s
+19:25:08 b12x-0240 rc=1 7s :: 1 failed, 5 passed, 47 deselected in 3.98s
+19:25:15 bench-b12x rc=0 7s :: 
+worker tests done 19:25:15
+19:27:09 prefix-cold-1 rc=0 46s :: 31 passed in 42.81s
+19:27:55 prefix-cold-2 rc=0 46s :: 31 passed in 42.98s
+19:28:41 prefix-cold-3 rc=0 46s :: 31 passed in 42.67s
+19:35:35 prefix-memcheck rc=137 414s :: 
+cold done 19:35:35

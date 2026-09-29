@@ -1,0 +1,8 @@
+00:49:17 start head
+00:49:45 mla-bits rc=0 28s :: 50 passed in 24.94s
+00:49:53 mla-bench rc=0 8s :: 
+00:50:01 sparse-bits rc=0 8s :: 30 passed, 3 skipped in 4.81s
+00:51:27 mla-latent-v2 rc=0 86s :: 20 passed in 82.95s (0:01:22)
+00:51:32 mla-kvfp8-v2 rc=1 5s :: 2 failed, 47 deselected in 2.29s
+00:51:37 mla-kvfp8-v1 rc=1 5s :: 2 failed, 24 deselected in 2.26s
+00:51:37 head r2 done

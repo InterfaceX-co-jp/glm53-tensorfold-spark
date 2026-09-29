@@ -45,10 +45,10 @@ index c39625f..03f1a09 100644
                      profile.lap("other")
                      profile.P.prefix = ""
 diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
-index e08374d..d6962c2 100644
+index e08374d..0f2c299 100644
 --- i/src/tensorfold/families/glm5_next/cuda/engine.py
 +++ w/src/tensorfold/families/glm5_next/cuda/engine.py
-@@ -345,6 +345,28 @@ class GlmEngine:
+@@ -345,6 +345,32 @@ class GlmEngine:
          self.online = (calib.OnlineCosts(self.costs["verify"]) if calib.online() and rank == 0 and n == 1
                         else None)
          self.calib_on = calib.online()      # patches/0090: the default of ``tf_knobs.calib_online``
@@ -64,8 +64,12 @@ index e08374d..d6962c2 100644
 +        latent.BF16_TC = pfglue.latent_tc_default()
 +        tc_both = self._gather_ints(pfglue.load_settings())
 +        if tc_both[0] != tc_both[1]:
-+            raise RuntimeError(f"the two ranks were started with different GLM53_TF_LATENT_TC: {tc_both[0]}, "
-+                               f"{tc_both[1]}")
++            raise RuntimeError(f"the two ranks were started with different GLM53_TF_LATENT_TC / "
++                               f"GLM53_TF_MTP_PREFILL_CACHE: {tc_both[0]}, {tc_both[1]}")
++        pfglue.MTP_CACHE = pfglue.mtp_cache_default()   # prefill's MTP rows: cache writes only (same bits)
++        if rank == 0 and pfglue.MTP_CACHE:
++            print("[tensorfold] MTP prefill rows: head cache writes only (patches/0190, GLM53_TF_MTP_PREFILL_CACHE=1)"
++                  + ("" if latent.on(w) else "; inactive: GLM53_TF_LATENT_KV=0"), flush=True)
 +        if rank == 0 and latent.BF16_TC:
 +            print("[tensorfold] latent absorb / expand on bf16 tensor cores in fast chunks (patches/0190, "
 +                  "GLM53_TF_LATENT_TC=1: new arithmetic, own snapshot tag)"
@@ -77,7 +81,7 @@ index e08374d..d6962c2 100644
          if n > 1:                           # patches/0120: per-request knobs, fast / lean prefill and every drafter
              from .batch import Batcher
  
-@@ -414,7 +436,7 @@ class GlmEngine:
+@@ -414,7 +440,7 @@ class GlmEngine:
      def _knob_state(self) -> dict[str, int]:
          """This rank's current value of every knob in the header (the load-time defaults between requests)."""
  
@@ -86,7 +90,7 @@ index e08374d..d6962c2 100644
  
          return {"expert_loop": int(bool(exl3_mm.LOOP)), "prefill_rows": int(self.e.prefill_rows),
                  "longctx_graphs": int(bool(self.e.longctx)), "profile": int(bool(profile.ON)),
-@@ -422,7 +444,11 @@ class GlmEngine:
+@@ -422,7 +448,11 @@ class GlmEngine:
                  "fast_prefill": int(bool(self.e.fast_prefill)),          # patches/0091
                  "fp8_prefill": int(bool(getattr(self.e, "fp8_prefill", False))),     # patches/0092
                  "prefill_overlap": int(pfoverlap.on()),                  # patches/0093
@@ -99,7 +103,7 @@ index e08374d..d6962c2 100644
  
      def _set_knobs(self, values: dict[str, int]) -> None:
          """Set the knobs whose value differs from the current one (the others are left exactly as they are)."""
-@@ -460,6 +486,22 @@ class GlmEngine:
+@@ -460,6 +490,22 @@ class GlmEngine:
              pfoverlap.set_request(bool(changed["prefill_overlap"]))
          if "fat_experts" in changed:            # patches/0170: the same bits either way (fat == fast2)
              exl3_mm.FAT = bool(changed["fat_experts"])
@@ -122,7 +126,7 @@ index e08374d..d6962c2 100644
  
      def _knobs(self, values: dict[str, int]):
          """Context: the request's knobs on this rank, then this rank's previous values again (also on errors)."""
-@@ -700,7 +742,10 @@ class GlmEngine:
+@@ -700,7 +746,10 @@ class GlmEngine:
  
          fast = self.e.fast_prefill if fast is None else fast
          fp8 = bool(getattr(self.e, "fp8_prefill", False)) if fp8 is None else fp8
@@ -689,10 +693,10 @@ index fdf1431..11f48fc 100644
          profile.lap("moe.combine")
 diff --git i/src/tensorfold/families/glm5_next/cuda/pfglue.py w/src/tensorfold/families/glm5_next/cuda/pfglue.py
 new file mode 100644
-index 0000000..811666d
+index 0000000..3ff754f
 --- /dev/null
 +++ w/src/tensorfold/families/glm5_next/cuda/pfglue.py
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,314 @@
 +"""Prefill "glue" for GLM-5.3-Flash on CUDA (patches/0190): the small ops between the big matmuls that a fast 8,192-row
 +chunk now spends most of its non-expert time in, each behind its own knob (per request through patches/0090's
 +header, so one load can A/B them).
@@ -868,8 +872,11 @@ index 0000000..811666d
 +def absorb(e, hidden, next_tokens: Sequence[int], p0: int, lo: int, absorb_fn):
 +    """``decode.absorb`` of rows at positions p0, p0 + 1, ... (hidden [k, D], the tokens after them), with the rows
 +    below ``lo`` skipped: their head caches zeroed and ``mtp_len`` advanced past them. ``absorb_fn``: decode.absorb.
-+    Returns the last absorbed row's logits (None when every row was skipped; prefill does not read them)."""
++    Returns the last absorbed row's logits (None when every row was skipped; prefill does not read them).
++    With ``MTP_CACHE`` (GLM53_TF_MTP_PREFILL_CACHE=1) the rows only write the head's caches (``cache_absorb``)."""
 +
++    if MTP_CACHE and cache_ok(e):
++        absorb_fn = cache_absorb
 +    k = len(next_tokens)
 +    skip = min(max(lo - p0, 0), k)
 +    if skip == 0:
@@ -886,6 +893,95 @@ index 0000000..811666d
 +    if skip == k:
 +        return None
 +    return absorb_fn(e, hidden[skip:], list(next_tokens[skip:]))
++
++
++# -- MTP prefill cache rows (GLM53_TF_MTP_PREFILL_CACHE, load-time) ----------------------------------------------
++#
++# A prefill absorbs every prompt position into the MTP head only for the head's caches: a row's cache entries (its
++# latent row, its indexer key and gate, the pools it completes) are functions of the row's own input (the main
++# model's hidden row and the next token) through row-local kernels, and prefill never reads the head's logits or
++# output rows (the pending last row is absorbed with its kept token in decode, by ``decode.draft``). So the head's
++# queries, index selection, sparse attention, o_proj, MoE (and their all-gathers) and final norm / lm_head over the
++# prompt were thrown away: ~90 ms a 2,048-row piece at 16k (5% of it), measured 2026-09-28 (results/W1). With this
++# switch prefill runs exactly the calls that produce the cache entries (the same functions on the same rows: the
++# same bits), and nothing after them. Decode, verify and drafting keep ``mtp.mtp_compute``. Both ranks must agree
++# (they would otherwise run different collectives): checked at load with ``load_settings``. Latent KV only (the
++# expanded cache keeps the full head); ``mtp_window`` still applies (rows below its start are zeroed, not written).
++
++CACHE_ENV = "GLM53_TF_MTP_PREFILL_CACHE"
++
++
++def mtp_cache_default() -> bool:
++    return bool(_int_env(CACHE_ENV, 0))
++
++
++MTP_CACHE = mtp_cache_default()
++
++
++def cache_ok(e) -> bool:
++    """Prefill's MTP rows can go through ``cache_absorb`` on this engine (latent KV, an MTP head, latent buffers)."""
++
++    w = getattr(e, "w", None)
++    if w is None or getattr(w, "mtp", None) is None or getattr(e, "mbuf", None) is None:
++        return False
++    meta = getattr(w, "meta", None)
++    return bool(meta.get("latent_kv")) if isinstance(meta, dict) else False
++
++
++def cache_absorb(e, hidden, next_tokens: Sequence[int]):
++    """``decode.absorb`` for prefill: the rows' head cache entries only, in chunks of the head's buffers, ``mtp_len``
++    advanced as ``absorb`` does. Returns None (prefill does not read the head's logits)."""
++
++    st = e.st
++    if st.mtp_drafted:                           # as decode.absorb: drafted rows are not kept
++        st.set_mtp_len(st.mtp_len - st.mtp_drafted)
++        st.mtp_drafted = 0
++    step = e.mbuf.rows
++    for s0 in range(0, len(next_tokens), step):
++        part = list(next_tokens[s0:s0 + step])
++        mtp_cache_rows(e.w, st, e.mbuf, part, hidden[s0:s0 + step])
++        st.set_mtp_len(st.mtp_len + len(part))
++    return None
++
++
++def mtp_cache_rows(w, st, b, next_tokens: Sequence[int], hidden) -> None:
++    """``mtp.mtp_compute``'s calls up to the head's cache writes (latent row, indexer key / gate, pools), on the
++    same buffers and rows, and nothing after them: the cache entries have the full head's bits."""
++
++    from . import glue, latent, profile, qmm, sparse
++    from .forward import _join
++    from .mtp import mtp_stage
++
++    n = mtp_stage(w, st, b, next_tokens, hidden)
++    c = w.cfg
++    m = w.mtp
++    D = c.hidden
++    glue.embed(b.ids[:n], w.embed, D, 1, b.me[:n])
++    if b.zero_first:
++        b.me[0].zero_()
++    glue.rmsnorm(b.me[:n], m.enorm, c.eps, b.mcat[:n, :D])
++    glue.rmsnorm(b.hin[:n], m.hnorm, c.eps, b.mcat[:n, D:])
++    qmm.matmul(b.mcat[:n], m.eh, qmm.group_sums(b.mcat[:n], b.mxs[:n]), out=b.mx[:n], part=b.sk)
++    layer = m.layer
++    glue.rmsnorm(b.mx[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
++    if profile.ON:
++        profile.lap("misc")
++    a = layer.dsa
++    # latent._project's first matmul and the kv norm (the q half is not needed), then _attend's cache write
++    qmm.matmul(b.normed[:n], a.proj, b.xs[:n], out=b.dp[:n], part=b.sk)
++    glue.rmsnorm(b.dp[:n, c.q_lora:], a.kv_norm, c.eps, b.lat[:n], b.xs_lat[:n])
++    latent.latent_write(b.lat[:n], st.mtp_kc, st.mtp_pos_dev)
++    if profile.ON:
++        profile.lap("dsa.proj")
++    if st.index is not None:                     # latent._index_proj, then _attend's index_update
++        ix = a.index
++        ik, ig, pk = st.index[-1]
++        qmm.matmul(b.normed[:n], ix.kw, b.xs[:n], out=b.ikr[:n], part=b.sk)
++        glue.router(b.normed[:n], ix.gate, b.igr[:n])
++        sparse.index_update(b.ikr[:n, :c.index_dim], b.igr[:n], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, st.mtp_pos_dev)
++        if profile.ON:
++            profile.lap("dsa.indexer")
++    _join(w)
 +
 +
 +def latent_tc_default() -> bool:
@@ -908,7 +1004,7 @@ index 0000000..811666d
 +def load_settings() -> list[int]:
 +    """The load-time switches both ranks must agree on (they decide a fast prefill's bits)."""
 +
-+    return [int(latent_tc_default())]
++    return [int(latent_tc_default()), int(mtp_cache_default())]
 +
 +
 +def settings() -> list[int]:

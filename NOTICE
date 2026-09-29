@@ -32,6 +32,25 @@ GLM-5.3-Flash EXL3 2x DGX Spark serving kits (patches/0170)
   Other ideas taken from the MiaAI-Lab kit (canary, preflight, memory gate, watchdog, /health, reasoning
   effort; patches/0150 and scripts/) are re-implemented, not copied; docs/MIA-AUDIT.md lists each one.
 
+b12x "RoCEnante" RoCE collectives (patches/0230)
+  local-inference-lab/b12x (https://github.com/local-inference-lab/b12x, b12x/comm/roce/, merged PRs #295
+  and #315, with the fixes of PR #438), Copyright 2026 Luke Alonso and the b12x contributors, Apache License
+  2.0 (text: vendor/TensorFold/LICENSES/Apache-2.0.txt; b12x ships no NOTICE file). The one-shot RoCE
+  all-gather in patches/0230-glm-roce-gather.patch (glm5_next/cuda/roce.cpp, roce.cu, roce_common.h, roce.py)
+  adapts its RDMA proxy (_roce_proxy.c), its all-gather kernel and PTX intrinsics (_allgather_cute.py,
+  _cute_intrinsics.py) and its runtime's protocol (roce_oneshot.py); the changes are listed in the patch's
+  file headers and in vendor/TensorFold/THIRD_PARTY_NOTICES.md as patched.
+
+b12x fast-prefill kernels (patches/0240)
+  local-inference-lab/b12x (https://github.com/local-inference-lab/b12x, commit d44247b6: b12x/norm/mhc,
+  b12x/sequence/kda_prefill with b12x/sequence/_shared/delta_prefill, b12x/attention/sparse_mla), Copyright 2026
+  Luke Alonso and the b12x contributors, Apache License 2.0 (text: vendor/TensorFold/LICENSES/Apache-2.0.txt; b12x
+  ships no NOTICE file). The Triton kernels in patches/0240-glm-b12x-prefill.patch (glm5_next/cuda/b12x_kda.py,
+  b12x_mhc.py, b12x_attn.py) re-implement algorithms and kernel structures of those b12x ops (the 16-token KDA tile
+  with its Neumann-product inverse and on-chip fp32 state; the fused hyper-connection post + mixing dots over column
+  blocks of all four streams; the one-pass-per-row sparse MLA softmax) on this project's arithmetic; no b12x code is
+  copied. The changes are listed in the files' headers and in vendor/TensorFold/THIRD_PARTY_NOTICES.md as patched.
+
 NVIDIA PyTorch container (nvcr.io/nvidia/pytorch:26.07-py3)
   The Docker image is built FROM this container and is subject to the NVIDIA Deep Learning Container
   License. PyTorch (BSD-3-Clause) and Triton (MIT) come from it.

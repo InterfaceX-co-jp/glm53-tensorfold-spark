@@ -1,0 +1,134 @@
+fitting each stream's acceptance to its recorded keeps (baseline policy, finite runs):
+  W1/conc 4x rep0: miss scale m 0.33 f 0.51, m 0.55 f 0.58, m 0.32 f 0.66, m 0.19 f 0.62
+  W1/conc 4x rep1: miss scale m 0.62 f 0.69, m 0.53 f 0.60, m 0.24 f 0.66, m 0.72 f 0.75
+  W5/conc-off 4x rep0: miss scale m 0.26 f 0.53, m 0.56 f 0.61, m 0.53 f 0.61, m 0.15 f 0.60
+  W5/conc-off 4x rep1: miss scale m 0.66 f 0.54, m 0.45 f 0.62, m 0.32 f 0.63, m 0.75 f 0.79
+  W5/conc-off 4x rep2: miss scale m 0.45 f 0.72, m 0.19 f 0.67, m 0.74 f 0.78, m 0.17 f 0.52
+  W5/conc-nographs 4x rep0: miss scale m 0.49 f 0.42, m 0.57 f 0.61, m 0.45 f 0.55, m 0.31 f 0.63
+  W5/conc-nographs 4x rep1: miss scale m 0.59 f 0.52, m 0.46 f 0.51, m 0.30 f 0.67, m 0.81 f 0.70
+  W5/conc-nographs 4x rep2: miss scale m 0.78 f 0.54, m 0.16 f 0.68, m 0.71 f 0.72, m 0.38 f 0.48
+  W5/conc-b48 4x rep0: miss scale m 0.40 f 0.48, m 0.56 f 0.61, m 0.72 f 0.61, m 0.31 f 0.60
+  W5/conc-b48 4x rep1: miss scale m 0.54 f 0.54, m 0.45 f 0.55, m 0.27 f 0.72, m 0.67 f 0.64
+  W5/conc-b48 4x rep2: miss scale m 0.53 f 0.59, m 0.10 f 0.69, m 0.73 f 0.71, m 0.28 f 0.47
+
+signal=info true row=6.0 ms, slot overhead=7.0 ms, 12 seeds, 512 tokens a stream, finite (makespan)
+
+W1/conc 4x rep0: measured aggregate 79.4 tok/s; recorded tok/round 4.15, 2.41, 2.50, 7.00; verify ms/round 125, 104, 106, 139
+  base                     aggregate   87.3  tok/round 4.12, 2.52, 2.84, 6.77  per stream 29.4, 21.8, 23.1, 43.4  verify ms/round 126, 103, 110, 140  serial 0%, 0%, 0%, 0%  mtp 32%, 46%, 78%, 14%
+  base:row=0               aggregate   88.1  tok/round 4.47, 2.58, 2.93, 7.07  per stream 30.5, 22.1, 23.4, 43.9  verify ms/round 131, 104, 112, 145  serial 0%, 0%, 0%, 0%  mtp 35%, 51%, 74%, 14%
+  base:row=8               aggregate   84.5  tok/round 3.53, 2.30, 2.54, 6.52  per stream 27.7, 21.1, 22.2, 45.8  verify ms/round 114, 98, 103, 129  serial 0%, 0%, 0%, 0%  mtp 33%, 51%, 70%, 13%
+  adapt:serial=0           aggregate   87.0  tok/round 3.89, 2.45, 2.79, 6.90  per stream 28.7, 21.7, 23.1, 45.2  verify ms/round 122, 101, 108, 138  serial 0%, 0%, 0%, 0%  mtp 56%, 62%, 75%, 14%
+  adapt:serial=0:every=16  aggregate   87.2  tok/round 3.78, 2.45, 2.76, 7.06  per stream 28.4, 21.8, 23.1, 46.3  verify ms/round 120, 101, 107, 138  serial 0%, 0%, 0%, 0%  mtp 69%, 68%, 77%, 7%
+  adapt                    aggregate   82.1  tok/round 3.86, 2.06, 2.43, 6.94  per stream 31.3, 20.5, 22.4, 51.4  verify ms/round 113, 91, 98, 125  serial 18%, 37%, 30%, 0%  mtp 29%, 31%, 47%, 11%
+  adapt:margin=5           aggregate   87.0  tok/round 3.88, 2.45, 2.79, 6.90  per stream 28.7, 21.7, 23.2, 45.2  verify ms/round 122, 101, 108, 138  serial 0%, 0%, 0%, 0%  mtp 57%, 63%, 76%, 14%
+  oracle                   aggregate  104.5  tok/round 5.81, 3.45, 4.41, 7.45  per stream 33.7, 26.1, 28.7, 40.8  verify ms/round 152, 117, 136, 162  serial 0%, 0%, 0%, 0%  mtp 37%, 59%, 79%, 16%
+
+W1/conc 4x rep1: measured aggregate 71.2 tok/s; recorded tok/round 2.34, 2.49, 7.00, 1.96; verify ms/round 104, 105, 130, 95
+  base                     aggregate   76.5  tok/round 2.31, 2.57, 6.99, 1.92  per stream 20.8, 22.3, 48.7, 19.1  verify ms/round 99, 103, 129, 90  serial 0%, 0%, 0%, 0%  mtp 60%, 59%, 14%, 73%
+  base:row=0               aggregate   76.4  tok/round 2.32, 2.61, 7.09, 1.94  per stream 20.8, 22.3, 48.7, 19.1  verify ms/round 100, 104, 131, 91  serial 0%, 0%, 0%, 0%  mtp 62%, 62%, 14%, 66%
+  base:row=8               aggregate   76.1  tok/round 2.16, 2.41, 6.47, 1.92  per stream 20.1, 21.7, 47.7, 19.0  verify ms/round 96, 100, 123, 90  serial 0%, 0%, 0%, 0%  mtp 56%, 63%, 13%, 61%
+  adapt:serial=0           aggregate   76.7  tok/round 2.27, 2.60, 6.89, 1.92  per stream 20.7, 22.7, 48.6, 19.2  verify ms/round 99, 103, 129, 90  serial 0%, 0%, 0%, 0%  mtp 74%, 65%, 12%, 70%
+  adapt:serial=0:every=16  aggregate   77.4  tok/round 2.27, 2.59, 7.05, 1.94  per stream 20.8, 22.7, 49.7, 19.3  verify ms/round 98, 103, 129, 90  serial 0%, 0%, 0%, 0%  mtp 77%, 71%, 8%, 75%
+  adapt                    aggregate   71.4  tok/round 1.88, 2.21, 6.96, 1.57  per stream 19.6, 22.1, 56.8, 17.8  verify ms/round 87, 92, 115, 80  serial 36%, 28%, 0%, 42%  mtp 38%, 43%, 12%, 40%
+  adapt:margin=5           aggregate   76.9  tok/round 2.27, 2.57, 6.96, 1.93  per stream 20.7, 22.5, 49.3, 19.2  verify ms/round 99, 103, 129, 90  serial 1%, 1%, 0%, 1%  mtp 72%, 73%, 14%, 69%
+  oracle                   aggregate   91.4  tok/round 3.29, 3.49, 7.42, 2.67  per stream 24.8, 25.7, 45.5, 22.9  verify ms/round 118, 120, 145, 104  serial 0%, 0%, 0%, 0%  mtp 57%, 60%, 14%, 49%
+
+W5/conc-off 4x rep0: measured aggregate 78.6 tok/s; recorded tok/round 4.19, 2.42, 2.53, 7.00; verify ms/round 127, 106, 108, 141
+  base                     aggregate   84.9  tok/round 4.14, 2.50, 2.45, 6.88  per stream 29.8, 21.6, 21.4, 44.3  verify ms/round 124, 103, 102, 139  serial 0%, 0%, 0%, 0%  mtp 41%, 42%, 51%, 15%
+  base:row=0               aggregate   85.0  tok/round 4.47, 2.46, 2.48, 6.99  per stream 30.9, 21.4, 21.5, 43.6  verify ms/round 129, 103, 103, 144  serial 0%, 0%, 0%, 0%  mtp 35%, 49%, 52%, 16%
+  base:row=8               aggregate   83.7  tok/round 3.69, 2.30, 2.36, 6.42  per stream 28.7, 21.1, 21.3, 44.4  verify ms/round 116, 98, 99, 130  serial 0%, 0%, 0%, 0%  mtp 28%, 56%, 58%, 14%
+  adapt:serial=0           aggregate   84.3  tok/round 3.74, 2.37, 2.42, 6.95  per stream 28.4, 21.2, 21.4, 46.4  verify ms/round 118, 100, 101, 136  serial 0%, 0%, 0%, 0%  mtp 64%, 61%, 65%, 19%
+  adapt:serial=0:every=16  aggregate   83.9  tok/round 3.97, 2.33, 2.37, 6.99  per stream 29.9, 21.2, 21.4, 46.7  verify ms/round 119, 98, 99, 136  serial 0%, 0%, 0%, 0%  mtp 62%, 63%, 71%, 19%
+  adapt                    aggregate   79.5  tok/round 3.57, 1.97, 2.07, 6.91  per stream 30.2, 19.9, 20.5, 52.4  verify ms/round 108, 90, 92, 122  serial 20%, 37%, 33%, 0%  mtp 42%, 31%, 37%, 19%
+  adapt:margin=5           aggregate   84.0  tok/round 3.69, 2.34, 2.41, 6.91  per stream 28.3, 21.1, 21.4, 46.5  verify ms/round 117, 100, 101, 135  serial 0%, 1%, 0%, 0%  mtp 64%, 63%, 62%, 20%
+  oracle                   aggregate  103.8  tok/round 5.91, 3.59, 3.75, 7.40  per stream 34.5, 26.2, 26.7, 41.0  verify ms/round 152, 121, 124, 160  serial 0%, 0%, 0%, 0%  mtp 32%, 49%, 57%, 21%
+
+W5/conc-off 4x rep1: measured aggregate 70.3 tok/s; recorded tok/round 2.34, 2.63, 7.10, 2.00; verify ms/round 104, 107, 132, 96
+  base                     aggregate   77.0  tok/round 2.67, 2.64, 6.95, 1.95  per stream 22.3, 22.2, 47.1, 19.3  verify ms/round 107, 106, 133, 90  serial 0%, 0%, 0%, 0%  mtp 31%, 43%, 12%, 59%
+  base:row=0               aggregate   77.5  tok/round 2.87, 2.79, 7.11, 1.96  per stream 23.1, 22.8, 47.1, 19.4  verify ms/round 110, 109, 136, 90  serial 0%, 0%, 0%, 0%  mtp 28%, 46%, 13%, 60%
+  base:row=8               aggregate   76.5  tok/round 2.49, 2.47, 6.61, 1.89  per stream 21.8, 21.7, 47.6, 19.1  verify ms/round 102, 102, 126, 89  serial 0%, 0%, 0%, 0%  mtp 31%, 51%, 12%, 63%
+  adapt:serial=0           aggregate   77.2  tok/round 2.45, 2.56, 7.06, 1.93  per stream 21.6, 22.3, 49.5, 19.3  verify ms/round 102, 104, 130, 90  serial 0%, 0%, 0%, 0%  mtp 60%, 62%, 13%, 71%
+  adapt:serial=0:every=16  aggregate   77.1  tok/round 2.36, 2.50, 7.19, 1.91  per stream 21.3, 22.1, 50.9, 19.3  verify ms/round 100, 102, 129, 90  serial 0%, 0%, 0%, 0%  mtp 68%, 67%, 10%, 76%
+  adapt                    aggregate   72.3  tok/round 2.06, 2.25, 7.00, 1.60  per stream 20.7, 22.1, 56.4, 18.1  verify ms/round 91, 93, 116, 81  serial 36%, 30%, 0%, 43%  mtp 27%, 40%, 12%, 33%
+  adapt:margin=5           aggregate   76.4  tok/round 2.40, 2.58, 6.92, 1.89  per stream 21.3, 22.4, 49.2, 19.1  verify ms/round 101, 104, 128, 89  serial 1%, 1%, 0%, 2%  mtp 61%, 63%, 16%, 66%
+  oracle                   aggregate   92.2  tok/round 4.02, 3.88, 7.43, 2.50  per stream 27.9, 27.4, 44.7, 23.1  verify ms/round 128, 126, 149, 97  serial 0%, 0%, 0%, 0%  mtp 16%, 47%, 13%, 43%
+
+W5/conc-off 4x rep2: measured aggregate 73.7 tok/s; recorded tok/round 2.48, 7.00, 2.00, 4.55; verify ms/round 105, 144, 94, 131
+  base                     aggregate   80.8  tok/round 2.61, 6.81, 1.99, 4.63  per stream 22.9, 43.7, 20.2, 32.5  verify ms/round 102, 140, 88, 128  serial 0%, 0%, 0%, 0%  mtp 73%, 16%, 59%, 29%
+  base:row=0               aggregate   80.3  tok/round 2.65, 6.99, 1.98, 4.87  per stream 23.0, 43.6, 20.1, 33.1  verify ms/round 102, 143, 88, 131  serial 0%, 0%, 0%, 0%  mtp 73%, 16%, 57%, 46%
+  base:row=8               aggregate   79.4  tok/round 2.42, 6.46, 1.93, 3.93  per stream 22.1, 44.8, 19.9, 30.2  verify ms/round 98, 130, 87, 117  serial 0%, 0%, 0%, 0%  mtp 72%, 13%, 58%, 23%
+  adapt:serial=0           aggregate   80.5  tok/round 2.61, 6.91, 1.94, 4.40  per stream 23.1, 45.3, 20.1, 31.8  verify ms/round 101, 139, 87, 125  serial 0%, 0%, 0%, 0%  mtp 76%, 11%, 76%, 50%
+  adapt:serial=0:every=16  aggregate   81.5  tok/round 2.61, 6.98, 1.97, 4.63  per stream 23.2, 45.5, 20.4, 33.1  verify ms/round 101, 139, 87, 126  serial 0%, 0%, 0%, 0%  mtp 81%, 7%, 76%, 47%
+  adapt                    aggregate   75.4  tok/round 2.22, 6.97, 1.64, 4.03  per stream 22.0, 51.3, 18.8, 33.1  verify ms/round 91, 125, 79, 112  serial 31%, 0%, 39%, 15%  mtp 47%, 12%, 34%, 37%
+  adapt:margin=5           aggregate   80.5  tok/round 2.63, 6.82, 1.93, 4.43  per stream 23.3, 45.0, 20.1, 32.0  verify ms/round 101, 138, 86, 125  serial 0%, 0%, 3%, 0%  mtp 77%, 14%, 71%, 49%
+  oracle                   aggregate   95.2  tok/round 3.68, 7.50, 2.59, 6.25  per stream 27.4, 42.0, 23.8, 36.6  verify ms/round 119, 158, 97, 151  serial 0%, 0%, 0%, 0%  mtp 74%, 14%, 51%, 40%
+
+W5/conc-nographs 4x rep0: measured aggregate 80.7 tok/s; recorded tok/round 4.09, 2.35, 2.56, 7.00; verify ms/round 121, 100, 104, 136
+  base                     aggregate   87.5  tok/round 4.81, 2.48, 2.64, 6.84  per stream 32.9, 21.9, 22.5, 43.3  verify ms/round 131, 102, 105, 143  serial 0%, 0%, 0%, 0%  mtp 15%, 45%, 44%, 13%
+  base:row=0               aggregate   88.5  tok/round 5.16, 2.56, 2.79, 6.93  per stream 33.7, 22.2, 23.1, 42.3  verify ms/round 138, 103, 108, 147  serial 0%, 0%, 0%, 0%  mtp 16%, 45%, 35%, 13%
+  base:row=8               aggregate   85.3  tok/round 4.19, 2.35, 2.49, 6.24  per stream 30.8, 21.4, 22.0, 42.3  verify ms/round 122, 99, 101, 133  serial 0%, 0%, 0%, 0%  mtp 19%, 47%, 44%, 12%
+  adapt:serial=0           aggregate   85.6  tok/round 4.18, 2.40, 2.54, 6.67  per stream 30.5, 21.6, 22.2, 44.3  verify ms/round 124, 100, 103, 137  serial 0%, 0%, 0%, 0%  mtp 39%, 65%, 61%, 16%
+  adapt:serial=0:every=16  aggregate   85.9  tok/round 4.08, 2.41, 2.58, 6.81  per stream 30.1, 21.7, 22.4, 44.8  verify ms/round 122, 100, 104, 138  serial 0%, 0%, 0%, 0%  mtp 46%, 66%, 65%, 14%
+  adapt                    aggregate   81.7  tok/round 4.25, 2.04, 2.21, 6.51  per stream 33.6, 20.4, 21.3, 47.5  verify ms/round 116, 91, 94, 127  serial 14%, 34%, 34%, 3%  mtp 22%, 35%, 29%, 16%
+  adapt:margin=5           aggregate   85.9  tok/round 4.37, 2.38, 2.57, 6.74  per stream 31.5, 21.6, 22.4, 44.3  verify ms/round 125, 100, 103, 138  serial 0%, 0%, 2%, 0%  mtp 31%, 68%, 58%, 16%
+  oracle                   aggregate  105.6  tok/round 6.14, 3.55, 3.86, 7.32  per stream 35.5, 26.4, 27.4, 40.6  verify ms/round 154, 120, 126, 161  serial 0%, 0%, 0%, 0%  mtp 14%, 42%, 51%, 15%
+
+W5/conc-nographs 4x rep1: measured aggregate 74.3 tok/s; recorded tok/round 2.54, 2.75, 7.00, 2.01; verify ms/round 104, 106, 129, 93
+  base                     aggregate   79.0  tok/round 2.70, 3.00, 6.88, 2.03  per stream 22.4, 23.9, 46.1, 19.7  verify ms/round 107, 112, 134, 92  serial 0%, 0%, 0%, 0%  mtp 28%, 40%, 12%, 48%
+  base:row=0               aggregate   79.9  tok/round 2.87, 3.16, 6.87, 2.10  per stream 23.0, 24.3, 44.8, 20.0  verify ms/round 111, 116, 137, 94  serial 0%, 0%, 0%, 0%  mtp 31%, 40%, 15%, 48%
+  base:row=8               aggregate   78.2  tok/round 2.54, 2.75, 6.35, 1.99  per stream 21.9, 23.1, 45.3, 19.6  verify ms/round 103, 106, 126, 91  serial 0%, 0%, 0%, 0%  mtp 27%, 35%, 12%, 52%
+  adapt:serial=0           aggregate   78.0  tok/round 2.48, 2.88, 6.72, 1.97  per stream 21.7, 23.9, 46.8, 19.5  verify ms/round 103, 108, 130, 91  serial 0%, 0%, 0%, 0%  mtp 52%, 53%, 17%, 67%
+  adapt:serial=0:every=16  aggregate   78.1  tok/round 2.44, 2.78, 6.91, 1.99  per stream 21.5, 23.4, 48.4, 19.5  verify ms/round 102, 107, 130, 92  serial 0%, 0%, 0%, 0%  mtp 61%, 62%, 13%, 59%
+  adapt                    aggregate   73.5  tok/round 2.18, 2.45, 6.83, 1.63  per stream 21.5, 23.2, 54.6, 18.4  verify ms/round 93, 97, 117, 81  serial 33%, 31%, 0%, 45%  mtp 24%, 28%, 13%, 26%
+  adapt:margin=5           aggregate   77.8  tok/round 2.47, 2.85, 6.78, 1.95  per stream 21.7, 23.9, 47.6, 19.5  verify ms/round 102, 107, 129, 90  serial 0%, 1%, 0%, 3%  mtp 50%, 55%, 17%, 62%
+  oracle                   aggregate   96.9  tok/round 3.87, 4.30, 7.32, 2.89  per stream 27.1, 28.9, 43.1, 24.2  verify ms/round 127, 133, 152, 107  serial 0%, 0%, 0%, 0%  mtp 26%, 38%, 14%, 29%
+
+W5/conc-nographs 4x rep2: measured aggregate 75.5 tok/s; recorded tok/round 2.52, 7.00, 2.04, 4.60; verify ms/round 103, 140, 93, 126
+  base                     aggregate   81.2  tok/round 2.74, 6.73, 2.02, 4.76  per stream 23.4, 42.7, 20.3, 32.7  verify ms/round 105, 141, 89, 130  serial 0%, 0%, 0%, 0%  mtp 26%, 19%, 49%, 25%
+  base:row=0               aggregate   81.3  tok/round 2.82, 6.92, 2.01, 4.97  per stream 23.7, 42.7, 20.3, 33.2  verify ms/round 107, 145, 89, 134  serial 0%, 0%, 0%, 0%  mtp 28%, 19%, 49%, 25%
+  base:row=8               aggregate   80.7  tok/round 2.49, 6.30, 2.00, 4.37  per stream 22.4, 42.4, 20.2, 31.9  verify ms/round 100, 134, 89, 123  serial 0%, 0%, 0%, 0%  mtp 32%, 14%, 46%, 15%
+  adapt:serial=0           aggregate   80.6  tok/round 2.52, 6.76, 2.00, 4.34  per stream 22.4, 44.4, 20.1, 31.6  verify ms/round 101, 138, 89, 124  serial 0%, 0%, 0%, 0%  mtp 50%, 21%, 63%, 49%
+  adapt:serial=0:every=16  aggregate   80.2  tok/round 2.47, 6.90, 1.93, 4.51  per stream 22.5, 45.5, 20.0, 32.8  verify ms/round 99, 138, 87, 124  serial 0%, 0%, 0%, 0%  mtp 55%, 16%, 72%, 39%
+  adapt                    aggregate   75.6  tok/round 2.19, 6.82, 1.64, 4.02  per stream 22.0, 50.9, 18.9, 33.2  verify ms/round 91, 124, 80, 111  serial 36%, 0%, 41%, 17%  mtp 20%, 16%, 27%, 25%
+  adapt:margin=5           aggregate   79.9  tok/round 2.52, 6.77, 1.95, 4.22  per stream 22.5, 44.9, 20.0, 31.1  verify ms/round 101, 136, 88, 122  serial 1%, 0%, 1%, 0%  mtp 45%, 19%, 67%, 49%
+  oracle                   aggregate   97.8  tok/round 3.94, 7.34, 2.71, 6.10  per stream 28.4, 41.6, 24.5, 36.1  verify ms/round 124, 158, 99, 151  serial 0%, 0%, 0%, 0%  mtp 20%, 19%, 37%, 22%
+
+W5/conc-b48 4x rep0: measured aggregate 73.6 tok/s; recorded tok/round 4.15, 2.29, 2.53, 7.00; verify ms/round 135, 108, 114, 154
+  base                     aggregate   85.1  tok/round 4.48, 2.34, 2.60, 6.73  per stream 31.4, 21.3, 22.4, 43.0  verify ms/round 128, 98, 104, 141  serial 0%, 0%, 0%, 0%  mtp 29%, 67%, 27%, 13%
+  base:row=0               aggregate   86.2  tok/round 4.85, 2.42, 2.64, 6.98  per stream 32.7, 21.6, 22.4, 43.2  verify ms/round 133, 101, 105, 145  serial 0%, 0%, 0%, 0%  mtp 26%, 59%, 29%, 13%
+  base:row=8               aggregate   83.9  tok/round 4.12, 2.26, 2.48, 6.09  per stream 30.6, 21.0, 22.0, 41.9  verify ms/round 121, 96, 101, 131  serial 0%, 0%, 0%, 0%  mtp 20%, 64%, 31%, 16%
+  adapt:serial=0           aggregate   84.9  tok/round 4.10, 2.36, 2.52, 6.78  per stream 30.1, 21.3, 22.0, 44.7  verify ms/round 123, 100, 103, 137  serial 0%, 0%, 0%, 0%  mtp 53%, 68%, 45%, 13%
+  adapt:serial=0:every=16  aggregate   84.6  tok/round 4.18, 2.35, 2.38, 6.95  per stream 30.7, 21.5, 21.7, 45.6  verify ms/round 122, 98, 99, 138  serial 0%, 0%, 0%, 0%  mtp 53%, 80%, 56%, 8%
+  adapt                    aggregate   79.9  tok/round 3.69, 2.02, 2.06, 6.76  per stream 30.8, 20.1, 20.4, 50.5  verify ms/round 110, 91, 92, 124  serial 20%, 32%, 36%, 0%  mtp 38%, 45%, 22%, 14%
+  adapt:margin=5           aggregate   85.0  tok/round 4.18, 2.35, 2.55, 6.77  per stream 30.5, 21.3, 22.2, 44.6  verify ms/round 123, 99, 103, 137  serial 0%, 1%, 1%, 0%  mtp 52%, 64%, 43%, 16%
+  oracle                   aggregate  103.8  tok/round 5.88, 3.41, 3.78, 7.33  per stream 34.8, 26.1, 27.1, 41.1  verify ms/round 151, 117, 124, 159  serial 0%, 0%, 0%, 0%  mtp 27%, 57%, 21%, 15%
+
+W5/conc-b48 4x rep1: measured aggregate 67.5 tok/s; recorded tok/round 2.40, 2.59, 7.00, 2.04; verify ms/round 113, 116, 145, 104
+  base                     aggregate   79.1  tok/round 2.57, 2.73, 6.80, 2.13  per stream 21.6, 22.4, 45.9, 19.8  verify ms/round 106, 108, 132, 96  serial 0%, 0%, 0%, 0%  mtp 39%, 50%, 16%, 47%
+  base:row=0               aggregate   79.7  tok/round 2.64, 2.84, 6.91, 2.19  per stream 21.6, 22.7, 45.7, 19.9  verify ms/round 109, 111, 135, 98  serial 0%, 0%, 0%, 0%  mtp 42%, 49%, 17%, 49%
+  base:row=8               aggregate   78.4  tok/round 2.43, 2.54, 6.41, 2.05  per stream 21.3, 22.0, 46.0, 19.6  verify ms/round 102, 103, 125, 93  serial 0%, 0%, 0%, 0%  mtp 38%, 47%, 14%, 50%
+  adapt:serial=0           aggregate   79.3  tok/round 2.53, 2.68, 6.60, 2.10  per stream 21.7, 22.5, 46.0, 19.8  verify ms/round 104, 107, 130, 95  serial 0%, 0%, 0%, 0%  mtp 55%, 64%, 20%, 64%
+  adapt:serial=0:every=16  aggregate   78.5  tok/round 2.52, 2.64, 6.60, 2.03  per stream 21.8, 22.5, 46.1, 19.6  verify ms/round 104, 106, 130, 93  serial 0%, 0%, 0%, 0%  mtp 55%, 77%, 22%, 74%
+  adapt                    aggregate   74.0  tok/round 2.09, 2.35, 6.62, 1.71  per stream 20.6, 22.4, 53.5, 18.5  verify ms/round 93, 96, 115, 85  serial 33%, 29%, 2%, 43%  mtp 32%, 38%, 15%, 28%
+  adapt:margin=5           aggregate   79.3  tok/round 2.54, 2.68, 6.67, 2.10  per stream 21.8, 22.6, 46.4, 19.8  verify ms/round 104, 106, 130, 95  serial 1%, 0%, 0%, 1%  mtp 50%, 60%, 20%, 63%
+  oracle                   aggregate   97.9  tok/round 3.87, 4.05, 7.38, 3.06  per stream 26.9, 27.6, 43.5, 24.5  verify ms/round 128, 130, 151, 111  serial 0%, 0%, 0%, 0%  mtp 38%, 48%, 17%, 33%
+
+W5/conc-b48 4x rep2: measured aggregate 70.8 tok/s; recorded tok/round 2.53, 7.00, 2.04, 4.72; verify ms/round 112, 155, 100, 143
+  base                     aggregate   81.4  tok/round 2.56, 6.94, 2.04, 4.81  per stream 22.6, 44.2, 20.4, 33.5  verify ms/round 101, 142, 90, 129  serial 0%, 0%, 0%, 0%  mtp 51%, 13%, 57%, 19%
+  base:row=0               aggregate   81.5  tok/round 2.60, 7.09, 2.07, 5.07  per stream 22.6, 43.6, 20.4, 33.9  verify ms/round 103, 146, 91, 134  serial 0%, 0%, 0%, 0%  mtp 50%, 18%, 58%, 18%
+  base:row=8               aggregate   80.7  tok/round 2.40, 6.46, 2.01, 4.29  per stream 21.9, 43.6, 20.2, 31.9  verify ms/round 98, 134, 90, 121  serial 0%, 0%, 0%, 0%  mtp 50%, 13%, 58%, 14%
+  adapt:serial=0           aggregate   82.1  tok/round 2.53, 6.93, 2.05, 4.60  per stream 22.7, 45.4, 20.5, 33.1  verify ms/round 101, 139, 90, 126  serial 0%, 0%, 0%, 0%  mtp 63%, 14%, 65%, 31%
+  adapt:serial=0:every=16  aggregate   81.5  tok/round 2.52, 7.11, 2.00, 4.62  per stream 22.8, 46.4, 20.4, 33.2  verify ms/round 100, 139, 89, 126  serial 0%, 0%, 0%, 0%  mtp 66%, 14%, 73%, 37%
+  adapt                    aggregate   76.5  tok/round 2.13, 6.92, 1.70, 4.09  per stream 21.6, 51.5, 19.1, 33.6  verify ms/round 90, 125, 81, 112  serial 33%, 0%, 38%, 20%  mtp 37%, 13%, 32%, 20%
+  adapt:margin=5           aggregate   81.4  tok/round 2.52, 6.91, 2.02, 4.54  per stream 22.6, 45.3, 20.4, 32.8  verify ms/round 101, 139, 90, 125  serial 1%, 0%, 2%, 0%  mtp 64%, 14%, 63%, 36%
+  oracle                   aggregate   98.4  tok/round 3.83, 7.53, 2.78, 6.23  per stream 27.9, 42.0, 24.6, 36.5  verify ms/round 122, 160, 101, 152  serial 0%, 0%, 0%, 0%  mtp 40%, 13%, 40%, 26%
+
+mean over 11 runs (vs base):
+  base                       81.8 tok/s  +0.0%  (runs +0.0% .. +0.0%)
+  base:row=0                 82.2 tok/s  +0.5%  (runs -0.7% .. +1.3%)
+  base:row=8                 80.7 tok/s  -1.4%  (runs -3.3% .. -0.5%)
+  adapt:serial=0             81.5 tok/s  -0.4%  (runs -2.2% .. +0.8%)
+  adapt:serial=0:every=16    81.4 tok/s  -0.4%  (runs -1.8% .. +1.2%)
+  adapt                      76.5 tok/s  -6.5%  (runs -6.9% .. -6.0%)
+  adapt:margin=5             81.3 tok/s  -0.6%  (runs -1.8% .. +0.5%)
+  oracle                     98.9 tok/s  +20.8%  (runs +17.7% .. +23.8%)

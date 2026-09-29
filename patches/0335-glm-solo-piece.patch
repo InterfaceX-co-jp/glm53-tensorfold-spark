@@ -1,0 +1,159 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/batch.py b/src/tensorfold/families/glm5_next/cuda/batch.py
+index 4a0e795..966b8b2 100644
+--- a/src/tensorfold/families/glm5_next/cuda/batch.py
++++ b/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -808,6 +808,7 @@ class Seq:
+     stepper: Stepper | None = None                # None while prefilling
+     t0: float = 0.0
+     pieces: int = 0
++    solo: int = 0                                 # patches/0335: pieces cut at GLM53_TF_SOLO_PIECE (alone in the batch)
+     emitted: int = 0                              # tokens produced by this run (a rerun re-produces the sent ones)
+     marks: tuple = ()                             # patches/0180: the session store's marks for this prompt
+     kinds: collections.Counter = field(default_factory=collections.Counter)   # patches/0200: its rounds by kind
+@@ -817,6 +818,7 @@ class Batcher:
+     """Up to ``n`` concurrent requests on a ``GlmEngine`` (both ranks)."""
+ 
+     short = 0                                     # patches/0200 defaults (a batcher built without ``__init__``)
++    solo = 0                                      # patches/0335: GLM53_TF_SOLO_PIECE (off)
+     parity_key = False
+     batch_mtp = False
+     last_kind = "alone"
+@@ -839,6 +841,19 @@ class Batcher:
+         self.graph_rows = _env_int("GLM53_TF_BATCH_GRAPH_ROWS", MAX_ROWS)
+         self.max_graphs = _env_int("GLM53_TF_BATCH_MAX_GRAPHS", 256)
+         self.piece = _env_int("GLM53_TF_BATCH_PIECE", 2048)
++        # patches/0335 (GLM53_TF_SOLO_PIECE=N, 0 = off): a fast prefill piece of a request that is ALONE in the batch
++        # (no other slot holds a request when its piece is cut) is N tokens instead of GLM53_TF_BATCH_PIECE; the next
++        # piece is cut at the batch piece again as soon as another request is admitted (a piece boundary). Bigger
++        # pieces run as bigger fast chunks when the lean set holds them (GLM53_TF_PREFILL_ROWS_MAX >= N), so the
++        # routed experts read their weights once per N rows instead of once per piece. Same bits: pieces end on the
++        # 64-token snapshot grid and resumed == fresh for any cut (patches/0085).
++        self.solo = _env_int("GLM53_TF_SOLO_PIECE", 0)
++        if self.solo < 0 or (self.solo and self.solo < 64):
++            raise ValueError(f"GLM53_TF_SOLO_PIECE={self.solo}: expected 0 (off) or at least 64 tokens")
++        both = g._gather_ints([self.solo])              # both ranks cut the same pieces
++        if both[0] != both[1]:
++            raise RuntimeError(f"the two ranks were started with different GLM53_TF_SOLO_PIECE: rank 0 {both[0]}, "
++                               f"rank 1 {both[1]}")
+         self.use_graphs = e.graphs is not None and os.environ.get("GLM53_TF_BATCH_GRAPHS", "1").strip() != "0"
+         # patches/0200 (each off by default): graph keys captured on their N-th sighting, windows padded to fewer
+         # graph keys, short prompts prefilled without waiting for the fair share
+@@ -947,6 +962,12 @@ class Batcher:
+             print(f"[tensorfold] batching {n} requests: {n - 1} extra sequence(s), {extra:.2f} GB on this rank "
+                   f"({e.st.capacity} cache slots each; prefill pieces of {self.piece} tokens, at most "
+                   f"{self.fair.share:g} of the time while others decode)", flush=True)
++            if self.solo:                               # patches/0335
++                most = int(getattr(e, "prefill_max", e.rows))
++                print(f"[tensorfold] GLM53_TF_SOLO_PIECE={self.solo}: a fast prompt alone in the batch prefills in "
++                      f"pieces of {self.solo} tokens (chunks of at most {most} rows"
++                      + ("" if most >= self.solo else "; raise GLM53_TF_PREFILL_ROWS_MAX for chunks as big as the "
++                         "piece") + ")", flush=True)
+             if self.kvp is not None:
+                 kp = self.kvp
+                 print(f"[tensorfold] KV pool (patches/0290): {kp.npages * kp.page} tokens in {kp.npages} pages of "
+@@ -1543,7 +1564,12 @@ class Batcher:
+                 # patches/0180: pieces end on the chunk grid and on the snapshot grid (the snapshot the next resumes)
+                 grid = batchplan.piece_grid(fastpf.grid(e.prefill_rows), int(getattr(e, "snap_grid", 0) or 0)) \
+                     if e.fast_prefill else 0
+-                end = batchplan.piece_end(seq.done, n, self.piece, grid)
++                # patches/0335: alone in the batch -> the solo piece (fast prefills only; both ranks see the same slots)
++                solo = batchplan.solo_piece(self.solo, self.piece, grid,
++                                            [i for i, q in enumerate(self.seqs) if q is not None and i != slot])
++                if solo != self.piece:
++                    seq.solo += 1
++                end = batchplan.piece_end(seq.done, n, solo, grid)
+                 e.checkpoints = seq.marks           # patches/0180: the store's marks inside this piece
+                 try:
+                     first = prefill(e, job.prompt[:end], job.sampling, mtp=use_mtp, drafter=drafter,
+@@ -1590,6 +1616,8 @@ class Batcher:
+                 job.out.put(exc)
+             return
+         job.stats.update(prefill_s=round(time.perf_counter() - seq.t0, 4), pieces=seq.pieces)
++        if seq.solo:                                    # patches/0335
++            job.stats["solo_pieces"] = seq.solo
+         if tag:
+             job.stats["fast_prefill"] = tag - tag % 64
+             from . import pfgrid
+diff --git a/src/tensorfold/families/glm5_next/cuda/batchplan.py b/src/tensorfold/families/glm5_next/cuda/batchplan.py
+index 4187b53..16e1aa8 100644
+--- a/src/tensorfold/families/glm5_next/cuda/batchplan.py
++++ b/src/tensorfold/families/glm5_next/cuda/batchplan.py
+@@ -127,6 +127,16 @@ def piece_end(done: int, n: int, piece: int, grid: int) -> int:
+     return n if n - done <= step else done + step
+ 
+ 
++def solo_piece(solo: int, piece: int, grid: int, others: Sequence[int]) -> int:
++    """patches/0335 (GLM53_TF_SOLO_PIECE): the piece size for a prompt's next piece: ``solo`` when it is set, the
++    prefill is fast (``grid`` > 0) and no other slot holds a request (``others``: those slots), else ``piece``
++    (GLM53_TF_BATCH_PIECE). Decided when the piece is cut, from the slots both ranks hold alike, so a request admitted
++    in this round's plan makes its neighbours' next pieces normal ones. Any cut gives the same bits (pieces end on the
++    snapshot grid; resumed == fresh)."""
++
++    return solo if solo and grid and not others else piece
++
++
+ def piece_grid(chunk: int, snap_grid: int) -> int:
+     """patches/0180: the bound fast pieces end on: a multiple of the chunk grid C and of the snapshot grid G (a piece
+     must end where its prefill takes the snapshot the next piece resumes from). G = 64 (default): C itself."""
+diff --git a/src/tensorfold/families/glm5_next/cuda/lean.py b/src/tensorfold/families/glm5_next/cuda/lean.py
+index 11f48fc..a85d98c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/lean.py
++++ b/src/tensorfold/families/glm5_next/cuda/lean.py
+@@ -129,7 +129,7 @@ class LeanBuffers:
+         self.eact = self.eaxs = None
+         if c.quant == "exl3":
+             # exl3_fast.cu's inputs: rotated rows per (row, slot) pair, fp16; no split-K partials (``Scratch.z``)
+-            self.exl3 = _Exl3Rows(rows, slots, D, ml, dev)
++            self.exl3 = _Exl3Rows(rows, slots, D, ml, dev, lazy_xu=lazy_xu())
+         else:
+             self.eact = torch.empty((rows, slots, ml), dtype=bf, device=dev)
+             self.eaxs = torch.empty((rows, slots, ml // 64), dtype=f32, device=dev)
+@@ -154,7 +154,7 @@ class LeanBuffers:
+             if isinstance(v, torch.Tensor):
+                 yield v
+             elif isinstance(v, _Exl3Rows):
+-                yield from (v.xg, v.xu, v.xd)
++                yield from (t for t in (v.xg, v._xu, v.xd) if t is not None)
+ 
+     def group(self, R: int) -> qmm.Group:
+         """The chunk's expert grouping (``Buffers.group``'s layout: members [maxu, R], row stride R), as views of one
+@@ -169,17 +169,35 @@ class LeanBuffers:
+         return [(a, min(self.block, R - a)) for a in range(0, R, self.block)]
+ 
+ 
+-class _Exl3Rows:
+-    """``exl3_mm.Scratch`` without ``z`` (the fused kernels keep no split-K partials): Xg, Xu, Xd per pair."""
++def lazy_xu() -> bool:
++    """patches/0335: GLM53_TF_LEAN_LAZY_XU=1 allocates the lean set's Xu (the up matrix's rotated rows, 72 KiB a row)
++    at its first use instead of at load. With gate and up sharing their sign vector (the GLM-5.3-Flash EXL3
++    checkpoints) the fat family (fat / once / auto / tc) reads Xg for both and Xu is never touched: 0.56 GiB a rank less
++    at 8,192-row chunks (0.14 at 2,048). A request that runs plain fast2 (tf_knobs.fat_experts = 0) allocates it then.
++    Memory only: the bits do not change."""
+ 
+-    def __init__(self, rows: int, slots: int, dims: int, width: int, device) -> None:
++    return os.environ.get("GLM53_TF_LEAN_LAZY_XU", "0").strip().lower() not in ("", "0", "false", "no", "off")
++
++
++class _Exl3Rows:
++    """``exl3_mm.Scratch`` without ``z`` (the fused kernels keep no split-K partials): Xg, Xu, Xd per pair.
++    patches/0335: ``lazy_xu``: Xu is made at its first use."""
++
++    def __init__(self, rows: int, slots: int, dims: int, width: int, device, lazy_xu: bool = False) -> None:
+         P = rows * slots
+         self.xg = torch.zeros((P, dims), dtype=torch.float16, device=device)
+-        self.xu = torch.zeros((P, dims), dtype=torch.float16, device=device)
++        self._xu = None if lazy_xu else torch.zeros((P, dims), dtype=torch.float16, device=device)
++        self._xu_shape, self._device = (P, dims), device
+         self.xd = torch.zeros((P, width), dtype=torch.float16, device=device)
+         self.z = None
+         self.rows, self.slots = rows, slots
+ 
++    @property
++    def xu(self) -> torch.Tensor:
++        if self._xu is None:
++            self._xu = torch.zeros(self._xu_shape, dtype=torch.float16, device=self._device)
++        return self._xu
++
+ 
+ def stage(w: Weights, st: State, lb: LeanBuffers, tokens) -> int:
+     """``forward.stage`` into the lean set's ids."""

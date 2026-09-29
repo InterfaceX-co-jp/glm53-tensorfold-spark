@@ -1,0 +1,11 @@
+6 requests, 11781 reply tokens; deep row 6.5 ms, host 3.9 ms a round, 3 seeds
+  8      91.4 tok/s  6.83 tok/round  lookup rounds 54.3%, lookup-kept tokens 55.2%, rounds keeping 9+ 0.0%
+  16    101.1 tok/s  9.41 tok/round  lookup rounds 38.8%, lookup-kept tokens 60.2%, rounds keeping 9+ 37.4%  gain +10.6% (median request +8.1%, requests >= +5%: 50%)
+  8g     91.4 tok/s  6.83 tok/round  lookup rounds 54.3%, lookup-kept tokens 55.2%, rounds keeping 9+ 0.0%, global hits 1  gain +0.0% (median request +0.0%, requests >= +5%: 0%)
+  16g   101.1 tok/s  9.41 tok/round  lookup rounds 38.8%, lookup-kept tokens 60.2%, rounds keeping 9+ 37.4%, global hits 1  gain +10.6% (median request +8.1%, requests >= +5%: 50%)
+    count                                       403 tok  8   92.4  16   92.4  8g   92.4  16g   92.4
+    primes                                      554 tok  8   93.1  16   93.1  8g   93.1  16g   93.1
+    json                                       2326 tok  8   74.3  16   74.2  8g   74.3  16g   74.2
+    edit:bench/multiturn.py                    3363 tok  8   98.0  16  114.4  8g   98.0  16g  114.4
+    edit:scripts/traffic-report.py             3554 tok  8   98.1  16  114.2  8g   98.1  16g  114.2
+    edit:bench/prefixshare.py                  1581 tok  8   97.1  16  112.8  8g   97.1  16g  112.8

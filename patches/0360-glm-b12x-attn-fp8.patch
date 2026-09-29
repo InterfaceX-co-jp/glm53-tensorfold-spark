@@ -1,0 +1,135 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/b12x_attn.py b/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
+index 0ac42b3..03032ea 100644
+--- a/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
++++ b/src/tensorfold/families/glm5_next/cuda/b12x_attn.py
+@@ -14,6 +14,32 @@ Arithmetic: ``latent.sparse_latent``'s tile steps in the same list order, the sa
+ chunked kernel's in the last fp32 bits of u (the merge's exp(m_c - m) rescaling is gone). Deterministic, one program
+ per (row, head tile) whatever the call's rows (row-independent); fast chunks only (decode, verify, the MTP head and
+ exact prefill keep the chunked kernels); new arithmetic, so its fast snapshots carry their own tag (``b12xpf``).
++
++patches/0360 (the FP8 latent cache production uses, patches/0220)
++-----------------------------------------------------------------
++FP8 == bf16 on the dequantized rows, by construction. Triton gives a ``tl.dot`` operand that was upcast from 8-bit
++data another register layout (``kWidth`` 4 instead of 2 on sm_121, Triton 3.7.1 and 3.8), which places the K
++elements differently inside each m16n8k16 MMA; with 0240's kernel the FP8 one-pass rows were not the bits of the same
++kernel on ``dequantize_rows`` (W3: that check failed; the row-subset and permutation checks passed). The dequantized
++tile now passes an impure identity (``_opaque``: one ``mov.b32`` per two values) that the upcast analysis does not look
++through, so both caches feed the dots in the same layout and the FP8 kernel is the bf16 kernel after the tile
++(``tests/b12x_onepass_ptx.py`` checks the layouts offline). The chunked kernels (decode, verify, exact and FP8
++production prefill today) are untouched.
++
++Row independence (0085): the grid is (R, ceil(H / BMQ)) with BMQ fixed by H (the weights); a program reads only its
++row's query, count and token list and walks the list in order in KT-token tiles, one fixed chain of mma and online-
++softmax steps whatever R, the other rows, the chunk or the lean / pipelined schedule. Nothing is split by R.
++
++Why it need not equal the chunked kernel's bits, and where it may run. It is not bit-identical to
++``latent.sparse_latent`` (the chunk merge's rescaling is gone). A kernel with other bits may serve only rows that
++are never recomputed by another kernel in the same configuration. Fast chunks are exactly such rows under patches/
++0080 / 0085: a fast-prefilled row is reused only through a snapshot of its own tag (fast G + 4 x the b12x bits) at a
++multiple of 64, a resumed request re-prefills every later row with fast chunks (so with this kernel), a reply's rows
++(decoded by the chunked kernel) are never kept in a fast snapshot, and exact requests never resume fast snapshots.
++Hence with bit 4 on: resumed == fresh (both prefill every row past the snapshot with fast chunks), drafted == serial
++(the same deterministic prefill, then the unchanged decode / verify kernels), batched == alone (batch pieces run
++``decode.prefill`` per slot; decode rounds never set ``b.fast``). Using it for decode / verify too is therefore not
++needed; it would also be slow there (one program a row and head tile: 1-2 programs for a 1-row step).
+ """
+ 
+ from __future__ import annotations
+@@ -29,11 +55,22 @@ STAGES = 1        # software pipelining of the key loop (no effect on bits); 2 n
+ WARPS = 8
+ 
+ 
++@triton.jit
++def _opaque(x):
++    """patches/0360: the identity, as an impure inline-asm op (one ``mov.b32`` per two bf16 values). Triton's choice of
++    a dot operand's register layout looks back through pure element-wise ops to the narrowest type loaded (e4m3 ->
++    ``kWidth`` 4); it stops here, so a dequantized FP8 tile feeds the dots exactly like a bf16 tile."""
++
++    return tl.inline_asm_elementwise("mov.b32 $0, $1;", "=r,r", [x], dtype=tl.bfloat16, is_pure=False, pack=2)
++
++
+ @triton.jit
+ def _lsparse_one(QA, LC, LCS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, L: tl.constexpr, KTS: tl.constexpr,
+                  SCALE: tl.constexpr, BMQ: tl.constexpr, FP8: tl.constexpr = False, RB: tl.constexpr = 0,
+-                 SB: tl.constexpr = 0, SA: tl.constexpr = 0, PT=None, PSH: tl.constexpr = 0):
+-    """Program (row r, head tile): the row's n selected tokens in list order, one online softmax, OUT = o / l."""
++                 SB: tl.constexpr = 0, SA: tl.constexpr = 0, PT=None, PSH: tl.constexpr = 0, OPQ: tl.constexpr = False):
++    """Program (row r, head tile): the row's n selected tokens in list order, one online softmax, OUT = o / l.
++    ``OPQ`` (patches/0360, FP8 compiled kernels): the dequantized tile through ``_opaque`` (the interpreter has no
++    inline asm; there it is the same values anyway)."""
+ 
+     r = tl.program_id(0)
+     hb = tl.program_id(1)
+@@ -51,6 +88,8 @@ def _lsparse_one(QA, LC, LCS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, L
+             ok = idx < n
+             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
+             kv = _lrows(LC, LCS, tok, ok, d, FP8, RB, SB, SA, PT, PSH)          # patches/0290: paged rows too
++            if OPQ:
++                kv = _opaque(kv)                                                  # patches/0360
+             valid = ok[None, :] & hok[:, None]
+             m, l, o = _ltile(q, kv, m, l, o, valid, SCALE)
+         tl.store(OUT + (r * H + h[:, None]).to(tl.int64) * L + d[None, :], o / l[:, None], mask=hok[:, None])
+@@ -67,11 +106,15 @@ def sparse_latent_one(qa: torch.Tensor, lc: torch.Tensor, tokens: torch.Tensor,
+     W = tokens.shape[1]
+     if not qa.is_contiguous() or not tokens.is_contiguous() or out.shape != (R, H, L) or not out.is_contiguous():
+         raise ValueError("sparse_latent_one: contiguous qa [R, H, L], tokens [R, W] and out [R, H, L] expected")
+-    bm = (BM if H >= BM else 16) if bm is None else int(bm)
++    bm = (BM if H >= BM else 16) if bm is None else int(bm)             # a function of H only: never of R
+     lcv, lcs, f8, rb, sb = _views(lc, L)
+     _lsparse_one[(R, triton.cdiv(H, bm))](qa, lcv, lcs, tokens, counts, out, W=W, H=H, L=L, KTS=KT, SCALE=scale,
+                                           BMQ=bm, FP8=f8, RB=rb, SB=sb, SA=SCALE_AT // 4, num_warps=WARPS,
+-                                          num_stages=STAGES if stages is None else int(stages), **_paging(lc))
++                                          num_stages=STAGES if stages is None else int(stages), **_paging(lc),
++                                          OPQ=bool(f8) and not _INTERPRETED)                     # patches/0360
++
++
++_INTERPRETED = type(_lsparse_one).__name__ == "InterpretedFunction"      # TRITON_INTERPRET=1 (no inline asm)
+ 
+ 
+ def reference(qa: torch.Tensor, lat: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, scale: float):
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index ca85ff5..43dc0c8 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -802,6 +802,16 @@ class GlmEngine:
+                           pfglue.latent_tc(getattr(self, "w", None)),          # patches/0190: GLM53_TF_LATENT_TC
+                           b12xpf.tag_bits(getattr(self, "w", None), b12x))     # patches/0240: tf_knobs.b12x
+ 
++    def _request_grid(self, values: dict) -> int:
++        """patches/0360: the snapshot tag a request's prefill will write, from the request's knobs (``values``, before
++        they are applied): the lookup (``_resume``, the session store's plan) must use the same tag ``decode._prefill``
++        gives the snapshots under those knobs. 0240 left ``b12x`` out of the lone engine's lookup, so the lookup used the
++        rank's default bits (0 between requests) while the snapshots carried the request's: a request with b12x bits
++        never resumed (``cached`` 0). The batcher uses this too."""
++
++        return self._grid(bool(values["fast_prefill"]), int(values["prefill_rows"]), bool(values["fp8_prefill"]),
++                          int(values.get("b12x", 0)))
++
+     def _resume(self, prompt: list[int], code: list[int], grid: int | None = None):
+         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters (and,
+         patches/0080, made by the request's prefill mode: ``grid``, default the engine's current one)."""
+@@ -977,7 +987,7 @@ class GlmEngine:
+             self.online = OnlineCosts(self.base_costs["verify"])
+         stop_eos = bool(getattr(self.request, "stop_eos", True))
+         # patches/0091: a snapshot made by the request's own prefill mode (exact, or fast on the request's grid)
+-        grid = self._grid(bool(values["fast_prefill"]), values["prefill_rows"], bool(values["fp8_prefill"]))
++        grid = self._request_grid(values)           # patches/0360: with the request's b12x bits
+         hit = self._resume(list(prompt), code, grid) if draft else None
+         sess = None
+         if self.store is not None:          # patches/0110: a stored session that resumes more, and the marks
+diff --git a/src/tensorfold/families/glm5_next/cuda/sessdisk.py b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+index 860542f..9e2236e 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sessdisk.py
++++ b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+@@ -180,7 +180,10 @@ KNOB_SKIP_PREFIX = ("GLM53_TF_SESSION_", "GLM53_TF_BATCH", "GLM53_TF_CALIB", "GL
+ KNOB_SKIP = {"GLM53_TF_T0", "GLM53_TF_LAUNCH_T0", "GLM53_TF_IMAGE_ID", "GLM53_TF_CLOCK_CAP", "GLM53_TF_BOOT_WARMUP",
+              "GLM53_TF_HEALTH", "GLM53_TF_EFFORT_FIELD", "GLM53_TF_DEFAULT_EFFORT", "GLM53_TF_PROFILE",
+              "GLM53_TF_DEPTH", "GLM53_TF_LOOKUP", "GLM53_TF_LOOKUP_MIN", "GLM53_TF_AUTO_FDRAFTS",
+-             "GLM53_TF_PREFILL_ROWS", "GLM53_TF_PREFILL_ROWS_MAX"}
++             "GLM53_TF_PREFILL_ROWS", "GLM53_TF_PREFILL_ROWS_MAX",
++             # patches/0360: the DEFAULT b12x bits; the bits a prefill ran are in every entry's snapshot tag (key), so
++             # changing the default must not hide the store (GLM53_TF_B12X_KDA_* decide bits: they stay in the hash)
++             "GLM53_TF_B12X"}
+ 
+ 
+ def knobs(env: dict | None = None) -> dict:

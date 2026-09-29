@@ -1,0 +1,121 @@
+{
+ "args": {
+  "base": "http://127.0.0.1:8000",
+  "model": "GLM-5.3-Flash-EXL3",
+  "system": 20000,
+  "user": 1500,
+  "sessions": 3,
+  "burst": 4,
+  "tokens": 48,
+  "modes": "sequential,burst,exact",
+  "extra": "{}",
+  "out": "results/W8/prefixA-20k.json"
+ },
+ "sequential": [
+  {
+   "name": "session 1",
+   "prompt_tokens": 31703,
+   "cached_tokens": 896,
+   "ttft_s": 27.313267402991187,
+   "prefill_s": 27.2432,
+   "restored": 26,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 1,
+   "queued_s": 0.008,
+   "text": "This document is a collection of 94 numbered lines (Q499853410-0-00000 through Q499853410-0-00093), each containing a sequence of six words drawn from a fixed"
+  },
+  {
+   "name": "session 2",
+   "prompt_tokens": 31688,
+   "cached_tokens": 16384,
+   "ttft_s": 13.88317627699871,
+   "prefill_s": 13.8561,
+   "restored": 33,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 1,
+   "queued_s": 0.011,
+   "text": "This document is a collection of 94 numbered lines (Q499853410-1-00000 through Q499853410-1-00093), each containing a sequence of six words drawn from a fixed"
+  },
+  {
+   "name": "session 3",
+   "prompt_tokens": 31664,
+   "cached_tokens": 29376,
+   "ttft_s": 2.3415205990022514,
+   "prefill_s": 2.3155,
+   "restored": 35,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 0,
+   "queued_s": 0.008,
+   "text": "This document is a numbered sequence of 94 lines (Q499853410-2-00000 through Q499853410-2-00093), each containing six words drawn from a fixed vocabulary of nature"
+  }
+ ],
+ "burst": {
+  "rows": [
+   {
+    "name": "burst 1",
+    "prompt_tokens": 31701,
+    "cached_tokens": 896,
+    "ttft_s": 27.33577471099852,
+    "prefill_s": 27.2756,
+    "restored": 26,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 1,
+    "queued_s": 0.023,
+    "text": "This document (B499853410-0) is a collection of 94 numbered lines, each containing a sequence of six nature-themed words (such as fjord, willow, saffron, and quartz), appearing"
+   },
+   {
+    "name": "burst 2",
+    "prompt_tokens": 31687,
+    "cached_tokens": 896,
+    "ttft_s": 84.42544290299702,
+    "prefill_s": 82.5513,
+    "restored": 26,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 2,
+    "queued_s": 1.832,
+    "text": "This document (B499853410-1) is a 94-line fragment of the same generated word-sequence corpus as BU499853410, consisting of numbered entries (B499853410"
+   },
+   {
+    "name": "burst 3",
+    "prompt_tokens": 31683,
+    "cached_tokens": 896,
+    "ttft_s": 55.8985955290118,
+    "prefill_s": 53.9677,
+    "restored": 26,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 2,
+    "queued_s": 1.821,
+    "text": "This document (B499853410-2) is a collection of 94 numbered lines, each containing a sequence of six nature-themed words (such as quartz, saffron, raven, granite, harbor, will"
+   },
+   {
+    "name": "burst 4",
+    "prompt_tokens": 31698,
+    "cached_tokens": 896,
+    "ttft_s": 113.03368522900564,
+    "prefill_s": 111.16,
+    "restored": 26,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 2,
+    "queued_s": 1.825,
+    "text": "This document (B499853410-3) is a collection of 94 numbered lines, each containing a sequence of six nature-themed words (such as tundra, fjord, granite, willow, orchid,"
+   }
+  ],
+  "wall_s": 114.12435068699415
+ },
+ "exact": [
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true
+ ]
+}

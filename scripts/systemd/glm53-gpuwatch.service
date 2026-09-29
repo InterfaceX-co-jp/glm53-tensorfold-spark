@@ -1,0 +1,33 @@
+# GB10 slow-state / clock watch for both Sparks (scripts/gpuwatch.py watch). User unit on the head node; it samples
+# the worker over ssh (WORKER_SSH from the config, key auth, one multiplexed connection). docs/OPS-GPUWATCH.md.
+#
+#   cp scripts/systemd/glm53-gpuwatch.{service,timer} ~/.config/systemd/user/
+#   $EDITOR ~/.config/systemd/user/glm53-gpuwatch.service      # the repo path, CONFIG, the webhook
+#   loginctl enable-linger "$USER"
+#   systemctl --user daemon-reload && systemctl --user enable --now glm53-gpuwatch.timer
+#   journalctl --user -u glm53-gpuwatch -f          # ALERT / STILL / CLEARED lines
+#   python3 scripts/gpuwatch.py status              # the last samples and the active conditions
+#
+# The timer starts the watch 3 minutes after boot (after dgx-gpu-clock-cap.service has applied -lgc 300,2250) and
+# restarts it within 5 minutes if it ever stops. The watch itself runs no GPU work (GPUWATCH_PROBE=off).
+# CSV + state: $XDG_STATE_HOME/glm53-tf/gpuwatch/ (14 days of CSV), the same STATE_DIR serve.sh uses.
+[Unit]
+Description=GLM-5.3 GB10 clock / slow-state watch (both Sparks)
+After=network-online.target
+
+[Service]
+Type=simple
+# edit: the checkout of this repo on the head node, and the config serve.sh starts
+WorkingDirectory=%h/glm53-tensorfold-spark
+Environment=CONFIG=config/prod.env
+Environment=PYTHONUNBUFFERED=1
+# Environment=GPUWATCH_WEBHOOK=https://hooks.example/...   # JSON POST {"text", "content", "severity", "key"}
+# Environment=WATCH_ALERT=%h/bin/notify                     # a command run with the message as $1 (shared with serve.sh)
+# Environment=GPUWATCH_PROBE=idle                           # opt-in bandwidth probe: see the doc before enabling
+ExecStart=/usr/bin/env python3 scripts/gpuwatch.py watch --interval 5
+Restart=on-failure
+RestartSec=30
+Nice=10
+# a sample is two nvidia-smi calls (one over ssh) every 5 s; keep the watch cheap and out of the server's way
+CPUQuota=10%
+MemoryMax=256M

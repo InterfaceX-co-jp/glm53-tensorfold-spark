@@ -1,0 +1,11 @@
+[Unit]
+Description=Start (and keep up) the GB10 clock / slow-state watch
+
+[Timer]
+OnBootSec=3min
+# re-activates the watch if it stopped (activating a running service is a no-op)
+OnUnitInactiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

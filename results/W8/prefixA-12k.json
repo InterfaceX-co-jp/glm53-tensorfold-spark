@@ -1,0 +1,121 @@
+{
+ "args": {
+  "base": "http://127.0.0.1:8000",
+  "model": "GLM-5.3-Flash-EXL3",
+  "system": 12000,
+  "user": 1500,
+  "sessions": 3,
+  "burst": 4,
+  "tokens": 48,
+  "modes": "sequential,burst,exact",
+  "extra": "{}",
+  "out": "results/W8/prefixA-12k.json"
+ },
+ "sequential": [
+  {
+   "name": "session 1",
+   "prompt_tokens": 19395,
+   "cached_tokens": 0,
+   "ttft_s": 17.03006385100889,
+   "prefill_s": 16.9829,
+   "restored": null,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 1,
+   "queued_s": 0.013,
+   "text": "This document (Q70187669-0) is a collection of 94 numbered lines, each containing a sequence of six codewords drawn from a fixed vocabulary of terms like pepper, basalt, quartz, cedar, r"
+  },
+  {
+   "name": "session 2",
+   "prompt_tokens": 19398,
+   "cached_tokens": 16384,
+   "ttft_s": 3.2503046579950023,
+   "prefill_s": 3.2313,
+   "restored": 21,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 1,
+   "queued_s": 0.008,
+   "text": "This document (Q70187669-1) is a collection of 94 numbered lines of six random words each, spanning the same vocabulary of nature- and color-themed terms (e.g., basalt, quartz, cedar,"
+  },
+  {
+   "name": "session 3",
+   "prompt_tokens": 19392,
+   "cached_tokens": 17152,
+   "ttft_s": 2.269808191995253,
+   "prefill_s": 2.2502,
+   "restored": 23,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 0,
+   "queued_s": 0.006,
+   "text": "This document (Q70187669-2) is a numbered list of 94 short lines, each containing six random words (e.g., \"raven tundra saffron harbor tundra iris\"), apparently generated as filler"
+  }
+ ],
+ "burst": {
+  "rows": [
+   {
+    "name": "burst 1",
+    "prompt_tokens": 19410,
+    "cached_tokens": 896,
+    "ttft_s": 35.525986262000515,
+    "prefill_s": 33.437,
+    "restored": 26,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 2,
+    "queued_s": 2.048,
+    "text": "This document (B70187669-0) is a collection of 94 numbered text fragments, each consisting of a sequence of six nature-themed words (such as cedar, orchid, saffron, tundra, fj"
+   },
+   {
+    "name": "burst 2",
+    "prompt_tokens": 19419,
+    "cached_tokens": 0,
+    "ttft_s": 17.582465211002273,
+    "prefill_s": 17.5303,
+    "restored": null,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 2,
+    "queued_s": 0.017,
+    "text": "This document (B70187669-1) is a collection of 94 numbered lines, each containing a sequence of six nature-themed words (such as meadow, cedar, raven, saffron, fjord,"
+   },
+   {
+    "name": "burst 3",
+    "prompt_tokens": 19425,
+    "cached_tokens": 896,
+    "ttft_s": 71.41073920499184,
+    "prefill_s": 69.3222,
+    "restored": 26,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 2,
+    "queued_s": 2.045,
+    "text": "This document (B70187669-2) is a collection of 94 numbered lines, each containing a sequence of six nature-themed words (such as willow, iris, xenon, juniper, yarrow, and"
+   },
+   {
+    "name": "burst 4",
+    "prompt_tokens": 19421,
+    "cached_tokens": 896,
+    "ttft_s": 53.37454989600519,
+    "prefill_s": 51.2867,
+    "restored": 26,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 2,
+    "queued_s": 2.041,
+    "text": "This document (B70187669-3) is a collection of 94 numbered lines, each containing a sequence of six nature-themed words (such as pepper, orchid, quartz, cedar, tundra, and meadow"
+   }
+  ],
+  "wall_s": 72.38647932399181
+ },
+ "exact": [
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true
+ ]
+}

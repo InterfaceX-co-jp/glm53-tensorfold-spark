@@ -1,0 +1,502 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/comm.py i/src/tensorfold/families/glm5_next/cuda/comm.py
+index cc45519..6d4e54c 100644
+--- c/src/tensorfold/families/glm5_next/cuda/comm.py
++++ i/src/tensorfold/families/glm5_next/cuda/comm.py
+@@ -84,6 +84,35 @@ class NCCL:
+         self._check(self.lib.ncclAllGather(send.data_ptr(), recv.data_ptr(), send.numel(), _DTYPES[send.dtype],
+                                            self.comm, stream))
+ 
++    def swap(self, sends: list[torch.Tensor], recvs: list[torch.Tensor]) -> None:
++        """patches/0320: two ranks trade tensors: each ``sends[i]`` goes to the other rank, which receives it into its
++        ``recvs[i]`` (contiguous; the other rank's ``sends[i]`` has ``recvs[i]``'s dtype and size, which the caller's
++        plan guarantees). One NCCL group of sends and receives on the current stream (captured like the all-gathers).
++        A copy: the received bytes are the sent bytes."""
++
++        if self.world != 2:
++            raise ValueError("swap: two ranks only")
++        lib = self.lib
++        if not getattr(self, "_p2p", False):
++            for name in ("ncclSend", "ncclRecv"):
++                getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
++                                               ctypes.c_void_p, ctypes.c_void_p]
++            lib.ncclGroupStart.argtypes = []
++            lib.ncclGroupEnd.argtypes = []
++            self._p2p = True
++        peer = 1 - self.rank
++        stream = torch.cuda.current_stream().cuda_stream
++        self._check(lib.ncclGroupStart())
++        try:
++            for t in sends:
++                if t.numel():
++                    self._check(lib.ncclSend(t.data_ptr(), t.numel(), _DTYPES[t.dtype], peer, self.comm, stream))
++            for t in recvs:
++                if t.numel():
++                    self._check(lib.ncclRecv(t.data_ptr(), t.numel(), _DTYPES[t.dtype], peer, self.comm, stream))
++        finally:
++            self._check(lib.ncclGroupEnd())
++
+     def barrier(self) -> None:
+         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
+         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
+@@ -112,3 +141,27 @@ def check(comm) -> None:
+     c = getattr(comm, "check", None)
+     if c is not None:
+         c()
++
++
++# -- patches/0320: row swaps between the two ranks (GLM53_TF_PREFILL_PP) ------------------------------------------------
++def swap(comm, sends: list[torch.Tensor], recvs: list[torch.Tensor]) -> None:
++    """Two ranks: ``sends[i]`` to the other rank's ``recvs[i]`` (``NCCL.swap``: send/recv in one group). A
++    communicator without ``swap`` (the RoCE one forwards to its NCCL base; test stand-ins) trades through its
++    all-gather: each pair padded to the larger of the two sizes, as bytes. Either way a copy."""
++
++    fn = getattr(comm, "swap", None)
++    if fn is not None:
++        fn(sends, recvs)
++        return
++    rank = comm.rank
++    for s, r in zip(sends, recvs):
++        sb, rb = s.contiguous().view(-1).view(torch.uint8), r.view(-1).view(torch.uint8)
++        n = max(sb.numel(), rb.numel())
++        if n == 0:
++            continue
++        pad = torch.zeros((n,), dtype=torch.uint8, device=s.device)
++        pad[:sb.numel()].copy_(sb)
++        both = torch.empty((2 * n,), dtype=torch.uint8, device=s.device)
++        comm.all_gather(pad, both)
++        other = both[(1 - rank) * n:(1 - rank) * n + rb.numel()]
++        rb.copy_(other)
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py i/src/tensorfold/families/glm5_next/cuda/engine.py
+index ca85ff5..de8086d 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ i/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -307,6 +307,19 @@ class GlmEngine:
+         if pfoverlap.DEFAULT.pipe and rank == 0:
+             note = "" if lean_mod.enabled() else " (inactive without GLM53_TF_LEAN_PREFILL=1)"
+             print(f"[tensorfold] prefill overlap: {pfoverlap.describe(pfoverlap.DEFAULT)}{note}", flush=True)
++        # patches/0320: GLM53_TF_PREFILL_PP changes a pipelined chunk's collectives (row swaps instead of all-gathers):
++        # both ranks must agree on it and, with it on, on whether the pipeline is the default
++        from . import pfpp
++
++        pp_both = self._gather_ints(pfpp.settings())
++        if pp_both[0] != pp_both[1]:
++            raise RuntimeError("the two ranks were started with different GLM53_TF_PREFILL_PP / GLM53_TF_PREFILL_OVERLAP "
++                               f"settings: {pp_both[0]}, {pp_both[1]}")
++        if pfpp.on() and rank == 0:
++            note = "" if (lean_mod.enabled() and pfoverlap.DEFAULT.pipe) else \
++                " (inactive without GLM53_TF_LEAN_PREFILL=1 and GLM53_TF_PREFILL_OVERLAP)"
++            print(f"[tensorfold] prefill row split: hyper-connections on each rank's half of a sub-block (patches/0320)"
++                  f"{note}", flush=True)
+         # patches/0290: GLM53_TF_KV_POOL_TOKENS / _PAGE / _SLACK decide where rows live and the admission policy (rank
+         # 0 plans, rank 1 follows it with a pool of its own): both ranks must agree
+         from . import kvpool
+diff --git c/src/tensorfold/families/glm5_next/cuda/pfoverlap.py i/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+index 5e3ddff..2dab82c 100644
+--- c/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
++++ i/src/tensorfold/families/glm5_next/cuda/pfoverlap.py
+@@ -444,6 +444,10 @@ def compute(w, st, b, lb, R: int, *, head: bool = True) -> torch.Tensor:
+         raise ValueError(f"lean chunk of {R} rows, the lean buffers hold {lb.rows}")
+     if lb.block > b.rows:
+         raise ValueError(f"lean sub-blocks of {lb.block} rows, the main buffers hold {b.rows}")
++    from . import pfpp
++
++    if pfpp.applies(w, lb, R):          # patches/0320: the rows' hyper-connections split between the ranks
++        return pfpp.compute(w, st, b, lb, R, head=head)
+     mode = MODE
+     pipe = _pipe(w, b, lb)
+     pipe.begin(mode.gather)
+diff --git c/src/tensorfold/families/glm5_next/cuda/pfpp.py i/src/tensorfold/families/glm5_next/cuda/pfpp.py
+new file mode 100644
+index 0000000..7116828
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/pfpp.py
+@@ -0,0 +1,389 @@
++"""Row-split ("sequence-parallel") hyper-connections in the pipelined lean prefill chunk (patches/0320,
++GLM53_TF_PREFILL_PP): patches/0084's chunk with every row-wise piece of work done ONCE across the two ranks instead of
++once on each.
++
++Why not pipeline parallelism, and what this is instead
++------------------------------------------------------
++``docs/PREFILL-PP.md`` has the numbers. In short: true PP needs each rank to hold whole layers, i.e. a second, PP-layout
++copy of ~75 GiB of weights next to the 76.6 GiB TP copy on a 121 GiB node (impossible), or giving up the TP layout
++(single-stream decode ~40% slower). Expert parallelism cannot reproduce TP's bits without shipping every routed
++pair's fp32 K-half outputs (~16x today's bytes). And the exchanges TP makes in prefill are already hidden by 0084's
++pipeline (the measured ``allgather`` lap is ~0.05% of a 28k prefill). What TP still wastes is work that is NOT split:
++every rank runs the hyper-connections (hc_post, the next hc_pre with its 20 Sinkhorn steps and norm), the embedding,
++the taps and the final norm on ALL rows of every sub-block, ~12% of a prefill, twice over.
++
++What changes
++------------
++Each sub-block of r rows is split in two row ranges at a multiple of 64 (``split``): rank 0 owns the first, rank 1 the
++rest. Per exchange site, instead of 0084's all-gather of the whole partial:
++
++1. ``issue`` (where the all-gather was): each rank sends the OTHER rank's rows of its partial and receives the other
++   rank's partial of its OWN rows (NCCL send/recv in one group: half the bytes of the all-gather on the critical
++   path). The partials are laid out [world, rows, D] per slot, so hc_post reads [rank 0's, rank 1's] partial of its
++   rows, rank 0 first, exactly the operands and order it reads today.
++2. The post runs hc_post and the next hc_pre (or the taps and the final norm) on the OWN rows only.
++3. ``share``: the own rows of what the next pieces read from every row (the normed rows and their group sums; after
++   the last layer the final-normed rows, their group sums and the DFlash2 taps) go to the other rank, in place, on
++   the comm stream; the next reader of those rows waits for it (``need``). Those readers are 3-4 pieces later (or the
++   MoE routing), so this second exchange is off the critical path except at the MoE boundary.
++
++The bytes a rank sends per site are the same as 0084's (r/2 rows of partial + r/2 rows of normed input, plus 1/32 for
++the group sums); the hyper-connection work a rank does is halved; the residual streams of the other rank's rows go
++stale in ``lb.x`` (nothing reads them after the chunk).
++
++Bits
++----
++Every kernel is the one 0084 runs, on the same operand values, only on a row subset: the hyper-connection kernels,
++``stream_mean`` and ``rmsnorm`` are row-independent (0084 already calls them on 64-row-aligned slabs, and on the
++partial last slab of any size), the exchanges are copies, and hc_post adds rank 0's partial first as before. Every
++row's streams, normed rows, group sums, taps and final rows are therefore bit-identical to 0084's (so to 0082's and
++0080's), and so are the KDA / DSA / MoE / head inputs built from them. Committed state and replies are unchanged
++(host: ``tests/cuda/test_prefill_pp_patches.py`` on the hash model with two real processes over gloo; GPU: the
++row-split kernel checks there, and the two-Spark checks in ``docs/PREFILL-PP.md``).
++
++Scope and knob
++--------------
++GLM53_TF_PREFILL_PP = 0 (default) | 1. Only pipelined lean chunks (GLM53_TF_LEAN_PREFILL=1 and 0084's pipeline on for
++the request) with two ranks and at least ``MIN_BLOCKS`` sub-blocks take this path; smaller chunks keep 0084's (two
++dependent exchanges a site would be exposed there). It changes the collectives a chunk makes, so both ranks must
++agree on it and on GLM53_TF_PREFILL_OVERLAP's default (checked at load).
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++from . import comm as comm_mod, fastpf, glue, lean, pfoverlap, profile, qmm
++from .pfoverlap import Pending
++
++ENV = "GLM53_TF_PREFILL_PP"
++MIN_BLOCKS = 2                        # sub-blocks a chunk needs before the row split pays for its second exchange
++
++
++def parse(raw: str | None = None) -> bool:
++    raw = os.environ.get(ENV, "0") if raw is None else raw
++    v = raw.strip().lower()
++    if v in ("", "0", "off", "false", "no"):
++        return False
++    if v in ("1", "on", "true", "yes"):
++        return True
++    raise ValueError(f"{ENV}={raw!r}: expected 0 or 1")
++
++
++ON = parse()
++
++
++def on() -> bool:
++    return ON
++
++
++def settings() -> list[int]:
++    """What both ranks must agree on: the knob, and with it on, whether 0084's pipeline is the default (a request
++    that does not set ``prefill_overlap`` runs the default, and only pipelined chunks are row-split)."""
++
++    return [int(ON), int(pfoverlap.DEFAULT.pipe) if ON else 0]
++
++
++def split(r: int) -> int:
++    """Rows of an r-row sub-block that rank 0 owns (its first ones; rank 1 owns the rest): half, rounded up to a
++    multiple of 64 (the grid 0084's slabs are cut on), at most r."""
++
++    h = -(-r // 2)
++    return min(r, -(-h // fastpf.GRID) * fastpf.GRID)
++
++
++def own(r: int, rank: int) -> tuple[int, int]:
++    """(first row, rows) of an r-row sub-block that ``rank`` owns, relative to the sub-block."""
++
++    h = split(r)
++    return (0, h) if rank == 0 else (h, r - h)
++
++
++def applies(w, lb, R: int) -> bool:
++    """This chunk is row-split: the knob, two ranks, a communicator, at least ``MIN_BLOCKS`` sub-blocks. Both ranks
++    decide the same (the same settings, R and block)."""
++
++    return (ON and w.comm is not None and w.world == 2 and getattr(w.comm, "world", 2) == 2
++            and len(lb.sub_blocks(R)) >= MIN_BLOCKS)
++
++
++# -- the exchanges ----------------------------------------------------------------------------------------------------
++class SplitPipe(pfoverlap.Pipe):
++    """0084's ``Pipe`` with [world, rows, D] slots: a producer writes its whole partial into ``[rank]``, ``issue``
++    swaps the rows each rank owns (send the other rank's rows, receive the other rank's partial of our rows into
++    ``[other]``), and ``share`` swaps row ranges of other tensors in place. Same stream / event / host-queue rules."""
++
++    def __init__(self, w, rows: int, dtype: torch.dtype) -> None:
++        dev = w.device
++        self.rows, self.dtype, self.D = rows, dtype, w.cfg.hidden
++        self.world = 2
++        self.rank = int(getattr(w, "rank", 0) if getattr(w.comm, "rank", None) is None else w.comm.rank)
++        self.buf = [torch.empty((2, rows, self.D), dtype=dtype, device=dev) for _ in range(2)]
++        self.part = [x[self.rank] for x in self.buf]      # 0084's names, for anything that inspects them
++        self.gath = None
++        self.cuda = dev.type == "cuda"
++        self.stream = None
++        if self.cuda:
++            self.stream = torch.cuda.Stream(device=dev, priority=-1)
++            self.ready = [torch.cuda.Event() for _ in range(2)]
++            self.done = [torch.cuda.Event() for _ in range(2)]
++        self.queue: list = []
++        self.busy = [False, False]
++        self.k = 0
++        self.overlap = False
++        self.issued = 0
++        self.swaps = 0                    # row exchanges (``share``), for the tests
++
++    def fits(self, w, rows: int, dtype: torch.dtype) -> bool:
++        return self.rows >= rows and self.dtype == dtype and w.comm is not None
++
++    def slot(self, R: int) -> torch.Tensor:
++        i = self.k % 2
++        if self.busy[i]:
++            raise RuntimeError("pfpp: a partial slot is written while its exchange is pending")
++        return self.buf[i][self.rank, :R]
++
++    def _run(self, w, sends, recvs, slot: int | None, out) -> Pending:
++        """Queue one swap: now on the current stream (no overlap), as a host job (no CUDA), or on the comm stream
++        after the compute stream's work so far."""
++
++        if not self.overlap:
++            comm_mod.swap(w.comm, sends, recvs)
++            if profile.ON:
++                profile.lap("allgather")
++            return Pending(out, None, None, None)
++        if slot is not None:
++            self.busy[slot] = True
++        if not self.cuda:
++            def job(sends=sends, recvs=recvs):
++                comm_mod.swap(w.comm, sends, recvs)
++
++            self.queue.append(job)
++            return Pending(out, None, job, -1 if slot is None else slot)
++        if slot is None:
++            ready, done = torch.cuda.Event(), torch.cuda.Event()
++        else:
++            ready, done = self.ready[slot], self.done[slot]
++        ready.record()
++        self.stream.wait_event(ready)
++        with torch.cuda.stream(self.stream):
++            comm_mod.swap(w.comm, sends, recvs)
++        done.record(self.stream)
++        return Pending(out, done, None, -1 if slot is None else slot)
++
++    def issue(self, w, b, R: int) -> Pending:
++        i = self.k % 2
++        if self.busy[i]:
++            raise RuntimeError("pfpp: an exchange is issued on a slot whose last exchange was not waited for")
++        self.k += 1
++        self.issued += 1
++        b.site = None
++        me, other = self.rank, 1 - self.rank
++        lo, n = own(R, me)
++        olo, on_ = own(R, other)
++        S = self.buf[i]
++        return self._run(w, [S[me, olo:olo + on_]], [S[other, lo:lo + n]], i, S[:, lo:lo + n])
++
++    def share(self, w, sends, recvs) -> Pending:
++        self.swaps += 1
++        return self._run(w, sends, recvs, None, None)
++
++    def wait(self, h: Pending):
++        if h.slot is None:
++            return h.out
++        if h.event is not None:
++            torch.cuda.current_stream().wait_event(h.event)
++        else:
++            while self.queue:
++                job = self.queue.pop(0)
++                job()
++                if job is h.job:
++                    break
++        if h.slot >= 0:
++            self.busy[h.slot] = False
++        if profile.ON:
++            profile.lap("allgather")
++        return h.out
++
++
++def _pipe(w, lb) -> SplitPipe:
++    dtype = torch.bfloat16 if w.meta.get("fast_gather16") else torch.float32
++    p = getattr(lb, "pp_pipe", None)
++    if p is None or not p.fits(w, lb.block, dtype):
++        p = SplitPipe(w, lb.block, dtype)
++        lb.pp_pipe = p
++    return p
++
++
++# -- the chunk --------------------------------------------------------------------------------------------------------
++class _SplitChunk(pfoverlap._Chunk):
++    """0084's piece order (pre(k), then post(k - 1)), with each post on this rank's rows and their results shared."""
++
++    def __init__(self, w, st, b, lb, R: int, pipe: SplitPipe, slab: int) -> None:
++        super().__init__(w, st, b, lb, R, pipe, slab)
++        self.rank = pipe.rank
++        self.rows_pending: dict[int, Pending] = {}       # sub-block start -> its rows' pending ``share``
++        self.fxs = _fxs_rows(lb, w)                      # final group sums of every row (the head's last row)
++
++    def own(self, a: int, r: int) -> tuple[int, int]:
++        lo, n = own(r, self.rank)
++        return a + lo, n
++
++    def other(self, a: int, r: int) -> tuple[int, int]:
++        lo, n = own(r, 1 - self.rank)
++        return a + lo, n
++
++    def slabs(self, a: int, r: int):
++        if r <= 0:
++            return []
++        return super().slabs(a, r)
++
++    def share(self, a: int, r: int, tensors) -> None:
++        lo, n = self.own(a, r)
++        olo, on_ = self.other(a, r)
++        if a in self.rows_pending:
++            raise RuntimeError("pfpp: rows shared again before their last share was waited for")
++        self.order.append(f"share {a}")
++        self.rows_pending[a] = self.pipe.share(self.w, [t[lo:lo + n] for t in tensors],
++                                               [t[olo:olo + on_] for t in tensors])
++
++    def need(self, a: int) -> None:
++        h = self.rows_pending.pop(a, None)
++        if h is not None:
++            self.order.append(f"need {a}")
++            self.pipe.wait(h)
++
++    def need_all(self) -> None:
++        for a in sorted(self.rows_pending):
++            self.need(a)
++
++    def _normed(self):
++        return (self.lb.normed, self.lb.xs)
++
++    # pieces: the pre work reads every row of its sub-block's normed input
++    def attn_pre(self, layer, a: int, r: int):
++        self.need(a)
++        return super().attn_pre(layer, a, r)
++
++    def ffn_pre(self, layer, a: int, r: int):
++        self.need(a)
++        return super().ffn_pre(layer, a, r)
++
++    def attn_post(self, layer, a: int, r: int, g) -> None:
++        lo, n = self.own(a, r)
++        for s0, m in self.slabs(lo, n):
++            if self.hc_post_pre(g, lo, s0, m, layer.ffn_hc, layer.post_norm):      # patches/0190
++                continue
++            self.hc_post(g, lo, s0, m)
++            self.hc_pre(layer.ffn_hc, layer.post_norm, s0, m)
++        self.share(a, r, self._normed())
++
++    def ffn_post(self, layer, nxt, a: int, r: int, g) -> None:
++        w, b, lb, c = self.w, self.b, self.lb, self.c
++        taps = b.tap_at.get(layer.index, ())
++        lo, n = self.own(a, r)
++        for s0, m in self.slabs(lo, n):
++            x = lb.x[s0:s0 + m]
++
++            def tap(x=x, s0=s0, m=m):
++                for slot in taps:
++                    glue.stream_mean(x, b.taps[slot][:m])
++                    lb.tapcat[s0:s0 + m, slot * lb.D:(slot + 1) * lb.D].copy_(b.taps[slot][:m])
++
++            if nxt is not None and self.hc_post_pre(g, lo, s0, m, nxt.attn_hc, nxt.in_norm, tap):
++                continue
++            self.hc_post(g, lo, s0, m)
++            tap()
++            if nxt is not None:
++                self.hc_pre(nxt.attn_hc, nxt.in_norm, s0, m)
++                continue
++            glue.stream_mean(x, b.hidden[:m])
++            glue.rmsnorm(b.hidden[:m], w.norm, c.eps, lb.fnormed[s0:s0 + m], self.fxs[s0:s0 + m])
++            if profile.ON:
++                profile.lap("hc")
++        if nxt is not None:
++            self.share(a, r, self._normed())
++        else:
++            final = [lb.fnormed, self.fxs] + ([lb.tapcat] if lb.tapcat is not None else [])
++            self.share(a, r, final)
++
++    def run(self) -> None:
++        w, lb, c = self.w, self.lb, self.c
++        R = self.R
++        blocks = lb.sub_blocks(R)
++        layers = w.layers
++        first = layers[0]
++        for a, r in blocks:
++            lo, n = self.own(a, r)
++            for s0, m in self.slabs(lo, n):
++                glue.embed(lb.ids[s0:s0 + m], w.embed, c.hidden, c.streams, lb.x[s0:s0 + m])
++                if profile.ON:
++                    profile.lap("embed")
++                self.hc_pre(first.attn_hc, first.in_norm, s0, m)
++            self.share(a, r, self._normed())
++        for li, layer in enumerate(layers):
++            nxt = layers[li + 1] if li + 1 < len(layers) else None
++            for a, r in blocks:
++                self.piece(f"{layer.index}a{a}", lambda a=a, r=r, L=layer: self.attn_pre(L, a, r),
++                           lambda g, a=a, r=r, L=layer: self.attn_post(L, a, r, g), drain=False)
++            if layer.mlp is None:
++                self.flush()             # the routing reads every row's FFN input: the last attention post, then
++                self.need_all()          # every sub-block's shared rows
++                lean._routed(layer, w, lb, R)
++            for a, r in blocks:
++                self.piece(f"{layer.index}f{a}", lambda a=a, r=r, L=layer: self.ffn_pre(L, a, r),
++                           lambda g, a=a, r=r, L=layer, N=nxt: self.ffn_post(L, N, a, r, g), drain=False)
++        self.flush()
++        self.need_all()                  # the final-normed rows, their sums and the taps of every row
++        self.fxs_last = self.fxs[R - 1:R]
++
++
++def _fxs_rows(lb, w) -> torch.Tensor:
++    """The final norm's group sums of every row of a chunk (0084 kept only the window's; the head's last row may be
++    the other rank's)."""
++
++    t = getattr(lb, "pp_fxs", None)
++    if t is None or t.shape[0] < lb.rows:
++        t = torch.empty((lb.rows, w.cfg.hidden // 64), dtype=torch.float32, device=w.device)
++        lb.pp_fxs = t
++    return t
++
++
++def compute(w, st, b, lb, R: int, *, head: bool = True) -> torch.Tensor:
++    """``pfoverlap.compute`` with the row split (``applies`` must hold): the same bits. Returns the last row's logits
++    [1, V/world] (stale unless ``head``); every row's final-normed rows in ``lb.fnormed[:R]`` and taps in
++    ``lb.tapcat[:R]`` on both ranks."""
++
++    if R > lb.rows:
++        raise ValueError(f"lean chunk of {R} rows, the lean buffers hold {lb.rows}")
++    if lb.block > b.rows:
++        raise ValueError(f"lean sub-blocks of {lb.block} rows, the main buffers hold {b.rows}")
++    mode = pfoverlap.MODE
++    pipe = _pipe(w, lb)
++    pipe.begin(mode.gather)
++    run = _SplitChunk(w, st, b, lb, R, pipe, pfoverlap.slab_rows(w, lb.block) if mode.slab else 0)
++    with fastpf.chunk(b, w.head):
++        b.defer = pipe
++        ok = False
++        try:
++            run.run()
++            ok = True
++        finally:
++            b.defer = None
++            if not ok:
++                run.rows_pending.clear()
++                pipe.abort()
++        if not pipe.idle() or run.rows_pending:
++            raise RuntimeError("pfpp: exchanges left pending at the end of a chunk")
++        if head:
++            qmm.matmul(lb.fnormed[R - 1:R], w.head, run.fxs_last, out=b.logits[:1], part=b.sk)
++        if profile.ON:
++            profile.lap("head")
++        lean._join(w)
++    compute.last = run
++    return b.logits[:1]
++
++
++compute.last = None

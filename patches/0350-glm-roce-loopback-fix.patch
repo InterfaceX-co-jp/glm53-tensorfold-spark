@@ -1,0 +1,471 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce.cpp b/src/tensorfold/families/glm5_next/cuda/roce.cpp
+index a4b8e33..fb21500 100644
+--- a/src/tensorfold/families/glm5_next/cuda/roce.cpp
++++ b/src/tensorfold/families/glm5_next/cuda/roce.cpp
+@@ -19,6 +19,9 @@
+ // peer, stripes the payload across the HCAs; each stripe is followed by its own 4-byte seq write on the same
+ // reliable-connected queue pair, so its flag cannot become visible before its payload. Nothing on the receive path
+ // involves the host: the DGX Spark's GB10 reads the pinned host memory the NIC wrote in place (no GPUDirect RDMA).
++//
++// patches/0350: the proxy thread (and the tests' Loop) also polls ``FailWatch`` (roce_watch.h) every iteration: the
++// host's view of a failed wait's flag at the moment of the failure, and whether it arrives later.
+ 
+ #include <errno.h>
+ #include <infiniband/verbs.h>
+@@ -38,6 +41,7 @@
+ #include <torch/extension.h>
+ 
+ #include "roce_common.h"
++#include "roce_watch.h"      // patches/0350
+ 
+ namespace tfroce {
+ 
+@@ -195,6 +199,12 @@ class Proxy {
+ 
+     std::string error() const { return err_; }
+ 
++    std::vector<uint64_t> watch() const {       // patches/0350: FailWatch::read
++        uint64_t out[7];
++        watch_.read(out);
++        return std::vector<uint64_t>(out, out + 7);
++    }
++
+     std::vector<uint64_t> stats() const {
+         std::vector<uint64_t> out = {ops_posted_, writes_completed_, last_seq_};
+         for (int h = 0; h < n_hca_; h++) {
+@@ -236,6 +246,15 @@ class Proxy {
+   private:
+     volatile uint32_t *ctrl() const { return reinterpret_cast<volatile uint32_t *>(region_ + ctrl_off_); }
+ 
++    // patches/0350: the host address of flag[peer][slot][hca] (nullptr out of range)
++    const volatile uint32_t *flag_at(uint32_t peer, uint32_t slot, uint32_t hca) const {
++        if (peer >= uint32_t(world_) || slot >= uint32_t(SLOTS) || hca >= uint32_t(n_hca_)) {
++            return nullptr;
++        }
++        return reinterpret_cast<const volatile uint32_t *>(
++            region_ + flag_off_ + ((uint64_t(peer) * SLOTS + slot) * uint64_t(n_hca_) + hca) * FLAG_STRIDE);
++    }
++
+     void set_err(const char *what, int e) { err_ = std::string(what) + ": " + (e ? strerror(e) : "failed"); }
+ 
+     bool open_hca(int h, const std::string &name) {
+@@ -500,7 +519,9 @@ class Proxy {
+         volatile uint32_t *c = ctrl();
+         uint64_t idle = 0;
+         const timespec nap = {0, 20000};
++        auto flags = [this](uint32_t p, uint32_t sl, uint32_t h) { return flag_at(p, sl, h); };
+         while (running_.load(std::memory_order_relaxed)) {
++            watch_.poll(c, flags);                  // patches/0350
+             const uint32_t seq = __atomic_load_n(&c[CTRL_SEQ], __ATOMIC_ACQUIRE);
+             if (seq == last_seq_) {
+                 idle++;
+@@ -557,6 +578,7 @@ class Proxy {
+     uint64_t ops_posted_ = 0;
+     uint64_t writes_completed_ = 0;
+     std::string err_;
++    FailWatch watch_;                             // patches/0350
+ };
+ 
+ // -- pinned region -------------------------------------------------------------------------------------------------
+@@ -639,14 +661,16 @@ class Launcher {
+ // -- tests on one GPU: a thread that plays every peer ------------------------------------------------------------------
+ // It polls the doorbell like the proxy and, for each sequence, "delivers" every peer's shard as this rank's staged
+ // shard XOR ``xor_key`` into recv[peer][slot], then the per-HCA flags (release stores after a full fence: the NIC's
+-// payload-before-flag order). ``stall_after`` >= 0: stop delivering after that many ops (timeout tests).
++// payload-before-flag order). ``stall_after`` >= 0: stop delivering after that many ops (timeout tests);
++// patches/0350 ``late``: resume delivering once the kernel's failure word is up (a peer that arrives after the
++// timeout: the watch must call it late, not "delivered but not seen").
+ class Loop {
+   public:
+     Loop(uint64_t host, uint64_t recv_off, uint64_t flag_off, uint64_t send_off, uint64_t ctrl_off, uint64_t slot_bytes,
+-         int world, int rank, int n_hca, int flag_stride, int slots, int xor_key, int64_t stall_after)
++         int world, int rank, int n_hca, int flag_stride, int slots, int xor_key, int64_t stall_after, bool late)
+         : region_(reinterpret_cast<uint8_t *>(host)), recv_off_(recv_off), flag_off_(flag_off), send_off_(send_off),
+           ctrl_off_(ctrl_off), slot_bytes_(slot_bytes), world_(world), rank_(rank), n_hca_(n_hca),
+-          flag_stride_(flag_stride), slots_(slots), xor_(uint8_t(xor_key)), stall_after_(stall_after) {
++          flag_stride_(flag_stride), slots_(slots), xor_(uint8_t(xor_key)), stall_after_(stall_after), late_(late) {
+         last_ = ctrl()[CTRL_SEQ];
+         running_.store(1);
+         int rc = pthread_create(&thread_, nullptr, &Loop::tramp, this);
+@@ -666,9 +690,23 @@ class Loop {
+ 
+     int64_t delivered() const { return delivered_.load(); }
+ 
++    std::vector<uint64_t> watch() const {
++        uint64_t out[7];
++        watch_.read(out);
++        return std::vector<uint64_t>(out, out + 7);
++    }
++
+   private:
+     volatile uint32_t *ctrl() const { return reinterpret_cast<volatile uint32_t *>(region_ + ctrl_off_); }
+ 
++    const volatile uint32_t *flag_at(uint32_t peer, uint32_t slot, uint32_t hca) const {
++        if (peer >= uint32_t(world_) || slot >= uint32_t(slots_) || hca >= uint32_t(n_hca_)) {
++            return nullptr;
++        }
++        return reinterpret_cast<const volatile uint32_t *>(
++            region_ + flag_off_ + ((uint64_t(peer) * slots_ + slot) * n_hca_ + hca) * flag_stride_);
++    }
++
+     static void *tramp(void *self) {
+         static_cast<Loop *>(self)->run();
+         return nullptr;
+@@ -676,14 +714,17 @@ class Loop {
+ 
+     void run() {
+         volatile uint32_t *c = ctrl();
++        auto flags = [this](uint32_t p, uint32_t sl, uint32_t h) { return flag_at(p, sl, h); };
+         while (running_.load(std::memory_order_relaxed)) {
++            watch_.poll(c, flags);                  // patches/0350
+             const uint32_t seq = __atomic_load_n(&c[CTRL_SEQ], __ATOMIC_ACQUIRE);
+             if (seq == last_) {
+                 continue;
+             }
+             for (uint32_t s = last_ + 1; s != seq + 1; s++) {
+-                if (stall_after_ >= 0 && delivered_.load() >= stall_after_) {
+-                    break;
++                if (stall_after_ >= 0 && delivered_.load() >= stall_after_ &&
++                    !(late_ && watch_.state.load(std::memory_order_acquire) != FailWatch::IDLE)) {
++                    break;                          // stalled (0350: an op not delivered stays pending)
+                 }
+                 const uint32_t slot = s & 1u;
+                 const uint32_t nbytes = c[CTRL_SLOT_NBYTES + slot];
+@@ -704,8 +745,8 @@ class Loop {
+                     }
+                 }
+                 delivered_.fetch_add(1);
++                last_ = s;
+             }
+-            last_ = seq;
+         }
+     }
+ 
+@@ -714,7 +755,9 @@ class Loop {
+     int world_, rank_, n_hca_, flag_stride_, slots_;
+     uint8_t xor_;
+     int64_t stall_after_;
++    bool late_;
+     uint32_t last_ = 0;
++    FailWatch watch_;                             // patches/0350
+     pthread_t thread_{};
+     std::atomic<int> running_{0};
+     std::atomic<int64_t> delivered_{0};
+@@ -746,6 +789,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def("stop", &Proxy::stop, py::call_guard<py::gil_scoped_release>())
+         .def("failed", &Proxy::failed)
+         .def("error", &Proxy::error)
++        .def("watch", &Proxy::watch)
+         .def("stats", &Proxy::stats)
+         .def("destroy", &Proxy::destroy, py::call_guard<py::gil_scoped_release>());
+     py::class_<Launcher>(m, "Launcher")
+@@ -754,7 +798,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .def("run", &Launcher::run);
+     py::class_<Loop>(m, "Loop")
+         .def(py::init<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, int, int, int, int, int, int,
+-                      int64_t>())
++                      int64_t, bool>())
+         .def("delivered", &Loop::delivered)
++        .def("watch", &Loop::watch)
+         .def("destroy", &Loop::destroy, py::call_guard<py::gil_scoped_release>());
+ }
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce.cu b/src/tensorfold/families/glm5_next/cuda/roce.cu
+index ffda11d..988e610 100644
+--- a/src/tensorfold/families/glm5_next/cuda/roce.cu
++++ b/src/tensorfold/families/glm5_next/cuda/roce.cu
+@@ -20,6 +20,12 @@
+ //   5. the last block to finish advances the device-resident epoch (so a replayed CUDA graph carries on with
+ //      the next sequence) and mirrors it into the host-visible completion word.
+ // Data are only moved, never combined: the gathered bytes equal NCCL's.
++//
++// patches/0350: a timed-out wait claims the failure record with a compare-and-swap on the device poison word (up
++// to blocks x HCAs threads may time out; one writes, so the record is never torn), stores what it last read of the
++// flag (CTRL_ERR_SEEN) and only then the failure word; the epoch is published only if no wait of this launch failed
++// (the device poison, not the host word). The host's view of the same flag at that moment is taken by the proxy
++// thread (roce_watch.h), which tells "arrived late" from "delivered but not seen".
+ 
+ #include <cuda_runtime.h>
+ #include <stdint.h>
+@@ -85,16 +91,26 @@ __device__ __forceinline__ uint64_t globaltimer() {
+     return t;
+ }
+ 
+-// Spin until *flag == want (system scope, acquire). false after timeout_ns of wall-clock time without a match.
+-__device__ __noinline__ bool wait_flag(const uint32_t *flag, uint32_t want, uint64_t timeout_ns) {
++__device__ __forceinline__ uint32_t atom_cas_gpu(uint32_t *p, uint32_t cmp, uint32_t v) {
++    uint32_t old;
++    asm volatile("atom.relaxed.gpu.global.cas.b32 %0, [%1], %2, %3;" : "=r"(old) : "l"(p), "r"(cmp), "r"(v) : "memory");
++    return old;
++}
++
++// Spin until *flag == want (system scope, acquire). false after timeout_ns of wall-clock time without a match;
++// ``seen``: the last value read (patches/0350: the failure record keeps it).
++__device__ __noinline__ bool wait_flag(const uint32_t *flag, uint32_t want, uint64_t timeout_ns, uint32_t *seen) {
+     const uint64_t t0 = globaltimer();
+     uint32_t polls = 0;
+     while (true) {
+-        if (ld_acquire_sys(flag) == want) {
++        const uint32_t v = ld_acquire_sys(flag);
++        if (v == want) {
++            *seen = v;
+             return true;
+         }
+         if ((++polls & 1023u) == 0u && globaltimer() - t0 > timeout_ns) {
+-            return ld_acquire_sys(flag) == want;   // one last look
++            *seen = ld_acquire_sys(flag);          // one last look
++            return *seen == want;
+         }
+     }
+ }
+@@ -186,13 +202,17 @@ __global__ void __launch_bounds__(1024) gather_kernel(GatherArgs a) {
+         if (peer != a.rank) {
+             const uint32_t *flag = reinterpret_cast<const uint32_t *>(
+                 a.flag_base + ((static_cast<uint64_t>(peer) * a.slots + slot) * a.n_hca + hca) * a.flag_stride);
+-            if (!wait_flag(flag, seq, a.timeout_ns)) {
++            uint32_t seen = 0u;
++            if (!wait_flag(flag, seq, a.timeout_ns, &seen) && atom_cas_gpu(a.poison, 0u, 1u) == 0u) {
++                // the first timed-out wait of the runtime writes the record; the failure word goes last, after a
++                // system fence, so a host that sees it reads a whole record (roce_watch.h, Runtime.check)
+                 st_relaxed_sys(ctrl + CTRL_ERR_PEER, static_cast<uint32_t>(peer));
+                 st_relaxed_sys(ctrl + CTRL_ERR_HCA, static_cast<uint32_t>(hca));
+                 st_relaxed_sys(ctrl + CTRL_ERR_SEQ, seq);
++                st_relaxed_sys(ctrl + CTRL_ERR_SEEN, seen);
++                fence_sc_sys();
+                 st_relaxed_sys(ctrl + CTRL_FAILED, 1u);
+                 fence_sc_sys();
+-                st_release_gpu(a.poison, 1u);
+             }
+         }
+     }
+@@ -223,7 +243,7 @@ __global__ void __launch_bounds__(1024) gather_kernel(GatherArgs a) {
+         const uint32_t prior = atom_add_relaxed_gpu(a.tail_ctr, 1u);
+         if (((prior + 1u) & (gdim - 1u)) == 0u) {
+             fence_sc_gpu();
+-            if (ld_relaxed_sys(ctrl + CTRL_FAILED) == 0u) {
++            if (ld_relaxed_gpu(a.poison) == 0u && ld_relaxed_sys(ctrl + CTRL_FAILED) == 0u) {
+                 st_release_gpu(a.epoch, seq);
+                 st_relaxed_sys(ctrl + CTRL_COMPLETED, seq);
+             }
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce.py b/src/tensorfold/families/glm5_next/cuda/roce.py
+index 83f4f9f..d373848 100644
+--- a/src/tensorfold/families/glm5_next/cuda/roce.py
++++ b/src/tensorfold/families/glm5_next/cuda/roce.py
+@@ -58,6 +58,14 @@ engine checks after every sampler exchange (each step has one, after the step's
+ that says whether the peer's flag had reached this host's memory (lost in the GPU's view, sparkring #278's
+ signature) or never arrived, and what this rank's proxy had posted; the marker file makes the restarted pair use
+ NCCL. A timed-out step's data are not trusted: nothing derived from it is returned.
++
++patches/0350: "had reached this host's memory" is decided at the moment of the failure, not at the check. The
++kernel records its last read of the flag (``CTRL_ERR_SEEN``); the proxy thread notices the failure word within
++microseconds and records the flag as host memory holds it then, and how long after the failure it arrived, if it
++did (``roce_watch.h``). ``classify`` turns that into one of: ``not_seen`` (in host memory at the failure while the
++GPU read a stale value: a visibility problem), ``late`` (arrived after the timeout: a late or absent peer, e.g. a
++single process that ran one rank's collectives alone -- the W2 loopback), ``never`` (not arrived), ``unknown`` (no
++watch: only the check-time value). The W2 loopback failure was ``late`` (tests/test_roce_protocol_model.py).
+ """
+ 
+ from __future__ import annotations
+@@ -87,7 +95,8 @@ DEFAULT_MARK = "/cache/roce-failed"
+ # control record words (roce_common.h)
+ CTRL_SEQ, CTRL_NBYTES, CTRL_ERR_SEQ, CTRL_ERR_PEER, CTRL_SLOT_NBYTES, CTRL_ERR_HCA, CTRL_FAILED, CTRL_COMPLETED = \
+     0, 1, 2, 3, 4, 6, 7, 8
+-CTRL_WORDS = 9
++CTRL_ERR_SEEN = 9                     # patches/0350: the failed wait's last read of the flag
++CTRL_WORDS = 10
+ MAX_HCAS = 2
+ 
+ 
+@@ -314,7 +323,7 @@ def _ext():
+         from torch.utils.cpp_extension import load
+ 
+         here = Path(__file__).parent
+-        _EXT = load(name="tensorfold_glm_roce_v1", sources=[str(here / "roce.cpp"), str(here / "roce.cu")],
++        _EXT = load(name="tensorfold_glm_roce_v2", sources=[str(here / "roce.cpp"), str(here / "roce.cu")],
+                     extra_cflags=["-O2"], extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
+     return _EXT
+ 
+@@ -336,7 +345,7 @@ class Runtime:
+     GPU, a loop-back thread that plays the peers (``loop_xor``: every peer's shard = this rank's XOR the key)."""
+ 
+     def __init__(self, *, rank: int, world: int, hcas: list[Hca], s: Settings, loop_xor: int | None = None,
+-                 loop_stall_after: int = -1, n_hca: int | None = None) -> None:
++                 loop_stall_after: int = -1, n_hca: int | None = None, loop_late: bool = False) -> None:
+         ext = _ext()
+         self.ext, self.rank, self.world, self.s = ext, rank, world, s
+         self.hcas = list(hcas)
+@@ -374,7 +383,7 @@ class Runtime:
+             if loop_xor is not None:
+                 self.loop = ext.Loop(self.host, self.recv_off, self.flag_off, self.send_off, self.ctrl_off,
+                                      self.slot_bytes, world, rank, self.n_hca, self.flag_stride, self.slots,
+-                                     int(loop_xor) & 0xFF, int(loop_stall_after))
++                                     int(loop_xor) & 0xFF, int(loop_stall_after), bool(loop_late))
+             else:
+                 self.proxy = ext.Proxy(world, rank, [h.name for h in self.hcas], [h.gid_index for h in self.hcas],
+                                        s.traffic_class, self.host, self.total, self.slot_bytes)
+@@ -466,7 +475,12 @@ class Runtime:
+         out = {"doorbell": int(self.ctrl[CTRL_SEQ]), "completed": int(self.ctrl[CTRL_COMPLETED]),
+                "failed": int(self.ctrl[CTRL_FAILED]), "err_seq": int(self.ctrl[CTRL_ERR_SEQ]),
+                "err_peer": int(self.ctrl[CTRL_ERR_PEER]), "err_hca": int(self.ctrl[CTRL_ERR_HCA]),
+-               "flags": flags, "ops": self.ops}
++               "gpu_seen": int(self.ctrl[CTRL_ERR_SEEN]), "flags": flags, "ops": self.ops}
++        watcher = self.proxy if self.proxy is not None else self.loop            # patches/0350
++        if watcher is not None and hasattr(watcher, "watch"):
++            w = [int(v) for v in watcher.watch()]
++            out["watch"] = {"state": w[0], "seq": w[1], "peer": w[2], "hca": w[3], "host_at_fail": w[4],
++                            "gpu_seen": w[5], "late_ms": round(w[6] / 1e6, 3)}
+         if self.proxy is not None:
+             st = [int(v) for v in self.proxy.stats()]
+             out.update(ops_posted=st[0], writes_completed=st[1], proxy_last_seq=st[2],
+@@ -485,8 +499,7 @@ class Runtime:
+         seq, peer, h = snap["err_seq"], snap["err_peer"], snap["err_hca"]
+         seen = int(self.flags[self._flag_word(peer, seq & 1, h)]) if peer < self.world and h < self.n_hca else -1
+         name = self.hcas[h].name if h < len(self.hcas) else f"HCA {h}"
+-        where = ("the flag HAS reached this host's memory (the GPU did not observe it: sparkring #278's signature)"
+-                 if seen == seq else f"the flag never arrived (host memory holds {seen})")
++        where = classify(seq, snap["gpu_seen"], seen, snap.get("watch"))[1]      # patches/0350
+         posted = f", this rank's proxy posted up to {snap['proxy_last_seq']}" if "proxy_last_seq" in snap else ""
+         return (f"RoCE all-gather on rank {self.rank} timed out after {self.s.timeout_s:g} s waiting for rank "
+                 f"{peer} on {name} at sequence {seq}: {where}; doorbell {snap['doorbell']}, completed "
+@@ -512,6 +525,31 @@ class Runtime:
+             self._free()
+ 
+ 
++def classify(seq: int, gpu_seen: int, host_now: int, watch: dict | None) -> tuple[str, str]:
++    """patches/0350: (kind, sentence) for a wait that timed out at ``seq``: ``gpu_seen`` the kernel's last read of the
++    flag, ``host_now`` the flag in host memory at the check, ``watch`` the proxy's record (``roce_watch.h``; None or
++    state 0 when there is none). Kinds: not_seen, late, never, unknown (see the module doc)."""
++
++    if watch and watch.get("state") and watch.get("seq") == seq:
++        at = watch["host_at_fail"]
++        if at == seq and gpu_seen != seq:
++            return "not_seen", (f"the flag WAS in this host's memory when the wait failed while the GPU's last read "
++                                f"returned {gpu_seen}: a GPU-visibility failure (sparkring #278's signature)")
++        if watch["state"] == 2:
++            return "late", (f"the flag arrived {watch['late_ms']:g} ms AFTER the wait failed (the GPU's last read "
++                            f"{gpu_seen}, host memory {at} then): the peer was late or had not launched this "
++                            f"collective, not a visibility problem")
++        if at == seq:
++            return "unknown", (f"the flag was in host memory at the failure and the GPU's last read also returned it "
++                               f"({gpu_seen}): the wait gave up at its last look")
++        return "never", (f"the flag never arrived (host memory held {at} at the failure, {host_now} now; the GPU's "
++                         f"last read {gpu_seen})")
++    if host_now == seq:
++        return "unknown", (f"the flag is in this host's memory NOW (the GPU's last read returned {gpu_seen}); "
++                           f"whether it arrived before the timeout is not known (no watch record)")
++    return "never", f"the flag never arrived (host memory holds {host_now})"
++
++
+ class RoceComm:
+     """The engine's communicator with the RoCE runtime beside NCCL: ``all_gather`` (control exchanges) stays on
+     ``base``; ``all_gather_fast`` (the model's exchanges) goes over RoCE when one rank's shard is at most
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce_common.h b/src/tensorfold/families/glm5_next/cuda/roce_common.h
+index fd012da..5773692 100644
+--- a/src/tensorfold/families/glm5_next/cuda/roce_common.h
++++ b/src/tensorfold/families/glm5_next/cuda/roce_common.h
+@@ -18,7 +18,8 @@ enum : int {
+     CTRL_ERR_HCA = 6,      // the HCA whose flag never came
+     CTRL_FAILED = 7,       // 1 once any wait timed out (wrap-safe, unlike a sequence number)
+     CTRL_COMPLETED = 8,    // the last sequence completed on this rank (doorbell ahead of it: an op is in flight)
+-    CTRL_WORDS = 9,
++    CTRL_ERR_SEEN = 9,     // patches/0350: the failed wait's last read of the flag (what the GPU observed)
++    CTRL_WORDS = 10,
+ };
+ 
+ struct GatherArgs {
+diff --git a/src/tensorfold/families/glm5_next/cuda/roce_watch.h b/src/tensorfold/families/glm5_next/cuda/roce_watch.h
+new file mode 100644
+index 0000000..d02f497
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/roce_watch.h
+@@ -0,0 +1,91 @@
++// The host's view of a failed RoCE wait, taken within microseconds of the failure (patches/0350).
++//
++// patches/0230's diagnosis read the peer's flag word from host memory when ``Runtime.check`` ran, long after the
++// kernel gave up, and called "flag in host memory" the GPU-visibility failure of sparkring #278. A flag that arrives
++// AFTER the timeout (a peer that was late, or never launched until this rank gave up) reads the same then. The W2
++// single-node loopback failure was that case (see tests/test_roce_protocol_model.py).
++//
++// ``FailWatch::poll`` runs on the busy-spinning proxy thread (and on the tests' loop-back thread), once a loop
++// iteration: one acquire load of the failure word, which shares the doorbell's cache line. When the word turns 1 it
++// records, at once, the flag word the kernel waited for as host memory holds it and the kernel's last read of it
++// (``CTRL_ERR_SEEN``); then it keeps watching that word and records how long after the failure it arrived, if it does.
++// Then:
++//   host_at_fail == seq, gpu_seen != seq  -> the flag WAS in host memory while the GPU read a stale value:
++//                                            a real visibility problem (sparkring #278's signature)
++//   host_at_fail != seq, arrives later    -> the peer was late (no visibility problem)
++//   host_at_fail != seq, never arrives    -> never sent
++// No CUDA, torch or verbs here: tests/test_roce_watch.py compiles it with a plain C++ compiler.
++#pragma once
++
++#include <stdint.h>
++#include <time.h>
++
++#include <atomic>
++
++namespace tfroce {
++
++// 32-bit words of the control record that the watch reads (the full list: roce_common.h)
++enum : int {
++    WATCH_CTRL_ERR_SEQ = 2,
++    WATCH_CTRL_ERR_PEER = 3,
++    WATCH_CTRL_ERR_HCA = 6,
++    WATCH_CTRL_FAILED = 7,
++    WATCH_CTRL_ERR_SEEN = 9,
++};
++
++inline uint64_t watch_now_ns() {
++    timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
++}
++
++struct FailWatch {
++    enum : uint32_t { IDLE = 0, NOTICED = 1, ARRIVED = 2 };
++
++    // written by the polling thread only, published by ``state`` (release); read by Python after state != IDLE
++    std::atomic<uint32_t> state{IDLE};
++    uint32_t seq = 0, peer = 0, hca = 0;
++    uint32_t host_at_fail = 0;       // the flag word in host memory when the failure word was first seen
++    uint32_t gpu_seen = 0;           // the kernel's last read of it
++    uint64_t noticed_ns = 0;         // CLOCK_MONOTONIC then
++    std::atomic<uint64_t> late_ns{0};  // ARRIVED: from noticing to the flag reading ``seq``
++    const volatile uint32_t *flag = nullptr;
++
++    // ``ctrl``: the control record; ``flag_at(peer, slot, hca)``: the flag word's host address
++    template <class FlagAt>
++    void poll(const volatile uint32_t *ctrl, FlagAt flag_at) {
++        const uint32_t s = state.load(std::memory_order_relaxed);
++        if (s == IDLE) {
++            if (__atomic_load_n(const_cast<const uint32_t *>(&ctrl[WATCH_CTRL_FAILED]), __ATOMIC_ACQUIRE) == 0u) {
++                return;
++            }
++            // the kernel wrote the error words, then a system fence, then the failure word: all visible now
++            seq = ctrl[WATCH_CTRL_ERR_SEQ];
++            peer = ctrl[WATCH_CTRL_ERR_PEER];
++            hca = ctrl[WATCH_CTRL_ERR_HCA];
++            gpu_seen = ctrl[WATCH_CTRL_ERR_SEEN];
++            flag = flag_at(peer, seq & 1u, hca);
++            host_at_fail = flag != nullptr ? *flag : 0u;
++            noticed_ns = watch_now_ns();
++            state.store(NOTICED, std::memory_order_release);
++            return;
++        }
++        if (s == NOTICED && flag != nullptr && host_at_fail != seq && *flag == seq) {
++            late_ns.store(watch_now_ns() - noticed_ns, std::memory_order_relaxed);
++            state.store(ARRIVED, std::memory_order_release);
++        }
++    }
++
++    // [state, seq, peer, hca, host_at_fail, gpu_seen, late_ns] (state 0: nothing noticed yet)
++    void read(uint64_t out[7]) const {
++        out[0] = state.load(std::memory_order_acquire);
++        out[1] = seq;
++        out[2] = peer;
++        out[3] = hca;
++        out[4] = host_at_fail;
++        out[5] = gpu_seen;
++        out[6] = late_ns.load(std::memory_order_relaxed);
++    }
++};
++
++}  // namespace tfroce
