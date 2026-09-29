@@ -1,0 +1,121 @@
+{
+ "args": {
+  "base": "http://127.0.0.1:8000",
+  "model": "GLM-5.3-Flash-EXL3",
+  "system": 12000,
+  "user": 1500,
+  "sessions": 3,
+  "burst": 4,
+  "tokens": 48,
+  "modes": "sequential,burst,exact",
+  "extra": "{}",
+  "out": "results/W8/prefixE-12k.json"
+ },
+ "sequential": [
+  {
+   "name": "session 1",
+   "prompt_tokens": 20277,
+   "cached_tokens": 0,
+   "ttft_s": 14.544269489008002,
+   "prefill_s": 14.4915,
+   "restored": null,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 2,
+   "queued_s": 0.01,
+   "text": "This document is a collection of 94 numbered lines (Q462756537-0-00000 through Q462756537-0-00093), each containing a sequence of six nature-themed words (such"
+  },
+  {
+   "name": "session 2",
+   "prompt_tokens": 20266,
+   "cached_tokens": 17920,
+   "ttft_s": 2.1278700289985863,
+   "prefill_s": 2.111,
+   "restored": 22,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 0,
+   "queued_s": 0.006,
+   "text": "This document (Q462756537-1) is a collection of 94 numbered lines of pseudo-random word sequences, each pairing an identifier (Q462756537-1-00000 through Q462"
+  },
+  {
+   "name": "session 3",
+   "prompt_tokens": 20266,
+   "cached_tokens": 17920,
+   "ttft_s": 2.10968564999348,
+   "prefill_s": 2.0912,
+   "restored": 22,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 0,
+   "queued_s": 0.006,
+   "text": "This document is a collection of 94 numbered lines (Q462756537-2-00000 through Q462756537-2-00092), each containing a sequence of six nature-themed words (such"
+  }
+ ],
+ "burst": {
+  "rows": [
+   {
+    "name": "burst 1",
+    "prompt_tokens": 20259,
+    "cached_tokens": 0,
+    "ttft_s": 14.940393955010222,
+    "prefill_s": 14.8966,
+    "restored": null,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 3,
+    "queued_s": 0.026,
+    "text": "This document (B462756537-0) is a collection of 94 numbered lines, each containing a sequence of six arbitrary words (such as \"orchid,\" \"amber,\" \"pepper,\" \"basalt,\""
+   },
+   {
+    "name": "burst 2",
+    "prompt_tokens": 20266,
+    "cached_tokens": 17920,
+    "ttft_s": 21.04646099099773,
+    "prefill_s": 5.9674,
+    "restored": 28,
+    "restored_disk": null,
+    "prefix_wait": 2,
+    "marks": 0,
+    "queued_s": 15.048,
+    "text": "This document (B462756537-1) is a collection of 94 numbered lines, each containing a sequence of six random words drawn from a fixed vocabulary of nature- and color-themed terms (e.g., juniper"
+   },
+   {
+    "name": "burst 3",
+    "prompt_tokens": 20258,
+    "cached_tokens": 17920,
+    "ttft_s": 17.410981827997603,
+    "prefill_s": 2.3263,
+    "restored": 28,
+    "restored_disk": null,
+    "prefix_wait": 2,
+    "marks": 0,
+    "queued_s": 15.048,
+    "text": "This document (B462756537-2) is a collection of 94 numbered lines, each containing a sequence of six random words drawn from a fixed vocabulary of nature- and material-themed terms (e.g., juniper"
+   },
+   {
+    "name": "burst 4",
+    "prompt_tokens": 20269,
+    "cached_tokens": 17920,
+    "ttft_s": 23.345303652997245,
+    "prefill_s": 8.2587,
+    "restored": 28,
+    "restored_disk": null,
+    "prefix_wait": 2,
+    "marks": 0,
+    "queued_s": 15.044,
+    "text": "Document B462756537-3 is a collection of 94 numbered lines (B462756537-3-00000 through B462756537-3-00093), each containing a"
+   }
+  ],
+  "wall_s": 24.806971976999193
+ },
+ "exact": [
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true
+ ]
+}

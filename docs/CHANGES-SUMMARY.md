@@ -1,7 +1,8 @@
 # Changes summary
 
 > **Work in progress.** Every number below comes from one pair of DGX Sparks and the abliterated checkpoint
-> `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`, over two days (2026-09-27/28). Statuses and defaults may change.
+> `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`, over three days (2026-09-27 to 2026-09-29). Statuses and defaults may
+> change. What changed since the initial public release: [Update 2026-09-29](#update-2026-09-29-patches-0230-0410-test-windows-w1-w10).
 
 Every engine change is a patch against TensorFold `2f8e514` (0.3.4), applied at image build, with a `GLM53_TF_*` knob
 that defaults to upstream behaviour. Details, knobs and exactness arguments: [`PATCHES.md`](PATCHES.md). Raw numbers:
@@ -9,8 +10,61 @@ that defaults to upstream behaviour. Details, knobs and exactness arguments: [`P
 
 **Gain** column: *measured* = an A/B on the real model on this pair (source run in brackets); *estimate* = from
 kernel timings, a microbenchmark or arithmetic, not an end-to-end A/B. **Status**: *on* = set in both production
-configs (`config/prod*.env.example`); *batch* = on in the 4 x 256k config only; *single* = single-stream config only;
+configs (`config/prod*.env.example`); *batch* = on in the batch configs (production and 4 x 256k) only; *single* = single-stream config only;
 *opt-in* = off unless you set it; *rejected* = tried, measured, left off; *superseded* / *tool* as noted.
+
+## Update 2026-09-29 (patches 0230-0410, test windows W1-W10)
+
+Since the initial public release (patches 0001-0220, the 4 x 256k batch config), 20 patches were added (0230-0410,
+57 in total) and ten GPU test windows run (W1-W10, `docs/RESULTS.md`; scripts and JSON in `results/W1`-`W10`). The
+production config (`config/prod.env.example`) is now 4 concurrent requests over one shared 1,048,576-token FP8 KV
+pool. Its headline numbers (W10): prefill ~1,607 tok/s at 24.5k and ~1,600 at 98k (was 1,154 / 1,127; the vLLM kit:
+1,448 at 28k), single-stream decode 1.20-1.96x the vLLM kit on every cell (tf code greedy 77.6, kit structured 100.6),
+~78 tok/s aggregate at 4 streams, restart in 22-23 s, exact 10/10, batchexact 4/4, MMLU-200 88.0%, refusals 0/10.
+
+Adopted (on in `config/prod.env.example`):
+
+| Patch | What | Gain (measured) | Window |
+| --- | --- | --- | --- |
+| 0190 update | `attn_bm32` (32-query latent tiles) + `GLM53_TF_MTP_PREFILL_CACHE=1` (the MTP head's prefill rows as cache writes only) | +11% prefill at 24.5k / 98k, same bits | W1 |
+| 0250 `glm-session-nvme` | the session store's NVMe tier (`GLM53_TF_SESSION_DISK`): per-rank shards, SHA-256 per chunk, write-through, restart indexing | a 39k session back in 0.42-0.45 s instead of 31 s, also after a restart | W4 |
+| 0290 `glm-kv-pool` | one paged latent KV pool shared by the 4 slots (`GLM53_TF_KV_POOL_TOKENS`); admission reserves pages, spills idle slots, or waits | 1M context a request (was 262k) at the same memory; prefill -0.5 to -2% | W6 |
+| 0300 `glm-request-log` | one JSON line a request, no text (`GLM53_TF_REQUEST_LOG`); `scripts/traffic-report.py` | tool; no speed change | W8 |
+| 0310 `glm-prefix-share` | snapshots at the end of the system prompt; new sessions resume there (`GLM53_TF_PREFIX_SHARE`) | 4-session burst over ~18k system prompt 28.2 s instead of 72.4 s; 2nd session TTFT 2.24 vs 3.25 s | W8 |
+| 0320 `glm-prefill-row-split` | each rank runs the hyper-connections on half the rows (`GLM53_TF_PREFILL_PP`) | +7.3-8.1% prefill, same bits | W8 |
+| 0335 `glm-solo-piece` | a lone request prefills in larger pieces (`GLM53_TF_SOLO_PIECE`) | +3-4% at 4,096 rows (+6% at 8,192, rejected for memory in W9) | W8, W9 |
+| 0230 + 0350 `glm-roce-gather`, `glm-roce-loopback-fix` | one-shot RoCE all-gather ported from b12x (Apache-2.0), up to 256 KiB, NCCL fallback + failure marker (`GLM53_TF_COMM_BACKEND=roce`); 0350 explained W2's loopback failure (the harness) | decode +10.8% (1 stream) / +4.3% (4 streams) median, transcripts byte-identical | W9 |
+| 0360 `glm-b12x-attn-fp8` | b12x bit 4 (one-pass sparse latent attention) fit for FP8 KV and sessions (`GLM53_TF_B12X=4`) | +6.3% / +6.7% prefill, same reply hashes | W9 |
+| 0390 `glm-mla-expand-v2` | latent absorb / expand retiled, same bits (`GLM53_TF_MLA_EXPAND=v2`) | +7.1% / +6.7% prefill | W10 |
+| 0370 `glm-decode-overlap-cpu-pin` | decode-round host work off the critical path (`GLM53_TF_DECODE_OVERLAP=1`) | decode +1.3-1.9% (1 stream), +1-3% (4 streams), transcripts identical | W10 |
+| 0380 `glm-deep-verify` | verify windows of up to 16 rows (`GLM53_TF_MAX_DRAFT_ROWS=16`) | edit cells +16-27%, every other cell within +-2%, all reply hashes identical | W10 |
+
+Measured and not adopted (the patches stay in the series, off by default):
+
+| Patch | Result | Window |
+| --- | --- | --- |
+| 0240 `glm-b12x-prefill` bits 1-2 (b12x KDA, fused mhc) | KDA 0.94x, fused mhc 0.69-0.74x of today's kernels; only bit 4 helps (adopted via 0360) | W3 |
+| 0260 `glm-expert-decode-once` | never beats `fat` (0.89-1.01x) | W2 |
+| 0270 `glm-fast-experts-auto` | -2% end to end although fast2 wins the isolated kernel at <= 2,048 rows | W5 |
+| 0280 `glm-batch-buckets` | 80-91% graph replays but -5% aggregate at 4 streams (padded rows cost ~1 ms each) | W5 |
+| 0330 `glm-expert-tc` | cfg 1/2 cannot launch on GB10 (registers); cfg 3 -4% end to end | W8 |
+| 0340 `glm-batch-adapt` | offline simulator: per-slot drafter choice -0.4%, serial rounds for weak slots -6.5%; not run on GPU end to end | offline, W9 (per-slot cost measured) |
+| 0370 `GLM53_TF_CPU_PIN` | +0.4% | W10 |
+| 0400 `glm-kda-v2` | split +1.0-1.2% (bar +2%); fused slower than today | W10 |
+| 0410 `glm-sparse-v2` | +0% end to end (kernel 0.82x) | W10 |
+| 8,192-row lone chunks | +~4% prefill, but the 4 x 250k stress minimum fell to 7.23 GiB on the worker (target >= 8) | W9, W10 |
+
+Measurement-only work: `docs/PROFILE.md` (W7 nsys profile of prefill and decode), `docs/ROOFLINE.md` (first-principles
+roofline and ranked gaps), `docs/RESEARCH-NIGHT.md` and `docs/PARADIGMS.md` (surveys), `docs/DECODE-PLAN.md` (a sourced plan toward +40% decode, not yet run), `docs/DEEP-VERIFY.md` /
+`docs/ADAPTIVE-DRAFT.md` (draft simulators: `bench/draftsim.py`, `bench/lookupsim.py`), design notes `docs/KV-POOL.md`,
+`PREFIX-SHARE.md`, `PREFILL-PP.md`, `EXPERT-TC.md`, `DECODE-OVERLAP.md`, `MLA-EXPAND.md`, `KDA-V2.md`, `SPARSE-V2.md`,
+`ROCE-FIX.md`.
+
+Launcher and ops: `scripts/gpuwatch.py` (GB10 clock / power-clamp / slow-state watch; `serve.sh gpucheck`, a
+preflight gate, systemd units, `docs/OPS-GPUWATCH.md`), `scripts/traffic-report.py`, `serve.sh` mounts the NVMe
+session tier (`HEAD_SESSIONS` / `WORKER_SESSIONS`) and takes `CPUSET`; the Dockerfile installs libibverbs if a base
+image lacks it (0230). Memory notes: the worker node binds; a 314k needle right after the stress and MMLU dipped to
+7.39 GiB MemAvailable on it (no OOM), recorded as an open end in `docs/RESULTS.md` W10.
 
 ## The journey (headline numbers over time)
 
@@ -27,6 +81,12 @@ configs (`config/prod*.env.example`); *batch* = on in the 4 x 256k config only; 
 | 09-27 23:57 | single-stream production (S1: fat experts, fast boot) | 44.7 / 98.1 | 1,162 / 1,209 / 1,162 | 524k | load 34-37 s |
 | 09-28 01:55 | + 0190 `moe_glue=5`, 0210 (Z1) | - | - / 1,266 / 1,238 | 524k | follow-up turn 2.35 s |
 | 09-28 11:00 | 4 x 256k batch, FP8 KV (K1/P1) | 41.2 / 95.7 | - / 1,154 (24.5k) / 1,127 (98k) | 4 x 262k | 72-77 tok/s aggregate at 4 streams |
+| 09-28 12:55 | W1: + 0190 `attn_bm32` + MTP prefill cache rows | - | - / 1,283 (24.5k) / 1,258 (98k) | 4 x 262k | same bits |
+| 09-28 13:44 | W4: + 0250 NVMe session tier | - | unchanged | 4 x 262k | 39k session back in 0.42-0.45 s instead of 31 s, also after a restart |
+| 09-28 16:35 | W6: + 0290 shared KV pool | - | - / 1,252 / 1,250 | **4 requests, 1M pool, 1M a request** | needle at 358k found; 4 x 300k overfill stress passes |
+| 09-28 19:15 | W8: + 0300 / 0310 / 0320 / 0335, 8,192-row lone chunks | - | - / 1,468-1,473 / 1,447-1,451 | same | 4-session burst over an ~18k system prompt 28 s instead of 72 s |
+| 09-28 23:26 | W9: + 0230/0350 RoCE, 0360 b12x bit 4, back to 4,096-row chunks (memory) | - | - / 1,499 / 1,496 | same | decode +7% (1 stream) / +4% (4 streams); stress minimum 9.72 / 8.67 GiB |
+| 09-29 04:25 | W10: + 0390 MLA expand v2, 0370 decode overlap, 0380 16-row verify (production now) | 44.6 / 100.6 | - / ~1,607 (24.5k) / ~1,600 (98k) | same | edit cells 111-116 tok/s; 4 streams ~78 aggregate; MMLU-200 88.0% |
 
 ## Engine patches, ordered by impact
 
@@ -73,7 +133,7 @@ configs (`config/prod*.env.example`); *batch* = on in the 4 x 256k config only; 
 | 0130 decode-step kernels (`DECODE_KERNELS=v2[,pdl]`) | slower on the real model: 1-row verify 31.8 -> 32.7 / 32.9 ms; tf code greedy 64.3 -> 62.4 / 56.4 tok/s | regression |
 | 0190 `hc_fused` | bit-exact but 7-8x slower on GB10 (num_stages=1 to fit shared memory) | slower |
 | 0190 `moe_glue=7` (one-kernel router) | 1,218 / 1,229 vs 1,266 / 1,238 for `moe_glue=5` | slower at 8192 rows |
-| 0190 `attn_bm32` + `mtp_window` | up to 1,389 / 1,357 tok/s at 28k / 112k (+10%), exact 10/10 | rank 0 ran out of unified memory at 524k context + 12 GiB store; `mtp_window` cut decode after a 112k prompt 81 -> 56 tok/s; not yet re-validated at smaller memory settings |
+| 0190 `attn_bm32` + `mtp_window` | up to 1,389 / 1,357 tok/s at 28k / 112k (+10%), exact 10/10 | rank 0 ran out of unified memory at 524k context + 12 GiB store; `mtp_window` cut decode after a 112k prompt 81 -> 56 tok/s. **Update (W1)**: `attn_bm32` is on in the batch / production configs (+5% prefill, memory unchanged); `mtp_window` stays off |
 | 0190 `LATENT_TC` | bf16 tensor-core absorb / expand | changes replies |
 | 0170 BF16 KDA projection copy | 1.45x on that matmul | +3.26 GiB a rank; unaffordable with the session store at 524k |
 | Single-stream `SESSION_GIB=12` at 524k | worked for hours | the store filled under agent traffic and the pair died of unified-memory OOM; examples use 6 (single) / 2 (batch) |

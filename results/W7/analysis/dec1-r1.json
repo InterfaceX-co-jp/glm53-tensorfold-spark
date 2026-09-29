@@ -1,0 +1,57 @@
+{
+ "segment": 1,
+ "inflight": 1,
+ "rounds": 106,
+ "mean": {
+  "wall_ms": 59.454,
+  "gpu_busy_ms": 54.941,
+  "compute_busy_ms": 49.944,
+  "nccl_exposed_ms": 4.893,
+  "idle_ms": 4.513,
+  "nccl_count": 99.755,
+  "kernels": 1845.887,
+  "family_ms": {
+   "routed experts (exl3 grouped)": 26.315,
+   "dense q4 GEMMs (proj, shared expert, head, drafter)": 16.334,
+   "NCCL": 4.893,
+   "DSA/MLA attention + indexer": 2.639,
+   "KDA (chain, conv, replay)": 1.615,
+   "hyper-connections": 1.524,
+   "MoE router / grouping / combine": 1.263,
+   "norms / elementwise / other": 0.285,
+   "memcpy / memset": 0.104
+  },
+  "phase_ms": {
+   "verify forward": 49.055,
+   "drafting (MTP / DFlash2)": 4.819,
+   "sampling": 0.551,
+   "round other": 0.444
+  }
+ },
+ "median_round": {
+  "wall_ms": 56.544,
+  "gpu_busy_ms": 54.282,
+  "compute_busy_ms": 49.435,
+  "nccl_exposed_ms": 4.736,
+  "idle_ms": 2.262,
+  "family_ms": {
+   "routed experts (exl3 grouped)": 24.521,
+   "dense q4 GEMMs (proj, shared expert, head, drafter)": 16.923,
+   "NCCL": 4.736,
+   "DSA/MLA attention + indexer": 2.896,
+   "KDA (chain, conv, replay)": 1.836,
+   "hyper-connections": 1.63,
+   "MoE router / grouping / combine": 1.374,
+   "norms / elementwise / other": 0.296,
+   "memcpy / memset": 0.111
+  },
+  "phase_ms": {
+   "verify forward": 46.942,
+   "drafting (MTP / DFlash2)": 6.021,
+   "round other": 0.68,
+   "sampling": 0.57
+  },
+  "nccl_count": 100,
+  "kernels": 1870
+ }
+}

@@ -1,0 +1,11 @@
+00:36:30 start head
+00:39:34 mla-bits rc=0 184s :: 50 passed in 179.21s (0:02:59)
+00:39:45 sparse-bits rc=1 11s :: 6 failed, 27 passed in 8.18s
+00:42:13 mla-bench rc=0 148s :: 
+00:42:31 sparse-bench rc=0 18s :: 
+00:42:57 sparse-bench-random rc=0 26s :: 
+00:43:03 b12x-ref rc=0 6s :: 3 passed, 20 deselected in 3.41s
+00:43:10 mla-latent-v2 rc=1 7s :: 5 failed, 5 passed, 10 errors in 4.02s
+00:43:16 mla-kvfp8-v2 rc=1 6s :: 2 failed, 47 deselected in 2.65s
+00:43:16 head tests done
+00:43:25 sparse-bits2 rc=0 8s :: 30 passed, 3 skipped in 5.33s

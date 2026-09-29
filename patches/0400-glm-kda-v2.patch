@@ -1,0 +1,585 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 31c3a88..43720da 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -284,6 +284,13 @@ class GlmEngine:
+                   f"does not depend on them), snapshots every {pfgrid.snapshot_grid()} tokens (tail "
+                   f"{pfgrid.snapshot_tail()}), {'bf16' if fastpf.gather16() else 'fp32'} gathers"
+                   + (f"; row-invariant kernels for {gone}" if gone else ""), flush=True)
++        # patches/0400: GLM53_TF_KDA_V2 (fast chunks' KDA recurrence with fast_kda's bits: speed only, so the ranks
++        # need not agree); its settings are parsed here so a bad value fails at load, not in the first prefill
++        if fastpf.enabled() and fastpf.kda_v2 is not None and fastpf.kda_v2.mode():
++            kmode, kcfg = fastpf.kda_v2.mode(), fastpf.kda_v2.config()
++            if rank == 0:
++                print(f"[tensorfold] KDA recurrence v2 ({'split' if kmode == 1 else 'fused'}, fast_kda's bits): "
++                      + ", ".join(f"{k} {v}" for k, v in kcfg.items()) + " (patches/0400)", flush=True)
+         # patches/0170: GLM53_TF_KDA_PROJ_BF16=1: a bf16 copy of each KDA input projection (the 4-bit weights'
+         # values, rounded once) for fast chunks; checked equal on both ranks by fastpf.settings() above
+         if fastpf.kda_bf16():
+diff --git a/src/tensorfold/families/glm5_next/cuda/fastpf.py b/src/tensorfold/families/glm5_next/cuda/fastpf.py
+index a669a64..1f62d23 100644
+--- a/src/tensorfold/families/glm5_next/cuda/fastpf.py
++++ b/src/tensorfold/families/glm5_next/cuda/fastpf.py
+@@ -119,6 +119,7 @@ def _optional(name: str):
+ 
+ 
+ fast_kda = _optional("fast_kda")      # the chunked KDA scan
++kda_v2 = _optional("kda_v2") if fast_kda is not None else None     # patches/0400: its faster twin, same bits
+ fast_qmm = _optional("fast_qmm")      # large-M 4-bit / BF16 matmuls
+ 
+ 
+@@ -279,6 +280,9 @@ def kda_chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm
+             return b12x_kda.kda_prefill16(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps,
+                                           lower, rows, scratch, state_out, pos=pos)
+     if fast_kda is not None:
++        if kda_v2 is not None and kda_v2.mode():     # patches/0400 (GLM53_TF_KDA_V2): fast_kda's bits, faster
++            return kda_v2.kda_prefill_v2(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps,
++                                         lower, rows, scratch, state_out, pos=pos)
+         return fast_kda.kda_prefill_chunked(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps,
+                                             lower, rows, scratch, state_out, pos=pos)
+     from . import kda as kda_mod
+diff --git a/src/tensorfold/families/glm5_next/cuda/kda_v2.py b/src/tensorfold/families/glm5_next/cuda/kda_v2.py
+new file mode 100644
+index 0000000..3fbc49a
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/kda_v2.py
+@@ -0,0 +1,525 @@
++"""KDA prefill recurrence v2 (patches/0400, ``GLM53_TF_KDA_V2``): ``fast_kda``'s bits, fewer bytes, more CTAs.
++
++``kda_prefill_v2`` is a drop-in for ``fast_kda.kda_prefill_chunked`` (same contract, same arguments) that produces
++the SAME BITS: every output row, the state after the last row (so every snapshot), whatever the call sizes. It runs
++``fast_kda``'s three stages -- (1) prep, per (64-row chunk, head): everything that does not depend on the state; (2)
++the state scan, per (head, block of value rows): E = U - W S^T, O = Q~ S^T + P E, S <- S diag(e^{G_C}) + E^T K^;
++(3) the gated RMSNorm -- with each floating-point operation unchanged, and changes only where data lives and which
++program does which piece of work.
++
++Why it is the same arithmetic (checked op by op on the compiled kernels by ``tests/kda_v2_compile.py``):
++
++- The value columns of the state are independent. In the scan, row j of S (value j, all 128 keys) only meets
++  column j of U / E / O: E[:, j] = U[:, j] - W S[j, :]^T, O[:, j] = Q~ S[j, :]^T + P E[:, j] and
++  S[j, :] <- S[j, :] * e^{G_C} + E[:, j]^T K^. The only sums run over keys (W S^T, Q~ S^T: 128) or chunk rows (P E,
++  E^T K^: 64), never over values. So a program holding 32 value rows computes, per element, exactly what a program
++  holding 64 does: the same dots over the same K, in the same order.
++- A ``tl.dot`` on sm_12x is an mma.sync chain (m16n8k8 for tf32, one per 8 of K, the accumulator carried from one
++  k-step to the next in ascending K); what an element gets depends on its row of A, its column of B, the start
++  value of the accumulator and K's order -- not on the tile's M / N or the warps. Splitting K into two dots whose
++  second one starts from the first one's accumulator (``KSPLIT``) is the same chain.
++- Reductions (``tl.sum`` / ``tl.cumsum``) are the only ops whose order depends on the layout. They sit in the prep
++  (the q / k norms, the decay's cumsum, the 16 x 16 forward substitution), which runs with ``fast_kda``'s code and
++  num_warps (8); the compile test checks every reduce / scan has the reference kernel's operand encoding.
++- fp32 values stored and loaded back are the same values: moving an fp32 intermediate between registers, L2 and
++  DRAM changes no bit. No bf16 rounding is added or removed (O is rounded to bf16 where ``fast_kda`` rounds it).
++
++Modes (``GLM53_TF_KDA_V2``, load-time; default 0 = ``fast_kda`` unchanged):
++
++1 ``split``: ``fast_kda._kda_prep`` unchanged, then ``_state2``: value blocks of ``GLM53_TF_KDA_V2_BV`` (32: 128
++  programs instead of 64 on 48 SMs), the blocks of a head launched next to each other (grid (DV / BV, H)), so they
++  read their chunk's W / Q~ / K^ / P at the same time and DRAM serves each once (``fast_kda``'s grid (H, 2) puts
++  the two blocks of a head 32 programs apart: at 1 program an SM the second one runs a wave later and reads it all
++  again from DRAM: ~74 MB a 512-row call instead of ~37). ``KSPLIT`` halves the dot operands (less shared memory).
++2 ``fused``: ONE persistent kernel of ``GLM53_TF_KDA_V2_CTAS`` programs (default: one an SM) takes work items by
++  ticket: prep(c, h) and state steps (c, value block, h), in the order prep(0..LAG-1), then per chunk c: prep(c) and
++  the state steps of chunk c - LAG. A state step waits (spinning on a flag) for its chunk's prep and for the previous
++  step of its value block; a prep waits for the ring slot it overwrites to be read by every state step of chunk
++  c - RING. Every wait points to an EARLIER ticket, held by a program that is running, so there is no deadlock
++  whatever the number of resident programs. The per-(chunk, head) workspace is a ring of RING chunks (~14 MB at
++  RING 3 with 32 heads) that stays in L2, instead of ``fast_kda``'s 46 MB a 512-row call written to and read back
++  from DRAM; the prep's A / T scratch is per program. The state passes from step to step through ``state_out``
++  (fp32, exact). The last waves of both kernels overlap instead of idling.
++
++Both modes finish with ``fast_kda._kda_norm`` unchanged. ``save_replay``, |lower| > ``fast_kda.MAX_ABS_LOWER`` and
++the precision / bv arguments of ``fast_kda`` other than the defaults go to ``fast_kda`` (same result, old speed).
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++from . import fast_kda as fk
++from .fast_kda import (OFF_A, OFF_BETA, OFF_DEC, OFF_G, OFF_K, OFF_P, OFF_Q, OFF_T, OFF_V, WORK, WORK_C, _conv_act,
++                       _kda_norm)
++
++DK = DV = 128
++CHUNK = 64
++TMP = OFF_T.value - OFF_A.value + 64 * 64     # a fused program's A / T scratch (fp32 elements)
++TMP_C = tl.constexpr(TMP)
++
++
++def _env_int(name: str, default: int) -> int:
++    v = os.environ.get(name, "").strip()
++    return int(v) if v else default
++
++
++def mode() -> int:
++    """GLM53_TF_KDA_V2: 0 (off, ``fast_kda``), 1 (split) or 2 (fused); also ``split`` / ``fused``."""
++
++    v = os.environ.get("GLM53_TF_KDA_V2", "0").strip().lower()
++    v = {"": "0", "off": "0", "no": "0", "false": "0", "split": "1", "on": "1", "yes": "1", "true": "1",
++         "fused": "2"}.get(v, v)
++    if v not in ("0", "1", "2"):
++        raise ValueError(f"GLM53_TF_KDA_V2={v!r}: expected 0, 1 (split) or 2 (fused)")
++    return int(v)
++
++
++def config() -> dict:
++    """The speed settings (none of them changes a bit): split: value rows a scan program (16 / 32 / 64), its warps,
++    a register cap (``maxnreg``: ptxas' allocation only, the PTX is the same; 168 fits 3 programs of 4 warps an SM,
++    so the 128 programs of bv 32 are all resident at once); the K split of the scan's dots; fused: value rows a
++    step (32 / 64), programs (0 = one an SM, or two with a register cap of 128), lag, ring size, register cap.
++    (num_stages > 1 needs 120-160 KB of shared memory: not offered.)"""
++
++    cfg = dict(bv=_env_int("GLM53_TF_KDA_V2_BV", 32), warps=_env_int("GLM53_TF_KDA_V2_WARPS", 4),
++               maxnreg=_env_int("GLM53_TF_KDA_V2_MAXNREG", 168), ksplit=_env_int("GLM53_TF_KDA_V2_KSPLIT", 1),
++               ctas=_env_int("GLM53_TF_KDA_V2_CTAS", 0), lag=_env_int("GLM53_TF_KDA_V2_LAG", 1),
++               ring=_env_int("GLM53_TF_KDA_V2_RING", 3), fbv=_env_int("GLM53_TF_KDA_V2_FUSED_BV", 64),
++               fmaxnreg=_env_int("GLM53_TF_KDA_V2_FUSED_MAXNREG", 0))
++    if cfg["bv"] not in (16, 32, 64) or cfg["fbv"] not in (32, 64):
++        raise ValueError("GLM53_TF_KDA_V2_BV: 16, 32 or 64; GLM53_TF_KDA_V2_FUSED_BV: 32 or 64 (128 needs > 99 KB "
++                         "of shared memory or spills)")
++    if cfg["warps"] not in (2, 4, 8):
++        raise ValueError("GLM53_TF_KDA_V2_WARPS: 2, 4 or 8")
++    for k in ("maxnreg", "fmaxnreg"):
++        if cfg[k] and not 64 <= cfg[k] <= 255:
++            raise ValueError("GLM53_TF_KDA_V2_MAXNREG / _FUSED_MAXNREG: 0 (none) or 64..255")
++    if cfg["lag"] < 1 or cfg["ring"] < cfg["lag"] + 1:
++        raise ValueError("GLM53_TF_KDA_V2_LAG >= 1 and GLM53_TF_KDA_V2_RING >= LAG + 1")
++    return cfg
++
++
++# -- the scan: one chunk of one block of value rows -------------------------------------------------------------------
++@triton.jit
++def _scan_chunk(work, SW, SU, SQ, SK, OUT, s, s1, s2, c, h, jr, R, off, H: tl.constexpr, PREC: tl.constexpr,
++                KSPLIT: tl.constexpr, CG: tl.constexpr):
++    """``fast_kda._kda_state``'s loop body for chunk c (workspace ``work``) on the value rows jr. KSPLIT == 0: the
++    state is ``s`` [BV, 128]; else its key halves ``s1`` / ``s2`` [BV, 64] and every product over the keys is two
++    dots, the second starting from the first one's accumulator (the same k-step chain). Returns the new state."""
++
++    l = tl.arange(0, 64)
++    i = tl.arange(0, 128)
++    i1 = tl.arange(0, 64)
++    i2 = 64 + tl.arange(0, 64)
++    wp = (work + OFF_G).to(SW.dtype)
++    up = (work + OFF_V).to(SU.dtype)
++    qp = (work + OFF_Q).to(SQ.dtype)
++    kp = (work + OFF_K).to(SK.dtype)
++    if KSPLIT:                  # each operand loaded right before its dot: one 16 KB staging buffer live at a time
++        ws = tl.dot(tl.load(wp + l[:, None] * 128 + i1[None, :], cache_modifier=CG).to(tl.float32), tl.trans(s1),
++                    input_precision=PREC)
++        ws = tl.dot(tl.load(wp + l[:, None] * 128 + i2[None, :], cache_modifier=CG).to(tl.float32), tl.trans(s2), ws,
++                    input_precision=PREC)
++        eb = tl.load(up + l[:, None] * 128 + jr[None, :], cache_modifier=CG).to(tl.float32) - ws
++        ob = tl.dot(tl.load(qp + l[:, None] * 128 + i1[None, :], cache_modifier=CG).to(tl.float32), tl.trans(s1),
++                    input_precision=PREC)
++        ob = tl.dot(tl.load(qp + l[:, None] * 128 + i2[None, :], cache_modifier=CG).to(tl.float32), tl.trans(s2), ob,
++                    input_precision=PREC)
++        ob = tl.dot(tl.load(work + OFF_P + l[:, None] * 64 + l[None, :], cache_modifier=CG), eb, ob,
++                    input_precision=PREC)
++    else:
++        w = tl.load(wp + l[:, None] * 128 + i[None, :], cache_modifier=CG).to(tl.float32)
++        ub = tl.load(up + l[:, None] * 128 + jr[None, :], cache_modifier=CG).to(tl.float32)
++        eb = ub - tl.dot(w, tl.trans(s), input_precision=PREC)
++        qt = tl.load(qp + l[:, None] * 128 + i[None, :], cache_modifier=CG).to(tl.float32)
++        pm = tl.load(work + OFF_P + l[:, None] * 64 + l[None, :], cache_modifier=CG)
++        ob = tl.dot(qt, tl.trans(s), input_precision=PREC) + tl.dot(pm, eb, input_precision=PREC)
++    row = c * 64 - off + l
++    valid = (row >= 0) & (row < R)
++    tl.store(OUT + tl.where(valid, row, 0).to(tl.int64)[:, None] * (H * 128) + h * 128 + jr[None, :],
++             ob.to(tl.bfloat16), mask=valid[:, None])
++    if KSPLIT:
++        d1 = tl.load(work + OFF_DEC + i1, cache_modifier=CG)
++        s1 = tl.dot(tl.trans(eb), tl.load(kp + l[:, None] * 128 + i1[None, :], cache_modifier=CG).to(tl.float32),
++                    s1 * d1[None, :], input_precision=PREC)
++        d2 = tl.load(work + OFF_DEC + i2, cache_modifier=CG)
++        s2 = tl.dot(tl.trans(eb), tl.load(kp + l[:, None] * 128 + i2[None, :], cache_modifier=CG).to(tl.float32),
++                    s2 * d2[None, :], input_precision=PREC)
++    else:
++        kh = tl.load(kp + l[:, None] * 128 + i[None, :], cache_modifier=CG).to(tl.float32)
++        dec = tl.load(work + OFF_DEC + i, cache_modifier=CG)
++        s = s * dec[None, :] + tl.dot(tl.trans(eb), kh, input_precision=PREC)
++    return s, s1, s2
++
++
++@triton.jit
++def _state2(WORKBUF, SW, SU, SQ, SK, S_IN, S_OUT, OUT, R, off, NC, H: tl.constexpr, BV: tl.constexpr,
++            PREC: tl.constexpr, KSPLIT: tl.constexpr):
++    """Mode 1's scan, program (value block, head): ``fast_kda._kda_state`` with the blocks of a head adjacent."""
++
++    h = tl.program_id(1)
++    jr = tl.program_id(0) * BV + tl.arange(0, BV)
++    i = tl.arange(0, 128)
++    i1 = tl.arange(0, 64)
++    base = h.to(tl.int64) * (128 * 128) + jr[:, None] * 128
++    if KSPLIT:
++        s = tl.zeros((BV, 128), dtype=tl.float32)          # unused
++        s1 = tl.load(S_IN + base + i1[None, :])
++        s2 = tl.load(S_IN + base + 64 + i1[None, :])
++    else:
++        s = tl.load(S_IN + base + i[None, :])
++        s1 = tl.zeros((BV, 64), dtype=tl.float32)          # unused
++        s2 = s1
++    for c in range(NC):
++        work = WORKBUF + (c * H + h).to(tl.int64) * WORK_C
++        s, s1, s2 = _scan_chunk(work, SW, SU, SQ, SK, OUT, s, s1, s2, c, h, jr, R, off, H, PREC, KSPLIT, "")
++    if KSPLIT:
++        tl.store(S_OUT + base + i1[None, :], s1)
++        tl.store(S_OUT + base + 64 + i1[None, :], s2)
++    else:
++        tl.store(S_OUT + base + i[None, :], s)
++
++
++# -- the prep of one (chunk, head): fast_kda._kda_prep's body, with the A / T scratch where the caller says ------------
++@triton.jit
++def _prep_item(c, h, work, tmp, P, p_stride, b_off, A, a_stride, CS, CW, A_LOG, DT_BIAS, SW, SU, SQ, SK, KSAVE, VSAVE,
++               GSAVE, BSAVE, lower, R, off, H: tl.constexpr, SAVE: tl.constexpr, BCC: tl.constexpr,
++               PREC: tl.constexpr, CG: tl.constexpr):
++    """``fast_kda._kda_prep`` for chunk c, head h: K^, Q~, U, W, P, e^{G_C} into ``work`` (the chunk's slot, the
++    same layout), A and T in ``tmp`` (offsets OFF_A / OFF_T). Every statement is ``_kda_prep``'s, in its order; CG
++    (".cg" in the fused kernel) only makes the loads bypass L1, which a ring slot rewritten by another SM needs."""
++
++    C: tl.constexpr = 3 * H * 128
++    NSUB: tl.constexpr = 64 // BCC
++    l = tl.arange(0, 64)
++    i = tl.arange(0, 128)
++    bl = tl.arange(0, BCC)
++    WK = work + OFF_K
++    WQ = work + OFF_Q
++    WV = work + OFF_V
++    WG = work + OFF_G
++    WB = work + OFF_BETA
++    WA = tmp + OFF_A
++    WP = work + OFF_P
++    WT = tmp + OFF_T
++    WD = work + OFF_DEC
++    decay_rate = tl.exp(tl.load(A_LOG + h))
++    dtb = tl.load(DT_BIAS + h * 128 + i)
++    row = c * 64 - off + l
++    valid = (row >= 0) & (row < R)
++    rowc = tl.where(valid, row, 0).to(tl.int64)
++    qa = _conv_act(P, p_stride, CS, CW, row, valid, h * 128 + i, C)
++    ka = _conv_act(P, p_stride, CS, CW, row, valid, H * 128 + h * 128 + i, C)
++    va = _conv_act(P, p_stride, CS, CW, row, valid, 2 * H * 128 + h * 128 + i, C)
++    qinv = 1.0 / tl.sqrt(tl.sum(qa * qa, axis=1) + 1e-6)
++    kinv = 1.0 / tl.sqrt(tl.sum(ka * ka, axis=1) + 1e-6)
++    q = tl.where(valid[:, None], (qa * qinv[:, None]) * (1.0 / tl.sqrt(128.0)), 0.0)
++    k = tl.where(valid[:, None], ka * kinv[:, None], 0.0)
++    v = tl.where(valid[:, None], va, 0.0)
++    araw = tl.load(A + rowc[:, None] * a_stride + h * 128 + i[None, :], mask=valid[:, None], other=0.0)
++    z = decay_rate * (araw.to(tl.float32) + dtb[None, :])
++    gl = tl.where(valid[:, None], lower * (1.0 / (1.0 + tl.exp(-z))), 0.0)
++    braw = tl.load(P + rowc * p_stride + b_off + h, mask=valid, other=0.0).to(tl.float32)
++    beta = tl.where(valid, (1.0 / (1.0 + tl.exp(-braw))).to(tl.bfloat16).to(tl.float32), 0.0)
++    gc = tl.cumsum(gl, axis=0)
++    tl.store(WK + l[:, None] * 128 + i[None, :], k)
++    tl.store(WQ + l[:, None] * 128 + i[None, :], q)
++    tl.store(WV + l[:, None] * 128 + i[None, :], v)
++    tl.store(WG + l[:, None] * 128 + i[None, :], gc)
++    tl.store(WB + l, beta)
++    if SAVE:
++        sv = (rowc * H + h) * 128
++        tl.store(KSAVE + sv[:, None] + i[None, :], k, mask=valid[:, None])
++        tl.store(GSAVE + sv[:, None] + i[None, :], tl.exp(gl), mask=valid[:, None])
++        tl.store(VSAVE + sv[:, None] + i[None, :], v.to(tl.bfloat16), mask=valid[:, None])
++        tl.store(BSAVE + rowc * H + h, beta, mask=valid)
++    tl.debug_barrier()
++    gs = tl.load(WG + l[:, None] * 128 + i[None, :], cache_modifier=CG)
++    ks = tl.load(WK + l[:, None] * 128 + i[None, :], cache_modifier=CG)
++    for a in tl.static_range(NSUB):
++        ra = a * BCC + bl
++        gref = tl.load(WG + a * BCC * 128 + i, cache_modifier=CG)
++        gt = tl.load(WG + ra[:, None] * 128 + i[None, :], cache_modifier=CG)
++        lk = tl.load(WK + ra[:, None] * 128 + i[None, :], cache_modifier=CG) * tl.exp(gt - gref[None, :])
++        lq = tl.load(WQ + ra[:, None] * 128 + i[None, :], cache_modifier=CG) * tl.exp(gt - gref[None, :])
++        s_ok = l < (a + 1) * BCC
++        rk = tl.where(s_ok[:, None], ks * tl.exp(tl.where(s_ok[:, None], gref[None, :] - gs, 0.0)), 0.0)
++        aa = tl.dot(lk, tl.trans(rk), input_precision=PREC)
++        pa = tl.dot(lq, tl.trans(rk), input_precision=PREC)
++        bt = tl.load(WB + ra, cache_modifier=CG)
++        aa = tl.where(l[None, :] < ra[:, None], aa * bt[:, None], 0.0)
++        pa = tl.where(l[None, :] <= ra[:, None], pa, 0.0)
++        tl.store(WA + ra[:, None] * 64 + l[None, :], aa)
++        tl.store(WP + ra[:, None] * 64 + l[None, :], pa)
++    tl.debug_barrier()
++    ab = tl.arange(0, NSUB)
++    r3 = ab[:, None, None] * BCC + bl[None, :, None]
++    c3 = ab[:, None, None] * BCC + bl[None, None, :]
++    nd = tl.load(WA + r3 * 64 + c3, cache_modifier=CG)
++    x = tl.where(r3 == c3, 1.0, 0.0)
++    for r in tl.static_range(1, BCC):
++        nrow = tl.sum(tl.where(bl[None, :, None] == r, nd, 0.0), axis=1)
++        new = tl.where(bl[None, :] == r, 1.0, 0.0) - tl.sum(nrow[:, :, None] * x, axis=1)
++        x = tl.where(bl[None, :, None] == r, new[:, None, :], x)
++    tl.store(WT + r3 * 64 + c3, x)
++    tl.debug_barrier()
++    for a in tl.static_range(1, NSUB, 2):
++        ra = a * BCC + bl
++        rb = (a - 1) * BCC + bl
++        taa = tl.load(WT + ra[:, None] * 64 + ra[None, :], cache_modifier=CG)
++        tbb = tl.load(WT + rb[:, None] * 64 + rb[None, :], cache_modifier=CG)
++        aab = tl.load(WA + ra[:, None] * 64 + rb[None, :], cache_modifier=CG)
++        tab = -tl.dot(taa, tl.dot(aab, tbb, input_precision="ieee"), input_precision="ieee")
++        tl.store(WT + ra[:, None] * 64 + rb[None, :], tab)
++    tl.debug_barrier()
++    hi = 32 + tl.arange(0, 32)
++    lo = tl.arange(0, 32)
++    blk_lo = (lo[None, :] // BCC) <= (lo[:, None] // BCC)
++    thi = tl.load(WT + hi[:, None] * 64 + hi[None, :], mask=blk_lo, other=0.0, cache_modifier=CG)
++    tlo = tl.load(WT + lo[:, None] * 64 + lo[None, :], mask=blk_lo, other=0.0, cache_modifier=CG)
++    ahl = tl.load(WA + hi[:, None] * 64 + lo[None, :], cache_modifier=CG)
++    thl = -tl.dot(thi, tl.dot(ahl, tlo, input_precision="ieee"), input_precision="ieee")
++    tl.debug_barrier()
++    tl.store(WT + hi[:, None] * 64 + lo[None, :], thl)
++    tl.debug_barrier()
++    gc = tl.load(WG + l[:, None] * 128 + i[None, :], cache_modifier=CG)
++    glast = tl.load(WG + 63 * 128 + i, cache_modifier=CG)
++    bt = tl.load(WB + l, cache_modifier=CG)
++    k = tl.load(WK + l[:, None] * 128 + i[None, :], cache_modifier=CG)
++    kt = (bt[:, None] * k) * tl.exp(gc)
++    khat = k * tl.exp(glast[None, :] - gc)
++    qt = tl.load(WQ + l[:, None] * 128 + i[None, :], cache_modifier=CG) * tl.exp(gc)
++    tl.debug_barrier()
++    tl.store(WK.to(SK.dtype) + l[:, None] * 128 + i[None, :], khat.to(SK.dtype.element_ty))
++    tl.store(WQ.to(SQ.dtype) + l[:, None] * 128 + i[None, :], qt.to(SQ.dtype.element_ty))
++    tl.store(WD + i, tl.exp(glast))
++    lower_blk = (l[None, :] // BCC) <= (l[:, None] // BCC)
++    t = tl.load(WT + l[:, None] * 64 + l[None, :], mask=lower_blk, other=0.0, cache_modifier=CG)
++    w = tl.dot(t, kt, input_precision=PREC)
++    v = tl.load(WV + l[:, None] * 128 + i[None, :], cache_modifier=CG)
++    u = tl.dot(t, bt[:, None] * v, input_precision=PREC)
++    tl.debug_barrier()
++    tl.store(WG.to(SW.dtype) + l[:, None] * 128 + i[None, :], w.to(SW.dtype.element_ty))
++    tl.store(WV.to(SU.dtype) + l[:, None] * 128 + i[None, :], u.to(SU.dtype.element_ty))
++
++
++@triton.jit
++def _prep_ref(P, p_stride, b_off, A, a_stride, CS, CW, A_LOG, DT_BIAS, WORKBUF, SW, SU, SQ, SK, KSAVE, VSAVE, GSAVE,
++              BSAVE, lower, R, off, H: tl.constexpr, SAVE: tl.constexpr, BCC: tl.constexpr, PREC: tl.constexpr,
++              CG: tl.constexpr):
++    """``_prep_item`` as ``fast_kda._kda_prep``'s grid (chunk, head) on its workspace: the compile test's check that
++    the helper is ``_kda_prep`` op for op (and a fallback prep)."""
++
++    c = tl.program_id(0)
++    h = tl.program_id(1)
++    work = WORKBUF + (c * H + h).to(tl.int64) * WORK_C
++    _prep_item(c, h, work, work, P, p_stride, b_off, A, a_stride, CS, CW, A_LOG, DT_BIAS, SW, SU, SQ, SK, KSAVE, VSAVE,
++               GSAVE, BSAVE, lower, R, off, H, SAVE, BCC, PREC, CG)
++
++
++# -- mode 2: one persistent kernel --------------------------------------------------------------------------------------
++@triton.jit
++def _spin_until(FLAG, target):
++    """Wait until the int32 at FLAG is >= target (one thread polls with acquire; the CTA barrier after the
++    broadcast orders every thread's later loads after it)."""
++
++    seen = tl.atomic_add(FLAG, 0, sem="acquire", scope="gpu")
++    while seen < target:
++        seen = tl.atomic_add(FLAG, 0, sem="acquire", scope="gpu")
++    tl.debug_barrier()
++
++
++@triton.jit
++def _fused(P, p_stride, b_off, A, a_stride, CS, CW, A_LOG, DT_BIAS, RINGBUF, TMPBUF, SW, SU, SQ, SK, S_IN, S_OUT, OUT, CTL,
++           lower, R, off, NC, LAG, H: tl.constexpr, NVB: tl.constexpr, RING: tl.constexpr, BCC: tl.constexpr,
++           PREC: tl.constexpr, KSPLIT: tl.constexpr):
++    """Mode 2. CTL (int32, zeroed by the caller): [0] ticket counter, [1 + c*H + h] prep(c, h) done,
++    [1 + NC*H + c*H + h] state steps of chunk c, head h done (0..NVB), [1 + 2*NC*H + h*NVB + vb] steps of value
++    block (h, vb) done (0..NC). Tickets: prep(0..LAG-1, all h), then for g = LAG .. NC-1: prep(g, all h) and the NVB*H
++    state steps of chunk g - LAG, then the state steps of the last LAG chunks. Item k of a state group is value
++    block k % NVB of head k // NVB (the blocks of a head adjacent)."""
++
++    BV: tl.constexpr = 128 // NVB
++    NSTATE: tl.constexpr = NVB * H
++    GROUP: tl.constexpr = H + NVB * H
++    FLAG_S = CTL + 1 + NC * H
++    FLAG_V = CTL + 1 + 2 * NC * H
++    n_items = NC * H + NC * NSTATE
++    head_items = LAG * H
++    mid_items = (NC - LAG) * GROUP
++    tmp = TMPBUF + tl.program_id(0).to(tl.int64) * TMP_C - OFF_A          # this program's A / T (P's place unused)
++    t = tl.atomic_add(CTL, 1, sem="acq_rel", scope="gpu")
++    while t < n_items:
++        # -- decode the ticket -----------------------------------------------------------------------------------
++        is_prep = t < head_items
++        c = t // H
++        k = t % H
++        if t >= head_items:
++            u = t - head_items
++            if u < mid_items:
++                g = LAG + u // GROUP
++                r = u % GROUP
++                is_prep = r < H
++                c = tl.where(is_prep, g, g - LAG)
++                k = tl.where(is_prep, r, r - H)
++            else:
++                u2 = u - mid_items
++                c = NC - LAG + u2 // NSTATE
++                k = u2 % NSTATE
++        if is_prep:
++            h = k
++            slot = RINGBUF + ((c % RING) * H + h).to(tl.int64) * WORK_C
++            if c >= RING:                               # the slot's previous chunk read by all its state steps
++                _spin_until(FLAG_S + (c - RING) * H + h, NVB)
++            _prep_item(c, h, slot, tmp, P, p_stride, b_off, A, a_stride, CS, CW, A_LOG, DT_BIAS, SW, SU, SQ, SK,
++                       SW, SW, SW, SW, lower, R, off, H, False, BCC, PREC, ".cg")
++            tl.debug_barrier()                          # every thread's stores before the flag
++            tl.atomic_add(CTL + 1 + c * H + h, 1, sem="release", scope="gpu")
++        else:
++            h = k // NVB
++            vb = k % NVB
++            jr = vb * BV + tl.arange(0, BV)
++            _spin_until(CTL + 1 + c * H + h, 1)        # the chunk's prep
++            _spin_until(FLAG_V + h * NVB + vb, c)      # the previous step of this value block
++            slot = RINGBUF + ((c % RING) * H + h).to(tl.int64) * WORK_C
++            base = h.to(tl.int64) * (128 * 128) + jr[:, None] * 128
++            i = tl.arange(0, 128)
++            i1 = tl.arange(0, 64)
++            if KSPLIT:
++                s = tl.zeros((BV, 128), dtype=tl.float32)
++                if c == 0:
++                    s1 = tl.load(S_IN + base + i1[None, :], cache_modifier=".cg")
++                    s2 = tl.load(S_IN + base + 64 + i1[None, :], cache_modifier=".cg")
++                else:
++                    s1 = tl.load(S_OUT + base + i1[None, :], cache_modifier=".cg")
++                    s2 = tl.load(S_OUT + base + 64 + i1[None, :], cache_modifier=".cg")
++            else:
++                if c == 0:
++                    s = tl.load(S_IN + base + i[None, :], cache_modifier=".cg")
++                else:
++                    s = tl.load(S_OUT + base + i[None, :], cache_modifier=".cg")
++                s1 = tl.zeros((BV, 64), dtype=tl.float32)
++                s2 = s1
++            s, s1, s2 = _scan_chunk(slot, SW, SU, SQ, SK, OUT, s, s1, s2, c, h, jr, R, off, H, PREC, KSPLIT, ".cg")
++            if KSPLIT:
++                tl.store(S_OUT + base + i1[None, :], s1)
++                tl.store(S_OUT + base + 64 + i1[None, :], s2)
++            else:
++                tl.store(S_OUT + base + i[None, :], s)
++            tl.debug_barrier()
++            tl.atomic_add(FLAG_S + c * H + h, 1, sem="release", scope="gpu")
++            tl.atomic_add(FLAG_V + h * NVB + vb, 1, sem="release", scope="gpu")
++        t = tl.atomic_add(CTL, 1, sem="acq_rel", scope="gpu")
++
++
++# -- host side ------------------------------------------------------------------------------------------------------
++_BUF: dict[tuple, torch.Tensor] = {}
++
++
++def _buf(name: str, numel: int, dtype, device) -> torch.Tensor:
++    key = (name, str(device), dtype)
++    b = _BUF.get(key)
++    if b is None or b.numel() < numel:
++        b = torch.empty((numel,), dtype=dtype, device=device)
++        _BUF[key] = b
++    return b
++
++
++def _sms(device) -> int:
++    if torch.cuda.is_available() and torch.device(device).type == "cuda":
++        return torch.cuda.get_device_properties(device).multi_processor_count
++    return 4                                              # the interpreter: any count works
++
++
++def schedule(nc: int, heads: int, nvb: int, lag: int) -> list[tuple]:
++    """The fused kernel's ticket order in Python (tests): ('p', c, h) / ('s', c, h, vb)."""
++
++    lag = min(lag, nc)
++    out = [("p", c, h) for c in range(lag) for h in range(heads)]
++    for g in range(lag, nc):
++        out += [("p", g, h) for h in range(heads)]
++        out += [("s", g - lag, k // nvb, k % nvb) for k in range(nvb * heads)]
++    for c in range(nc - lag, nc):
++        out += [("s", c, k // nvb, k % nvb) for k in range(nvb * heads)]
++    return out
++
++
++def kda_prefill_v2(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
++                   conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
++                   norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch=None,
++                   state_out: torch.Tensor | None = None, *, pos: int, save_replay: bool = False,
++                   out: torch.Tensor | None = None, work: torch.Tensor | None = None, precision: str | None = None,
++                   bv: int | None = None, num_warps: int = 8, v2: int | None = None, cfg: dict | None = None
++                   ) -> torch.Tensor:
++    """``fast_kda.kda_prefill_chunked``'s contract and bits. ``v2``: the mode (default: ``mode()``); ``cfg``: the
++    speed settings (default: ``config()``). Anything ``fast_kda`` would do differently (save_replay, another
++    precision, an explicit bv, the serial fallback) goes to ``fast_kda``."""
++
++    m = mode() if v2 is None else int(v2)
++    prec = precision or fk.DOT_PRECISION
++    if (m == 0 or save_replay or bv is not None or num_warps != 8 or not fk.supported(lower)
++            or prec != fk.DOT_PRECISION or fk.STORE_BF16):
++        return fk.kda_prefill_chunked(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower,
++                                      rows, scratch, state_out, pos=pos, save_replay=save_replay, out=out, work=work,
++                                      precision=precision, **({} if bv is None else {"bv": bv}), num_warps=num_warps)
++    cfg = config() if cfg is None else cfg
++    H = int(a_log.numel())
++    if state_out is None:
++        raise ValueError("kda_prefill_v2: state_out is required")
++    if rows < 1 or p.shape[0] < rows or a.shape[0] < rows or g.shape[0] < rows:
++        raise ValueError("kda_prefill_v2: rows")
++    if p.stride(1) != 1 or a.stride(1) != 1 or g.stride(1) != 1:
++        raise ValueError("kda_prefill_v2: unit column strides expected")
++    if p.dtype != torch.bfloat16 or a.dtype != torch.bfloat16 or g.dtype != torch.bfloat16:
++        raise ValueError("kda_prefill_v2: bf16 projection/gate rows expected")
++    if not (conv_state.is_contiguous() and conv_w.is_contiguous() and state_in.is_contiguous()
++            and state_out.is_contiguous()):
++        raise ValueError("kda_prefill_v2: conv state, conv weight and states must be contiguous")
++    if state_in.numel() != H * DK * DV or state_out.numel() != H * DK * DV or state_in.dtype != torch.float32:
++        raise ValueError("kda_prefill_v2: states must be fp32 [H, 128, 128]")
++    if conv_w.shape[0] != 3 * H * DK or conv_w.shape[1] != 4:
++        raise ValueError("kda_prefill_v2: conv weight [3*H*128, 4] expected")
++    if scratch is not None:
++        o = scratch.out[:rows]
++    elif out is not None:
++        o = out[:rows]
++    else:
++        o = torch.empty((rows, H * DV), dtype=torch.bfloat16, device=p.device)
++    if o.shape != (rows, H * DV) or not o.is_contiguous():
++        raise ValueError("kda_prefill_v2: out must be a contiguous [rows, H*128] bf16")
++    off = int(pos) % CHUNK
++    nc = -(-(off + rows) // CHUNK)
++    ksplit = bool(cfg["ksplit"])
++    if m == 1:
++        if work is None:
++            work = fk.workspace(H, nc, p.device)
++        if work.numel() < nc * H * WORK:
++            raise ValueError("kda_prefill_v2: work too small")
++        fk._kda_prep[(nc, H)](p, p.stride(0), int(b_off), a, a.stride(0), conv_state, conv_w, a_log, dt_bias, work,
++                              work, work, work, work, work, work, work, work, float(lower), int(rows), off, H=H,
++                              SAVE=False, BCC=fk.BC, PREC=prec, num_warps=8, num_stages=1)
++        bvv = int(cfg["bv"])
++        extra = {"maxnreg": int(cfg["maxnreg"])} if cfg["maxnreg"] else {}
++        _state2[(DV // bvv, H)](work, work, work, work, work, state_in, state_out, o, int(rows), off, nc, H=H, BV=bvv,
++                                PREC=prec, KSPLIT=ksplit, num_warps=int(cfg["warps"]), num_stages=1, **extra)
++    else:
++        nvb = DV // int(cfg["fbv"])
++        ring = int(cfg["ring"])
++        lag = min(int(cfg["lag"]), nc)
++        ctas = int(cfg["ctas"]) or _sms(p.device) * (2 if 0 < cfg["fmaxnreg"] <= 128 else 1)
++        extra = {"maxnreg": int(cfg["fmaxnreg"])} if cfg["fmaxnreg"] else {}
++        ringbuf = _buf("ring", ring * H * WORK, torch.float32, p.device)
++        tmp = _buf("tmp", ctas * TMP, torch.float32, p.device)
++        ctl = _buf("ctl", 1 + 2 * nc * H + H * nvb, torch.int32, p.device)
++        ctl[:1 + 2 * nc * H + H * nvb].zero_()
++        _fused[(ctas,)](p, p.stride(0), int(b_off), a, a.stride(0), conv_state, conv_w, a_log, dt_bias, ringbuf, tmp,
++                        ringbuf, ringbuf, ringbuf, ringbuf, state_in, state_out, o, ctl, float(lower), int(rows), off,
++                        nc, lag, H=H, NVB=nvb, RING=ring, BCC=fk.BC, PREC=prec, KSPLIT=ksplit, num_warps=8,
++                        num_stages=1, **extra)
++    _kda_norm[(triton.cdiv(rows, 32), H)](o, g, g.stride(0), norm_w, float(eps), int(rows), H=H, BR=32, num_warps=4)
++    return o
+diff --git a/src/tensorfold/families/glm5_next/cuda/sessdisk.py b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+index 58e8122..601dff3 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sessdisk.py
++++ b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+@@ -196,6 +196,9 @@ def knobs(env: dict | None = None) -> dict:
+ # patches/0300: the request log only reports
+ KNOB_SKIP_PREFIX = KNOB_SKIP_PREFIX + ("GLM53_TF_REQUEST_LOG",)
+ 
++# patches/0400: the KDA recurrence v2 computes fast_kda's bits (speed settings only)
++KNOB_SKIP_PREFIX = KNOB_SKIP_PREFIX + ("GLM53_TF_KDA_V2",)
++
+ 
+ def layout_sig(comps) -> list:
+     """The cache tensors a page / tail holds: rows a page, MTP or not, dtype, a row's shape."""

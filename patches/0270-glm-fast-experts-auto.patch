@@ -1,0 +1,120 @@
+diff --git i/src/tensorfold/families/glm5_next/cuda/engine.py w/src/tensorfold/families/glm5_next/cuda/engine.py
+index da3df71..d946e80 100644
+--- i/src/tensorfold/families/glm5_next/cuda/engine.py
++++ w/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -475,7 +475,7 @@ class GlmEngine:
+                 "fast_prefill": int(bool(self.e.fast_prefill)),          # patches/0091
+                 "fp8_prefill": int(bool(getattr(self.e, "fp8_prefill", False))),     # patches/0092
+                 "prefill_overlap": int(pfoverlap.on()),                  # patches/0093
+-                "fat_experts": int(bool(exl3_mm.FAT)),                   # patches/0170
++                "fat_experts": exl3_mm.family(),                         # patches/0170 / 0270
+                 "moe_glue": pfglue.moe_glue(glue),                       # patches/0190
+                 "mtp_window": int(pfglue.MTP_WINDOW),
+                 "hc_fused": int(glue.HC_FUSED),
+@@ -516,8 +516,8 @@ class GlmEngine:
+             from . import pfoverlap
+ 
+             pfoverlap.set_request(bool(changed["prefill_overlap"]))
+-        if "fat_experts" in changed:            # patches/0170: the same bits either way (fat == fast2)
+-            exl3_mm.FAT = bool(changed["fat_experts"])
++        if "fat_experts" in changed:            # patches/0170 / 0270: the same bits every way (fat == fast2)
++            exl3_mm.set_family(changed["fat_experts"])
+         if "moe_glue" in changed:               # patches/0190: the same bits either way
+             from . import glue, pfglue
+ 
+diff --git i/src/tensorfold/families/glm5_next/cuda/exl3_mm.py w/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+index daf6c57..5dc5da5 100644
+--- i/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ w/src/tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -56,8 +56,15 @@ def _env(name: str, default: str) -> str:
+ # an expert's members over the same weight tiles; same bits as fat / fast2). FAT stays the per-request switch
+ # (tf_knobs.fat_experts: 1 = the configured fat-family kernels, 0 = fast2); ONCE picks once within it.
+ # GLM53_TF_ONCE_PAIR=0: every unit is two column blocks of one pass (no shared decode; for A/B timing).
+-FAT = _env("GLM53_TF_FAST_EXPERTS", "fast2") in ("fat", "once")
++FAT = _env("GLM53_TF_FAST_EXPERTS", "fast2") in ("fat", "once", "auto")
+ ONCE = _env("GLM53_TF_FAST_EXPERTS", "fast2") == "once"
++# patches/0270: GLM53_TF_FAST_EXPERTS=auto is a fat-family mode that picks the kernels per fast chunk by its row count:
++# fast2 for FAST2_ROWS lo <= R < hi (GLM53_TF_FAST2_ROWS="lo,hi"), fat (or once, see ONCE) otherwise. fast2 reads the
++# one rotated input (rot_in1) when gate and up share their sign vector, as fat does. Same bits either way
++# (fast2 == fat == once), so the switch keeps 0085's row independence and shares snapshots. The per-request knob
++# fat_experts: 0 = fast2, 1 = the fat family (fat / once), 2 = auto.
++AUTO = _env("GLM53_TF_FAST_EXPERTS", "fast2") == "auto"
++FAST2_ROWS = tuple(int(v) for v in _env("GLM53_TF_FAST2_ROWS", "0,4096").split(","))
+ ONCE_PAIR = _env("GLM53_TF_ONCE_PAIR", "1") not in ("0", "false", "no", "off")
+ # once only for windows of at least this many rows (fat below; the same bits either way, so the switch keeps 0085's
+ # row independence): pairs of passes exist only when experts have > 64 members, i.e. from ~2048-4096-row chunks
+@@ -67,8 +74,34 @@ FAT_TICKET = _env("GLM53_TF_FAT_TICKET", "1") not in ("0", "false", "no", "off")
+ FAT_SHARED_X = _env("GLM53_TF_FAT_SHARED_X", "auto") not in ("0", "false", "no", "off")
+ if FAT_STAGES not in (3, 4):
+     raise ValueError(f"GLM53_TF_FAT_STAGES={FAT_STAGES}: expected 3 or 4")
+-if _env("GLM53_TF_FAST_EXPERTS", "fast2") not in ("fast2", "v1", "fat", "once"):
+-    raise ValueError(f"GLM53_TF_FAST_EXPERTS={os.environ.get('GLM53_TF_FAST_EXPERTS')!r}: expected fast2, v1, fat or once")
++if _env("GLM53_TF_FAST_EXPERTS", "fast2") not in ("fast2", "v1", "fat", "once", "auto"):
++    raise ValueError(f"GLM53_TF_FAST_EXPERTS={os.environ.get('GLM53_TF_FAST_EXPERTS')!r}: expected fast2, v1, fat, once "
++                     "or auto")
++if len(FAST2_ROWS) != 2 or not 0 <= FAST2_ROWS[0] <= FAST2_ROWS[1]:
++    raise ValueError(f"GLM53_TF_FAST2_ROWS={os.environ.get('GLM53_TF_FAST2_ROWS')!r}: expected lo,hi with 0 <= lo <= hi")
++
++
++def family() -> int:
++    """patches/0270: the fast chunks' expert kernels as the per-request knob fat_experts says them: 0 fast2, 1 the fat
++    family (fat / once), 2 auto (fast2 or the fat family by the chunk's rows)."""
++
++    return 2 if FAT and AUTO else int(bool(FAT))
++
++
++def set_family(v: int) -> None:
++    """patches/0270: the inverse of ``family`` (the same bits every way)."""
++
++    global FAT, AUTO
++    v = int(v)
++    if v not in (0, 1, 2):
++        raise ValueError(f"fat_experts={v}: expected 0, 1 or 2")
++    FAT, AUTO = v >= 1, v == 2
++
++
++def auto_fast2(R: int) -> bool:
++    """patches/0270: an auto chunk of R rows runs fast2 (else the fat family)."""
++
++    return AUTO and FAST2_ROWS[0] <= R < FAST2_ROWS[1]
+ 
+ 
+ def shared_suh(ex: "Exl3Experts") -> bool:
+@@ -167,6 +200,11 @@ def routed(x: torch.Tensor, pick: torch.Tensor, group, ex: Exl3Experts, s: Scrat
+             fx.rot_in1(x, x.stride(0), pick, ex.suh_g, s.xg, R, D, slots)
+         else:
+             ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
++        if auto_fast2(R):                    # patches/0270: fast2 on the fat family's rotated input, the same bits
++            fx.gateup(s.xg, s.xg if shx else s.xu, ex.gt, ex.ut, group.ids, group.count, group.members, ex.svh_g,
++                      ex.svh_u, ex.suh_d, s.xd, D, NI, slots, float(limit))
++            fx.down(s.xd, ex.dt, group.ids, group.count, group.members, ex.svh_d, y, NI, D, slots)
++            return
+         if ONCE and group.members.shape[1] >= ONCE_MIN_ROWS:     # patches/0260: the same bits (3 stages)
+             fx.gateup_once(s.xg, s.xg if shx else s.xu, ex.gt, ex.ut, group.ids, group.count, group.members, ex.svh_g,
+                            ex.svh_u, ex.suh_d, s.xd, D, NI, slots, float(limit), shx, FAT_TICKET, ONCE_PAIR)
+diff --git i/src/tensorfold/families/glm5_next/cuda/knobs.py w/src/tensorfold/families/glm5_next/cuda/knobs.py
+index dfb5d2a..1ea880f 100644
+--- i/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ w/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -31,8 +31,10 @@ its snapshots are tagged C + 1 and resume FP8 fast requests of the same grid onl
+     prefill_overlap 0 | 1                    GLM53_TF_PREFILL_OVERLAP (0)   patches/0084's pipelined lean chunks
+                                                                             (same bits; 1 = the env's variant, or
+                                                                             gather,slab)
+-    fat_experts     0 | 1                    GLM53_TF_FAST_EXPERTS=fat (0)  patches/0170's fat expert kernels in
+-                                                                            fast chunks (same bits as fast2)
++    fat_experts     0 | 1 | 2                GLM53_TF_FAST_EXPERTS=fat (1)  patches/0170's fat expert kernels in
++                                             / auto (2), else 0             fast chunks (same bits as fast2); 2
++                                                                            (patches/0270): fast2 or fat by the
++                                                                            chunk's rows (GLM53_TF_FAST2_ROWS)
+     moe_glue        0 .. 7                   GLM53_TF_MOE_GLUE (0)          patches/0190, bits: 1 grouping by a
+                                                                             parallel sort, 2 one-kernel router, 4
+                                                                             shared expert read in place by the
+@@ -75,7 +77,7 @@ RANGES: dict[str, tuple[int, int | None]] = {
+     "fast_prefill": (0, 1),              # patches/0091
+     "fp8_prefill": (0, 1),               # patches/0092
+     "prefill_overlap": (0, 1),           # patches/0093
+-    "fat_experts": (0, 1),               # patches/0170
++    "fat_experts": (0, 2),               # patches/0170 (2: patches/0270's auto)
+     "moe_glue": (0, 7),                  # patches/0190
+     "mtp_window": (0, 1 << 30),          # patches/0190
+     "hc_fused": (0, 3),                  # patches/0190

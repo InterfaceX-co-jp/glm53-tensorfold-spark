@@ -1,0 +1,62 @@
+{
+ "bits": 4,
+ "sessions": [
+  {
+   "conv": 0,
+   "turn": 0,
+   "prompt": 60900,
+   "cached": 0,
+   "sha": "8e6efa2a06ef83ac",
+   "prefill_s": 38.8574,
+   "cold_sha": null,
+   "cold_cached": null,
+   "same": true,
+   "knobs": 4
+  },
+  {
+   "conv": 0,
+   "turn": 1,
+   "prompt": 60920,
+   "cached": 60864,
+   "sha": "c9617cc4e7fed4e7",
+   "prefill_s": 0.2865,
+   "cold_sha": "c9617cc4e7fed4e7",
+   "cold_cached": 0,
+   "same": true,
+   "knobs": 4
+  },
+  {
+   "conv": 0,
+   "turn": 2,
+   "prompt": 60939,
+   "cached": 60864,
+   "sha": "01ec2ddf6cd1850a",
+   "prefill_s": 0.3381,
+   "cold_sha": "01ec2ddf6cd1850a",
+   "cold_cached": 0,
+   "same": true,
+   "knobs": 4
+  }
+ ],
+ "batch": {
+  "same": [
+   true,
+   true,
+   true,
+   true
+  ],
+  "shas": [
+   "408f935ffbd7efcf",
+   "3506d2203ed16893",
+   "21cd6b5b69575ec5",
+   "3506d2203ed16893"
+  ],
+  "cached": [
+   0,
+   0,
+   0,
+   0
+  ]
+ },
+ "ok": true
+}

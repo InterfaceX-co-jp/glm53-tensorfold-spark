@@ -1,0 +1,471 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/app.py b/src/tensorfold/families/glm5_next/cuda/app.py
+index 0c07647..d50097b 100644
+--- a/src/tensorfold/families/glm5_next/cuda/app.py
++++ b/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -24,6 +24,9 @@ opens a think block, so it gets an empty ``<think></think>`` and no reasoning-ef
+ patches/0210: a request's prompt is encoded once (``check`` hands its ids to ``run``), and with GLM53_TF_TOKCACHE (on
+ unless ``0``; ``verify`` checks every reuse against a full encode) only the text after the longest special-token
+ prefix a recent prompt shares is encoded (``prompt_tokens.py``). Only rank 0 tokenizes; rank 1 receives the ids.
++
++patches/0300: GLM53_TF_REQUEST_LOG=<file> appends one JSON line per request (sizes, cache source, timings, finish,
++hashes of token ids; never text) on this, the serving rank (``reqlog.py``).
+ """
+ 
+ from __future__ import annotations
+@@ -34,6 +37,7 @@ from typing import Any, Callable
+ from tensorfold.cuda.server import App
+ 
+ from .prompt_tokens import Memo, PromptTokens
++from . import reqlog as reqlog_mod
+ 
+ # patches/0150: OpenAI ``reasoning_effort`` -> (enable_thinking, the template's reasoning_effort or None: its default)
+ EFFORTS: dict[str, tuple[bool, str | None]] = {
+@@ -99,6 +103,14 @@ class GlmApp(App):
+         self.effort_field, self.default_effort = effort_env()       # patches/0150
+         self.prompt_tokens = PromptTokens(self.tok, model_dir / "tokenizer.json")   # patches/0210
+         self.prompt_memo = Memo()
++        # patches/0300: the request log (GLM53_TF_REQUEST_LOG; None: off); the App serves on rank 0 only
++        import threading
++
++        self.reqlog = reqlog_mod.RequestLog.from_env(self.tok)
++        self._rl = threading.local()
++        if self.reqlog is not None:
++            print(f"[tensorfold] request log (patches/0300): one JSON line a request to {self.reqlog.path}",
++                  flush=True)
+         if getattr(engine, "batch", None) is not None:
+             # GLM53_TF_BATCH (patches/0030): the engine queues concurrent requests itself, so ``App.run`` must not
+             # serialize them
+@@ -137,7 +149,10 @@ class GlmApp(App):
+         """patches/0210: the ids ``check`` encoded for this text on this request thread, else from the cache."""
+ 
+         ids = self.prompt_memo.take(text)
+-        return ids if ids is not None else self.prompt_tokens.encode(text)
++        ids = ids if ids is not None else self.prompt_tokens.encode(text)
++        if self.reqlog is not None:                     # patches/0300: the request's prompt, before it runs
++            self._rl.ticket = self.reqlog.begin(ids)
++        return ids
+ 
+     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+         apply_effort(body, field=self.effort_field, default=self.default_effort,
+@@ -153,4 +168,27 @@ class GlmApp(App):
+ 
+         self.engine.request.background = body.get("priority") == "background" or (
+             chat and is_title_request(body.get("messages"), body.get("tools")))
+-        return super().run(body, chat, emit)
++        log = self.reqlog
++        if log is None:
++            return super().run(body, chat, emit)
++        # patches/0300: one line for this request once it ends (host only, on this HTTP thread)
++        self._rl.ticket = None
++
++        def logged_emit(delta: dict[str, Any]) -> bool:
++            log.first(getattr(self._rl, "ticket", None))
++            return emit(delta)
++
++        result, error = None, None
++        try:
++            result = super().run(body, chat, logged_emit)
++            return result
++        except BaseException as exc:
++            error = exc
++            raise
++        finally:
++            kwargs = body.get("chat_template_kwargs") or {}
++            thinking = bool(kwargs.get("enable_thinking", self.default_thinking)) if chat else None
++            eff = body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens
++            log.end(getattr(self._rl, "ticket", None), body=body, chat=chat, result=result, error=error,
++                    thinking=thinking, max_tokens_eff=int(eff) if eff else None)
++            self._rl.ticket = None
+diff --git a/src/tensorfold/families/glm5_next/cuda/batch.py b/src/tensorfold/families/glm5_next/cuda/batch.py
+index 4a0e795..ee1606c 100644
+--- a/src/tensorfold/families/glm5_next/cuda/batch.py
++++ b/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -1521,6 +1521,9 @@ class Batcher:
+                               else ())
+         job.stats.update(cached=cached, slot=slot, queued_s=round(time.perf_counter() - job.submitted, 3)
+                          if job.submitted else 0.0)
++        job.stats["marks"] = len(self.seqs[slot].marks)          # patches/0300: the store's checkpoints it takes
++        if self.kvp is not None:
++            job.stats["kv_free"] = self.kvp.available()       # patches/0300: pool pages left after its reservation
+         if entry is not None:
+             job.stats["restored"] = entry.id
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index ca85ff5..2164f2a 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -864,6 +864,10 @@ class GlmEngine:
+         if store is not None:
+             self._store_save(saves)                 # patches/0110
+         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
++        if store is not None and sess is not None and sess.entry is not None:
++            stats["restored"] = sess.entry.id       # patches/0300: resumed from the session store (RAM)
++        elif store is not None and sess is not None and sess.disk is not None and hit is not None:
++            stats["restored_disk"] = sess.disk.id   # patches/0300: from its NVMe tier
+         if store is not None and sess is not None and sess.disk is not None:
+             stats["disk"] = dict(store.disk.last)   # patches/0250: the read (bytes, s, GB/s, pages read / skipped)
+         if grid:
+diff --git a/src/tensorfold/families/glm5_next/cuda/reqlog.py b/src/tensorfold/families/glm5_next/cuda/reqlog.py
+new file mode 100644
+index 0000000..1be5b54
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/reqlog.py
+@@ -0,0 +1,343 @@
++"""Per-request log for GLM-5.3-Flash (patches/0300, GLM53_TF_REQUEST_LOG=<file>; off by default).
++
++One JSON line per request, appended to a file on rank 0 (the only rank that serves HTTP), for traffic analysis
++(``scripts/traffic-report.py``): how long prompts are, how much of them was resumed and from where, how long prefill
++and decode took, and how much prefill a shared prefix could have saved (patches/0310). No text is written: token
++counts, timings, engine stats and hashes of token ids only.
++
++A line (every key always present; ``null`` when unknown):
++
++- ``ts`` (end, unix s), ``start`` (arrival), ``n`` (sequence number since start), ``kind`` (chat / completion);
++- ``prompt`` tokens, ``cached`` tokens (resumed, not prefilled), ``cache_src``: ``slot`` (the slot's / engine's own
++  snapshot), ``ram`` (the session store, patches/0110 / 0180), ``disk`` (its NVMe tier, patches/0250) or ``none``;
++- ``prefill_s``, ``prefill_tps`` ((prompt - cached) / prefill_s), ``queue_s`` (batch admission wait), ``first_s``
++  (arrival to the first streamed delta), ``decode_tokens``, ``decode_s``, ``decode_tps``, ``tokens_per_round``,
++  ``rounds``, ``pieces``, ``slot``, ``kv_pages`` (the KV pool reservation, patches/0290), ``kv_free`` (pool pages
++  free after it), ``marks`` (session-store checkpoints the prefill took);
++- ``thinking``, ``effort``, ``max_tokens`` (asked; ``null``: the server's default), ``max_tokens_eff``, ``finish``
++  (stop / length / tool_calls / cancelled / error), ``error`` (the exception's class), ``tools``, ``messages``,
++  ``policy``, ``fast_prefill``;
++- prefix analysis: ``head_hash`` (a hash of the first ``HASH_TOKENS`` = 4,096 token ids) and ``head_len``;
++  ``sys_len`` (the first user / assistant / observation role token: everything before it is system prompt + tools)
++  and ``sys_hash``; ``conv`` (a hash of the prompt through its first assistant role token: the system prompt plus
++  the first user message, the same for every turn of one conversation); ``lcp`` (the longest common prefix with any
++  of the last GLM53_TF_REQUEST_LOG_PROMPTS (64) prompts), ``lcp_same`` (with one of the same ``conv``), ``lcp_other``
++  (with one of another ``conv``: what a new session shares with other sessions).
++
++Hashes: blake2b-64 of the token ids (little-endian int32), keyed with GLM53_TF_REQUEST_LOG_SALT when set (then a
++known system prompt cannot be recognised from the log by hashing its tokens).
++
++Cost: nothing on the engine's side. ``begin`` (before ``generate``) keeps a reference to the prompt's id list;
++everything else runs on the request's HTTP thread after the reply: an int32 copy of the ids and a C-speed comparison
++against the kept prompts (~1-5 ms at 100k tokens), one line appended. A failure to log is printed once and never
++fails a request.
++
++Rotation: when the file passes GLM53_TF_REQUEST_LOG_MB (64) MiB it becomes ``<file>.1`` (``.1`` -> ``.2``, ...,
++GLM53_TF_REQUEST_LOG_KEEP (3) old files kept).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import sys
++import threading
++import time
++from array import array
++from collections import deque
++from typing import Any, Sequence
++
++ENV = "GLM53_TF_REQUEST_LOG"
++HASH_TOKENS = 4096
++ROLES = {"user": "<|user|>", "assistant": "<|assistant|>", "observation": "<|observation|>"}
++
++
++def settings(env: dict | None = None) -> dict | None:
++    """The log's settings, validated; None when GLM53_TF_REQUEST_LOG is unset or empty (off)."""
++
++    env = os.environ if env is None else env
++    path = (env.get(ENV) or "").strip()
++    if not path or path == "0":
++        return None
++    mb = float(env.get("GLM53_TF_REQUEST_LOG_MB", "64") or 64)
++    keep = int(env.get("GLM53_TF_REQUEST_LOG_KEEP", "3") or 3)
++    window = int(env.get("GLM53_TF_REQUEST_LOG_PROMPTS", "64") or 64)
++    if mb <= 0 or keep < 0 or window < 0:
++        raise ValueError("GLM53_TF_REQUEST_LOG_MB must be > 0, GLM53_TF_REQUEST_LOG_KEEP and "
++                         "GLM53_TF_REQUEST_LOG_PROMPTS >= 0")
++    return {"path": path, "max_bytes": int(mb * 2 ** 20), "keep": keep, "window": window,
++            "salt": (env.get("GLM53_TF_REQUEST_LOG_SALT") or "").encode()}
++
++
++def role_ids(tok) -> dict[str, int]:
++    """{role: token id} of the chat template's role tokens the tokenizer knows (``tokenizers.Tokenizer``)."""
++
++    out = {}
++    for name, text in ROLES.items():
++        try:
++            i = tok.token_to_id(text)
++        except Exception:                    # noqa: BLE001 - a tokenizer without the call: no roles
++            i = None
++        if i is not None:
++            out[name] = int(i)
++    return out
++
++
++def first_of(ids: array, targets: Sequence[int], lo: int = 0) -> int:
++    """The first position >= lo of any of ``targets`` in ``ids`` (C-speed ``index``), or -1."""
++
++    best = -1
++    for t in targets:
++        try:
++            i = ids.index(int(t), lo, best if best >= 0 else len(ids))
++        except ValueError:
++            continue
++        best = i
++    return best
++
++
++def common(a: array, b: array) -> int:
++    """The longest common prefix of two int32 arrays (block compares at C speed, then the block's tokens)."""
++
++    n = min(len(a), len(b))
++    lo = 0
++    step = 4096
++    while lo < n:
++        hi = min(n, lo + step)
++        if a[lo:hi] == b[lo:hi]:
++            lo = hi
++            continue
++        while a[lo] == b[lo]:
++            lo += 1
++        return lo
++    return n
++
++
++class Prefixes:
++    """The last ``window`` prompts (int32 arrays) with their conversation keys."""
++
++    def __init__(self, window: int) -> None:
++        self.kept: deque = deque(maxlen=max(int(window), 0))
++
++    def match(self, ids: array, conv: str | None, before: int | None = None) -> tuple[int, int, int]:
++        """(lcp with any kept prompt, with one of the same conversation, with one of another); ``before``: only
++        prompts that arrived before request number ``before``."""
++
++        best = same = other = 0
++        for n, kid, kconv in self.kept:
++            if before is not None and n >= before:
++                continue
++            if not len(kid) or not len(ids) or kid[0] != ids[0]:
++                continue
++            d = common(ids, kid)
++            best = max(best, d)
++            if conv is not None and kconv == conv:
++                same = max(same, d)
++            else:
++                other = max(other, d)
++        return best, same, other
++
++    def add(self, ids: array, conv: str | None, n: int = 0) -> None:
++        self.kept.append((n, ids, conv))
++
++
++class Ticket:
++    __slots__ = ("n", "start", "ids", "first", "seen", "conv")
++
++    def __init__(self, n: int, ids: list[int]) -> None:
++        self.n, self.start, self.ids, self.first, self.conv = n, time.time(), ids, None, None
++        self.seen: list = []               # the prompts that arrived before this one and were not kept yet
++
++
++class RequestLog:
++    """Rank 0's request log (``GlmApp``): ``begin`` when a request's prompt is known, ``end`` after its reply."""
++
++    def __init__(self, path: str, *, max_bytes: int = 64 << 20, keep: int = 3, window: int = 64, salt: bytes = b"",
++                 roles: dict[str, int] | None = None) -> None:
++        self.path = path
++        self.max_bytes, self.keep, self.salt = int(max_bytes), int(keep), bytes(salt)
++        self.roles = dict(roles or {})
++        self.prefixes = Prefixes(window)
++        self.lock = threading.Lock()
++        self.n = 0
++        self.live: dict[int, Ticket] = {}     # requests begun and not ended: later arrivals compare with them too
++        self.fh = None
++        self.warned = False
++        self.written = 0
++
++    @classmethod
++    def from_env(cls, tok=None) -> "RequestLog | None":
++        s = settings()
++        if s is None:
++            return None
++        return cls(s["path"], max_bytes=s["max_bytes"], keep=s["keep"], window=s["window"], salt=s["salt"],
++                   roles=role_ids(tok) if tok is not None else {})
++
++    # -- hashing -------------------------------------------------------------------------------------------------
++    def hash(self, ids: array) -> str:
++        h = hashlib.blake2b(digest_size=8, key=self.salt[:64]) if self.salt else hashlib.blake2b(digest_size=8)
++        h.update(ids.tobytes())
++        return h.hexdigest()
++
++    # -- requests ------------------------------------------------------------------------------------------------
++    def begin(self, ids: list[int]) -> Ticket:
++        """A request's prompt ids, before it runs (O(1): the list is kept by reference)."""
++
++        with self.lock:
++            self.n += 1
++            t = Ticket(self.n, ids)
++            t.seen = [x for x in self.live.values()]
++            self.live[t.n] = t
++        return t
++
++    def first(self, t: Ticket | None) -> None:
++        if t is not None and t.first is None:
++            t.first = time.time()
++
++    def _prep(self, t: Ticket) -> None:
++        """A ticket's int32 ids and conversation key (once; under ``lock``)."""
++
++        if t.conv is not None:
++            return
++        ids = t.ids if isinstance(t.ids, array) else array("i", t.ids)
++        t.ids = ids
++        a = first_of(ids, [self.roles["assistant"]]) if "assistant" in self.roles else -1
++        t.conv = self.hash(ids[:a + 1]) if a >= 0 else self.hash(ids[:HASH_TOKENS])
++
++    def analyse(self, t: Ticket) -> dict[str, Any]:
++        """The prefix fields of a request: its ids against the kept prompts and the ones in flight before it."""
++
++        with self.lock:
++            self._prep(t)
++            ids, conv = t.ids, t.conv
++            lcp, same, other = self.prefixes.match(ids, conv, t.n)
++            for x in t.seen:                     # arrived before this one, not kept when it arrived
++                self._prep(x)
++                if len(x.ids) and len(ids) and x.ids[0] == ids[0]:
++                    d = common(ids, x.ids)
++                    lcp = max(lcp, d)
++                    if x.conv == conv:
++                        same = max(same, d)
++                    else:
++                        other = max(other, d)
++        roles = self.roles
++        sys_len = first_of(ids, [roles[k] for k in ("user", "assistant", "observation") if k in roles])
++        head = ids[:HASH_TOKENS]
++        return {"head_hash": self.hash(head), "head_len": len(head),
++                "sys_len": sys_len if sys_len >= 0 else None,
++                "sys_hash": self.hash(ids[:sys_len]) if sys_len > 0 else None,
++                "conv": conv, "lcp": lcp, "lcp_same": same, "lcp_other": other}
++
++    def end(self, t: Ticket | None, *, body: dict, chat: bool, result: dict | None, error: BaseException | None,
++            thinking: bool | None, max_tokens_eff: int | None) -> dict | None:
++        """Write the request's line (never raises). -> the record (tests)."""
++
++        if t is None:
++            return None
++        try:
++            rec = self.record(t, body=body, chat=chat, result=result, error=error, thinking=thinking,
++                              max_tokens_eff=max_tokens_eff)
++            self.write(rec)
++            return rec
++        except Exception as exc:              # noqa: BLE001 - logging never fails a request
++            if not self.warned:
++                self.warned = True
++                print(f"[tensorfold] request log (GLM53_TF_REQUEST_LOG={self.path}): {exc!r}; further errors not "
++                      "shown", file=sys.stderr, flush=True)
++            return None
++        finally:
++            with self.lock:
++                self.live.pop(t.n, None)
++                if t.conv is not None:
++                    self.prefixes.add(t.ids, t.conv, t.n)
++                t.seen = []
++
++    def record(self, t: Ticket, *, body: dict, chat: bool, result: dict | None, error: BaseException | None,
++               thinking: bool | None, max_tokens_eff: int | None) -> dict[str, Any]:
++        stats = dict((result or {}).get("stats") or {})
++        prompt = len(t.ids)
++        cached = int(stats.get("cached", 0) or 0)
++        if stats.get("restored_disk") is not None:
++            src = "disk"
++        elif stats.get("restored") is not None:
++            src = "ram"
++        elif cached > 0:
++            src = "slot"
++        else:
++            src = "none"
++        prefill_s = _num(stats.get("prefill_s"))
++        decode_s = _num(stats.get("decode_s"))
++        done = int((result or {}).get("completion_tokens", 0) or 0) if result is not None else None
++        if error is not None:
++            finish = "error"
++        elif stats.get("cancelled"):
++            finish = "cancelled"
++        else:
++            finish = (result or {}).get("finish")
++        kw = body.get("chat_template_kwargs") or {}
++        asked = body.get("max_tokens") or body.get("max_completion_tokens")
++        knobs = stats.get("tf_knobs") or {}
++        now = time.time()
++        rec = {
++            "ts": round(now, 3), "start": round(t.start, 3), "n": t.n, "kind": "chat" if chat else "completion",
++            "prompt": prompt, "cached": cached, "cache_src": src,
++            "prefill_s": prefill_s,
++            "prefill_tps": round((prompt - cached) / prefill_s, 1) if prefill_s else None,
++            "queue_s": _num(stats.get("queued_s")),
++            "first_s": round(t.first - t.start, 3) if t.first is not None else None,
++            "decode_tokens": done, "decode_s": decode_s,
++            "decode_tps": round(done / decode_s, 2) if decode_s and done else None,
++            "tokens_per_round": _num(stats.get("tokens_per_round")), "rounds": stats.get("rounds"),
++            "pieces": stats.get("pieces"), "slot": stats.get("slot"), "kv_pages": stats.get("kv_pages"),
++            "kv_free": stats.get("kv_free"), "marks": stats.get("marks"),
++            "thinking": thinking, "effort": kw.get("reasoning_effort") if thinking else None,
++            "effort_asked": body.get("reasoning_effort"),
++            "max_tokens": int(asked) if asked else None, "max_tokens_eff": max_tokens_eff,
++            "finish": finish, "error": type(error).__name__ if error is not None else None,
++            "tools": len(body.get("tools") or []), "messages": len(body.get("messages") or []) if chat else None,
++            "policy": stats.get("policy"), "fast_prefill": stats.get("fast_prefill", knobs.get("fast_prefill")),
++        }
++        rec.update(self.analyse(t))
++        return rec
++
++    # -- the file ----------------------------------------------------------------------------------------------
++    def write(self, rec: dict) -> None:
++        line = (json.dumps(rec, separators=(",", ":"), sort_keys=False) + "\n").encode()
++        with self.lock:
++            if self.fh is None:
++                d = os.path.dirname(os.path.abspath(self.path))
++                os.makedirs(d, exist_ok=True)
++                self.fh = open(self.path, "ab", buffering=0)
++                self.written = os.fstat(self.fh.fileno()).st_size
++            if self.written and self.written + len(line) > self.max_bytes:
++                self._rotate()
++            self.fh.write(line)
++            self.written += len(line)
++
++    def _rotate(self) -> None:
++        self.fh.close()
++        self.fh = None
++        if self.keep <= 0:
++            os.remove(self.path)
++        else:
++            for i in range(self.keep - 1, 0, -1):
++                src = f"{self.path}.{i}"
++                if os.path.exists(src):
++                    os.replace(src, f"{self.path}.{i + 1}")
++            os.replace(self.path, f"{self.path}.1")
++        self.fh = open(self.path, "ab", buffering=0)
++        self.written = 0
++
++    def close(self) -> None:
++        with self.lock:
++            if self.fh is not None:
++                self.fh.close()
++                self.fh = None
++
++
++def _num(v) -> float | None:
++    try:
++        return round(float(v), 4) if v is not None else None
++    except (TypeError, ValueError):
++        return None
+diff --git a/src/tensorfold/families/glm5_next/cuda/sessdisk.py b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+index 860542f..fdfd3b9 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sessdisk.py
++++ b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+@@ -189,6 +189,10 @@ def knobs(env: dict | None = None) -> dict:
+             and not k.startswith(KNOB_SKIP_PREFIX)}
+ 
+ 
++# patches/0300: the request log only reports
++KNOB_SKIP_PREFIX = KNOB_SKIP_PREFIX + ("GLM53_TF_REQUEST_LOG",)
++
++
+ def layout_sig(comps) -> list:
+     """The cache tensors a page / tail holds: rows a page, MTP or not, dtype, a row's shape."""
+ 

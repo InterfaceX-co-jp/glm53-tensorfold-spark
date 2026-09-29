@@ -15,9 +15,9 @@ process is up on either node. Stop vLLM (or anything else) first.
 
 | Config | Copy from | Context | Concurrency | KV | Use it for |
 | --- | --- | --- | --- | --- | --- |
-| Single-stream, long context | `config/prod-single.env.example` | 524,288 | 1 (others queue) | bf16 latent | one user / one agent, the longest prompts, the fastest prefill (1,266 tok/s at 28k) |
-| 4 x 256k batch | `config/prod.env.example` | 262,144 a slot | 4 | FP8 latent | several agents or sessions at once (72-77 tok/s aggregate at 4 streams) |
-| 4 x 256k, bigger store | `config/prod-batch.env.example` | 262,144 a slot | 4 | FP8 latent | same, 4 GiB session store; only if your nodes have more free memory (worker hit 7.3 GiB in stress) |
+| **Production** (4 requests, shared pool) | `config/prod.env.example` | up to 1,048,576 a request, 1,048,576 shared by the 4 | 4 | FP8 latent, paged pool | the default: agents with subagents, several sessions at once (~78 tok/s aggregate at 4 streams), the fastest prefill (~1,600 tok/s), NVMe session tier |
+| Single-stream, long context (earlier) | `config/prod-single.env.example` | 524,288 | 1 (others queue) | bf16 latent | one request at a time with bf16 KV (1,266 tok/s prefill at 28k) |
+| 4 x 256k batch (earlier) | `config/prod-batch.env.example` | 262,144 a slot | 4 | FP8 latent | the pre-pool batch config, 4 GiB session store; only if your nodes have more free memory (worker hit 7.3 GiB in stress) |
 | Safe / minimal (upstream-like) | `config/tensorfold.env.example` | 32,768 | 1 | per-head K/V (upstream) | a baseline with few patches active; check a problem against it |
 
 ```bash
@@ -35,11 +35,31 @@ states so switching back to one costs ~0.4-1 s instead of a re-prefill. Keep `GL
 12 GiB at 524k the store filled under agent traffic and the pair died of unified-memory OOM. `stop` strings end the
 reply, but the engine keeps decoding silently to EOS / `max_tokens` before the next queued request starts.
 
-### 4 x 256k batch (FP8 KV)
+### Production: 4 requests over a shared 1M-token pool (FP8 KV)
 
-`config/prod.env.example`. Four requests decode together; prompts prefill in 2048-token pieces between the others'
-rounds, so a long prompt delays the decoders by ~2 s at most but takes longer itself (TTFT 45 s for ~40k beside 3
-decoders). KV is stored as FP8 (`GLM53_TF_KV_DTYPE=fp8`): greedy replies differ from bf16 KV from the first tokens on;
+`config/prod.env.example`. Four requests decode together, and their latent KV lives in one paged pool of 1,048,576
+tokens (patch 0290): one request can grow to 1M tokens, and admission reserves prompt + `max_tokens` pages, spills
+idle slots' sessions to the store when the pool is short, or waits. A request alone prefills in 4,096-row chunks
+(0335); beside decoders, prompts prefill in 2048-token pieces between the others' rounds, so a long prompt delays the
+decoders by a few seconds at most but takes longer itself. What else the config turns on, each measured in
+`docs/RESULTS.md` W1-W10:
+
+- the NVMe session tier (0250, `GLM53_TF_SESSION_DISK=/sessions`, up to 64 GiB a node): an evicted ~39k-token session
+  comes back in ~0.4 s instead of a 31 s re-prefill, also after a restart. `serve.sh` mounts
+  `HEAD_SESSIONS` / `WORKER_SESSIONS` (default `<HF cache>/../glm53-tf/sessions`) at `/sessions`;
+- shared system-prompt reuse (0310, `GLM53_TF_PREFIX_SHARE=1`): a new session resumes at the end of a system prompt
+  another session already prefilled; a burst of 4 over an ~18k-token system prompt takes 28 s instead of 72 s;
+- the RoCE all-gather (0230/0350, `GLM53_TF_COMM_BACKEND=roce`): decode +4-11%. It needs `/dev/infiniband` in the
+  containers (serve.sh passes it) and falls back to NCCL on a setup failure; a run-time failure writes
+  `/cache/roce-failed` and the next start uses NCCL (delete the file to retry). `GLM53_TF_COMM_BACKEND=nccl` turns it
+  off. `docs/ROCE-FIX.md` has the validation stages to run on a new pair first;
+- row-split prefill (0320), b12x bit 4 one-pass attention (0360), MLA expand v2 (0390): prefill, same bits;
+- decode overlap (0370) and verify windows of up to 16 rows (0380): decode, same bits;
+- the request log (0300, `GLM53_TF_REQUEST_LOG=/sessions/requests.jsonl`, no text): `python3
+  scripts/traffic-report.py <head sessions dir>/requests.jsonl` summarizes reuse, sizes and speeds.
+
+The same config at `CONTEXT=262144` without `GLM53_TF_KV_POOL_TOKENS` is the earlier 4 x 256k batch config (every slot's
+caches allocated at full size). KV is stored as FP8 (`GLM53_TF_KV_DTYPE=fp8`): greedy replies differ from bf16 KV from the first tokens on;
 quality checks held (MMLU-200 88.0%, refusals 0/10, needle 9/9 at 28k and 3/3 at 112k). To go back to bf16 KV
 without a rebuild: `GLM53_TF_KV_DTYPE=bf16` with `GLM53_TF_SESSION_GIB=0` / `GLM53_TF_BATCH_SESSIONS=0`, or 3
 slots, or the single-stream config. The memory gate (`MEM_GATE_GIB=108`, `MEM_GATE_DROP_CACHES=1`) needs
@@ -99,8 +119,8 @@ long tables that way against 5-6/6 with thinking off.
 
 Nothing to do: every request resumes from the longest stored prefix of the same conversation (the stored states
 are keyed by the token prefix). With the single-stream config the store holds `GLM53_TF_SESSION_GIB` of other
-sessions; in the batch config each slot keeps its own conversation, and the 2 GiB store holds a few more (a 5th
-session can evict the oldest). Check `cached_tokens` in `usage`. `"priority": "background"` (and opencode's
+sessions; in the batch configs each slot keeps its own conversation, the 2 GiB RAM store holds a few more, and in the
+production config the NVMe tier keeps every evicted session (up to 64 GiB a node) and survives restarts. Check `cached_tokens` in `usage`. `"priority": "background"` (and opencode's
 session-title requests, recognised automatically) waits behind foreground requests.
 
 ## 3. A/B a knob without a restart (`tf_knobs`)
@@ -126,6 +146,7 @@ curl -s $B/v1/chat/completions -H 'Content-Type: application/json' -d '{
 | `fast_prefill`, `fp8_prefill`, `prefill_overlap` | 0/1 | 0091-0093 |
 | `fat_experts` | 0/1 | 0170 |
 | `moe_glue`, `mtp_window`, `hc_fused`, `attn_bm32` | see `docs/PATCHES.md` 0190 | 0190 |
+| `b12x` | bit mask; 4 = one-pass sparse latent attention (production), 1 / 2 not adopted | 0240 / 0360 |
 
 Load-time settings (`GLM53_TF_NONEXPERT`, `GLM53_TF_LATENT_KV`, `GLM53_TF_KV_DTYPE`, `GLM53_TF_BATCH`, the prefill
 buffer size, calibration) answer HTTP 400 if sent per request. Every bench script takes `--extra '{"tf_knobs": {...}}'`.
@@ -170,6 +191,11 @@ python3 bench/multiturn.py --base $B --model $M --modes concurrent,stall,slots -
 python3 bench/quality.py --base $B --model $M --label mine --out results/mine-quality.json
 # opencode-shaped tool calls (21 cases; corruption = leaked GLM markup or bad JSON)
 GLM_URL=$B/v1/chat/completions GLM_MODEL=$M python3 bench/toolcall_harness.py --reps 5 --out results/mine-tools.json
+# shared system-prompt reuse (0310): sessions and a burst of 4 over one ~18k-token system prompt
+python3 bench/prefixshare.py --base $B --model $M --system 12000 --out results/mine-prefix.json
+# memory worst case (batch configs): 4 conversations grown to ~250k, then a 32k turn beside 3 decoders
+python3 bench/multiturn.py --base $B --model $M --modes stress --stress-target 250000 --stress-step 60000 \
+    --stress-final 32000 --long-tokens 512 --mem-hosts local,$WORKER_SSH --out results/mine-stress.json
 # A/B a knob on reply agreement and needle retrieval
 python3 bench/fp8ab.py --base $B --model $M --modes agree,needle --knob fast_prefill
 ```
@@ -196,7 +222,15 @@ scripts/serve.sh preflight   # config, ssh, image on both nodes, RDMA port ACTIV
 scripts/serve.sh canary      # the post-load probes on demand (fails on degenerate output or a dead drafter)
 scripts/serve.sh xid 2h      # NVIDIA Xid events on both nodes
 scripts/serve.sh watch       # watchdog loop; or the systemd user units in scripts/systemd/
+scripts/serve.sh gpucheck    # GB10 clock / power-clamp / slow-state check of both nodes (strict: gate benchmarks on it)
+python3 scripts/gpuwatch.py status                           # the GPU watch's last samples (docs/OPS-GPUWATCH.md)
+python3 scripts/traffic-report.py <head sessions dir>/requests.jsonl   # the request log (0300), no text
 ```
+
+`preflight` also runs the GPU check (`GPUWATCH_PREFLIGHT=off|on|strict`, default `on`): a clock- or power-clamped
+GB10 (it survives warm reboots; a full power drain clears it) is a start problem. The GPU watch has its own user
+units (`scripts/systemd/glm53-gpuwatch.{service,timer}`). `CPUSET` (or `HEAD_CPUSET` / `WORKER_CPUSET`) passes
+`--cpuset-cpus` to both containers; it is not used in production (pinning measured +0.4%).
 
 The watchdog timer (`scripts/systemd/glm53-tf-watchdog.{service,timer}`, edit `WorkingDirectory` and `CONFIG`)
 checks `/health` every minute and, with `WATCH_HEAL=1`, restarts both ranks after repeated failures. Watch
@@ -210,6 +244,9 @@ checks `/health` every minute and, with `WATCH_HEAL=1`, restarts both ranks afte
 | an env knob | remove it from the config and `scripts/serve.sh restart` (defaults are upstream behaviour) |
 | FP8 KV | `GLM53_TF_KV_DTYPE=bf16` plus the memory changes in section 1 |
 | batching | use `config/prod-single.env.example` |
+| the shared KV pool | drop `GLM53_TF_KV_POOL_TOKENS` and set `CONTEXT=262144` (the earlier 4 x 256k config) |
+| RoCE | `GLM53_TF_COMM_BACKEND=nccl` (or leave `/cache/roce-failed` in place) |
+| a W8-W10 knob (`PREFILL_PP`, `PREFIX_SHARE`, `B12X`, `MLA_EXPAND`, `DECODE_OVERLAP`, `MAX_DRAFT_ROWS`) | remove it from the config and restart; each is off by default and was adopted on its own A/B |
 | a patch | build with `--build-arg PATCHES="..."` listing the ones to keep, and `IMAGE=<tag>` |
 | everything | `scripts/serve.sh stop`; start your previous stack (vLLM kit or upstream TensorFold). Old images stay tagged; `IMAGE=<old tag> scripts/serve.sh start` |
 

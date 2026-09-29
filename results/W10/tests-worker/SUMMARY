@@ -1,0 +1,10 @@
+00:38:41 start worker
+00:42:52 kda-bits rc=0 251s :: 345 passed in 248.04s (0:04:08)
+00:43:07 kda-bench rc=0 15s :: 
+00:45:30 kda-sweep rc=0 143s :: 
+00:45:35 overlap rc=1 5s :: 18 failed, 11 passed in 1.93s
+00:45:41 deep rc=1 6s :: 2 failed, 3 passed, 17 skipped in 3.57s
+00:45:46 bpar-ov rc=1 5s :: 5 failed, 13 passed, 8 errors in 1.77s
+00:45:51 bsess-ov rc=1 5s :: 17 failed, 5 passed, 6 errors in 1.70s
+00:46:02 lean-kda2 rc=1 11s :: 3 failed, 35 passed, 15 errors in 7.98s
+00:46:02 worker tests done

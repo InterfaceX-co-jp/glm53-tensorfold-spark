@@ -1,0 +1,24 @@
+fitting each stream's acceptance to its recorded keeps (baseline policy, finite runs):
+  W1/conc 4x rep0: miss scale m 0.21 f 0.54, m 0.46 f 0.48, m 0.40 f 0.55, m 0.11 f 0.84
+  W1/conc 4x rep1: miss scale m 0.55 f 0.48, m 0.34 f 0.43, m 0.19 f 0.90, m 0.56 f 0.59
+  W5/conc-off 4x rep0: miss scale m 0.21 f 0.40, m 0.39 f 0.63, m 0.36 f 0.39, m 0.13 f 0.60
+  W5/conc-off 4x rep1: miss scale m 0.57 f 0.41, m 0.36 f 0.46, m 0.14 f 0.68, m 0.73 f 0.37
+  W5/conc-off 4x rep2: miss scale m 0.42 f 0.46, m 0.17 f 0.74, m 0.62 f 0.45, m 0.22 f 0.44
+  W5/conc-nographs 4x rep0: miss scale m 0.35 f 0.43, m 0.47 f 0.53, m 0.32 f 0.47, m 0.17 f 0.88
+  W5/conc-nographs 4x rep1: miss scale m 0.52 f 0.46, m 0.35 f 0.38, m 0.18 f 0.60, m 0.64 f 0.53
+  W5/conc-nographs 4x rep2: miss scale m 0.61 f 0.52, m 0.20 f 0.92, m 0.75 f 0.58, m 0.30 f 0.46
+  W5/conc-b48 4x rep0: miss scale m 0.17 f 0.50, m 0.45 f 0.53, m 0.60 f 0.44, m 0.11 f 0.78
+  W5/conc-b48 4x rep1: miss scale m 0.49 f 0.44, m 0.31 f 0.49, m 0.22 f 0.72, m 0.62 f 0.44
+  W5/conc-b48 4x rep2: miss scale m 0.41 f 0.49, m 0.08 f 0.62, m 0.61 f 0.51, m 0.26 f 0.44
+
+signal=flat true row=6.0 ms, slot overhead=7.0 ms, 12 seeds, 512 tokens a stream, finite (makespan)
+
+mean over 11 runs (vs base):
+  base                       80.6 tok/s  +0.0%  (runs +0.0% .. +0.0%)
+  base:row=0                 81.7 tok/s  +1.4%  (runs +0.6% .. +2.6%)
+  base:row=8                 79.2 tok/s  -1.8%  (runs -3.0% .. -0.2%)
+  adapt:serial=0             80.3 tok/s  -0.4%  (runs -2.2% .. +0.9%)
+  adapt:serial=0:every=16    80.3 tok/s  -0.4%  (runs -2.1% .. +1.4%)
+  adapt                      75.9 tok/s  -5.9%  (runs -7.1% .. -4.8%)
+  adapt:margin=5             80.2 tok/s  -0.6%  (runs -2.0% .. +0.5%)
+  oracle                    105.9 tok/s  +31.3%  (runs +29.5% .. +35.6%)

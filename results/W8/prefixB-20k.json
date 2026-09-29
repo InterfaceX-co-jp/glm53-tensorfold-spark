@@ -1,0 +1,121 @@
+{
+ "args": {
+  "base": "http://127.0.0.1:8000",
+  "model": "GLM-5.3-Flash-EXL3",
+  "system": 20000,
+  "user": 1500,
+  "sessions": 3,
+  "burst": 4,
+  "tokens": 48,
+  "modes": "sequential,burst,exact",
+  "extra": "{}",
+  "out": "results/W8/prefixB-20k.json"
+ },
+ "sequential": [
+  {
+   "name": "session 1",
+   "prompt_tokens": 31695,
+   "cached_tokens": 896,
+   "ttft_s": 25.89311783100129,
+   "prefill_s": 25.8263,
+   "restored": 26,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 2,
+   "queued_s": 0.014,
+   "text": "This document is a numbered collection of 94 short lines (Q936398045-0-00000 through Q936398045-0-00093), each consisting of a sequence of six color/nature"
+  },
+  {
+   "name": "session 2",
+   "prompt_tokens": 31682,
+   "cached_tokens": 29376,
+   "ttft_s": 2.214929987996584,
+   "prefill_s": 2.1884,
+   "restored": 34,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 0,
+   "queued_s": 0.01,
+   "text": "This document is a collection of 94 numbered lines (Q936398045-1-00000 through Q936398045-1-00093), each containing a sequence of six words drawn from a fixed"
+  },
+  {
+   "name": "session 3",
+   "prompt_tokens": 31710,
+   "cached_tokens": 29376,
+   "ttft_s": 2.2903594380040886,
+   "prefill_s": 2.2739,
+   "restored": 34,
+   "restored_disk": null,
+   "prefix_wait": null,
+   "marks": 0,
+   "queued_s": 0.008,
+   "text": "This document is a collection of 94 numbered lines (Q936398045-2-00000 through Q936398045-2-00093), each containing a sequence of six nature-themed words (such"
+  }
+ ],
+ "burst": {
+  "rows": [
+   {
+    "name": "burst 1",
+    "prompt_tokens": 31710,
+    "cached_tokens": 896,
+    "ttft_s": 26.111222549996455,
+    "prefill_s": 26.0301,
+    "restored": 26,
+    "restored_disk": null,
+    "prefix_wait": null,
+    "marks": 2,
+    "queued_s": 0.026,
+    "text": "This document (B936398045-0) is a collection of 94 numbered lines, each containing a sequence of six nature-themed words (such as tundra, iris, umber, juniper, violet, and"
+   },
+   {
+    "name": "burst 2",
+    "prompt_tokens": 31729,
+    "cached_tokens": 29376,
+    "ttft_s": 34.340041126997676,
+    "prefill_s": 10.2685,
+    "restored": 39,
+    "restored_disk": null,
+    "prefix_wait": 13,
+    "marks": 0,
+    "queued_s": 24.001,
+    "text": "This document (B936398045-1) is a collection of 94 numbered text fragments, each consisting of a sequence of six nature-themed words (such as \"ember granite fjord umber granite violet\"), spanning entries"
+   },
+   {
+    "name": "burst 3",
+    "prompt_tokens": 31720,
+    "cached_tokens": 29376,
+    "ttft_s": 32.03359461799846,
+    "prefill_s": 7.9711,
+    "restored": 39,
+    "restored_disk": null,
+    "prefix_wait": 13,
+    "marks": 0,
+    "queued_s": 23.999,
+    "text": "This document (B936398045-2) is a collection of 94 numbered text fragments, each consisting of a sequence of six nature-themed words (such as orchid, quartz, fjord, saffron,"
+   },
+   {
+    "name": "burst 4",
+    "prompt_tokens": 31710,
+    "cached_tokens": 29376,
+    "ttft_s": 28.435267036009463,
+    "prefill_s": 4.3696,
+    "restored": 39,
+    "restored_disk": null,
+    "prefix_wait": 13,
+    "marks": 0,
+    "queued_s": 24.001,
+    "text": "This document (B936398045-3) is a collection of 94 numbered text fragments, each consisting of a sequence of six nature-themed words (such as meadow, basalt, nectar, cedar, orch"
+   }
+  ],
+  "wall_s": 35.73357865899743
+ },
+ "exact": [
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true
+ ]
+}

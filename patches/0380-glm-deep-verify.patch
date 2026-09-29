@@ -1,0 +1,314 @@
+diff --git c/src/tensorfold/families/glm5_next/cuda/batch.py i/src/tensorfold/families/glm5_next/cuda/batch.py
+index e890e43..6fa0370 100644
+--- c/src/tensorfold/families/glm5_next/cuda/batch.py
++++ i/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -11,8 +11,9 @@ Slots. One ``forward.State`` per slot (slot 0 is the engine's own ``e.st``), the
+ slot has the engine's context (latent KV with patches/0060, index rings with patches/0065), its own KDA states, its
+ own MTP-head cache and CUDA graphs, and its own DFlash2 context (``_drafter_view``: the drafter's weights and
+ buffers shared, its context caches, positions and graphs per slot). Slots other than 0 keep window-sized KDA
+-projection / replay rows (8 rows); a prefill on such a slot borrows slot 0's (``_borrow``), which only hold the
+-rows of one forward between that forward and its commit.
++projection / replay rows (``engine.MAX_ROWS``: 8, or patches/0380's GLM53_TF_MAX_DRAFT_ROWS up to 16); a prefill on
++such a slot borrows slot 0's (``_borrow``), which only hold the rows of one forward between that forward and its
++commit.
+ 
+ A round (``_execute``, both ranks, from rank 0's plan: ``batchplan``):
+ 
+@@ -1967,7 +1968,8 @@ class Batcher:
+             job.stats.update(decode_s=round(time.perf_counter() - st.start, 4), rounds=st.rounds,
+                              batched_rounds=st.shared, min_rows=1 + min(st.depths, default=0),
+                              tokens_per_round=round((len(tokens) - 1) / max(st.rounds, 1), 3), sha256=sha,
+-                             keeps=st.keeps, drafters="".join(st.arms), round_kinds={k: round(v, 1) for k, v in q.kinds.items()})
++                             keeps=st.keeps, drafters="".join(st.arms), depths=st.depths,     # 0380: drafts a round
++                             round_kinds={k: round(v, 1) for k, v in q.kinds.items()})
+             if getattr(st, "adapt", None) is not None:  # patches/0340
+                 job.stats["adapt"] = dict(serial=st.adapt.serial, probes=st.adapt.probes)
+         job.stats.update(cancelled=cancelled)
+diff --git c/src/tensorfold/families/glm5_next/cuda/calib.py i/src/tensorfold/families/glm5_next/cuda/calib.py
+index 6793d92..ee20317 100644
+--- c/src/tensorfold/families/glm5_next/cuda/calib.py
++++ i/src/tensorfold/families/glm5_next/cuda/calib.py
+@@ -43,6 +43,7 @@ from typing import Sequence
+ 
+ MODES = ("random", "real", "cached")
+ SPANS = 3                 # continuation spans a window size is timed on (real mode)
++DEEP_FROM = 8             # patches/0380: windows past this many rows are fitted on their own line
+ PROMPT_MAX = 256          # tokens of TEXT kept
+ 
+ # A short fixed text of the kinds this server decodes: prose, a numbered explanation, and code with a docstring.
+@@ -131,9 +132,17 @@ def window_costs(both: dict[str, float], most: int, spans: int) -> list[float]:
+         v = {r: statistics.fmean(both[f"v{r}_{s}"] for s in range(spans)) for r in range(1, most + 1)}
+     else:
+         v = {r: both[f"v{r}"] for r in range(1, most + 1)}
+-    rows = list(range(2, most + 1))
++    # patches/0380: windows past 8 rows (GLM53_TF_MAX_DRAFT_ROWS) on a line of their own, through the 8-row window's
++    # fitted cost, so the 1..8 table is the one an 8-row calibration fits from the same times
++    first = min(most, DEEP_FROM)
++    rows = list(range(2, first + 1))
+     base, slope = fit_line(rows, [v[r] for r in rows])
+-    return [v[1]] + [base + slope * r for r in rows]
++    table = [v[1]] + [base + slope * r for r in rows]
++    if most > first:
++        deep = list(range(first, most + 1))
++        _, slope2 = fit_line(deep, [v[r] for r in deep])
++        table += [table[-1] + max(slope2, 0.0) * (r - first) for r in range(first + 1, most + 1)]
++    return table
+ 
+ 
+ # -- online refinement (rank 0) ------------------------------------------------------------------------------------
+diff --git c/src/tensorfold/families/glm5_next/cuda/deep.py i/src/tensorfold/families/glm5_next/cuda/deep.py
+new file mode 100644
+index 0000000..8f69713
+--- /dev/null
++++ i/src/tensorfold/families/glm5_next/cuda/deep.py
+@@ -0,0 +1,84 @@
++"""Deeper verify windows (patches/0380): ``GLM53_TF_MAX_DRAFT_ROWS`` (load-time, both ranks equal, default 8).
++
++A round verifies the pending token and up to ``MAX_DRAFT_ROWS - 1`` drafts as one window. Upstream (and every patch
++before this one) fixes that at 8 rows (``engine.MAX_ROWS``). This knob raises the cap to at most 16. Which rows a
++round actually verifies is still decided by the existing rules: patches/0071's cost-derived depths (a draft joins
++the window only while its expected token beats the request's rate times its row's marginal ms, from the drafter's
++own probability corrected per position) and the lookup gate of patches/0020. So a deeper cap only adds rows to
++rounds whose drafts are confident enough to pay for them.
++
++What can fill rows past the 8th:
++
++- prompt-lookup drafts (patches/0020): a copy of an earlier span, up to ``MAX_DRAFT_ROWS - 1`` tokens, priced per
++  match-length band;
++- MTP chains: the head chains one draft a step, so a chain can run to ``MAX_DRAFT_ROWS - 1`` drafts when each step
++  pays;
++- DFlash2: one block pass proposes ``block_size - 1`` positions (7 for the published drafter, block 8). Past that,
++  only with ``GLM53_TF_DFLASH_BLOCK`` (below).
++
++``GLM53_TF_DFLASH_BLOCK=N`` (load-time, both ranks equal; default: the checkpoint's ``block_size``): run the drafter's
++block pass over N rows (``[pending, mask x (N - 1)]``). The published drafter was trained with blocks of 8, so masks
++past the 7th are out of distribution (DBloom, arXiv 2608.30427: naive widening at inference does not work), and the
++wider bidirectional block can also change the first 7 picks. Drafts only propose, so replies are unchanged; it is an
++experiment for the GPU window, where the per-position acceptance decides (``depth.Calibration`` prices positions
++past 7 from their own evidence). ``GLM53_TF_AUTO_FDRAFTS`` must be raised with it for ``auto`` to verify them.
++
++Exactness: every decode, verify and MTP kernel is row-independent for any window of 1 to 512 rows (the same code runs
++exact prefill chunks of up to ``GLM53_TF_PREFILL_ROWS`` rows; ``qmm.bucket`` puts 1-16 rows in one tile size), the
++accept rule keeps rows up to the first draft that differs from the keyed sample, and ``forward.commit`` replays the
++kept prefix. A deeper window changes how many positions a round confirms, never which token a position gets.
++
++Sizes that follow the cap, per rank on GLM-5.3-Flash at a 1M-token capacity, 16 rows against 8 (about +115 MB):
++patches/0050's ``sparse.LongScratch`` of the main and MTP buffer sets (scores and keys of every pool for each row: +25
++MB each), ``latent.SPARSE_ROWS`` (preallocated sparse partials, +2.6 MB each), the batch slots' window-sized KDA
++projection / replay rows (0120: +20 MB a slot other than slot 0, whose rows are the prefill buffers'), 0120's batched
++KDA rows (tiny); the long-context graph keys (rows 1..N, captured lazily as before, ``GLM53_TF_LONGCTX_MAX_GRAPHS``
++still caps them) and the batch graph keys (``GLM53_TF_BATCH_GRAPH_ROWS`` defaults to the cap); the calibration (windows
++of 1..N rows timed at load; ``calib.window_costs`` keeps the 1..8 table an 8-row calibration fits from the same times
++and extends it on its own line).
++
++No torch here.
++"""
++
++from __future__ import annotations
++
++import os
++
++DEFAULT = 8               # upstream's widest verify window (the pending token and 7 drafts)
++LIMIT = 16                # the widest window this patch sizes for
++ENV = "GLM53_TF_MAX_DRAFT_ROWS"
++BLOCK_ENV = "GLM53_TF_DFLASH_BLOCK"
++
++
++def max_rows(value: str | None = None) -> int:
++    """GLM53_TF_MAX_DRAFT_ROWS (or ``value``): the widest verify window, 8 to 16 rows (default 8)."""
++
++    raw = (os.environ.get(ENV, "") if value is None else str(value)).strip()
++    try:
++        n = int(raw) if raw else DEFAULT
++    except ValueError:
++        raise ValueError(f"{ENV}={raw!r}: expected an integer from {DEFAULT} to {LIMIT}") from None
++    if not DEFAULT <= n <= LIMIT:
++        raise ValueError(f"{ENV}={n}: expected {DEFAULT} to {LIMIT} rows (a pending token and up to {LIMIT - 1} "
++                         "drafts)")
++    return n
++
++
++def dflash_block(rows: int | None = None, value: str | None = None) -> int:
++    """GLM53_TF_DFLASH_BLOCK (or ``value``): the DFlash2 block pass's rows, 0 = the checkpoint's ``block_size``. At
++    most the widest window (``rows``, default ``max_rows()``)."""
++
++    raw = (os.environ.get(BLOCK_ENV, "") if value is None else str(value)).strip()
++    most = max_rows() if rows is None else int(rows)
++    try:
++        n = int(raw) if raw else 0
++    except ValueError:
++        raise ValueError(f"{BLOCK_ENV}={raw!r}: expected 0 (the checkpoint's block) or 2 to {most}") from None
++    if n and not 2 <= n <= most:
++        raise ValueError(f"{BLOCK_ENV}={n}: expected 0 (the checkpoint's block) or 2 to {most} "
++                         f"({ENV}={most} is the widest verify window)")
++    return n
++
++
++ROWS = max_rows()         # read once at import, like every load-time knob (both ranks compare it at load)
++DRAFTS = ROWS - 1         # the most drafts a window holds
+diff --git c/src/tensorfold/families/glm5_next/cuda/depth.py i/src/tensorfold/families/glm5_next/cuda/depth.py
+index e285806..0aa02f6 100644
+--- c/src/tensorfold/families/glm5_next/cuda/depth.py
++++ i/src/tensorfold/families/glm5_next/cuda/depth.py
+@@ -46,7 +46,9 @@ from __future__ import annotations
+ import os
+ from typing import Sequence
+ 
+-MAX_DRAFTS = 7            # a verify window holds the pending token and up to 7 drafts
++from . import deep as _deep                                     # patches/0380
++
++MAX_DRAFTS = _deep.DRAFTS  # a verify window holds the pending token and up to 7 drafts (0380: up to 15)
+ PRIOR = 2.0               # the correction's prior weight (in units of summed probability)
+ DECAY = 0.97              # evidence at a position fades by this each round that verifies it
+ AHEAD_PRIOR = 0.8         # an unseen position's acceptance before evidence: optimistic, so the chain explores it
+@@ -229,7 +231,8 @@ OPT_KIND = 6              # [6, most drafts, drafter (0 MTP, 1 DFlash2), 0]
+ 
+ 
+ def parse_policy(spec: str) -> list[int] | None:
+-    """``om[N]`` / ``of[N]`` -> [OPT_KIND, N, 0 or 1, 0] (N from 1 to 7, default 7); ``o`` is ``auto`` with cost
++    """``om[N]`` / ``of[N]`` -> [OPT_KIND, N, 0 or 1, 0] (N from 1 to MAX_DRAFTS, 7 without patches/0380, default
++    MAX_DRAFTS); ``o`` is ``auto`` with cost
+     depths (``engine.encode_policy``). None for other specs."""
+ 
+     spec = str(spec).strip()
+diff --git c/src/tensorfold/families/glm5_next/cuda/engine.py i/src/tensorfold/families/glm5_next/cuda/engine.py
+index c91e435..e3f7939 100644
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ i/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -71,12 +71,14 @@ from typing import Any, Callable
+ from .lookup import LOOKUP_KIND, lookup_for, parse_policy, with_lookup     # patches/0020
+ from . import depth as depth_mod                                            # patches/0071
+ from . import knobs as knobs_mod                                            # patches/0090
++from . import deep as deep_mod                                              # patches/0380
+ 
+ DEFAULT_POLICY = "auto"
+ DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
+ EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
+ GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
+-MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
++# the widest verify window (a pending token and up to 7 drafts); patches/0380: GLM53_TF_MAX_DRAFT_ROWS (8 to 16)
++MAX_ROWS = deep_mod.ROWS
+ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
+ 
+ 
+@@ -229,14 +231,18 @@ class GlmEngine:
+         if rows_max < max(prefill_rows, 1):
+             raise ValueError(f"GLM53_TF_PREFILL_ROWS={prefill_rows}, GLM53_TF_PREFILL_ROWS_MAX={rows_max}: expected "
+                              "1 <= PREFILL_ROWS <= PREFILL_ROWS_MAX")
++        # patches/0380: GLM53_TF_MAX_DRAFT_ROWS sizes the windows (buffers, graphs, calibration); GLM53_TF_DFLASH_BLOCK
++        # the drafter's block pass: both change what a round drafts, so both ranks must agree
++        dblock = deep_mod.dflash_block(MAX_ROWS)
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), self.f_most, longctx,
+-                prefill_rows, rows_max]
++                prefill_rows, rows_max, MAX_ROWS, dblock]
+         both = self._gather_ints(mine)
+         if both[0] != both[1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts): "
+                                f"rank 0 {both[0]}, rank 1 {both[1]}; pull the draft model on both machines (or pass "
+                                "--drafter none to both) and give both the same flags (and GLM53_TF_LONGCTX_GRAPHS, "
+-                               "GLM53_TF_PREFILL_ROWS, GLM53_TF_PREFILL_ROWS_MAX)")
++                               "GLM53_TF_PREFILL_ROWS, GLM53_TF_PREFILL_ROWS_MAX, GLM53_TF_MAX_DRAFT_ROWS, "
++                               "GLM53_TF_DFLASH_BLOCK)")
+         w = load(model_dir, rank=rank)
+         fastboot.mark("weights", f"{w.nbytes() / 1e9:.1f} GB on the GPU")
+         w.comm = self.comm
+@@ -339,7 +345,7 @@ class GlmEngine:
+         if drafter is not None:
+             from .dflash2 import Drafter
+ 
+-            self.drafter = Drafter(drafter, w, capacity=capacity)
++            self.drafter = Drafter(drafter, w, capacity=capacity, block=dblock or None)     # patches/0380
+             fastboot.mark("DFlash2 drafter weights")
+         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=rows_max, graphs=True,
+                         graph_rows=GRAPH_ROWS,
+@@ -630,19 +636,22 @@ class GlmEngine:
+         def tokens(n: int) -> list[int]:
+             return [int(t) for t in rng.integers(0, vocab, n)]
+ 
++        stride = deep_mod.DEFAULT                     # patches/0380 (== MAX_ROWS without it)
+         if how == "random":
+             prompt, cont, spans = tokens(64), [], 0
+         else:
+             prompt = self._share(calib.prompt_ids(self.model_dir, vocab) if self.rank == 0
+                                  else None)
+             first = prefill(e, prompt, None, mtp=False, drafter=None)
+-            cont = serial_decode(e, first, calib.SPANS * MAX_ROWS, None).tokens   # greedy: the same on both ranks
++            # patches/0380: spans start every 8 tokens whatever MAX_ROWS is (a deeper window's first 8 rows are the
++            # tokens and positions an 8-row calibration times), and run MAX_ROWS tokens from there
++            cont = serial_decode(e, first, calib.SPANS * stride + MAX_ROWS - stride, None).tokens   # greedy: both ranks
+             spans = calib.SPANS
+         best: dict[str, float] = {}
+         for s in range(max(spans, 1)):
+-            prefill(e, prompt + cont[:s * MAX_ROWS], None, mtp=True, drafter=self.drafter)
++            prefill(e, prompt + cont[:s * stride], None, mtp=True, drafter=self.drafter)
+             hidden = e.main_hidden(slice(0, MAX_ROWS)).clone()
+-            span = cont[s * MAX_ROWS:(s + 1) * MAX_ROWS]
++            span = cont[s * stride:s * stride + MAX_ROWS]
+             one, six = (tokens(1), tokens(6)) if not spans else (span[:1], span[:6])
+             start = st.mtp_len
+ 
+@@ -966,6 +975,8 @@ class GlmEngine:
+                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
+         if res.arms:
+             stats.update(drafters=res.arms, keeps=res.keeps)
++        if res.depths:
++            stats["depths"] = res.depths        # patches/0380: drafts verified a round (keeps are the rows kept)
+         if res.stages:
+             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
+         return stats
+diff --git c/src/tensorfold/families/glm5_next/cuda/knobs.py i/src/tensorfold/families/glm5_next/cuda/knobs.py
+index 1ea880f..5f6884d 100644
+--- c/src/tensorfold/families/glm5_next/cuda/knobs.py
++++ i/src/tensorfold/families/glm5_next/cuda/knobs.py
+@@ -62,13 +62,15 @@ from __future__ import annotations
+ 
+ from typing import Any, Mapping
+ 
++from . import deep as _deep                 # patches/0380
++
+ DEPTHS = ("threshold", "cost")
+ 
+ # key -> (lowest, highest or None for "the engine's limit"), all integers (JSON true/false count as 1/0)
+ RANGES: dict[str, tuple[int, int | None]] = {
+     "lookup": (0, 1),
+     "lookup_min": (1, 64),
+-    "auto_fdrafts": (1, 7),
++    "auto_fdrafts": (1, _deep.DRAFTS),   # patches/0380: up to GLM53_TF_MAX_DRAFT_ROWS - 1
+     "expert_loop": (0, 1),
+     "prefill_rows": (1, None),
+     "calib_online": (0, 1),
+diff --git c/src/tensorfold/families/glm5_next/cuda/latent.py i/src/tensorfold/families/glm5_next/cuda/latent.py
+index 9e5d483..eb012f8 100644
+--- c/src/tensorfold/families/glm5_next/cuda/latent.py
++++ i/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -56,11 +56,14 @@ import torch
+ import triton
+ import triton.language as tl
+ 
++from . import deep as _deep                                     # patches/0380
+ from . import fp8pf, glue, kvpool, profile, qmm, sparse
+ from .qmm import B16, Q4
+ 
+ CHUNK = 512              # keys a program visits (the expanded kernel's chunk: the same chunk counts serve both)
+-SPARSE_ROWS = 8          # rows whose sparse partials are preallocated (decode/verify/MTP windows; captured steps)
++# rows whose sparse partials are preallocated (decode/verify/MTP windows; captured steps); patches/0380: the widest
++# verify window (GLM53_TF_MAX_DRAFT_ROWS)
++SPARSE_ROWS = max(8, _deep.ROWS)
+ KT = 32                  # latent rows a tile step reads (32 x 512 bf16 = 32 KB)
+ BM = 16                  # (row, head) queries a tensor-core tile holds
+ ATTN_WARPS = 8           # a tile's [16, 512] fp32 accumulator and [32, 512] latent rows need the registers of 8 warps
+diff --git c/src/tensorfold/families/glm5_next/cuda/lookup.py i/src/tensorfold/families/glm5_next/cuda/lookup.py
+index 1289c02..97574d9 100644
+--- c/src/tensorfold/families/glm5_next/cuda/lookup.py
++++ i/src/tensorfold/families/glm5_next/cuda/lookup.py
+@@ -36,7 +36,9 @@ from typing import Sequence
+ 
+ LOOKUP_KIND = 20                  # policy code kind of ``lN[:M]``: [20, N, M, 0]
+ DEFAULT_MIN = 3                   # ``lN``'s match threshold when M is not given
+-MAX_DRAFTS = 7                    # a verify window holds the pending token and up to 7 drafts
++from . import deep as _deep                     # patches/0380
++
++MAX_DRAFTS = _deep.DRAFTS         # a verify window holds the pending token and up to 7 drafts (0380: up to 15)
+ CANDIDATES = 64                   # earlier occurrences of the suffix's n-gram examined a round (most recent first)
+ EXTEND = 64                       # a backward match is not measured past this many tokens
+ # (shortest match of the band, prior p): the chance a lookup draft is kept after a kept one, before this request

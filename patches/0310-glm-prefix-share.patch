@@ -1,0 +1,383 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/batch.py b/src/tensorfold/families/glm5_next/cuda/batch.py
+index ee1606c..2338312 100644
+--- a/src/tensorfold/families/glm5_next/cuda/batch.py
++++ b/src/tensorfold/families/glm5_next/cuda/batch.py
+@@ -994,6 +994,62 @@ class Batcher:
+             self._prefetch(slot, sess)                  # (after this round's spills and the slot's reservation)
+         return slot, len(e.ids)
+ 
++    def _share_wait(self, job: Job, admits: list) -> bool:
++        """patches/0310 (GLM53_TF_PREFIX_SHARE_WAIT, rank 0): whether ``job`` should wait a round because a request in
++        flight (prefilling, or admitted earlier this round) of the same prefill mode and drafters will soon store a
++        mark inside the prefix they share, at least ``fork_min`` past what ``job`` can resume now. It then resumes
++        there instead of prefilling the same tokens beside it. Never waits on a request that is not prefilling (its
++        marks are stored), so it ends when the partner passes the mark (stored or not), finishes, or is cancelled."""
++
++        share = getattr(self.store, "share", None) if self.store is not None else None
++        if share is None or not share.wait or not job.draft:
++            return False
++        from .sessions import common_prefix
++
++        g = self.g
++        grid = self._grid(job.values)
++        _, m, f = g._drafters(job.code)
++        partners = [(s.job, s.done, s.marks) for s in self.seqs if s is not None and s.stepper is None
++                    and not s.job.cancel]
++        partners += [(j, c, tuple(j.sess.marks) if j.sess is not None else ()) for _, c, j in admits]
++        have = None
++        for pj, done, marks in partners:
++            if not marks or not pj.draft or self._grid(pj.values) != grid:
++                continue
++            _, pm, pf = g._drafters(pj.code)
++            if (m and not pm) or (f and not pf):         # its snapshots lack a draft cache this request needs
++                continue
++            ahead = [q for q in marks if done < q < len(job.prompt)]
++            if not ahead:
++                continue
++            d = common_prefix(job.prompt, pj.prompt)
++            ahead = [q for q in ahead if q <= d]
++            if not ahead:
++                continue
++            if have is None:
++                have = self._resumable(job, grid, m, f and g.drafter is not None)
++            if max(ahead) >= have + self.store.fork_min:
++                return True
++        return False
++
++    def _resumable(self, job: Job, grid: int, need_mtp: bool, need_f: bool) -> int:
++        """patches/0310: the longest prefix ``job`` could resume now (any slot's snapshot, the store, its disk)."""
++
++        best = 0
++        for s in range(self.n):
++            snap = self._resume(s, job.prompt, job.code, grid)
++            if snap is not None:
++                best = max(best, len(snap.ids))
++        e = self.store.index.find(job.prompt, grid, need_mtp, need_f)
++        if e is not None:
++            best = max(best, len(e.ids))
++        disk = getattr(self.store, "disk", None)
++        if disk is not None:
++            d = disk.index.find(job.prompt, grid, need_mtp, need_f)
++            if d is not None:
++                best = max(best, len(d.ids))
++        return best
++
+     def _prefetch(self, slot: int, sess) -> None:
+         """patches/0250: start reading a disk entry into ``slot`` when the slot is idle (a slot freed by a cancel in
+         this round is read in ``_admit`` instead); its own snapshots no longer match its caches."""
+@@ -1289,6 +1345,10 @@ class Batcher:
+                 job = waiting[i]
+                 if not free:
+                     break
++                if self._share_wait(job, admits):          # patches/0310: a partner prefills its prefix
++                    self.counts["prefix_wait"] += 1
++                    job.stats["prefix_wait"] = job.stats.get("prefix_wait", 0) + 1
++                    continue
+                 if (others or admits) and batchplan.admit_free(self._free(), self._headroom()) < self.admit_min:
+                     self.counts["deferred"] += 1               # short of memory: it waits for a request to end
+                     break
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 2164f2a..ede82bd 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -448,12 +448,18 @@ class GlmEngine:
+         from . import sessdisk              # patches/0250: the NVMe tier (GLM53_TF_SESSION_DISK), both ranks
+ 
+         sessdisk.attach(self, store)
++        store.attach_share(sessions.PrefixShare.from_env(self.model_dir))     # patches/0310 (None: off)
+         if self.rank == 0:
+             ix = store.index
+             print(f"[tensorfold] session store: {ix.budget / 2 ** 30:.1f} GiB, pages of {sessions.PAGE} tokens "
+                   f"({ix.page_bytes / 2 ** 20:.2f} MiB, {ix.page_bytes / sessions.PAGE / 1024:.2f} KB a token), "
+                   f"marks every {store.every} tokens and at forks of {store.fork_min}+"
+                   + (f", behind {self.batch.n} batch slots" if self.batch is not None else ""), flush=True)
++            if store.share is not None:
++                sh = store.share
++                print(f"[tensorfold] shared prefixes (patches/0310): a mark at the end of the system prompt (role "
++                      f"tokens {sh.roles}, {sh.lo}-{sh.hi} tokens, {sh.points} a prompt), at most {sh.keep} "
++                      f"system-only entries kept, admissions wait for a partner's mark: {int(sh.wait)}", flush=True)
+         return store
+ 
+     def _store_save(self, snaps: list) -> None:
+diff --git a/src/tensorfold/families/glm5_next/cuda/sessdisk.py b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+index fdfd3b9..a1aebab 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sessdisk.py
++++ b/src/tensorfold/families/glm5_next/cuda/sessdisk.py
+@@ -176,7 +176,8 @@ def settings() -> list[int]:
+ # knobs that cannot change a stored bit (paths, scheduling, the store's own sizes, reporting); every other
+ # GLM53_TF_* knob is in the hash, so a new knob is conservative by default (it only costs a cold start)
+ KNOB_SKIP_PREFIX = ("GLM53_TF_SESSION_", "GLM53_TF_BATCH", "GLM53_TF_CALIB", "GLM53_TF_PREPARED", "GLM53_TF_STALL",
+-                    "GLM53_TF_TOKCACHE", "GLM53_TF_KV_POOL")      # patches/0290: where rows live, never their bits
++                    "GLM53_TF_TOKCACHE", "GLM53_TF_KV_POOL",      # patches/0290: where rows live, never their bits
++                    "GLM53_TF_PREFIX_SHARE")                      # patches/0310: where snapshots are taken
+ KNOB_SKIP = {"GLM53_TF_T0", "GLM53_TF_LAUNCH_T0", "GLM53_TF_IMAGE_ID", "GLM53_TF_CLOCK_CAP", "GLM53_TF_BOOT_WARMUP",
+              "GLM53_TF_HEALTH", "GLM53_TF_EFFORT_FIELD", "GLM53_TF_DEFAULT_EFFORT", "GLM53_TF_PROFILE",
+              "GLM53_TF_DEPTH", "GLM53_TF_LOOKUP", "GLM53_TF_LOOKUP_MIN", "GLM53_TF_AUTO_FDRAFTS",
+diff --git a/src/tensorfold/families/glm5_next/cuda/sessions.py b/src/tensorfold/families/glm5_next/cuda/sessions.py
+index 4374fed..a098f5d 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sessions.py
++++ b/src/tensorfold/families/glm5_next/cuda/sessions.py
+@@ -77,6 +77,25 @@ NVMe tier (patches/0250, GLM53_TF_SESSION_DISK=<dir>, ``sessdisk.py``): entries
+ directory (every save, or on eviction), looked up after the RAM store, and read back straight into the live slot;
+ the plan carries the disk entry and the disk index's digest; sessions survive restarts.
+ 
++Shared prefixes across sessions (patches/0310, GLM53_TF_PREFIX_SHARE=1; off by default)
++--------------------------------------------------------------------------------
++Without it a NEW session over a system prompt another session already prefilled resumes only at a snapshot some
++earlier prefill took at or before their common prefix: a GLM53_TF_SESSION_EVERY mark (16,384, 32,768, ...) or the
++fork mark a previous sharer took. The first session never marks its fork point (it has no partner yet), so the
++second session over a system prompt shorter than 16,384 tokens prefills it all (and takes the fork mark the third
++one resumes at). ``PrefixShare`` adds, to the marks rank 0 plans, the position of the prompt's first
++user / assistant / observation role token (everything before it is the system prompt and the tools), on the
++snapshot grid (the page for exact prefills, 64 for fast ones), when it lies in [GLM53_TF_PREFIX_SHARE_MIN (2,048),
++GLM53_TF_PREFIX_SHARE_MAX (131,072)] and is not stored already: the first session leaves the snapshot the second
++resumes at. The entries of these marks have ``kind == "prefix"`` (rank 0's bookkeeping); at most
++GLM53_TF_PREFIX_SHARE_KEEP (4) stay in the RAM store (rank 0 evicts the least recently used one first, a decision
++rank 1 replays; they also go to the NVMe tier like any entry), and every other entry is under the store's LRU as
++before. In batch mode
++(``batch.Batcher._plan``) a session admitted while another one is still prefilling toward such a mark of a prompt it
++shares waits for it (GLM53_TF_PREFIX_SHARE_WAIT, on), then resumes at it instead of prefilling the same prefix side
++by side. A mark is a snapshot the prefill takes where the engine may take one (the exact chunk cut there, fast marks
++on the 64-grid): no new arithmetic, resumed == fresh as for every mark.
++
+ This module imports no torch at load: ``SessionIndex`` (keys, lookup, LRU, reference counts, budget) is plain
+ Python and tested on the host; ``SessionStore`` moves the tensors.
+ """
+@@ -143,6 +162,105 @@ def batch_enabled() -> bool:
+     return v == "1"
+ 
+ 
++# -- patches/0310: shared-prefix marks -----------------------------------------------------------------------------
++ROLE_TOKENS = ("<|user|>", "<|assistant|>", "<|observation|>")
++
++
++def _env_int(name: str, default: int, lo: int = 0) -> int:
++    raw = os.environ.get(name, "").strip()
++    n = int(raw) if raw else default
++    if n < lo:
++        raise ValueError(f"{name}={n}: expected >= {lo}")
++    return n
++
++
++def prefix_share() -> bool:
++    """GLM53_TF_PREFIX_SHARE=1 (patches/0310): marks at the end of the system prompt; default 0 (off)."""
++
++    v = os.environ.get("GLM53_TF_PREFIX_SHARE", "0").strip()
++    if v not in ("0", "1", ""):
++        raise ValueError(f"GLM53_TF_PREFIX_SHARE={v}: expected 0 or 1")
++    return v == "1"
++
++
++def role_token_ids(model_dir) -> list[int]:
++    """The chat template's role tokens (``ROLE_TOKENS``) in the checkpoint's tokenizer: GLM53_TF_PREFIX_SHARE_TOKENS
++    (comma-separated ids) when set, else tokenizer_config.json's ``added_tokens_decoder``, else tokenizer.json's
++    ``added_tokens``."""
++
++    import json
++    from pathlib import Path
++
++    raw = os.environ.get("GLM53_TF_PREFIX_SHARE_TOKENS", "").strip()
++    if raw:
++        return sorted({int(x) for x in raw.replace(" ", "").split(",") if x})
++    found: dict[str, int] = {}
++    d = Path(model_dir) if model_dir is not None else None
++    if d is not None and (d / "tokenizer_config.json").exists():
++        dec = json.loads((d / "tokenizer_config.json").read_text()).get("added_tokens_decoder") or {}
++        for i, t in dec.items():
++            if isinstance(t, dict) and t.get("content") in ROLE_TOKENS:
++                found[t["content"]] = int(i)
++    if len(found) < len(ROLE_TOKENS) and d is not None and (d / "tokenizer.json").exists():
++        for t in json.loads((d / "tokenizer.json").read_text()).get("added_tokens") or []:
++            if t.get("content") in ROLE_TOKENS:
++                found.setdefault(t["content"], int(t["id"]))
++    return sorted(found.values())
++
++
++class PrefixShare:
++    """Where a prompt's system part ends: extra marks in rank 0's plan (``SessionStore.plan``)."""
++
++    def __init__(self, roles, *, lo: int = 2048, hi: int = 131072, points: int = 1, keep: int = 4,
++                 wait: bool = True) -> None:
++        self.roles = sorted({int(r) for r in roles})
++        self.lo, self.hi, self.points, self.keep, self.wait = int(lo), int(hi), int(points), int(keep), bool(wait)
++
++    @classmethod
++    def from_env(cls, model_dir=None) -> "PrefixShare | None":
++        if not prefix_share():
++            return None
++        roles = role_token_ids(model_dir)
++        if not roles:
++            raise ValueError("GLM53_TF_PREFIX_SHARE=1: no role tokens (<|user|>, <|assistant|>, <|observation|>) in "
++                             "the tokenizer; set GLM53_TF_PREFIX_SHARE_TOKENS")
++        return cls(roles, lo=_env_int("GLM53_TF_PREFIX_SHARE_MIN", 2048, 1),
++                   hi=_env_int("GLM53_TF_PREFIX_SHARE_MAX", 131072, 1),
++                   points=_env_int("GLM53_TF_PREFIX_SHARE_POINTS", 1, 1),
++                   keep=_env_int("GLM53_TF_PREFIX_SHARE_KEEP", 4, 0),
++                   wait=_env_int("GLM53_TF_PREFIX_SHARE_WAIT", 1, 0) == 1)
++
++    def _first(self, ids: Sequence[int], lo: int, hi: int) -> int:
++        best = -1
++        for r in self.roles:
++            try:
++                i = ids.index(r, lo, best if best >= 0 else hi)     # C-speed scan
++            except ValueError:
++                continue
++            best = i
++        return best
++
++    def points_of(self, prompt: Sequence[int]) -> list[int]:
++        """Positions p of the first ``points`` role tokens (the prefix before each), lo <= p <= hi."""
++
++        out: list[int] = []
++        hi = min(len(prompt), self.hi + 1)
++        at = 0
++        while len(out) < self.points and at < hi:
++            p = self._first(prompt, at, hi)
++            if p < 0:
++                break
++            if p >= self.lo:
++                out.append(p)
++            at = p + 1
++        return out
++
++    def is_prefix(self, ids: Sequence[int]) -> bool:
++        """A system-only prefix: no role token after the first position (reports and tests)."""
++
++        return len(ids) > 1 and self._first(ids, 1, len(ids)) < 0
++
++
+ def settings() -> list[int]:
+     """What both ranks must agree on (MiB, tokens, tokens)."""
+ 
+@@ -160,6 +278,21 @@ def snapshot_grid(tag: int) -> int:
+     return tag - tag % 64 if tag else 0
+ 
+ 
++def grid_points(tag: int, n: int, extra: Sequence[int]) -> list[int]:
++    """patches/0310: positions ``extra`` of an n-token prompt as marks: rounded down to the snapshot grid (a page for
++    exact snapshots, as fork marks), inside (0, the prompt's own snapshot point)."""
++
++    g = snapshot_grid(tag)
++    step = g or PAGE
++    limit = (n // g) * g if g else n
++    out = []
++    for x in extra:
++        q = min(int(x), limit) // step * step
++        if 0 < q < limit:
++            out.append(q)
++    return out
++
++
+ # -- hashing --------------------------------------------------------------------------------------------------------
+ # patches/0220: the latent cache's row format (GLM53_TF_KV_DTYPE) in every entry and page key: b"" for bf16 (the keys
+ # of earlier patches), b"kv:fp8" for FP8 rows (``SessionStore`` sets it from the engine at load)
+@@ -304,6 +437,7 @@ class SessionIndex:
+         self.next_id = 1
+         self.counters = {"saved": 0, "skipped": 0, "duplicate": 0, "evicted": 0}
+         self.on_evict = None                     # patches/0250: called with an entry before its pages go
++        self.prefix_keep: int | None = None      # patches/0310: most ``prefix`` entries rank 0 keeps (None: no limit)
+ 
+     # -- accounting ------------------------------------------------------------------------------------------------
+     @property
+@@ -387,12 +521,13 @@ class SessionIndex:
+         return self.entries.get(i) if i is not None else None
+ 
+     def marks(self, prompt: Sequence[int], tag: int, resume: int, *, has_mtp: bool, drafter: bool, every: int,
+-              fork_min: int, blocks: list[bytes] | None = None, others: Sequence[Sequence[int]] = ()) -> list[int]:
++              fork_min: int, blocks: list[bytes] | None = None, others: Sequence[Sequence[int]] = (),
++              extra: Sequence[int] = ()) -> list[int]:
+         """Positions where the request's prefill should also snapshot: the fork point (the page or grid point at or
+         before the longest common prefix with a stored entry, or with one of ``others``: patches/0180, the prompts
+         of the requests in flight beside it) and every ``every`` tokens, each at least ``fork_min`` past the resume
+         point, before the prompt's own snapshot (exact: ``len(prompt)``; fast: its last grid point), and not stored
+-        already."""
++        already. ``extra`` (patches/0310): more positions (rounded down to the grid alike)."""
+ 
+         n = len(prompt)
+         g = snapshot_grid(tag)
+@@ -404,6 +539,9 @@ class SessionIndex:
+         q = min(d, limit) // step * step
+         if q >= resume + fork_min and 0 < q < limit:
+             want.add(q)
++        for q in grid_points(tag, n, extra):    # patches/0310: the end of the system prompt (``PrefixShare``)
++            if q >= resume + fork_min:
++                want.add(q)
+         if every:
+             gap = max(step, every // step * step)
+             m = (resume // gap + 1) * gap
+@@ -487,6 +625,12 @@ class SessionIndex:
+             if ok and self.used + self._need(new, private) > self.budget:
+                 raise RuntimeError("session stores diverged: rank 1 has no room for an entry rank 0 stored")
+         else:
++            if kind == "prefix" and self.prefix_keep is not None:     # patches/0310: at most ``prefix_keep`` of them
++                olds = sorted((x for x in self.entries.values() if x.kind == "prefix"), key=lambda x: (x.used, x.id))
++                while olds and len(olds) >= max(self.prefix_keep, 1):
++                    v = olds.pop(0)
++                    self.evict(v.id)
++                    evicted.append(v.id)
+             floor = private + -(-new // self.extent) * self.extent_bytes    # with every other page gone
+             ok = floor <= self.budget
+             while ok and self.used + self._need(new, private) > self.budget:
+@@ -673,6 +817,8 @@ class SessionStore:
+         self.slot_comps: list[list[Comp]] = [self.comps]
+         self.slot_live: list[dict[int, bytes]] = [self.live]
+         self.disk = None                         # patches/0250: ``sessdisk.DiskTier`` (``attach_disk``)
++        self.share = None                        # patches/0310: ``PrefixShare`` (``attach_share``)
++        self.planned: dict[tuple, bool] = {}     # patches/0310: system-prompt marks planned, not saved yet
+         if drafter is not None:
+             e.snap_window = capture_window       # ``decode.take_snapshot`` keeps the drafter's window
+ 
+@@ -723,6 +869,27 @@ class SessionStore:
+         if tier is not None and tier.policy == "evict":
+             self.index.on_evict = tier.on_evict
+ 
++    def attach_share(self, share: "PrefixShare | None") -> None:
++        """patches/0310: marks at the end of the system prompt, ``prefix`` entries (at most ``share.keep``)."""
++
++        self.share = share
++        self.index.prefix_keep = share.keep if share is not None and share.keep > 0 else None
++
++    def _plan_prefix(self, tag: int, ids: Sequence[int]) -> None:
++        """patches/0310 (rank 0): a mark planned at the end of a system prompt; its entry's ``kind`` will be
++        ``prefix`` (the last 256 planned are remembered: a request that never saves them leaves no trace)."""
++
++        planned = self.planned
++        planned[(tag, len(ids), _h(_bytes(ids)))] = True
++        while len(planned) > 256:
++            planned.pop(next(iter(planned)))
++
++    def _planned_prefix(self, tag: int, ids: Sequence[int]) -> bool:
++        planned = getattr(self, "planned", None)
++        if not planned or not any(k[0] == tag and k[1] == len(ids) for k in planned):
++            return False
++        return planned.pop((tag, len(ids), _h(_bytes(ids))), None) is not None
++
+     def live_of(self, slot: int) -> dict[int, bytes]:
+         return self.live if slot == self.cur else self.slot_live[slot]
+ 
+@@ -767,8 +934,15 @@ class SessionStore:
+                 entry, resume = None, len(found.ids)
+             others = list(others) + [prompt[:disk.index.lcp(prompt, blocks)]]     # fork points on disk too
+         has_mtp = need_mtp and self.e.w.mtp is not None
++        share = getattr(self, "share", None)    # patches/0310: the end of the system prompt
++        extra = share.points_of(prompt) if share is not None else ()
+         marks = self.index.marks(prompt, tag, resume, has_mtp=has_mtp, drafter=need_drafter, every=self.every,
+-                                 fork_min=self.fork_min, blocks=blocks, others=others)
++                                 fork_min=self.fork_min, blocks=blocks, others=others, extra=extra)
++        if extra:
++            points = set(grid_points(tag, len(prompt), extra))
++            for m in marks:
++                if m in points:
++                    self._plan_prefix(tag, prompt[:m])
+         if disk is not None:
+             marks = [m for m in marks if disk.index.has(tag, prompt[:m], has_mtp, need_drafter) is None]
+             return Plan(entry, marks, found, disk.digest())
+@@ -900,6 +1074,8 @@ class SessionStore:
+     def save(self, snap, forced=None, kind: str = "turn") -> Saved:
+         tag = int(snap.grid)
+         drafter = snap.drafter_end == len(snap.ids) and getattr(snap, "window", None) is not None
++        if kind == "turn" and self._planned_prefix(tag, snap.ids):
++            kind = "prefix"                     # patches/0310: a system-prompt mark (rank 0 keeps a few)
+         res = self.index.save(tag=tag, ids=snap.ids, mtp_len=snap.mtp_len, drafter=drafter,
+                               snap_bytes=snap_bytes(snap), kind=kind, forced=forced,
+                               can_grow=self._can_grow if forced is None else None)

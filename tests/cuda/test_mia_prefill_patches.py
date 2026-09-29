@@ -56,10 +56,11 @@ D, NI, E, TOP, LIMIT = 4096, 1024, 288, 8, 10.0
 def test_knob_in_header_and_load_only_bf16():
     from tensorfold.families.glm5_next.cuda import knobs
 
-    assert "fat_experts" in knobs.HEADER and knobs.RANGES["fat_experts"] == (0, 1)       # patches/0190 appends after it
+    # patches/0190 appends after it; patches/0270 adds 2 (auto)
+    assert "fat_experts" in knobs.HEADER and knobs.RANGES["fat_experts"] == (0, 2)
     assert knobs.parse({"fat_experts": True}, rows_max=512) == {"fat_experts": 1}
-    with pytest.raises(ValueError, match="0 to 1"):
-        knobs.parse({"fat_experts": 2}, rows_max=512)
+    with pytest.raises(ValueError, match="0 to 2"):
+        knobs.parse({"fat_experts": 3}, rows_max=512)
     with pytest.raises(ValueError, match="GLM53_TF_KDA_PROJ_BF16"):
         knobs.parse({"kda_proj_bf16": 1}, rows_max=512)
     values = {k: 0 for k in knobs.HEADER}

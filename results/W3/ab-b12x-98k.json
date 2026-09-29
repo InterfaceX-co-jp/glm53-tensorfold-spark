@@ -1,0 +1,155 @@
+[
+ {
+  "ctx": 112000,
+  "name": "b4",
+  "cold": {
+   "wall": 76.31,
+   "prompt_tokens": 98043,
+   "cached": 0,
+   "prefill_s": 75.2569,
+   "prefill_tps": 1302.8,
+   "tokens": 64,
+   "decode_tps": 73.2,
+   "tpr": 7.0,
+   "rounds": 9,
+   "m": 2,
+   "f": 7,
+   "drafters": "ffmmfffff",
+   "keeps": [
+    8,
+    8,
+    4,
+    8,
+    8,
+    8,
+    8,
+    8,
+    4
+   ],
+   "kinds": {
+    "alone": 9,
+    "pad_rows": 0,
+    "verify_ms": 760.4,
+    "draft_ms": 67.2
+   },
+   "knobs": {
+    "b12x": 4
+   },
+   "t": "13:30:37",
+   "sha": "1869ee090909d5cd"
+  },
+  "warm": {
+   "wall": 1.09,
+   "prompt_tokens": 98043,
+   "cached": 97984,
+   "prefill_s": 0.2685,
+   "prefill_tps": 365150.8,
+   "tokens": 64,
+   "decode_tps": 80.2,
+   "tpr": 7.0,
+   "rounds": 9,
+   "m": 2,
+   "f": 7,
+   "drafters": "ffmmfffff",
+   "keeps": [
+    8,
+    8,
+    4,
+    8,
+    8,
+    8,
+    8,
+    8,
+    4
+   ],
+   "kinds": {
+    "alone": 9,
+    "pad_rows": 0,
+    "verify_ms": 700.5,
+    "draft_ms": 60.3
+   },
+   "knobs": {
+    "b12x": 4
+   },
+   "t": "13:30:38",
+   "sha": "1869ee090909d5cd"
+  }
+ },
+ {
+  "ctx": 112000,
+  "name": "b0",
+  "cold": {
+   "wall": 79.61,
+   "prompt_tokens": 98045,
+   "cached": 0,
+   "prefill_s": 78.5716,
+   "prefill_tps": 1247.8,
+   "tokens": 64,
+   "decode_tps": 72.5,
+   "tpr": 6.3,
+   "rounds": 10,
+   "m": 2,
+   "f": 8,
+   "drafters": "ffmmffffff",
+   "keeps": [
+    8,
+    8,
+    3,
+    1,
+    8,
+    8,
+    8,
+    8,
+    8,
+    4
+   ],
+   "kinds": {
+    "eager": 7,
+    "pad_rows": 0,
+    "verify_ms": 773.1,
+    "draft_ms": 58.3,
+    "capture": 2,
+    "graph": 1
+   },
+   "knobs": null,
+   "t": "13:31:58",
+   "sha": "1869ee090909d5cd"
+  },
+  "warm": {
+   "wall": 1.11,
+   "prompt_tokens": 98045,
+   "cached": 97984,
+   "prefill_s": 0.2857,
+   "prefill_tps": 343174.7,
+   "tokens": 64,
+   "decode_tps": 80.2,
+   "tpr": 6.3,
+   "rounds": 10,
+   "m": 2,
+   "f": 8,
+   "drafters": "ffmmffffff",
+   "keeps": [
+    8,
+    8,
+    3,
+    1,
+    8,
+    8,
+    8,
+    8,
+    8,
+    4
+   ],
+   "kinds": {
+    "graph": 7,
+    "pad_rows": 0,
+    "verify_ms": 711.3,
+    "draft_ms": 49.4,
+    "eager": 3
+   },
+   "knobs": null,
+   "t": "13:31:59",
+   "sha": "1869ee090909d5cd"
+  }
+ }
+]

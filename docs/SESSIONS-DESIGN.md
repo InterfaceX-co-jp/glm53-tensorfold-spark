@@ -7,7 +7,8 @@ keys include the token after the page (MTP rows) and, for fast prefill, the whol
 and gates are not stored (0065's ring: the tail rides in `conv`); snapshots also keep the DFlash2 drafter's window;
 checkpoints are taken at fork points and every 16k tokens ("marks"); batching (0030) keeps its own slots, except with
 patches/0180 (`GLM53_TF_BATCH_SESSIONS=1`: one store behind every 0120 slot, restores copied into a free slot). The sketch
-below is kept as written.
+below is kept as written. The optional NVMe spill of section 3 is patches/0250 (`GLM53_TF_SESSION_DISK`, `sessdisk.py`): write-through or
+on eviction, restored straight into the live slot, persistent across restarts.
 
 Written 2026-09-27 alongside `patches/0060-glm-latent-kv.patch`
 (`GLM53_TF_LATENT_KV=1`), which makes the attention cache small enough to keep many conversations resident.

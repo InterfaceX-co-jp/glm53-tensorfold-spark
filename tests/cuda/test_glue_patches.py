@@ -673,6 +673,73 @@ def test_engine_mtp_window_state(eb, el, which):
     assert _same(win, again)
 
 
+class _Cache:
+    """pfglue.MTP_CACHE (GLM53_TF_MTP_PREFILL_CACHE, load-time on the server; a module global here)."""
+
+    def __init__(self, on: bool):
+        self.on = on
+
+    def __enter__(self):
+        from tensorfold.families.glm5_next.cuda import pfglue
+
+        self.saved, pfglue.MTP_CACHE = pfglue.MTP_CACHE, self.on
+        return self
+
+    def __exit__(self, *exc):
+        from tensorfold.families.glm5_next.cuda import pfglue
+
+        pfglue.MTP_CACHE = self.saved
+
+
+@gpu
+@pytest.mark.parametrize("n", [65, 1000, 3000])
+@pytest.mark.parametrize("C", [256, 1024])
+def test_engine_mtp_prefill_cache_state(el, n, C):
+    """GLM53_TF_MTP_PREFILL_CACHE: prefill's MTP rows write only the head's caches. The whole committed state (the
+    head's latent rows, its index keys / gates / pools, mtp_len) == the full head's, bit for bit (latent KV, dense
+    and sparse rows past the dense limit), with and without an MTP window; replies too (MTP, DFlash2, auto)."""
+
+    from test_cindep_patches import _Variant, _same, _state
+
+    from tensorfold.families.glm5_next.cuda import pfglue
+
+    assert pfglue.cache_ok(el.e)
+    prompt = list(np.random.default_rng(790 + n).integers(0, 1000, size=n))
+    for window in (0, 256):
+        with _Variant(el, C), _Glue(window=window), _Cache(False):
+            ref = _state(el, prompt)
+        with _Variant(el, C), _Glue(window=window), _Cache(True):
+            got = _state(el, prompt)
+        assert _same(ref, got), (window, [i for i, (a, b) in enumerate(zip(ref, got)) if not torch.equal(a, b)])
+
+
+@gpu
+@pytest.mark.parametrize("policy", [None, "f3", "auto:1:1:0"])
+def test_engine_mtp_prefill_cache_replies(el, policy):
+    """Replies and their draft statistics (the same drafts: the head's caches are the same) with the cache-only
+    prefill == the full head's; resumed == fresh."""
+
+    from test_cindep_patches import _cold, _gen, _sampling
+
+    s = _sampling("greedy")
+    rng = np.random.default_rng(890)
+    more = lambda k: [int(t) for t in rng.integers(0, 1000, size=k)]       # noqa: E731
+    p1 = more(2600)
+    el.cache = []
+    with _Cache(False):
+        off, st_off = _gen(el, p1, s, policy=policy, knobs={"prefill_rows": 1024})
+    el.cache = []
+    with _Cache(True):
+        on, st_on = _gen(el, p1, s, policy=policy, knobs={"prefill_rows": 1024})
+        assert on == off
+        assert st_on.get("keeps") == st_off.get("keeps")
+        p2 = p1 + on + more(90)
+        warm, stats = _gen(el, p2, s, policy=policy, knobs={"prefill_rows": 1024})
+        assert stats["cached"] > 0
+    with _Cache(False):
+        assert warm == _cold(el, p2, s, knobs={"prefill_rows": 1024})
+
+
 @gpu
 @pytest.mark.parametrize("sampling", ["greedy", "sampled"])
 @pytest.mark.parametrize("policy", [None, "2", "f3", "auto:1:1:0"])

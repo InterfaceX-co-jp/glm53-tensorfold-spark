@@ -349,6 +349,20 @@ def test_nccl_passthrough(kit):
     assert args.count("NCCL_IB_HCA=fakehca0") == 1                   # not passed twice
 
 
+def test_cpuset(kit):
+    """patches/0370: CPUSET -> docker run --cpuset-cpus on both ranks; HEAD_ / WORKER_ per node; unset: absent."""
+    r = kit.run("start")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--cpuset-cpus" not in (kit.state / "args.glm53-tf-r0").read_text().split("\n")
+    kit.run("stop")
+    r = kit.run("start", CPUSET="5-9,15-19", WORKER_CPUSET="15-19")
+    assert r.returncode == 0, r.stdout + r.stderr
+    a0 = (kit.state / "args.glm53-tf-r0").read_text().split("\n")
+    a1 = (kit.state / "args.glm53-tf-r1").read_text().split("\n")
+    assert a0[a0.index("--cpuset-cpus") + 1] == "5-9,15-19"
+    assert a1[a1.index("--cpuset-cpus") + 1] == "15-19"
+
+
 def test_strict_canary_failure_stops_both(kit):
     kit.engine.replies["capital"] = "banana banana"
     r = kit.run("start", CANARY="strict")

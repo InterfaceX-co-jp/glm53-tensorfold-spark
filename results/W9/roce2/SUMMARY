@@ -1,0 +1,27 @@
+19:50:56 bench rc0=0 rc1=0 21s :: saved a 90-exchange step (graph): 16384 B: 3.02 ms, 65536 B: 5.32 ms, 131072 B: 4.13 ms, 1048576 B: 11.39 ms
+19:56:26 fault rc0=1 rc1=255 330s :: 
+rank 0: NO ERROR after 0.00 s (expected a timeout)
+rank 1: its next exchange completed (rank 0 had staged and sent that sequence before it timed out; rank 0 is poisoned and sends nothing more)
+rank 1 snapshot: {"doorbell": 180, "completed": 180, "failed": 0, "err_seq": 0, "err_peer": 0, "err_hca": 0, "gpu_seen": 0, "flags": {"0/0/0": 180, "0/0/1": 180, "0/1/0": 179, "0/1/1": 179}, "ops": 180, "watch": {"state": 0, "seq": 0, "peer": 0, "hca
+19:56:45 stress rc0=0 rc1=0 19s :: stress ok
+19:56:50 soak rc0=1 rc1=1 5s :: rank 0: DIFFERENT BYTES at 16384 B after 0 replays
+STOP soak
+19:58:13 fault2 rc0=0 rc1=0 11s :: rank 0: raised after 3.00 s: RoCE all-gather on rank 0 timed out after 3 s waiting for rank 1 on roceP2p1s0f1 at sequence 180: the flag never arrived (host memory held 178 at the failure, 178 now; the GPU's last read 178
+rank 0: raised after 3.00 s: RoCE all-gather on rank 0 timed out after 3 s waiting for rank 1 on roceP2p1s0f1 at sequence 180: the flag never arrived (host memory held 178 at the failure, 178 now; the GPU's last read 178); doorbell 180, completed 179, this rank's proxy posted up to 180. The runtime 
+rank 0 snapshot: {"doorbell": 180, "completed": 179, "failed": 1, "err_seq": 180, "err_peer": 1, "err_hca": 0, "gpu_seen": 178, "flags": {"1/0/0": 178, "1/0/1": 178, "1/1/0": 179, "1/1/1": 179}, "ops": 180, "watch": {"state": 1, "seq": 180, "peer": 1, "hca": 0, "host_at_fail": 178, "gpu_seen": 178, 
+[tensorfold] roce: RoCE all-gather on rank 0 timed out after 3 s waiting for rank 1 on roceP2p1s0f1 at sequence 180: the flag never arrived (host memory held 178 at the failure, 178 now; the GPU's last read 178); doorbell 180, completed 179, this rank's proxy posted up to 180. The runtime is poisone
+rank 1: its next exchange completed (rank 0 had staged and sent that sequence before it timed out; rank 0 is poisoned and sends nothing more)
+rank 1 snapshot: {"doorbell": 180, "completed": 180, "failed": 0, "err_seq": 0, "err_peer": 0, "err_hca": 0, "gpu_seen": 0, "flags": {"0/0/0": 180, "0/0/1": 180, "0/1/0": 179, "0/1/1": 179}, "ops": 180, "watch": {"state": 0, "seq": 0, "peer": 0, "hca": 0, "host_at_fail": 0, "gpu_seen": 0, "late_ms":
+19:58:18 soak2 rc0=1 rc1=1 5s :: rank 0: DIFFERENT BYTES at 16384 B after 0 replays: 32768 bytes, shard0 16384 shard1 16384, first 0 last 32767, z all zero False, z head [129, 4, 135, 10, 141, 16] want [0, 131, 6, 137, 12, 143]
+rank 0: DIFFERENT BYTES at 16384 B after 0 replays: 32768 bytes, shard0 16384 shard1 16384, first 0 last 32767, z all zero False, z head [129, 4, 135, 10, 141, 16] want [0, 131, 6, 137, 12, 143]
+rank 1: DIFFERENT BYTES at 16384 B after 0 replays: 32768 bytes, shard0 16384 shard1 16384, first 0 last 32767, z all zero False, z head [129, 4, 135, 10, 141, 16] want [0, 131, 6, 137, 12, 143]
+roce two-node (b) done 19:58:18
+20:24:27 soak3 rc0=137 rc1=1 1530s :: 
+rank 0 13:15:01 replays 617674 ops 55591099 posted 55591099 per_hca [{'writes': 55591099, 'bytes': 2049308557424}, {'writes': 55591099, 'bytes': 2049308557360}]
+rank 0 13:16:01 replays 656322 ops 59069419 posted 59069419 per_hca [{'writes': 59069419, 'bytes': 2177533345904}, {'writes': 59069419, 'bytes': 2177533345840}]
+rank 0 13:17:01 replays 694980 ops 62548639 posted 62548639 per_hca [{'writes': 62548639, 'bytes': 2305791311984}, {'writes': 62548639, 'bytes': 2305791311920}]
+rank 0 13:18:01 replays 733634 ops 66027499 posted 66027499 per_hca [{'writes': 66027499, 'bytes': 2434036007024}, {'writes': 66027499, 'bytes': 2434036006960}]
+roce two-node (c) done 20:24:27
+20:39:30 soak4 rc0=0 rc1=0 186s :: rank 0: soak ok, 113664 replays x 90 ops
+rank 0: soak ok, 113664 replays x 90 ops
+rank 1: soak ok, 113664 replays x 90 ops

@@ -1,0 +1,192 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/latent.py b/src/tensorfold/families/glm5_next/cuda/latent.py
+index 9e5d483..73a6299 100644
+--- a/src/tensorfold/families/glm5_next/cuda/latent.py
++++ b/src/tensorfold/families/glm5_next/cuda/latent.py
+@@ -46,6 +46,11 @@ patches/0290, GLM53_TF_KV_POOL_TOKENS (``kvpool``): a latent cache may be a ``kv
+ the batch slots. Every kernel below that reads or writes latent rows maps a logical row to its physical row through
+ the slot's page table first (``_prow``; PT / PSH, PSH = log2 rows a page, 0 = a contiguous cache: the branch is pruned
+ at compile time), under the same masks: the same values at other addresses, the same bits.
++
++patches/0390, GLM53_TF_MLA_EXPAND=v2 (load-time; default v1): ``absorb`` / ``expand`` through ``_absorb2`` /
++``_expand2``, the same fp32 FMA chain per output element retiled (up to 128 rows a program share one dequantization of
++the kv_b tile instead of 16; k in 16-wide dot steps; a head's programs adjacent). Same bits as v1 for every row and any
++row count, so every snapshot, session and exactness guarantee is shared with v1 (``EXPAND_V2`` below).
+ """
+ 
+ from __future__ import annotations
+@@ -83,6 +88,35 @@ BF16_BM32 = False
+ # snapshots carry their own tag (``pfgrid.TC``) so they never resume a prefill of the other arithmetic.
+ BF16_TC = False
+ TC_ROWS = 64
++# patches/0390 (GLM53_TF_MLA_EXPAND=v2, load-time; default v1 = the kernels above): ``absorb`` / ``expand`` through
++# ``_absorb2`` / ``_expand2``, the same arithmetic retiled. Every output element keeps the ONE fp32 FMA chain the v1
++# kernels give it (``tl.dot(..., input_precision="ieee")`` lowers to ``acc = fma(a_k, b_k, acc)`` for k = 0 .. K - 1
++# per element, from the carried accumulator, whatever the tile shape or layout: Triton's FMADotUtility.cpp; the
++# ``acc + tl.dot(x, w)`` of v1 is folded into ``tl.dot(x, w, acc)`` by Combine.cpp's CombineDotAddPattern), over the
++# same k order (64-wide groups ascending, ascending within), from +0.0, with the same exactly dequantized weights
++# (q * s + b: q < 16 and a bf16 s, so q * s is exact and fused or not gives one value) and the same bf16 rounding.
++# Only the tiling changes: up to 128 rows a program (v1: 16) share one dequantization of the kv_b tile, k in 16-wide
++# dot steps (v1: 64, which spilled), programs of one head adjacent in the grid (its u / q rows stay in L2). So the
++# bits are v1's for every row whatever the launch's row count: prefill, decode, verify and MTP steps all use it.
++# docs/MLA-EXPAND.md in the deployment repo.
++EXPAND_ENV = "GLM53_TF_MLA_EXPAND"
++
++
++def expand_mode() -> str:
++    """GLM53_TF_MLA_EXPAND: ``v1`` (default; also empty / 0 / off) or ``v2`` (the retiled kernels, same bits)."""
++
++    v = os.environ.get(EXPAND_ENV, "v1").strip().lower()
++    if v in ("", "0", "off", "v1"):
++        return "v1"
++    if v in ("1", "v2"):
++        return "v2"
++    raise ValueError(f"{EXPAND_ENV} must be v1 or v2, not {v!r}")
++
++
++EXPAND_V2 = expand_mode() == "v2"
++if EXPAND_V2:
++    print("[tensorfold] latent absorb / expand: v2 kernels (patches/0390, GLM53_TF_MLA_EXPAND=v2; same bits as v1)",
++          flush=True)
+ # patches/0240 (``tf_knobs.b12x`` bit 4, ``b12xpf``): fast chunks' sparse rows through ``b12x_attn.sparse_latent_one``
+ # (one online softmax over a row's whole token list; new arithmetic, own snapshot tag). False everywhere else
+ SPARSE_ONE = False
+@@ -337,6 +371,11 @@ def absorb(q: torch.Tensor, kv_k: Q4 | B16, out: torch.Tensor) -> torch.Tensor:
+     W, S, B, is_q4 = _parts(kv_k)
+     if kv_k.n != H * DQ or kv_k.k != L or DQ % 64 or L % 64 or not q.is_contiguous() or not out.is_contiguous():
+         raise ValueError("latent absorb: shapes do not match kv_b's key rows")
++    if EXPAND_V2:                                                                   # patches/0390: same bits
++        bm, bk, warps = v2_tiles(R, "absorb")
++        _absorb2[(H * (L // 64), triton.cdiv(R, bm))](q, W, S, B, out, R, H=H, DQ=DQ, L=L, N=kv_k.n, IS_Q4=is_q4,
++                                                      BMR=bm, BK=bk, num_warps=warps, num_stages=1)
++        return out
+     _absorb[(triton.cdiv(R, BM), H, L // 64)](q, W, S, B, out, R, H=H, DQ=DQ, L=L, N=kv_k.n, IS_Q4=is_q4, BMR=BM,
+                                                num_warps=4)
+     return out
+@@ -369,11 +408,127 @@ def expand(u: torch.Tensor, kv_v: Q4 | B16, out: torch.Tensor) -> torch.Tensor:
+     DV = kv_v.n // H
+     if kv_v.k != L or DV * H != kv_v.n or DV % 64 or out.shape != (R, kv_v.n) or not out.is_contiguous():
+         raise ValueError("latent expand: shapes do not match kv_b's value rows")
++    if EXPAND_V2:                                                                   # patches/0390: same bits
++        bm, bk, warps = v2_tiles(R, "expand")
++        _expand2[(kv_v.n // V2_BN, triton.cdiv(R, bm))](u, W, S, B, out, R, H=H, DV=DV, L=L, N=kv_v.n, IS_Q4=is_q4,
++                                                        BMR=bm, BN=V2_BN, BK=bk, num_warps=warps, num_stages=1)
++        return out
+     _expand[(triton.cdiv(R, BM), kv_v.n // 64)](u, W, S, B, out, R, H=H, DV=DV, L=L, N=kv_v.n, IS_Q4=is_q4, BMR=BM,
+                                                num_warps=4)
+     return out
+ 
+ 
++# -- patches/0390: absorb / expand retiled, v1's bits (GLM53_TF_MLA_EXPAND=v2) -----------------------------------------
++# (rows up to, rows a program, k a dot step, warps) by launch rows, per kernel. Any entry gives the same bits (every
++# output element is one FMA chain over k in order, independent of its tile-mates and of how k is cut into dot
++# steps), so this table only picks speed. Offline picks (ptxas for sm_121, Triton 3.7.1 = the image's: no spills,
++# <= 128 registers where 2 programs of 8 warps fit an SM; Triton 3.7 needs k >= 16 a dot); tests/cuda/bench_mla_expand.py
++# sweeps it on the GPU. 16-row programs for decode / verify / MTP windows (as many programs as v1), 64-128 rows for
++# prefill (4-8 x fewer dequantizations of kv_b than v1's 16).
++V2_TILES = {
++    "expand": ((16, 16, 16, 4), (32, 32, 16, 4), (1 << 62, 64, 16, 4)),              # W10 GPU sweep: 4 warps
++    "absorb": ((16, 16, 32, 4), (32, 32, 32, 4), (64, 64, 32, 4), (1 << 62, 64, 32, 4)),  # (bench_mla_expand --sweep)
++}
++V2_BN = 64               # expand's output rows a program (divides the head's DV)
++
++
++def v2_tiles(R: int, kind: str) -> tuple[int, int, int]:
++    """(rows a program, k a dot step, warps) of ``kind`` (expand / absorb) for a launch of R rows."""
++
++    for top, bm, bk, warps in V2_TILES[kind]:
++        if R <= top:
++            return bm, bk, warps
++    raise AssertionError(R)
++
++
++@triton.jit
++def _wcols(W, S, B, n0, g, c0, N: tl.constexpr, K: tl.constexpr, IS_Q4: tl.constexpr, BN: tl.constexpr,
++           BK: tl.constexpr):
++    """Rows n0 .. n0 + BN - 1, columns g 64 + c0 .. + BK - 1 (inside group g) of an [N, K] weight as fp32, each
++    element ``_wtile``'s value (s * q + b, or the BF16 value)."""
++
++    n = n0 + tl.arange(0, BN)
++    if IS_Q4:
++        KG: tl.constexpr = K // 64
++        rw = tl.arange(0, BK // 8)
++        words = tl.load(W + ((n // 64) * (KG * 512) + g * 512 + (n % 64) * 8 + c0 // 8)[:, None] + rw[None, :])
++        shifts = tl.arange(0, 8) * 4
++        q = (words[:, :, None] >> shifts[None, None, :]) & 0xF
++        q = tl.reshape(q, (BN, BK)).to(tl.float32)
++        s = tl.load(S + g * N + n).to(tl.float32)
++        b = tl.load(B + g * N + n).to(tl.float32)
++        return q * s[:, None] + b[:, None]
++    else:
++        j = tl.arange(0, BK)
++        return tl.load(W + n[:, None].to(tl.int64) * K + (g * 64 + c0 + j)[None, :]).to(tl.float32)
++
++
++@triton.jit
++def _wrows(W, S, B, n0, g, N: tl.constexpr, K: tl.constexpr, IS_Q4: tl.constexpr, BK: tl.constexpr):
++    """Rows n0 .. n0 + BK - 1 (inside one 64-row block), columns g 64 .. g 64 + 63 of an [N, K] weight as fp32, each
++    element ``_wtile``'s value."""
++
++    n = n0 + tl.arange(0, BK)
++    c = tl.arange(0, 64)
++    if IS_Q4:
++        KG: tl.constexpr = K // 64
++        rw = tl.arange(0, 8)
++        words = tl.load(W + ((n // 64) * (KG * 512) + g * 512 + (n % 64) * 8)[:, None] + rw[None, :])
++        shifts = tl.arange(0, 8) * 4
++        q = (words[:, :, None] >> shifts[None, None, :]) & 0xF
++        q = tl.reshape(q, (BK, 64)).to(tl.float32)
++        s = tl.load(S + g * N + n).to(tl.float32)
++        b = tl.load(B + g * N + n).to(tl.float32)
++        return q * s[:, None] + b[:, None]
++    else:
++        return tl.load(W + n[:, None].to(tl.int64) * K + (g * 64 + c)[None, :]).to(tl.float32)
++
++
++@triton.jit
++def _absorb2(Q, W, S, B, QA, M, H: tl.constexpr, DQ: tl.constexpr, L: tl.constexpr, N: tl.constexpr,
++             IS_Q4: tl.constexpr, BMR: tl.constexpr, BK: tl.constexpr):
++    """``_absorb`` retiled. Program (head h and latent group g = program_id(0), row tile): QA[r, h, g 64 ..] =
++    bf16(sum_i q[r, h, i] W[h DQ + i, g 64 ..]), one fp32 FMA chain an element over i = 0 .. DQ - 1 in order (BK a
++    dot step); the 8 groups of a head are adjacent programs (they read the same q rows)."""
++
++    GL: tl.constexpr = L // 64
++    h = tl.program_id(0) // GL
++    g = tl.program_id(0) % GL
++    rm = tl.program_id(1) * BMR + tl.arange(0, BMR)
++    ok = rm < M
++    k = tl.arange(0, BK)
++    acc = tl.zeros((BMR, 64), dtype=tl.float32)
++    for it in range(DQ // 64):
++        for kk in tl.static_range(64 // BK):
++            x = tl.load(Q + (rm[:, None] * H + h) * DQ + it * 64 + kk * BK + k[None, :], mask=ok[:, None], other=0.0)
++            wt = _wrows(W, S, B, h * DQ + it * 64 + kk * BK, g, N, L, IS_Q4, BK)      # [BK inputs i, 64 latent j]
++            acc = tl.dot(x.to(tl.float32), wt, acc, input_precision="ieee")
++    j = tl.arange(0, 64)
++    tl.store(QA + (rm[:, None] * H + h) * L + g * 64 + j[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
++@triton.jit
++def _expand2(U, W, S, B, OUT, M, H: tl.constexpr, DV: tl.constexpr, L: tl.constexpr, N: tl.constexpr,
++             IS_Q4: tl.constexpr, BMR: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    """``_expand`` retiled. Program (BN output rows n of head h = n // DV, row tile): OUT[r, n] = bf16(sum_j u[r, h, j]
++    W[n, j]), one fp32 FMA chain an element over j = 0 .. L - 1 in order (BK a dot step); the DV / BN programs of a
++    head are adjacent (they read the same u rows)."""
++
++    n0 = tl.program_id(0) * BN
++    h = n0 // DV
++    rm = tl.program_id(1) * BMR + tl.arange(0, BMR)
++    ok = rm < M
++    k = tl.arange(0, BK)
++    acc = tl.zeros((BMR, BN), dtype=tl.float32)
++    for g in range(L // 64):
++        for kk in tl.static_range(64 // BK):
++            x = tl.load(U + (rm[:, None] * H + h) * L + g * 64 + kk * BK + k[None, :], mask=ok[:, None], other=0.0)
++            wt = _wcols(W, S, B, n0, g, kk * BK, N, L, IS_Q4, BN, BK)                 # [BN outputs n, BK latent j]
++            acc = tl.dot(x, tl.trans(wt), acc, input_precision="ieee")
++    o = tl.arange(0, BN)
++    tl.store(OUT + rm[:, None] * N + n0 + o[None, :], acc.to(tl.bfloat16), mask=ok[:, None])
++
++
+ # -- patches/0083: tensor-core absorb / expand for FP8 fast prefill chunks ---------------------------------------------
+ @triton.jit
+ def _absorb_tc(Q, W, S, B, QA, M, H: tl.constexpr, DQ: tl.constexpr, L: tl.constexpr, N: tl.constexpr,

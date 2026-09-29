@@ -18,6 +18,11 @@ ENV PIP_NO_CACHE_DIR=1 \
 # of PTX compiled for sm_121 (CUDA_CACHE_PATH; ~/.nv/ComputeCache by default, lost with every `docker rm`; 4 GiB
 # instead of the 256 MiB default so PyTorch's and NCCL's PTX-only kernels stay cached). patches/0140.
 
+# patches/0230 (GLM53_TF_COMM_BACKEND=roce) builds its RDMA proxy against libibverbs at first use. The 26.07 base
+# already ships libibverbs-dev + ibverbs-providers (rdma-core 63); install them only if a base ever drops them.
+RUN test -f /usr/include/infiniband/verbs.h || (apt-get update \
+ && apt-get install -y --no-install-recommends libibverbs-dev ibverbs-providers && rm -rf /var/lib/apt/lists/*)
+
 COPY vendor/TensorFold /src/TensorFold
 COPY patches /src/patches
 # PATCHES: space-separated patch number prefixes to apply (e.g. "0001 0002 0003"); empty = every patch, in order
