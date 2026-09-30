@@ -1,13 +1,13 @@
 # Results
 
 > **Work in progress.** Measured on one pair of DGX Sparks, 2026-09-27 to 2026-09-30, with the **abliterated** checkpoint
-> below. The sections are in the order the work happened; the newest ones are the current state: **W19** (the end of
-> this file) for the production config (`config/prod.env.example`: 4 requests sharing a 1M-token KV pool, image input,
+> below. The sections are in the order the work happened; the newest ones are the current state: **W20** (the end of
+> this file) for 0620's tool-calling fixes and the current 3-run RigMark numbers (image b11), **W19** for the production config (`config/prod.env.example`: 4 requests sharing a 1M-token KV pool, image input,
 > replay snapshots, multi-slot prefill, the 0580 expert load path, two-function NCCL, 0550's scratch, structured
-> output), W18 for the 0550 attribution, **W17** for the 3-run averaged RigMark numbers (image b9; not re-run since), W15 for image input and replay, W10-W12 for the text-only stack it grew from, "Stacked run and production config" for the older
+> output), W18 for the 0550 attribution, **W17** for the earlier 3-run RigMark numbers (image b9), W15 for image input and replay, W10-W12 for the text-only stack it grew from, "Stacked run and production config" for the older
 > single-stream config. The public repo carries the benchmark JSON and the window scripts of the runs in `results/`
-> (E*, F*, L*, M*, P*, Q*, A1, B1, B2, S1, X1, Y1, Z1, Z2, W1-W12, W14-W19, FINAL-20260930, rigmark (W13, W15's two
-> RigMark runs and W17's three), roofline, sim0340, sim0380, theory2, THEORY2-SESSION, upstream-0362, draftvocab); logs (`*.log`, `*.out`, `*.err`,
+> (E*, F*, L*, M*, P*, Q*, A1, B1, B2, S1, X1, Y1, Z1, Z2, W1-W12, W14-W20, FINAL-20260930, tooleval, rigmark (W13, W15's two
+> RigMark runs, W17's three and W20's three), roofline, sim0340, sim0380, theory2, THEORY2-SESSION, upstream-0362, draftvocab); logs (`*.log`, `*.out`, `*.err`,
 > RigMark's `run.log`), nsys traces, test output of the early runs and some runs (B3, K0, K1, P1, T*) are summarized
 > here only, so some file names below point at logs that are not in the repo. Hosts in the JSON were normalized to
 > `127.0.0.1` / `<worker-ssh>`, node names to head / worker (also in file names: `tests-head/`, `probe-head.log`, `kg-head/`),
@@ -2383,3 +2383,127 @@ windows and the second window ran the combined load, the 0570-off re-run and the
 gates ran with unlocked clocks (each compares old vs new in one process). The 0570 cold bench times its best eligible
 placement, not 0570's fixed `SMALL_PLACE`; in situ it lost anyway. Not re-run with 0570 off: the memory sequence (0570
 allocates 32 KB) and the capture.
+
+## W20: recipe batch (b11 = b10 + 0620) + final RigMark x3 and tool-calling benches (2026-09-30, one campaign 13:54-19:20 + tool benches after) — adopted: image b11 with `GLM53_TF_TOOL_FIXES=all`; not adopted: container cpusets on the X925s, `GLM53_TF_GRAMMAR_THREADS=8`; prod on b11
+
+Files: `results/W20/` (text / JSON only in this repo: per load `*-B10*` (the image b10 control load) and `*-RECIPE*`
+in W18's harness naming; `summary-B10-RECIPE.md`; `structured-B10|RECIPE.json`; `build-patches.txt` (b11); `final/`
+(the 3 RigMark rounds' `summary.md`; receipts in `results/rigmark/tensorfold-20260930-w20-final-r*`);
+`final-glmbench/`; `*-PROD*` = checks on the restored prod). Logs, per-probe CPU / RoCE traces and the request logs
+are not published. Harness: W18's gates; every load on :8001, page cache dropped, 4 slots, RoCE trace on (same in
+every load).
+
+Host-side tuning outside this repo, done in the same campaign on image b10 before the recipe batch: +4.8% single-stream
+decode, +4.3% at 4 streams, more memory headroom (stress-test memory minimum now ~10.7 GiB). Bits unchanged (glmbench
+reply hashes 13/13 equal). B10 below is image b10 after that tuning.
+
+### 1. Recipe batch (one load; `summary-B10-RECIPE.md`)
+
+**Image `glm53-tensorfold:b11`** = `results/W19/build-patches.txt` + 0620 (`results/W20/build-patches.txt`); every patch
+applies, built on the head (cached base layers, 8 s), shipped with `docker save | docker load` (152 s), identical layer
+list on both nodes. **RECIPE** = `config/prod.env` + `IMAGE=b11 CPUSET=5-9,15-19 GLM53_TF_GRAMMAR_THREADS=8
+GLM53_TF_TOOL_FIXES=all` (boot lines: `tool calling (patches/0620): GLM53_TF_TOOL_FIXES=args,choice,history,reasoning,
+thinkcalls`, grammar `mask fills on 8 thread(s)`, both containers `--cpuset-cpus 5-9,15-19`, and **`http: HTTP threads
+on 5-9`**: with no A725 in the set, 0530 puts the HTTP threads on half the X925s). First start: 1 slot, serve.sh's
+automatic restart gave 4.
+
+| gate | B10 (b10) | RECIPE | bar |
+| --- | --- | --- | --- |
+| exact / batchexact (before and after stress + MMLU), transcripts, reply sha | 10/10, 4/4 x2, True, 8794a3463259cc2f | same | pass |
+| glmbench 13 cells: hashes / geomean | 13/13 | 13/13 == B10; **+0.21%** | not lower: pass |
+| 4 streams, mean of 6 | 88.58 [92.5, 84.6, 87.8, 93.5, 85.0, 88.1] | **87.22** [90.9, 83.7, 86.3, 91.5, 84.4, 86.5]: **-1.5%, lower in every paired rep** (-0.7..-2.1%) | **FAIL** |
+| 4 streams RoCE skew mean / p90 (us) | 39.8 / 88.1 | 46.0 / 121.4 | |
+| prefill 24.5k / 98k (mean of 4) | 1,659 / 1,654 | 1,661 / 1,652 | pass |
+| N1 12/12, grouped == alone 92/92, MMLU-200 88.0%, refusals 0/10, needle 314k | pass | pass | pass |
+| stress / whole-load min r0 / r1 | 10.72 / 10.77 | 10.57 / 10.43 | >= 8: pass |
+| structured (`bench/structured.py` schemas / rigmark / tools / plain) | PASS (plain written as the reference) | PASS, plain hashes == B10 | pass |
+| rigmark-shape schema run: tok/s, exposed mask wait a window | 76.5 / 76.8; 0.87 / 0.42 ms (mean 0.65) | 77.7 / 77.3; 0.75 / 0.59 ms (mean 0.67) | 8 threads: **no gain** |
+| C4 per-stream TTFT (reasoning low / off) | 0.721 / 0.565 s | 0.722 / 0.568 s | |
+
+Decisions:
+
+- **0620 / `GLM53_TF_TOOL_FIXES=all`: adopted** (every gate passes; host only, tool requests only; its benefit is in §4).
+- **`CPUSET=5-9,15-19`: not adopted.** The only knob in the load that touches unconstrained decode, and 4 streams fell
+  in all 6 paired reps; the HTTP threads (tokenizing / streaming 4 replies) now share the X925s with the engine. A
+  cpuset that keeps an A725 or two for HTTP (`CPUSET=0,5-9,15-19` + `CPU_PIN=http=0`) was not tried.
+- **`GLM53_TF_GRAMMAR_THREADS=8`: not adopted** (exposed wait unchanged at ~0.65 ms a window; the unconstrained run moved
+  as much as the schema run, +2%).
+
+### 2. Production
+
+`config/prod.env` (`config/prod.env.example` here): `IMAGE=glm53-tensorfold:b11` + `GLM53_TF_TOOL_FIXES=all` (header
+with the gates and the revert). Prod restarted (page cache dropped, ready in 64 s, **4 request slots**, RoCE on both
+functions, the `tool calling (patches/0620)` boot line, grammar 4 threads, HTTP threads on 0-4,10-14, canary 79.7
+tok/s). Checks on prod (`*-PROD*`): exact 10/10, batchexact 4/4, reply sha 8794a3463259cc2f, prefill 24.5k 1,658 tok/s.
+
+### 3. RigMark on the final prod (3 runs, 18:49-19:16, prod serving, no restart, nothing else on the endpoint)
+
+W17's final RigMark procedure (`scripts/rigmark/run.sh tensorfold`, RigMark pinned at
+`c5a0db01b054` clean, body `{"chat_template_kwargs":{"reasoning_effort":"low"}}`, a new COMPARISON_ID a
+run `...-tensorfold-w20-final-rN`, run.sh's metadata); receipts `results/rigmark/tensorfold-20260930-w20-final-r1..r3`
+(sha256 ok, **15/15 basic output gates each**), summary `results/W20/final/summary.md` (W17's `summarize.py`).
+
+| metric (mean of 3, min-max) | **W20 prod (b11)** | W17 prod (b9), 3 runs | change | vLLM TP2 k=7 (Alex) | W20 / vLLM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| code decode tok/s | **72.4** (72.2-72.6) | 67.9 | +6.6% | 44.0 | 1.65x |
+| prose decode tok/s | **45.7** (45.3-45.8) | 43.0 | +6.3% | 18.9 | 2.42x |
+| structured decode tok/s | **95.6** (95.6-95.7) | 88.8 | +7.7% | 64.9 | 1.47x |
+| code / prose / structured TTFT s | 0.48 / 0.38 / 0.45 | 0.50 / 0.41 / 0.47 | | 0.60 / 0.49 / 0.47 | |
+| cold prefill 8K / 32K / 64K tok/s | **1,610 / 1,684 / 1,667** | 1,560 / 1,634 / 1,620 | +3.2 / +3.0 / +2.9% | 1,813 / 1,908 / 1,922 | 0.89 / 0.88 / 0.87x |
+| replay TTFT 8K / 32K / 64K s | 0.21 / 0.23 / 0.26 | 0.22 / 0.25 / 0.27 | | 4.52 / 2.97 / 5.77 | 21 / 13 / 22x |
+| C1 / C2 / C4 aggregate tok/s | **57.5 / 76.0 / 95.1** (C4 93.0-98.4) | 53.1 / 70.1 / 91.0 | +8.3 / +8.4 / +4.5% | 31.6 / 42.0 / 66.1 | 1.82 / 1.81 / 1.44x |
+| C1 / C2 / C4 per-stream TTFT s | 0.47 / 0.61 / 0.84 | 0.49 / 0.65 / 0.89 | | 0.60 / 0.68 / 0.81 | C4 0.96x |
+
+W17 -> W20 includes W19 (b10: 0580 expert loads, NCCL 2 functions, scratch, CPU_PIN, grammar: +3.3% 1 stream / +3.0%
+4 streams / +1.5% prefill in W19's own A/B) and the host-side tuning above (+4.8% / +4.3%). C4 first tokens (0.84 s)
+are still the one row behind vLLM's (0.81 s).
+
+### 4. glmbench on the final prod (3 rounds, 19:35-19:42, prod serving on :8000, nothing else on the endpoint)
+
+`results/W20/final-glmbench/` (suites tf,tweet,kit,edit, `--reps 3 --long-tokens 512` a round = the W20 loads'
+ab.sh settings; `table.py` -> `table-final.md`). A round's cell value = the median of its 3 reps; mean / min / max over
+the 3 rounds. "W20 b10" = the same suite once in the B10 load (b10, :8001, RoCE trace on). Yesterday's image and the
+vLLM kit: the fixed reference numbers (greedy chat / code / structured; vLLM also hashmap / essay).
+
+| suite | cell | mode | tokens | mean | min | max | W20 b10 | vs B10 | yesterday | vLLM kit | vs vLLM | hashes |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| tf | code | sampled (T=1) | 64 | **51.1** | 51.0 | 51.1 | 51.8 | -1.4% |  |  |  | rounds agree |
+| tf | chat | sampled (T=1) | 64 | **48.6** | 48.1 | 48.9 | 49.5 | -1.7% |  |  |  | rounds agree |
+| tf | code | greedy (T=0) | 64 | **89.6** | 89.3 | 90.0 | 88.9 | +0.8% | 77.6 | 41.9 | 2.14x | same |
+| tf | chat | greedy (T=0) | 64 | **51.6** | 51.5 | 51.6 | 49.8 | +3.6% | 44.6 | 22.8 | 2.26x | same |
+| tweet | sequence | greedy (T=0) | 512 | **105.1** | 105.0 | 105.1 | 105.0 | +0.1% |  |  |  | same |
+| tweet | code | greedy (T=0) | 512 | **75.9** | 75.8 | 76.0 | 70.8 | +7.3% |  |  |  | same |
+| tweet | json | greedy (T=0) | 512 | **84.0** | 84.0 | 84.0 | 84.3 | -0.4% |  |  |  | same |
+| kit | hashmap | greedy (T=0) | 200 | **59.6** | 59.5 | 59.7 | 60.0 | -0.8% |  | 30.0 | 1.99x | same |
+| kit | structured | greedy (T=0) | 200 | **112.3** | 111.9 | 113.1 | 113.9 | -1.4% | 100.6 | 72.7 | 1.54x | same |
+| kit | essay | greedy (T=0) | 200 | **50.5** | 50.4 | 50.6 | 50.6 | -0.3% |  | 26.1 | 1.93x | same |
+| edit | edit-rename | greedy (T=0) | 1024 | **124.1** | 123.1 | 124.7 | 125.1 | -0.8% |  |  |  | same |
+| edit | edit-comments | greedy (T=0) | 1024 | **108.0** | 105.9 | 109.2 | 109.9 | -1.7% |  |  |  | same |
+| edit | edit-print-to-log | greedy (T=0) | 1024 | **126.5** | 125.7 | 127.1 | 128.7 | -1.7% |  |  |  | same |
+
+geomean vs B10 over 13 cells: +0.09%
+
+Hashes: every round's 13/13 cells (11/11 greedy) == B10's (b10), i.e. b11 + `TOOL_FIXES=all` is bit-identical on this
+suite; greedy cells return one sha across all 9 reps; sampled (seeded) cells agree round to round. Geomean vs B10
++0.09% (the prod server has no RoCE trace on; the cells move -1.7..+7.3%, tweet code 512 being B10's one low cell).
+Against yesterday's image: chat greedy 44.6 -> 51.6 (+15.7%), code greedy 77.6 -> 89.6 (+15.5%), structured 100.6 ->
+112.3 (+11.6%). Against the vLLM kit: 2.14x code, 2.26x chat, 1.54x structured, 1.99x hashmap, 1.93x essay.
+
+### 5. Tool-calling benchmarks (docs/TOOL-CALLING.md §5) — partial
+
+Run from a separate machine (`scripts/tooleval/run.sh`; tool-eval-bench c7b5b95, spark-bench 125ba16) against prod
+over an SSH port forward to the head's 127.0.0.1:8000. spark-bench was stopped mid-run (the rig was needed for §4).
+Results: `results/tooleval/20260930-teb-off-fixes-PARTIAL/`. **One run on our checkpoint, not an average.**
+
+| run | bench | result |
+| --- | --- | --- |
+| F1: prod b11, `TOOL_FIXES=all`, thinking off | tool-eval-bench, 69 scenarios, temperature 0 | **complete: score 90** (124 / 138 points; deployability 86, responsiveness 78); **C multi-step chains 8/8 (100%)**; A 6/6, B 6/6, D 5/6, E 6/6, F 6/6, G 4/6, H 10/10, I 18/20, J 6/6, K 23/26, L 7/8, M 3/6, N 6/6, O 10/12; not passed: TC-21, 43, 51, 62, 68 (fail), TC-11, 39, 52, 57 (partial). The tester's run (their checkpoint, issue #6): 90 / C 75% |
+| F1 | spark-bench TrueScore | stopped mid-run: no score |
+| B1 (fixes off, thinking off), F2 (fixes on, thinking high) | both | not run yet |
+
+### 6. Notes
+
+- The 1-stream RoCE trace is empty in B10 and RECIPE: the dump fires every 65,536 exchanges and the 1-stream probe
+  sits right at that count, so it got no dump; the 4-stream trace (the plan's gate) is in every load.
+- A test window that ends with prod stopped (`serve.sh stop` removes the containers) is not healed by the watchdog
+  (it stands down on "both ranks absent"): start prod again yourself.
