@@ -3,7 +3,7 @@
 Four sets of receipts, newest first:
 
 0. **W20 run: 3 rounds on the W20 production config** (2026-09-30, image b11 = b10's patches + 0620 with
-   `GLM53_TF_TOOL_FIXES=all`, plus the OS tuning of docs/OS-TUNING.md on both nodes): [`tensorfold-20260930-w20-final-r1/`](tensorfold-20260930-w20-final-r1/),
+   `GLM53_TF_TOOL_FIXES=all`): [`tensorfold-20260930-w20-final-r1/`](tensorfold-20260930-w20-final-r1/),
    [`-r2/`](tensorfold-20260930-w20-final-r2/), [`-r3/`](tensorfold-20260930-w20-final-r3/). See [below](#w20-run-3-rounds-averaged).
 1. **W17 release run: the 3-round averaged run on the release config** (2026-09-30, image b9 = patches 0001-0490 +
    0500 + 0540 + 0550 + 0560, `config/prod.env.example` of this release): [`tensorfold-20260930-w17-final-r1/`](tensorfold-20260930-w17-final-r1/),
@@ -17,7 +17,7 @@ Four sets of receipts, newest first:
 
 ## W20 run (3 rounds, averaged)
 
-Production after W20 (image b11, `config/prod.env.example` of this update; OS tuning applied and both nodes rebooted),
+Production after W20 (image b11, `config/prod.env.example` of this update),
 serving, not restarted between runs. Three back-to-back RigMark standard-suite runs (2026-09-30 11:49-12:16 UTC,
 538 / 541 / 543 s), RigMark pinned at `c5a0db01b054` (clean), `reasoning_effort` low, a new comparison ID a run
 (`2026-09-glm53-exl3-2xspark-tensorfold-w20-final-r1` / `-r2` / `-r3`). All three valid: 15/15 basic output gates each.
@@ -39,7 +39,7 @@ included.
 | Code / prose / structured TTFT s | **0.48** / **0.38** / **0.45** | 0.50 / 0.41 / 0.47 | 0.60 / 0.49 / 0.47 |
 
 Against W17: decode +5-8%, cold prefill +3%, C4 aggregate +4.5%; from W19's adopted changes (0580 expert loads, NCCL on
-both CX7 functions) and the W20 OS tuning. Still behind Alex's vLLM receipt: cold prefill (0.87-0.89x) and C4 per-stream
+both CX7 functions) and host-side tuning outside this repo. Still behind Alex's vLLM receipt: cold prefill (0.87-0.89x) and C4 per-stream
 TTFT (0.84 vs 0.81 s). The "Read this before comparing" notes under the W13 baseline apply: different weights
 (abliterated EXL3 4-bit here, NVFP4 there), drafter policy, context limit, day and machines.
 

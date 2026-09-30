@@ -1,6 +1,6 @@
 rounds: 3 (final)
 
-| suite | cell | mode | tokens | mean | min | max | W20 OSALL | vs OSALL | yesterday | vLLM kit | vs vLLM | hashes |
+| suite | cell | mode | tokens | mean | min | max | W20 b10 | vs B10 | yesterday | vLLM kit | vs vLLM | hashes |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | tf | code | sampled (T=1) | 64 | **51.1** | 51.0 | 51.1 | 51.8 | -1.4% |  |  |  | rounds agree |
 | tf | chat | sampled (T=1) | 64 | **48.6** | 48.1 | 48.9 | 49.5 | -1.7% |  |  |  | rounds agree |
@@ -16,4 +16,4 @@ rounds: 3 (final)
 | edit | edit-comments | greedy (T=0) | 1024 | **108.0** | 105.9 | 109.2 | 109.9 | -1.7% |  |  |  | same |
 | edit | edit-print-to-log | greedy (T=0) | 1024 | **126.5** | 125.7 | 127.1 | 128.7 | -1.7% |  |  |  | same |
 
-geomean vs OSALL over 13 cells: +0.09%
+geomean vs B10 over 13 cells: +0.09%

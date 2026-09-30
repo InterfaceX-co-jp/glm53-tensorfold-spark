@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """W20 final glmbench: per-cell table over rounds. table.py TAG [REF_TAG] (in this dir: glmbench-TAG-rN.json).
 Per round a cell's value = median decode tok/s of its reps; table = mean / min / max over rounds, greedy (T=0) vs sampled
-(T=1) labelled, vs W20 OSALL (../glmbench-OSALL.json, one round), yesterday's image and the vLLM kit (fixed numbers).
+(T=1) labelled, vs the W20 image b10 control load (../glmbench-B10.json, one round), yesterday's image and the vLLM kit (fixed numbers).
 Hash check: every rep of every round of a greedy cell returns the same sha; sampled cells are seeded (same per rep)."""
 import glob, json, os, statistics, sys
 
@@ -23,9 +23,9 @@ def cells(path):
 
 
 rounds = [cells(p) for p in sorted(glob.glob(os.path.join(here, f"glmbench-{tag}-r[0-9].json")))]
-osall = cells(os.path.join(here, "..", "glmbench-OSALL.json"))
+ref = cells(os.path.join(here, "..", "glmbench-B10.json"))
 print(f"rounds: {len(rounds)} ({tag})\n")
-print("| suite | cell | mode | tokens | mean | min | max | W20 OSALL | vs OSALL | yesterday | vLLM kit | vs vLLM | hashes |")
+print("| suite | cell | mode | tokens | mean | min | max | W20 b10 | vs B10 | yesterday | vLLM kit | vs vLLM | hashes |")
 print("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
 for k in rounds[0]:
     s, p, t, n = k
@@ -33,12 +33,12 @@ for k in rounds[0]:
     shas = [r[k][1] for r in rounds if k in r]
     same = "same" if len({h for x in shas for h in x}) == 1 else ("rounds agree" if all(x == shas[0] for x in shas) else "DIFFER")
     m = statistics.mean(v)
-    o = osall.get(k, (None,))[0]
+    o = ref.get(k, (None,))[0]
     y = YEST.get((s, p, t)); vl = VLLM.get((s, p, t))
     mode = "greedy (T=0)" if t == 0 else "sampled (T=1)"
     f = lambda x: f"{x:.1f}" if x is not None else ""
     print(f"| {s} | {p} | {mode} | {n} | **{m:.1f}** | {min(v):.1f} | {max(v):.1f} | {f(o)} | "
           f"{(100 * (m / o - 1)):+.1f}% | {f(y)} | {f(vl)} | {(f'{m / vl:.2f}x' if vl else '')} | {same} |"
           if o else f"| {s} | {p} | {mode} | {n} | **{m:.1f}** | {min(v):.1f} | {max(v):.1f} | | | {f(y)} | {f(vl)} | | {same} |")
-g = [statistics.mean([r[k][0] for r in rounds]) / osall[k][0] for k in rounds[0] if k in osall]
-print(f"\ngeomean vs OSALL over {len(g)} cells: {100 * (statistics.geometric_mean(g) - 1):+.2f}%")
+g = [statistics.mean([r[k][0] for r in rounds]) / ref[k][0] for k in rounds[0] if k in ref]
+print(f"\ngeomean vs B10 over {len(g)} cells: {100 * (statistics.geometric_mean(g) - 1):+.2f}%")

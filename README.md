@@ -24,42 +24,16 @@ SPDX-License-Identifier: Apache-2.0 (this project's own code, scripts, benchmark
 
 ## What's new (W20)
 
-OS tuning of both nodes, patch 0620 (tool-calling fixes, 77 patches in total), test window W20 and a new 3-run
-RigMark. Production config (`config/prod.env.example`): image b11 = image b10's list + 0620, with
-`GLM53_TF_TOOL_FIXES=all`. Numbers from [`docs/RESULTS.md`](docs/RESULTS.md) W20; OS guide and scripts:
-[`docs/OS-TUNING.md`](docs/OS-TUNING.md), [`scripts/os-tuning/`](scripts/os-tuning/).
+Patch 0620 (tool-calling fixes, 77 patches in total), test window W20 and a new 3-run RigMark. Production config
+(`config/prod.env.example`): image b11 = image b10's list + 0620, with `GLM53_TF_TOOL_FIXES=all`. Numbers from
+[`docs/RESULTS.md`](docs/RESULTS.md) W20.
 
-**The biggest gain this round came from the OS, not from kernels.** Same image (b10), same config, same gates;
-"before" is the machines as they were, "after" is every OS change applied and both nodes rebooted:
+Host-side tuning outside this repo: +4.8% single-stream decode, +4.3% at 4 streams, more memory headroom (stress-test
+memory minimum now ~10.7 GiB). Same bits (reply hashes unchanged).
 
-| OS tuning (image b10 both sides) | Before | **After** | Change |
-| --- | ---: | ---: | --- |
-| Decode, 1 stream (our glmbench geomean, 13 cells, reply hashes 13/13 equal) | | | **+4.8%** |
-| Decode, 4 streams aggregate (mean of 6 paired reps) | 84.95 tok/s | **88.58 tok/s** | **+4.3%** |
-| Prefill 24.5k / 98k | 1,645 / 1,637 tok/s | 1,659 / 1,654 tok/s | +0.5% |
-| 4 x 250k stress, MemAvailable minimum (head / worker) | 8.48 / **7.92 GiB** (under the 8 GiB gate) | **10.72 / 10.77 GiB** | +2.2 / +2.9 GiB |
-| Services running (head / worker) | 44 / 45 | 34 / 33 | |
-| Reboot to ssh / to serving (watchdog heal) | | 44-49 s / ~12.5 min | no failed units |
-
-What the OS changes are (each has an apply and a rollback script):
-
-- **Headless** (`multi-user.target`, no display manager), **idle services off** (desktop / update / reporting
-  daemons), **IRQs and chatty services moved onto the A725 cores** (the X925s left to the engine), a few sysctls,
-  journald capped at 1 GiB, and the CX7 MTU at 9000. Together: the decode and memory numbers above, bits unchanged.
-- **polkit memory leak.** polkitd grew to 2.8 / 3.0 GiB RSS on our nodes in ~3 days (~1 GiB a day a node). The cause
-  was a monitoring dashboard polling each node over Tailscale SSH every 1-2 s: each command opens a new logind
-  session, the desktop's (or the login greeter's) gnome-shell asks polkit about every new session (~37 checks/s), and
-  polkitd leaks a little on each check. Restarting it with a 512 MiB `MemoryMax` cap alone raised the stress minimum
-  from 8.48 / 7.92 to 11.18 / 10.90 GiB; after the headless reboot (no gnome-shell left to ask) its RSS stayed flat at
-  7-10 MiB under the same polling. **If you poll your Sparks over Tailscale SSH with a desktop running, check
-  `systemctl status polkit`**, and prefer one persistent connection for polling.
-- **MTU 9000 is about neutral for speed** (+0.85% at 4 streams, 1 stream -0.16%) and **costs ~0.75-1.4 GiB a node**
-  (mlx5 receive buffers). We kept it; `rollback-07-roce-mtu.sh` gives the memory back if you need it.
-- **Set "Restore on AC Power Loss" = Power On in the BIOS yourself** (Del at POST): it cannot be set from Linux, and
-  without it a power cut leaves both boxes off. Nothing else in the guide needs a keyboard on the box.
-- **Not adopted:** pinning the server containers onto the X925 cores (`CPUSET=5-9,15-19`: 4 streams -1.5% in every
-  paired rep, because the HTTP threads then share the engine's cores) and 8 grammar threads
-  (`GLM53_TF_GRAMMAR_THREADS=8`: no gain).
+**Not adopted:** pinning the server containers onto the X925 cores (`CPUSET=5-9,15-19`: 4 streams -1.5% in every
+paired rep, because the HTTP threads then share the engine's cores) and 8 grammar threads
+(`GLM53_TF_GRAMMAR_THREADS=8`: no gain).
 
 **Tool calling (patch 0620, adopted, `GLM53_TF_TOOL_FIXES=all`).** Fixes found while chasing an independent
 tester's multi-step results (issue #6): a `content: null` assistant turn rendered as the text `None` before its tool
@@ -382,7 +356,7 @@ Long prompts refused or cut short: [Context smaller than expected](docs/TRYING.m
 
 ## Contents
 
-- [What's new (W20)](#whats-new-w20) (OS tuning, tool calling, RigMark 3-run)
+- [What's new (W20)](#whats-new-w20) (tool calling, RigMark 3-run)
 - [What's new (W19)](#whats-new-w19)
 - [What's new (2026-09-30)](#whats-new-2026-09-30)
 - [Quickstart](#quickstart) ([image input](#image-input))
@@ -402,7 +376,7 @@ Long prompts refused or cut short: [Context smaller than expected](docs/TRYING.m
 
 [RigMark](https://github.com/alexellis/rigmark) standard suite, unmodified settings, `reasoning_effort` low
 (receipts and details in [`results/rigmark/`](results/rigmark/README.md)). These are RigMark numbers only; our own
-suite is under [Benchmarks](#benchmarks). Current: W20 production (image b11 + OS tuning), mean of 3 runs' medians:
+suite is under [Benchmarks](#benchmarks). Current: W20 production (image b11), mean of 3 runs' medians:
 
 | RigMark (mean of 3 runs' medians) | **TensorFold W20** (3 runs) | TensorFold W17 (3 runs) | vLLM TP2 k=7 (Alex Ellis, published) |
 |---|---:|---:|---:|
@@ -429,7 +403,7 @@ Our own suite (`bench/glmbench.py`), not RigMark. All our numbers are on the **a
 image input and warm replay with every text gate unchanged (reply hashes equal, prefill 24.5k / 98k ~1,605-1,610
 tok/s), W17 multi-slot prefill (4 streams 82.8 tok/s aggregate, mean of 3 runs; same reply hashes), and W19 decode +3.3% at 1
 stream / +3.0% at 4 streams (84.6 tok/s aggregate, mean of 6), prefill +1.5% (~1,630 tok/s at 24.5k and 98k) with every
-reply hash unchanged ([What's new (W19)](#whats-new-w19)), and W20 decode +4.8% / +4.3% from OS tuning (the decode
+reply hash unchanged ([What's new (W19)](#whats-new-w19)), and W20 decode +4.8% / +4.3% from host-side tuning outside this repo (the decode
 table below has W20's numbers). Full tables and methodology: [`docs/RESULTS.md`](docs/RESULTS.md) (sections W6-W20 for
 the current production config); raw JSON and the window scripts in [`results/`](results/).
 
@@ -448,7 +422,7 @@ Two TensorFold configurations:
 | Single-stream (earlier, 2026-09-28) | [`config/prod-single.env.example`](config/prod-single.env.example) | one request at a time, 524,288-token context, bf16 latent KV, fast/lean prefill in 8192-row chunks, session store |
 
 **Decode**, tok/s, single stream, thinking off (decode excludes prefill and time to first token). "Greedy" = T=0,
-"sampled" = T=1 (seeded). TF production = W20 (image b11, OS tuned, `config/prod.env.example`): 3 rounds, each the
+"sampled" = T=1 (seeded). TF production = W20 (image b11, `config/prod.env.example`): 3 rounds, each the
 median of 3 reps, mean of the rounds (`results/W20/final-glmbench/`); every greedy cell returned one reply hash across
 all 9 reps. TF W10 = the earlier production column (load R16, median of 3); vLLM kit and single-stream: median of 5.
 
@@ -631,7 +605,7 @@ Main groups:
 | 4 concurrent streams | ~78 tok/s aggregate in W10 (median; 70-80 across runs); 84.6 in W19, 88.6 in W20 (mean of 6, 5 mixed prompts); RigMark C4 95.1 vs vLLM 66.1, but C4 first token 0.84 vs 0.81 s | Reederey87 publishes 63-66 warm; **MiaAI-Lab publishes 146.5 aggregate on 4-stream structured output** (base weights, their client), higher than anything we measured at 4 streams (`docs/RESEARCH-NIGHT.md` §5) |
 | Context | 4 requests share one 1,048,576-token pool: a request can grow to 1M, but not four at once (admission waits or spills idle sessions to the store) | 850k-1M in one context |
 | KV precision | **FP8** latent KV: greedy replies diverge from bf16 KV within the first 0-78 tokens on 15 of 20 prompts (quality checks above held; long-session recall checked by needle at 314k-358k only) | FP8 KV too |
-| Memory margin | **W20: 10.6-10.8 GiB** stress minimum after the OS tuning (8.48 / 7.92 GiB on the same image before it; see What's new (W20)). W19: after W17's heavy warm-up (~200 short requests before the gates) the 4 x 250k stress bottomed at **8.34 / 8.09 GiB** MemAvailable (head / worker; W17's config in the same sequence 7.75 / 7.61) and a 314k needle right after the stress and MMLU at **8.68 / 8.51 GiB** (6.58 / 6.31), no OOM and no engine error. The margin is thin on the worker in the stress (8.09 GiB, ~0.1 GiB over the gate). A lone prompt far beyond 314k no longer grows the allocator's prefill key blocks (0550's scratch, docs/MEMORY-SAFETY.md), but a ~900k prompt beside 3 busy slots has not been tested. A large file copy on the head node can serialize concurrent requests (page cache; `serve.sh start` drops the page cache and checks the slot count; 0550's page-cache admission is built in, off, untested on the GPU). 8,192-row prefill chunks (+~4% prefill) were rejected for memory before W19 and have not been re-tested with the new headroom | - |
+| Memory margin | **W20: stress-test memory minimum now ~10.7 GiB** (10.6-10.8 GiB). W19: after W17's heavy warm-up (~200 short requests before the gates) the 4 x 250k stress bottomed at **8.34 / 8.09 GiB** MemAvailable (head / worker; W17's config in the same sequence 7.75 / 7.61) and a 314k needle right after the stress and MMLU at **8.68 / 8.51 GiB** (6.58 / 6.31), no OOM and no engine error. The margin is thin on the worker in the stress (8.09 GiB, ~0.1 GiB over the gate). A lone prompt far beyond 314k no longer grows the allocator's prefill key blocks (0550's scratch, docs/MEMORY-SAFETY.md), but a ~900k prompt beside 3 busy slots has not been tested. A large file copy on the head node can serialize concurrent requests (page cache; `serve.sh start` drops the page cache and checks the slot count; 0550's page-cache admission is built in, off, untested on the GPU). 8,192-row prefill chunks (+~4% prefill) were rejected for memory before W19 and have not been re-tested with the new headroom | - |
 | API | no `logprobs`, `n > 1` rejected, images yes (0500) but no video, structured output yes (0610); in single-stream mode a `stop` match ends the reply but the engine keeps decoding silently to EOS / `max_tokens` before the next queued request starts | full OpenAI surface of vLLM |
 | Maturity | **work in progress**: one pair of Sparks, one checkpoint, four days of measurements (W1-W20) | production kits with many contributors |
 
@@ -682,7 +656,7 @@ Before publishing a fork: `scripts/check-public.sh` scans the tree for private I
 | `vendor/TensorFold` | TensorFold, pinned submodule (`2f8e514`, 0.3.4), unmodified |
 | `patches/` | engine patches, applied in order at image build |
 | `docker/` | Dockerfile, entrypoint, compose file |
-| `scripts/` | `serve.sh` (build / start / stop / status / logs / canary / watchdog / gpucheck; `PATCHES="..." serve.sh build` for a subset), `prepare.sh`, `gpuwatch.py` (GB10 clock / slow-state watch), `traffic-report.py` (request-log summary), `rigmark/` (turnkey RigMark runs, docs/RIGMARK.md), `os-tuning/` (apply / rollback / measure scripts for the OS changes, docs/OS-TUNING.md), `tooleval/` (tool-calling benchmark runner, docs/TOOL-CALLING.md), systemd units, `check-public.sh` |
+| `scripts/` | `serve.sh` (build / start / stop / status / logs / canary / watchdog / gpucheck; `PATCHES="..." serve.sh build` for a subset), `prepare.sh`, `gpuwatch.py` (GB10 clock / slow-state watch), `traffic-report.py` (request-log summary), `rigmark/` (turnkey RigMark runs, docs/RIGMARK.md), `tooleval/` (tool-calling benchmark runner, docs/TOOL-CALLING.md), systemd units, `check-public.sh` |
 | `config/` | `prod.env.example` (production, the default), earlier configs, `minimal.env.example` (32k debugging baseline) |
 | `AGENTS.md` | step-by-step setup for AI coding agents: checks, commands, expected logs, failures and fixes |
 | `bench/` | benchmark clients, MMLU-200 subset and full MMLU (`mmlu_full.py`), KL divergence (`divergence.py`), long-prompt exactness (`longexact.py`), tool-call harness, shared-prefix bench, draft-policy and lookup simulators, draft-vocabulary study and public ranking (`draftvocab.py`, `draftvocab_public.py`), page-cache probe |
