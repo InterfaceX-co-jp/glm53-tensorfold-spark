@@ -1,13 +1,13 @@
 # Results
 
 > **Work in progress.** Measured on one pair of DGX Sparks, 2026-09-27 to 2026-09-30, with the **abliterated** checkpoint
-> below. The sections are in the order the work happened; the newest ones are the current state: **W19** (the end of
-> this file) for the production config (`config/prod.env.example`: 4 requests sharing a 1M-token KV pool, image input,
+> below. The sections are in the order the work happened; the newest ones are the current state: **W20** (the end of
+> this file) for the OS tuning, 0620's tool-calling fixes and the current 3-run RigMark numbers (image b11), **W19** for the production config (`config/prod.env.example`: 4 requests sharing a 1M-token KV pool, image input,
 > replay snapshots, multi-slot prefill, the 0580 expert load path, two-function NCCL, 0550's scratch, structured
-> output), W18 for the 0550 attribution, **W17** for the 3-run averaged RigMark numbers (image b9; not re-run since), W15 for image input and replay, W10-W12 for the text-only stack it grew from, "Stacked run and production config" for the older
+> output), W18 for the 0550 attribution, **W17** for the earlier 3-run RigMark numbers (image b9), W15 for image input and replay, W10-W12 for the text-only stack it grew from, "Stacked run and production config" for the older
 > single-stream config. The public repo carries the benchmark JSON and the window scripts of the runs in `results/`
-> (E*, F*, L*, M*, P*, Q*, A1, B1, B2, S1, X1, Y1, Z1, Z2, W1-W12, W14-W19, FINAL-20260930, rigmark (W13, W15's two
-> RigMark runs and W17's three), roofline, sim0340, sim0380, theory2, THEORY2-SESSION, upstream-0362, draftvocab); logs (`*.log`, `*.out`, `*.err`,
+> (E*, F*, L*, M*, P*, Q*, A1, B1, B2, S1, X1, Y1, Z1, Z2, W1-W12, W14-W20, FINAL-20260930, tooleval, rigmark (W13, W15's two
+> RigMark runs, W17's three and W20's three), roofline, sim0340, sim0380, theory2, THEORY2-SESSION, upstream-0362, draftvocab); logs (`*.log`, `*.out`, `*.err`,
 > RigMark's `run.log`), nsys traces, test output of the early runs and some runs (B3, K0, K1, P1, T*) are summarized
 > here only, so some file names below point at logs that are not in the repo. Hosts in the JSON were normalized to
 > `127.0.0.1` / `<worker-ssh>`, node names to head / worker (also in file names: `tests-head/`, `probe-head.log`, `kg-head/`),
@@ -2383,3 +2383,225 @@ windows and the second window ran the combined load, the 0570-off re-run and the
 gates ran with unlocked clocks (each compares old vs new in one process). The 0570 cold bench times its best eligible
 placement, not 0570's fixed `SMALL_PLACE`; in situ it lost anyway. Not re-run with 0570 off: the memory sequence (0570
 allocates 32 KB) and the capture.
+
+## W20: OS tuning (machine batch) + recipe batch (b11 = b10 + 0620) + final RigMark x3 and tool-calling benches (2026-09-30, one campaign 13:54-19:20 + tool benches after) — adopted: every OS change (polkit cap, headless, services, sysctl, IRQs / services off the X925s, journald, CX7 MTU 9000), image b11 with `GLM53_TF_TOOL_FIXES=all`; not adopted: container cpusets on the X925s, `GLM53_TF_GRAMMAR_THREADS=8`; prod on b11
+
+Files: `results/W20/` (text / JSON only in this repo: per load `*-OSA*`, `*-OSB*`, `*-OSALL*`, `*-RECIPE*`, `*-M1500*`
+in W18's harness naming; `summary-*.md` = `measure.sh summary`; `link-m1500/`, `link-m9000/` = link
+benches; `structured-OSALL|RECIPE.json`; `build-patches.txt` (b11); `polkit-rss.txt` (polkitd RSS on both nodes every
+9 min); `final/` (the 3 RigMark rounds' `summary.md`; receipts in `results/rigmark/tensorfold-20260930-w20-final-r*`);
+`final-glmbench/`; `*-PROD*` = checks on the restored prod). Logs, OS snapshots, per-probe CPU / RoCE traces and the
+request logs are not published. Harness: `scripts/os-tuning/measure.sh` on W18's gates; every load on :8001, page
+cache dropped, 4 slots, RoCE trace on (same in every load).
+
+**Plan change mid-campaign:** the step-by-step A/Bs (C headless, D pinning, E MTU, F grammar threads) were
+replaced by two batches: a MACHINE batch (every OS change at once, one reboot test, one measurement OSALL) and a RECIPE
+batch (b11 + CPUSET + GRAMMAR_THREADS=8 + TOOL_FIXES=all in one load). OSA and OSB ran as planned before that.
+
+### 1. Machine batch (image b10, `config/prod.env` of W19 in every load; `measure.sh summary OSA OSB OSALL`)
+
+- **OSA** = as found (polkitd 2.77 / 3.01 GiB RSS after 70 / 78 h; six orphaned `memfast` samplers from earlier windows
+  killed on the worker first). **OSB** = + `apply-01-polkit.sh` (restart, MemoryMax 512M, no swap). **OSALL** = + `apply-all.sh`
+  (02 headless / multi-user.target, 03 services tier A, 04 sysctl, 05 IRQs + chatty services + user.slice on the A725s
+  0-4,10-14, 06 journald 1 GiB) + `PERSIST=1 apply-07-roce-mtu.sh` (MTU 9000, active_mtu 4096) on both nodes, then the
+  reboot test (worker first). **M1500** = OSALL's boot with the CX7 MTU set back to 1500 at runtime (QUICK: probes + ab.sh
+  only), to split MTU out.
+
+| metric | OSA | OSB | OSALL | M1500 |
+| --- | ---: | ---: | ---: | ---: |
+| idle MemAvailable min r0 / r1 (GiB, loaded, 60 s after canary) | 16.54 / 15.89 | **19.30 / 18.89** | 17.93 / 17.69 | 19.45 / 19.06 |
+| 4 x 250k stress MemAvailable min r0 / r1 | 8.48 / **7.92** (fails 8) | **11.18 / 10.90** | 10.72 / 10.77 | - |
+| 314k needle min r0 / r1 | 8.80 / 8.45 | 11.62 / 11.27 | 11.38 / 11.19 | - |
+| minimum over the whole load | 8.48 / 7.92 | 11.18 / 10.90 | 10.72 / 10.77 | - |
+| services running r0 / r1 | 44 / 45 | 44 / 45 | **34 / 33** | |
+| glmbench 1 stream geomean vs OSA (13 cells, hashes 13/13 in every load) | 0 | -0.12% | **+4.79%** | +4.62% |
+| 4 streams, mean of 6 (paired reps) | 84.95 | 84.93 | **88.58** (+4.3%) | 87.83 (-0.85% vs OSALL, every rep) |
+| lone slots 0-3 (tok/s) | 53.4-59.0 | 53.1-58.9 | 55.3-61.4 | 55.3-61.3 |
+| prefill 24.5k / 98k (mean of 4) | 1,645 / 1,637 | 1,650 / 1,645 | **1,659 / 1,654** | 1,658 / 1,648 (1 run) |
+| needle 314k lone prefill | 1,398.8 | 1,402.4 | 1,415.9 | - |
+| C4 per-stream TTFT (RigMark shape, reasoning low / thinking off) | 0.775 / 0.577 s | 0.779 / 0.579 s | 0.721 / 0.565 s | |
+| 4 streams RoCE trace: skew mean / p90 (us), rank 0 late | 36.2 / 73.6, 62% | 36.3 / 66.1, 50% | 39.8 / 88.1, 50% | 43.6 / 97.3, 67% |
+| transport p50 4 streams (us) | 4.06 | 3.04 | 4.51 | 2.94 |
+| 4 streams: busy % X925 / A725 (r0) | 21.1 / 1.0 | 21.1 / 1.0 | 20.6 / 1.8 | |
+| exact / batchexact (x2), transcripts, reply sha, N1, MMLU-200, refusals, OOM | pass, 88.0%, 0/10, 0 | same | same | exact / batchexact once, sha ok |
+
+Per-cell 1 stream, OSA -> OSALL (tok/s): tf code T=1 48.6 -> 51.8, chat T=1 46.9 -> 49.5, code T=0 84.4 -> 88.9,
+chat T=0 49.5 -> 49.8, tweet sequence 99.9 -> 105.0, json 80.5 -> 84.3, code 512 72.7 -> 70.8 (the one lower cell;
+RECIPE / M1500 75.5 / 75.3), kit hashmap 57.3 -> 60.0, structured 107.3 -> 113.9, essay 48.5 -> 50.6, edit 118-120 ->
+125-129 (comments 100.7 -> 109.9).
+
+Reading it:
+
+- **polkit (B): +2.7 / +3.0 GiB** on the stress minimum and idle; decode unchanged. The leaked pages were partly in swap
+  already (head 0.66 GiB), so swap use fell 2.0 -> 0.55 GiB too. Growth afterwards (`polkit-rss.txt`, a monitoring dashboard polling
+  each node over Tailscale SSH every 1-2 s throughout): with gdm still running the worker's polkitd grew 10 -> 22 MiB in 55 min (~0.3 GiB a day, the greeter's
+  checks); **after the headless reboot it stayed flat** (head 10.2 MiB, worker 7.6 MiB, 16:19-19:20). The cap never
+  came near.
+- **The rest (ALL): decode +4.8% at 1 stream, +4.3% at 4 streams, prefill +0.5%**, bits unchanged. M1500 shows that
+  this is not the MTU (1 stream -0.16%, 4 streams -0.85% at 1500): it is the headless / services / IRQ-affinity set
+  (not split further; one batch). The 4-stream RoCE skew did not improve (p90 66 -> 88 us), so the gain is
+  host-side time in the round, not the exchange wait.
+- **MTU 9000** costs memory: idle MemAvailable +1.5 / +1.4 GiB at 1500 on the same boot (M1500 vs OSALL); on an idle
+  node `ip link` 9000 -> 1500 frees 0.75 / 0.81 GiB of MemFree (mlx5 receive buffers). For it: +0.85% at 4 streams
+  (every paired rep), stable (bench_roce stress clean: 0 mismatched words, 0 failed; fault test ok). Link benches
+  (`link-m1500` / `link-m9000`): the RoCE 90-exchange graph steps unchanged (16k-256k: 3.1-5.3 ms both), NCCL (prod's
+  2-NIC 4-channel setting) all-gather 16 / 32 MiB 505 -> 488 / 1,001 -> 951 us, 1 / 2 MiB 55 -> 71 / 84 -> 92 us,
+  all-reduce 4 / 16 MiB 235 -> 221 / 834 -> 807 us. **Kept** (stable, gates pass, the stress minimum still 10.7 GiB);
+  `rollback-07-roce-mtu.sh` on both nodes returns ~0.75-1.5 GiB a node if memory gets tight.
+- OSALL's idle MemAvailable is below OSB's because it runs right after a reboot: nothing idle has been swapped out yet
+  (swap 0 vs 0.55 GiB in OSB) and the MTU buffers; under the stress it is within 0.1-0.5 GiB of OSB.
+
+### 2. Reboot test (worker first, then head)
+
+| | worker | head |
+| --- | --- | --- |
+| `systemctl reboot` -> LAN ssh back | **49 s** | **44 s** |
+| `systemd-analyze` | 35.8 s (userspace 6.9 s) | 66.9 s (userspace 43.9 s) |
+| state after boot | `running`, no failed units, multi-user.target, gdm inactive | same |
+| uplink / Tailscale up after kernel boot | +12 s / +16 s | +14 s / +18 s |
+| CX7 | both links up, MTU 9000, RoCE ACTIVE, active_mtu 4096 | same |
+| docker, GPU persistence, clock cap, the os-tuning unit (IRQs: 152 / 156 moved, 34 / 37 managed) | ok | ok |
+| polkitd | 7.5 MiB | 9-10 MiB |
+
+**Boot to serving (head, prod on b10 before the reboot, nothing touched after it): 756 s** (kernel boot -> rank 0
+container 750 s -> "serving" 756 s); `boot-check.sh` all OK except the re-arm timer (below). The time is the watchdog's
+`OnBootSec=10min`, 3 bad ticks and a ~60 s start. `OnBootSec=4min` (a drop-in) would make it ~6.5 min (not done).
+
+Found by the test:
+
+- **The watchdog heals only existing containers.** With both rank containers removed (`serve.sh stop`), a tick logs
+  "both ranks absent (stopped on purpose); standing down" forever. The reboot test therefore started prod first
+  (containers present -> exited at reboot -> 3 bad ticks -> heal). A power loss while prod is stopped for a window
+  will not bring prod back by itself.
+- The watchdog's re-arm timer had been created with `systemd-run` (transient) and was gone after the reboot; make
+  it a persistent unit (`scripts/systemd/`). boot-check.sh checks for it.
+- The link benches' `bench_roce.py fault` test wrote `/cache/roce-failed` (16:05:50), so the pre-reboot prod start, the
+  heal after the reboot and the first OSALL load **served on NCCL** (canary 70.5 tok/s). Caught from the empty RoCE trace;
+  the marker was deleted and OSALL re-run from scratch. The boot timing
+  is unaffected (a NCCL start takes as long). Delete `/cache/roce-failed` after any RoCE fault test.
+
+### 3. Recipe batch (one load on the OSALL machine state; `measure.sh summary OSALL RECIPE`)
+
+**Image `glm53-tensorfold:b11`** = `results/W19/build-patches.txt` + 0620 (`results/W20/build-patches.txt`); every patch
+applies, built on the head (cached base layers, 8 s), shipped with `docker save | docker load` (152 s), identical layer
+list on both nodes. **RECIPE** = `config/prod.env` + `IMAGE=b11 CPUSET=5-9,15-19 GLM53_TF_GRAMMAR_THREADS=8
+GLM53_TF_TOOL_FIXES=all` (boot lines: `tool calling (patches/0620): GLM53_TF_TOOL_FIXES=args,choice,history,reasoning,
+thinkcalls`, grammar `mask fills on 8 thread(s)`, both containers `--cpuset-cpus 5-9,15-19`, and **`http: HTTP threads
+on 5-9`**: with no A725 in the set, 0530 puts the HTTP threads on half the X925s). First start: 1 slot, serve.sh's
+automatic restart gave 4.
+
+| gate | OSALL (b10) | RECIPE | bar |
+| --- | --- | --- | --- |
+| exact / batchexact (before and after stress + MMLU), transcripts, reply sha | 10/10, 4/4 x2, True, 8794a3463259cc2f | same | pass |
+| glmbench 13 cells: hashes / geomean | 13/13 | 13/13 == OSALL; **+0.21%** | not lower: pass |
+| 4 streams, mean of 6 | 88.58 [92.5, 84.6, 87.8, 93.5, 85.0, 88.1] | **87.22** [90.9, 83.7, 86.3, 91.5, 84.4, 86.5]: **-1.5%, lower in every paired rep** (-0.7..-2.1%) | **FAIL** |
+| 4 streams RoCE skew mean / p90 (us) | 39.8 / 88.1 | 46.0 / 121.4 | |
+| prefill 24.5k / 98k (mean of 4) | 1,659 / 1,654 | 1,661 / 1,652 | pass |
+| N1 12/12, grouped == alone 92/92, MMLU-200 88.0%, refusals 0/10, needle 314k | pass | pass | pass |
+| stress / whole-load min r0 / r1 | 10.72 / 10.77 | 10.57 / 10.43 | >= 8: pass |
+| structured (`bench/structured.py` schemas / rigmark / tools / plain) | PASS (plain written as the reference) | PASS, plain hashes == OSALL | pass |
+| rigmark-shape schema run: tok/s, exposed mask wait a window | 76.5 / 76.8; 0.87 / 0.42 ms (mean 0.65) | 77.7 / 77.3; 0.75 / 0.59 ms (mean 0.67) | 8 threads: **no gain** |
+| C4 per-stream TTFT (reasoning low / off) | 0.721 / 0.565 s | 0.722 / 0.568 s | |
+
+Decisions:
+
+- **0620 / `GLM53_TF_TOOL_FIXES=all`: adopted** (every gate passes; host only, tool requests only; its benefit is in §6).
+- **`CPUSET=5-9,15-19`: not adopted.** The only knob in the load that touches unconstrained decode, and 4 streams fell
+  in all 6 paired reps; the HTTP threads (tokenizing / streaming 4 replies) now share the X925s with the engine. A
+  cpuset that keeps an A725 or two for HTTP (`CPUSET=0,5-9,15-19` + `CPU_PIN=http=0`) was not tried.
+- **`GLM53_TF_GRAMMAR_THREADS=8`: not adopted** (exposed wait unchanged at ~0.65 ms a window; the unconstrained run moved
+  as much as the schema run, +2%).
+
+### 4. Production
+
+`config/prod.env` (`config/prod.env.example` here): `IMAGE=glm53-tensorfold:b11` + `GLM53_TF_TOOL_FIXES=all` (header
+with the gates and the revert). The OS changes stay applied on both nodes (`scripts/os-tuning/rollback-*.sh` undo each).
+Prod restarted (page cache dropped, ready in 64 s, **4 request slots**, RoCE on both functions, the `tool calling
+(patches/0620)` boot line, grammar 4 threads, HTTP threads on 0-4,10-14, canary 79.7 tok/s), watchdog timer active.
+Checks on prod (`*-PROD*`): exact 10/10, batchexact 4/4, reply sha 8794a3463259cc2f, prefill 24.5k 1,658 tok/s.
+
+### 5. RigMark on the final prod (3 runs, 18:49-19:16, prod serving, no restart, nothing else on the endpoint)
+
+W17's final RigMark procedure (`scripts/rigmark/run.sh tensorfold`, RigMark pinned at
+`c5a0db01b054` clean, body `{"chat_template_kwargs":{"reasoning_effort":"low"}}`, a new COMPARISON_ID a
+run `...-tensorfold-w20-final-rN`, run.sh's metadata); receipts `results/rigmark/tensorfold-20260930-w20-final-r1..r3`
+(sha256 ok, **15/15 basic output gates each**), summary `results/W20/final/summary.md` (W17's `summarize.py`).
+
+| metric (mean of 3, min-max) | **W20 prod (b11, OS tuned)** | W17 prod (b9), 3 runs | change | vLLM TP2 k=7 (Alex) | W20 / vLLM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| code decode tok/s | **72.4** (72.2-72.6) | 67.9 | +6.6% | 44.0 | 1.65x |
+| prose decode tok/s | **45.7** (45.3-45.8) | 43.0 | +6.3% | 18.9 | 2.42x |
+| structured decode tok/s | **95.6** (95.6-95.7) | 88.8 | +7.7% | 64.9 | 1.47x |
+| code / prose / structured TTFT s | 0.48 / 0.38 / 0.45 | 0.50 / 0.41 / 0.47 | | 0.60 / 0.49 / 0.47 | |
+| cold prefill 8K / 32K / 64K tok/s | **1,610 / 1,684 / 1,667** | 1,560 / 1,634 / 1,620 | +3.2 / +3.0 / +2.9% | 1,813 / 1,908 / 1,922 | 0.89 / 0.88 / 0.87x |
+| replay TTFT 8K / 32K / 64K s | 0.21 / 0.23 / 0.26 | 0.22 / 0.25 / 0.27 | | 4.52 / 2.97 / 5.77 | 21 / 13 / 22x |
+| C1 / C2 / C4 aggregate tok/s | **57.5 / 76.0 / 95.1** (C4 93.0-98.4) | 53.1 / 70.1 / 91.0 | +8.3 / +8.4 / +4.5% | 31.6 / 42.0 / 66.1 | 1.82 / 1.81 / 1.44x |
+| C1 / C2 / C4 per-stream TTFT s | 0.47 / 0.61 / 0.84 | 0.49 / 0.65 / 0.89 | | 0.60 / 0.68 / 0.81 | C4 0.96x |
+
+W17 -> W20 includes W19 (b10: 0580 expert loads, NCCL 2 functions, scratch, CPU_PIN, grammar: +3.3% 1 stream / +3.0%
+4 streams / +1.5% prefill in W19's own A/B) and W20's OS set (+4.8% / +4.3% / +0.5% here). C4 first tokens (0.84 s)
+are still the one row behind vLLM's (0.81 s).
+
+### 6. glmbench on the final prod (3 rounds, 19:35-19:42, prod serving on :8000, nothing else on the endpoint)
+
+`results/W20/final-glmbench/` (suites tf,tweet,kit,edit, `--reps 3 --long-tokens 512` a round = the W20 loads'
+ab.sh settings; `table.py` -> `table-final.md`). A round's cell value = the median of its 3 reps; mean / min / max over
+the 3 rounds. "W20 OSALL" = the same suite once in the OSALL load (b10, :8001, RoCE trace on). Yesterday's image and the
+vLLM kit: the fixed reference numbers (greedy chat / code / structured; vLLM also hashmap / essay).
+
+| suite | cell | mode | tokens | mean | min | max | W20 OSALL | vs OSALL | yesterday | vLLM kit | vs vLLM | hashes |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| tf | code | sampled (T=1) | 64 | **51.1** | 51.0 | 51.1 | 51.8 | -1.4% |  |  |  | rounds agree |
+| tf | chat | sampled (T=1) | 64 | **48.6** | 48.1 | 48.9 | 49.5 | -1.7% |  |  |  | rounds agree |
+| tf | code | greedy (T=0) | 64 | **89.6** | 89.3 | 90.0 | 88.9 | +0.8% | 77.6 | 41.9 | 2.14x | same |
+| tf | chat | greedy (T=0) | 64 | **51.6** | 51.5 | 51.6 | 49.8 | +3.6% | 44.6 | 22.8 | 2.26x | same |
+| tweet | sequence | greedy (T=0) | 512 | **105.1** | 105.0 | 105.1 | 105.0 | +0.1% |  |  |  | same |
+| tweet | code | greedy (T=0) | 512 | **75.9** | 75.8 | 76.0 | 70.8 | +7.3% |  |  |  | same |
+| tweet | json | greedy (T=0) | 512 | **84.0** | 84.0 | 84.0 | 84.3 | -0.4% |  |  |  | same |
+| kit | hashmap | greedy (T=0) | 200 | **59.6** | 59.5 | 59.7 | 60.0 | -0.8% |  | 30.0 | 1.99x | same |
+| kit | structured | greedy (T=0) | 200 | **112.3** | 111.9 | 113.1 | 113.9 | -1.4% | 100.6 | 72.7 | 1.54x | same |
+| kit | essay | greedy (T=0) | 200 | **50.5** | 50.4 | 50.6 | 50.6 | -0.3% |  | 26.1 | 1.93x | same |
+| edit | edit-rename | greedy (T=0) | 1024 | **124.1** | 123.1 | 124.7 | 125.1 | -0.8% |  |  |  | same |
+| edit | edit-comments | greedy (T=0) | 1024 | **108.0** | 105.9 | 109.2 | 109.9 | -1.7% |  |  |  | same |
+| edit | edit-print-to-log | greedy (T=0) | 1024 | **126.5** | 125.7 | 127.1 | 128.7 | -1.7% |  |  |  | same |
+
+geomean vs OSALL over 13 cells: +0.09%
+
+Hashes: every round's 13/13 cells (11/11 greedy) == OSALL's (b10), i.e. b11 + `TOOL_FIXES=all` is bit-identical on this
+suite; greedy cells return one sha across all 9 reps; sampled (seeded) cells agree round to round. Geomean vs OSALL
++0.09% (the prod server has no RoCE trace on; the cells move -1.7..+7.3%, tweet code 512 being OSALL's one low cell).
+Against yesterday's image: chat greedy 44.6 -> 51.6 (+15.7%), code greedy 77.6 -> 89.6 (+15.5%), structured 100.6 ->
+112.3 (+11.6%). Against the vLLM kit: 2.14x code, 2.26x chat, 1.54x structured, 1.99x hashmap, 1.93x essay.
+
+### 7. Tool-calling benchmarks (docs/TOOL-CALLING.md §5) — partial
+
+Run from a separate machine (`scripts/tooleval/run.sh`; tool-eval-bench c7b5b95, spark-bench 125ba16) against prod
+over an SSH port forward to the head's 127.0.0.1:8000. spark-bench was stopped mid-run (the rig was needed for §6).
+Results: `results/tooleval/20260930-teb-off-fixes-PARTIAL/`. **One run on our checkpoint, not an average.**
+
+| run | bench | result |
+| --- | --- | --- |
+| F1: prod b11, `TOOL_FIXES=all`, thinking off | tool-eval-bench, 69 scenarios, temperature 0 | **complete: score 90** (124 / 138 points; deployability 86, responsiveness 78); **C multi-step chains 8/8 (100%)**; A 6/6, B 6/6, D 5/6, E 6/6, F 6/6, G 4/6, H 10/10, I 18/20, J 6/6, K 23/26, L 7/8, M 3/6, N 6/6, O 10/12; not passed: TC-21, 43, 51, 62, 68 (fail), TC-11, 39, 52, 57 (partial). The tester's run (their checkpoint, issue #6): 90 / C 75% |
+| F1 | spark-bench TrueScore | stopped mid-run: no score |
+| B1 (fixes off, thinking off), F2 (fixes on, thinking high) | both | not run yet |
+
+### 8. Manual steps (not scriptable)
+
+- **BIOS "Restore on AC Power Loss" = Power On** on both boxes (Del at POST; docs/OS-TUNING.md); it cannot be read
+  or set from Linux. Older Spark BIOS versions may not show it: update the BIOS first. Until then a power cut leaves
+  both boxes off.
+- After that, a real power-pull test with prod serving; expect ~13 min to serving (~6.5 min with `OnBootSec=4min` on
+  the watchdog timer).
+- A test window that ends with prod stopped (`serve.sh stop` removes the containers) is not covered by the boot heal
+  (the watchdog stands down on "both absent"): start prod again yourself.
+- The local desktop is gone on both nodes (headless); `sudo scripts/os-tuning/rollback-02-headless.sh START=1` brings it
+  back. Snaps are held and fwupd / apport / update-notifier timers are off: updates are manual (docs/OS-TUNING.md).
+
+### 9. Notes
+
+- Harness fixes in `measure.sh` during the run: `sample()` waited for every child (a watchdog sampler too), which stalled OSA
+  for 11 minutes after its 1-stream probe (killed by hand; OSA's gates ran 11 min later than planned, inside the
+  limit); `pin()` needed the image when prod was stopped (OSB's first launch refused; re-launched 11 min later).
+- The 1-stream RoCE trace is empty in OSALL, RECIPE (and a few others): the dump fires every 65,536 exchanges and the
+  1-stream probe sits right at that count, so it got no dump; the 4-stream trace (the plan's gate) is in every load.
+- OS snapshots (not published): journald now 1 GiB (was 2.8 / 4.0 GB), 34 / 33 services running (was 44 / 45).

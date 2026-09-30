@@ -27,7 +27,7 @@ PATTERNS=(
     "private IPv4 172.16/12|\\b172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9]{1,3}\\.[0-9]{1,3}\\b|$SSRF_FIXTURES"
     "CGNAT / Tailscale IPv4|\\b100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]{1,3}\\.[0-9]{1,3}\\b|$SSRF_FIXTURES"
     'Tailscale IPv6|fd7a:|'
-    'Tailscale names|\.ts\.net\b|tailnet|tailscale|'
+    'Tailscale tailnet names (the product name alone is fine)|[a-z0-9-]+\.ts\.net\b|'
     'gmail address|[a-z0-9._%+-]+@gmail\.com|'
     'MAC address|\b([0-9a-f]{2}:){5}[0-9a-f]{2}\b|'
     'serial number|serial[ _-]?(number|no\.?)[ :=]|'

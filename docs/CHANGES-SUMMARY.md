@@ -2,7 +2,8 @@
 
 > **Work in progress.** Every number below comes from one pair of DGX Sparks and the abliterated checkpoint
 > `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`, over four days (2026-09-27 to 2026-09-30). Statuses and defaults may
-> change. Updates since the initial public release: [W19](#update-w19-patches-0570-0610-test-windows-w18-w19),
+> change. Updates since the initial public release: [W20](#update-w20-2026-09-30-os-tuning-patch-0620-test-window-w20),
+> [W19](#update-w19-patches-0570-0610-test-windows-w18-w19),
 > [2026-09-30](#update-2026-09-30-patches-0420-0560-test-windows-w11-w17),
 > [2026-09-29](#update-2026-09-29-patches-0230-0410-test-windows-w1-w10).
 
@@ -14,6 +15,37 @@ that defaults to upstream behaviour. Details, knobs and exactness arguments: [`P
 kernel timings, a microbenchmark or arithmetic, not an end-to-end A/B. **Status**: *on* = set in both production
 configs (`config/prod*.env.example`); *batch* = on in the batch configs (production and 4 x 256k) only; *single* = single-stream config only;
 *opt-in* = off unless you set it; *rejected* = tried, measured, left off; *superseded* / *tool* as noted.
+
+## Update W20 (2026-09-30: OS tuning, patch 0620, test window W20)
+
+Since the W19 update, one patch was added (0620, 77 in total), both nodes were OS-tuned and one GPU campaign run (W20;
+`docs/RESULTS.md` W20, `results/W20`). The production config (`config/prod.env.example`) is W20's: image b11 = image
+b10's list + 0620, with `GLM53_TF_TOOL_FIXES=all`; the OS changes live in `scripts/os-tuning/` (guide:
+`docs/OS-TUNING.md`). Gates of the final config: exact 10/10 and batchexact 4/4 twice, W9 transcripts, reply sha
+8794a3463259cc2f, 13/13 glmbench hashes equal to b10's, N1 12/12, 92/92 grouped == alone, structured schemas / tools
+PASS, MMLU-200 88.0%, refusals 0/10, 4 x 250k stress minimum 10.57 / 10.68 GiB, needle 314k found. RigMark re-run 3
+times on production: code / prose / structured 72.4 / 45.7 / 95.6 tok/s, C1 / C2 / C4 57.5 / 76.0 / 95.1, cold prefill
+8K / 32K / 64K 1,610 / 1,684 / 1,667, 64K replay TTFT 0.26 s (W17: 67.9 / 43.0 / 88.8, 53.1 / 70.1 / 91.0,
+1,560 / 1,634 / 1,620, 0.27 s; `results/rigmark/tensorfold-20260930-w20-final-r*`).
+
+Adopted:
+
+| Change | What | Gain (measured) | Window |
+| --- | --- | --- | --- |
+| OS tuning, all at once (`scripts/os-tuning/apply-all.sh` + `apply-07-roce-mtu.sh`, reboot) | polkit restart + 512 MiB cap; headless (`multi-user.target`); idle services off; sysctl; IRQs, chatty services and user.slice on the A725 cores; journald 1 GiB; CX7 MTU 9000 | 1 stream glmbench geomean **+4.8%**, 4 streams **+4.3%** (84.95 -> 88.58 tok/s), prefill +0.5%, bits unchanged; stress minimum 8.48 / 7.92 -> 10.72 / 10.77 GiB | W20 (OSA -> OSALL) |
+| polkit restart + `MemoryMax=512M` (part of the above) | polkitd had leaked to 2.8 / 3.0 GiB RSS (~1 GiB a day a node), driven by a monitoring dashboard's per-command Tailscale SSH sessions and gnome-shell's polkit checks on each | stress minimum 8.48 / 7.92 -> 11.18 / 10.90 GiB alone; decode unchanged; flat after the headless reboot | W20 (OSA -> OSB) |
+| CX7 MTU 9000 (part of the above) | RoCE active_mtu 1024 -> 4096 | +0.85% at 4 streams (every paired rep), 1 stream -0.16%; costs ~0.75-1.4 GiB a node; kept, reversible | W20 (M1500) |
+| 0620 `glm-tool-calling` (`GLM53_TF_TOOL_FIXES=all`) | `content: null` rendered as `None`; reasoning of earlier tool steps restored when the client drops it; `tool_choice` none / named and `parallel_tool_calls: false`; arguments typed by the whole schema; calls at the end of an unclosed think block. Host only, tool requests only | same bits on tool-free requests (all hashes); tool-eval-bench 90, multi-step chains 8/8 (one run, thinking off; `results/tooleval/`) | W20 |
+
+Measured and not adopted:
+
+| Setting | Result | Window |
+| --- | --- | --- |
+| `CPUSET=5-9,15-19` (server containers on the X925 cores) | 4 streams -1.5% in all 6 paired reps: with no A725 in the set, 0530 puts the HTTP threads on the engine's cores | W20 (RECIPE) |
+| `GLM53_TF_GRAMMAR_THREADS=8` | exposed mask wait 0.67 vs 0.65 ms a window: no gain | W20 (RECIPE) |
+
+Manual, not scriptable: BIOS "Restore on AC Power Loss" = Power On on both nodes. Still off: 0570, 0590 (W19). Still
+behind vLLM on RigMark: cold prefill (0.87-0.89x) and C4 first token (0.84 vs 0.81 s).
 
 ## Update W19 (patches 0570-0610, test windows W18-W19)
 

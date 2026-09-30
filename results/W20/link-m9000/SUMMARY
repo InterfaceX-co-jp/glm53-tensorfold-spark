@@ -1,0 +1,8 @@
+16:05:10 m9000 bench1 rc0=0 rc1=0 10s :: saved a 90-exchange step (graph): 16384 B: 3.10 ms, 32768 B: 3.36 ms, 65536 B: 5.19 ms, 131072 B: 3.74 ms, 262144 B: 4.18 ms
+16:05:19 m9000 bench2 rc0=0 rc1=0 9s :: saved a 90-exchange step (graph): 16384 B: 3.29 ms, 32768 B: 3.24 ms, 65536 B: 4.98 ms, 131072 B: 3.80 ms, 262144 B: 4.20 ms
+16:05:42 m9000 stress rc0=0 rc1=0 23s :: stress ok
+16:05:53 m9000 fault rc0=0 rc1=0 11s :: 
+m9000-two-ch4 ag 4 MiB {'us': 144.4, 'algbw_GBs': 29.06, 'busbw_GBs': 14.53} | 16 MiB {'us': 488.4, 'algbw_GBs': 34.35, 'busbw_GBs': 17.18} | ar 4 MiB {'us': 221.2, 'busbw_GBs': 18.96} | ar 16 MiB {'us': 807.0, 'busbw_GBs': 20.79}
+m9000-one-def ag 4 MiB {'us': 284.3, 'algbw_GBs': 14.75, 'busbw_GBs': 7.38} | 16 MiB {'us': 785.1, 'algbw_GBs': 21.37, 'busbw_GBs': 10.68} | ar 4 MiB {'us': 512.2, 'busbw_GBs': 8.19} | ar 16 MiB {'us': 1480.9, 'busbw_GBs': 11.33}
+m9000-two-ch4-b ag 4 MiB {'us': 146.1, 'algbw_GBs': 28.71, 'busbw_GBs': 14.36} | 16 MiB {'us': 483.3, 'algbw_GBs': 34.72, 'busbw_GBs': 17.36} | ar 4 MiB {'us': 224.4, 'busbw_GBs': 18.69} | ar 16 MiB {'us': 812.3, 'busbw_GBs': 20.65}
+link m9000 done 16:06:05
