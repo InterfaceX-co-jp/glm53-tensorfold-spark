@@ -5,8 +5,8 @@ Follow me on X for more updates: https://x.com/jayleaton
 Serve GLM-5.3-Flash (the abliterated EXL3 4-bit checkpoint
 [`neko-legends/GLM-5.3-Flash-Uncensored-EXL3`](https://huggingface.co/neko-legends/GLM-5.3-Flash-Uncensored-EXL3))
 across two NVIDIA DGX Sparks, tensor-parallel over the 200 Gb/s CX7 link, behind an OpenAI-compatible API. The
-engine is [TensorFold](https://github.com/ashhart/TensorFold) (pinned, unmodified submodule) plus 71 patches applied
-at image build: 4-bit non-expert weights, image input (the checkpoint's own vision tower), a latent (absorbed MLA) KV cache, fast chunked prefill, a multi-session
+engine is [TensorFold](https://github.com/ashhart/TensorFold) (pinned, unmodified submodule) plus 76 patches applied
+at image build: 4-bit non-expert weights, image input (the checkpoint's own vision tower), structured output, a latent (absorbed MLA) KV cache, fast chunked prefill, a multi-session
 state cache with an NVMe tier, batching of up to 4 requests over a shared 1M-token KV pool, FP8 KV storage,
 shared system-prompt reuse, a RoCE all-gather, fast restarts, deeper drafting and verify windows, and ops tooling.
 Every patch is off by default; the configs in `config/` turn on the measured set, and
@@ -21,6 +21,66 @@ Weights attribution (the checkpoint's license requires it): the weights are by *
 included here. See [Licensing](#licensing).
 
 SPDX-License-Identifier: Apache-2.0 (this project's own code, scripts, benchmarks and docs; see [Licensing](#licensing)).
+
+## What's new (W19)
+
+Patches 0570-0610 (5 new, 76 in total), test windows W18 and W19, and a new production config
+(`config/prod.env.example`: image b10 = image b9's list + 0530, 0570, 0580, 0590, 0600, 0610). Numbers from
+[`docs/RESULTS.md`](docs/RESULTS.md) W18 / W19, measured against a control that is the same image with every new knob
+off (it served image b9's bits: 13/13 reply hashes equal). RigMark was not re-run for this update; the RigMark table
+below is still the image b9 release.
+
+| | Before (control) | **W19 production** | Change |
+| --- | ---: | ---: | --- |
+| Memory: 4 x 250k stress, MemAvailable minimum (head / worker) | 7.75 / 7.61 GiB | **8.34 / 8.09 GiB** | the 8 GiB gate passes again |
+| Memory: ~314k needle after the stress, minimum | 6.58 / 6.31 GiB | **8.68 / 8.51 GiB** | +2.1 / +2.2 GiB |
+| Decode, 1 stream (glmbench geomean, 13 cells) | | | **+3.3%** (chat 47.7 -> 49.5, code 70.4 -> 72.3, structured 104.3 -> 108.1 tok/s) |
+| Decode, 4 streams aggregate (mean of 6) | 82.2 tok/s | **84.6 tok/s** | **+3.0%** (every paired rep +1.9..+3.6%) |
+| Prefill 24.5k / 98k | 1,607 / 1,602 tok/s | **1,631 / 1,628 tok/s** | +1.5% |
+| C4 per-stream first token (RigMark shape, reasoning low; our client) | 0.81 s | **0.76 s** | -0.05 s |
+| Exactness (drafted == serial, batched == alone, reply hashes, grouped == alone 92/92), MMLU-200, refusals | pass, 88.0%, 0/10 | pass, 88.0%, 0/10 | unchanged |
+
+- **Memory headroom solved for the heavy stress case.** W17 left every config under the 8 GiB MemAvailable target
+  after a heavy warm-up. W18 traced the slow prefills that kept 0550 off to its allocator trim alone, and W19 adopted
+  0550's pre-grown selection scratch (`GLM53_TF_SELECT_SCRATCH=grow`; trim and page-cache admission stay off) together
+  with NCCL on 4 channels (less NCCL buffer memory): the stress minimum is back over 8 GiB on both nodes and the 314k
+  needle no longer dips (it had dropped ~3.5 GiB for ~35 s). This headroom is room for future gains that were
+  rejected on memory before, such as 8,192-row lone prefill chunks (+~4% prefill in W8, rejected at a 7.2-7.8 GiB
+  minimum).
+- **Decode +3.3% (1 stream) / +3.0% (4 streams)** from patch 0580 (`GLM53_TF_DEC_EXPERT_LOADS=1`, `_CFG=nc,8,1`): a
+  new load path for decode's routed experts (16-byte non-coherent vector loads issued a step ahead of the math, a
+  one-round-trip prologue), same bits.
+  The nsys traces put the routed experts' decode time 4.1-4.6% lower at 1 stream and 2.9-3.1% lower at 4 streams.
+  ([`docs/DECODE-KERNELS-2.md`](docs/DECODE-KERNELS-2.md))
+- **Prefill +1.5%** from NCCL on both functions of the CX7 port with 4 channels (`NCCL_IB_HCA` lists both,
+  `NCCL_PASSTHROUGH=1`, `NCCL_MIN/MAX_NCHANNELS=4`): a 4 MiB all-gather 322 -> 142 us, prefill's exposed NCCL time -21%.
+  The idea comes from the [kindlingai GX10 recipe](https://github.com/kindlingai/glm-5.3-flash-gx10)
+  ([`docs/KINDLING-AUDIT.md`](docs/KINDLING-AUDIT.md)).
+- **Structured output** (patch 0610, `GLM53_TF_GRAMMAR=1`, using [xgrammar](https://github.com/mlc-ai/xgrammar)):
+  OpenAI `response_format` (`json_object`, `json_schema`), vLLM's `guided_*` / `structured_outputs`, and tool calls
+  with `tool_choice: "required"`, a named function or `"strict": true`, enforced token by token. It stays exact with
+  speculative decoding and batching: drafts are checked against the grammar, and a constrained reply is the same
+  bytes drafted, undrafted and next to 3 other requests (8 schemas x greedy / sampled x thinking on / off: 32/32;
+  tools 6/6). Unconstrained replies are unchanged; a 50-object JSON task ran -0.4% tok/s.
+  ([`docs/STRUCTURED-OUTPUT.md`](docs/STRUCTURED-OUTPUT.md))
+- **Upstream TensorFold fixes, ported** (patch 0600, on by default; MIT code from TensorFold 0.3.6.2 / 0.5.0): a
+  client that disconnects frees its slot (0.18 s after the close, also while queued or prefilling); malformed requests
+  (wrong-typed sampling fields, bad `chat_template_kwargs`, non-UTF-8 bodies) get 400s instead of engine errors; image
+  URLs are fetched over https only, from public addresses only (no SSRF to loopback, LAN or cloud metadata), with the
+  connection pinned to the checked address; `return_token_ids`; `/health` reports token totals; `kill -USR1` dumps
+  every thread's stack. ([`docs/UPSTREAM-PORTS.md`](docs/UPSTREAM-PORTS.md), [`docs/UPSTREAM-050-AUDIT.md`](docs/UPSTREAM-050-AUDIT.md))
+- **Also adopted:** 0530's `GLM53_TF_CPU_PIN=http` (rank 0's HTTP threads off the engine's cores; no measurable
+  change, no cost). The image build installs xgrammar with `--no-deps` plus `transformers` and fails if the base
+  image's torch changed (`docker/Dockerfile`).
+
+**What didn't work in W19** (both stay in the series, off by default):
+
+- **0570 dense size switch** (0440's dense kernel for small 4-bit matrices only): 1.0-1.7x faster per shape in the
+  cold microbenchmark, but in the server the switched shapes took 1.7x the time of today's kernels (dense decode
+  +3-5%); with it on, 1-stream decode gained only +2.2% instead of +3.3%. Off.
+- **0590 fat2 prefill experts** (one persistent pipelined routed-expert kernel for prefill, ideas from the kindlingai
+  recipe re-implemented; no code copied): same bits, but 1.16x / 1.19x slower than today's `fat` kernel at 2,048 /
+  4,096 rows. Off. ([`docs/EXPERT-PREFILL-V2.md`](docs/EXPERT-PREFILL-V2.md))
 
 ## What's new (2026-09-30)
 
@@ -286,8 +346,10 @@ All our numbers are on the **abliterated** checkpoint `neko-legends/GLM-5.3-Flas
 one pair of DGX Sparks (GB10, TP=2), 2026-09-27 to 2026-09-30. The tables below are from test window W10
 (2026-09-29 04:20); since then W12 added +2.5% decode at 1 stream and +2.8% at 4 streams (81.2 tok/s aggregate), W15
 image input and warm replay with every text gate unchanged (reply hashes equal, prefill 24.5k / 98k ~1,605-1,610
-tok/s), and W17 multi-slot prefill (4 streams 82.8 tok/s aggregate, mean of 3 runs; same reply hashes). Full tables
-and methodology: [`docs/RESULTS.md`](docs/RESULTS.md) (sections W6-W17 for the current production config); raw JSON and the window scripts in [`results/`](results/).
+tok/s), W17 multi-slot prefill (4 streams 82.8 tok/s aggregate, mean of 3 runs; same reply hashes), and W19 decode +3.3% at 1
+stream / +3.0% at 4 streams (84.6 tok/s aggregate, mean of 6), prefill +1.5% (~1,630 tok/s at 24.5k and 98k) with every
+reply hash unchanged ([What's new (W19)](#whats-new-w19)). Full tables
+and methodology: [`docs/RESULTS.md`](docs/RESULTS.md) (sections W6-W19 for the current production config); raw JSON and the window scripts in [`results/`](results/).
 
 ### (a) Ours vs the vLLM production kit, same weights, same client
 
@@ -329,10 +391,10 @@ W10, from verify windows of up to 16 rows (patch 0380: +16-27% on these cells, e
 | Prompt | vLLM kit | **TF production** (alone) | TF single-stream (09-28) |
 | --- | ---: | ---: | ---: |
 | ~7k tokens | 1,340 tok/s | - | 1,162 tok/s |
-| ~24.5k-28k tokens | 1,448 tok/s at 28k (TTFT 19.4 s) | **~1,607 tok/s** at 24.5k (1,614 / 1,602; TTFT ~13.4 s) | 1,266 tok/s at 28k (TTFT 22.2 s) |
-| ~98k-112k tokens | - | **~1,600 tok/s** at 98k (1,577-1,606) | 1,238 tok/s at 112k (TTFT 90.5 s) |
-| 314k tokens (needle, after the stress run) | - | 1,376 tok/s, found | - |
-| TF vs vLLM at ~28k | | **~1.11x** (24.5k vs vLLM's 28k) | 0.87x |
+| ~24.5k-28k tokens | 1,448 tok/s at 28k (TTFT 19.4 s) | **~1,607 tok/s** at 24.5k (1,614 / 1,602; TTFT ~13.4 s); W19: **1,630-1,632** | 1,266 tok/s at 28k (TTFT 22.2 s) |
+| ~98k-112k tokens | - | **~1,600 tok/s** at 98k (1,577-1,606); W19: **1,624-1,630** | 1,238 tok/s at 112k (TTFT 90.5 s) |
+| 314k tokens (needle, after the stress run) | - | 1,376 tok/s, found (W19: 1,396) | - |
+| TF vs vLLM at ~28k | | **~1.11x** (24.5k vs vLLM's 28k; W19 ~1.13x) | 0.87x |
 
 **Multi-turn, concurrency, boot, quality**:
 
@@ -471,7 +533,10 @@ Main groups:
 | Per request | 0090-0093 | `"tf_knobs": {...}` in the request body |
 | Serving / ops | 0002, 0140, 0150, 0160, 0210, 0300 | prepared folders, `/health`, `/metrics`, `reasoning_effort`, `stop`, prompt-token cache, request log (`GLM53_TF_REQUEST_LOG`, no text) |
 | Multi-slot prefill | 0560 | `GLM53_TF_MULTI_PREFILL=1` (a round's prefill pieces in one forward; W17) |
-| Measured, not adopted (off) | 0240 (bits 1-2), 0260, 0270, 0280, 0330, 0340, 0400, 0410, 0440, 0450, 0370's `GLM53_TF_CPU_PIN`, 0460's RoCE latency knobs, 0510 / 0520 / 0530 (W16), 0550 (W17: in the image, `GLM53_TF_ADMIT_MEM=free`, `GLM53_TF_SELECT_SCRATCH=off`, `GLM53_TF_ALLOC_TRIM_GB=0`) | see [Limits](#limits-and-negatives) |
+| Decode expert loads / NCCL / memory (W19) | 0580, 0550, 0530 | `GLM53_TF_DEC_EXPERT_LOADS=1` + `_CFG=nc,8,1`, `GLM53_TF_SELECT_SCRATCH=grow`, `GLM53_TF_CPU_PIN=http`; NCCL on both CX7 functions with 4 channels (`NCCL_IB_HCA`, `NCCL_PASSTHROUGH=1`, `NCCL_MIN/MAX_NCHANNELS=4`) |
+| Structured output | 0610 | `GLM53_TF_GRAMMAR=1` (`response_format`, strict / required tool calls; exact under drafting and batching) |
+| Upstream ports | 0600 | on by default: `GLM53_TF_DISCONNECT=1` (a departed client frees its slot), request 400 hardening, image URL hardening (`GLM53_TF_VISION_FETCH_*`), `/health` token totals, USR1 stacks |
+| Measured, not adopted (off) | 0240 (bits 1-2), 0260, 0270, 0280, 0330, 0340, 0400, 0410, 0440, 0450, 0370's `GLM53_TF_CPU_PIN`, 0460's RoCE latency knobs, 0510 / 0520 (W16), 0550's trim and page-cache admission (`GLM53_TF_ALLOC_TRIM_GB=0`, `GLM53_TF_ADMIT_MEM=free`), 0570 and 0590 (W19) | see [Limits](#limits-and-negatives) |
 | Offline / tools, off | 0420 (draft vocabulary), 0430 (drafter-training records), 0470 (8-bit non-experts) | `docs/PATCHES.md` |
 
 ## Limits and negatives
@@ -479,13 +544,13 @@ Main groups:
 | | TensorFold + patches (production) | vLLM kit |
 | --- | --- | --- |
 | Single-stream decode | 1.20-1.96x faster on every measured cell | baseline |
-| Prefill | ~1,607 tok/s at 24.5k and ~1,600 at 98k, against 1,448 measured for the kit at 28k (~1.11x; not the same prompt length). MiaAI-Lab publishes 1,492-1,587 on base weights (table b) | measured 1,340-1,448 here |
-| 4 concurrent streams | ~78 tok/s aggregate (median; 70-80 across runs) | Reederey87 publishes 63-66 warm; **MiaAI-Lab publishes 146.5 aggregate on 4-stream structured output** (base weights, their client), higher than anything we measured at 4 streams (`docs/RESEARCH-NIGHT.md` §5) |
+| Prefill | ~1,631 tok/s at 24.5k and ~1,628 at 98k (W19; W17 ~1,607 / ~1,600), against 1,448 measured for the kit at 28k (~1.11x; not the same prompt length). MiaAI-Lab publishes 1,492-1,587 on base weights (table b) | measured 1,340-1,448 here |
+| 4 concurrent streams | ~78 tok/s aggregate in W10 (median; 70-80 across runs); 84.6 in W19 (mean of 6, 5 mixed prompts) | Reederey87 publishes 63-66 warm; **MiaAI-Lab publishes 146.5 aggregate on 4-stream structured output** (base weights, their client), higher than anything we measured at 4 streams (`docs/RESEARCH-NIGHT.md` §5) |
 | Context | 4 requests share one 1,048,576-token pool: a request can grow to 1M, but not four at once (admission waits or spills idle sessions to the store) | 850k-1M in one context |
 | KV precision | **FP8** latent KV: greedy replies diverge from bf16 KV within the first 0-78 tokens on 15 of 20 prompts (quality checks above held; long-session recall checked by needle at 314k-358k only) | FP8 KV too |
-| Memory margin | **the 8 GiB stress gate failed for every config in W17**, the previous production config (b7) included: after a heavier warm-up (~200 short requests before the gates) the 4 x 250k stress bottomed at **7.50 / 6.92 GiB** MemAvailable (head / worker; b7 7.47 / 7.41) and a 314k needle right after the stress and MMLU at **6.04 / 5.46 GiB** (b7 6.21 / 5.81), no OOM and no engine error in any load (W15's lighter sequence gave b7 8.27 / 8.28). A lone prompt far beyond 314k still grows the allocator's prefill key blocks (docs/MEMORY-SAFETY.md, ~16 GiB bound at 1M); 0550 bounds it but is off until its prefill slowdown is isolated, and a ~900k prompt beside 3 busy slots has not been tested. A large file copy on the head node can serialize concurrent requests (page cache; `serve.sh start` now drops the page cache and checks the slot count). 8,192-row prefill chunks (+~4% prefill) were rejected for memory | - |
-| API | no `logprobs`, `n > 1` rejected, images yes (0500) but no video; in single-stream mode a `stop` match ends the reply but the engine keeps decoding silently to EOS / `max_tokens` before the next queued request starts | full OpenAI surface of vLLM |
-| Maturity | **work in progress**: one pair of Sparks, one checkpoint, four days of measurements (W1-W17) | production kits with many contributors |
+| Memory margin | **the 8 GiB gate passes again since W19**: after W17's heavy warm-up (~200 short requests before the gates) the 4 x 250k stress bottomed at **8.34 / 8.09 GiB** MemAvailable (head / worker; W17's config in the same sequence 7.75 / 7.61) and a 314k needle right after the stress and MMLU at **8.68 / 8.51 GiB** (6.58 / 6.31), no OOM and no engine error. The margin is thin on the worker in the stress (8.09 GiB, ~0.1 GiB over the gate). A lone prompt far beyond 314k no longer grows the allocator's prefill key blocks (0550's scratch, docs/MEMORY-SAFETY.md), but a ~900k prompt beside 3 busy slots has not been tested. A large file copy on the head node can serialize concurrent requests (page cache; `serve.sh start` drops the page cache and checks the slot count; 0550's page-cache admission is built in, off, untested on the GPU). 8,192-row prefill chunks (+~4% prefill) were rejected for memory before W19 and have not been re-tested with the new headroom | - |
+| API | no `logprobs`, `n > 1` rejected, images yes (0500) but no video, structured output yes (0610); in single-stream mode a `stop` match ends the reply but the engine keeps decoding silently to EOS / `max_tokens` before the next queued request starts | full OpenAI surface of vLLM |
+| Maturity | **work in progress**: one pair of Sparks, one checkpoint, four days of measurements (W1-W19) | production kits with many contributors |
 
 Other negatives and trade-offs, measured:
 
@@ -540,7 +605,7 @@ Before publishing a fork: `scripts/check-public.sh` scans the tree for private I
 | `bench/` | benchmark clients, MMLU-200 subset and full MMLU (`mmlu_full.py`), KL divergence (`divergence.py`), long-prompt exactness (`longexact.py`), tool-call harness, shared-prefix bench, draft-policy and lookup simulators, draft-vocabulary study and public ranking (`draftvocab.py`, `draftvocab_public.py`), page-cache probe |
 | `train/` | drafter training (MTP head and DFlash2 distillation from 0430 records, a PyTorch reference of both, offline acceptance evaluation; docs/DRAFTER-TRAINING.md) |
 | `tests/` | patch tests (GPU) and launcher tests (host) |
-| `results/` | raw benchmark JSON and the test windows' scripts (W1-W17), the release run (`FINAL-20260930/`), RigMark receipts (`rigmark/`), synthetic test images (`W14/img/`); logs omitted |
+| `results/` | raw benchmark JSON and the test windows' scripts (W1-W19), the release run (`FINAL-20260930/`), RigMark receipts (`rigmark/`), synthetic test images (`W14/img/`); logs omitted |
 | `docs/` | results, patch notes, design and analysis notes |
 
 ## Licensing
@@ -551,6 +616,8 @@ Before publishing a fork: `scripts/check-public.sh` scans the tree for private I
 | TensorFold (`vendor/TensorFold`) | MIT, Copyright (c) 2026 TensorFold contributors; unmodified submodule, the patches are applied at build time. The TensorFold code the patches modify stays under its MIT License. Its third-party notices: `vendor/TensorFold/THIRD_PARTY_NOTICES.md`. |
 | RoCE all-gather in `patches/0230`, fast-prefill kernels in `patches/0240` | adapted from / re-implementing [b12x](https://github.com/local-inference-lab/b12x) (Apache-2.0, Luke Alonso and the b12x contributors); details in [`NOTICE`](NOTICE). |
 | Fat-expert MoE kernel structure in `patches/0170` | adapted from the Apache-2.0 [Reederey87 kit](https://github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark) (code MiaAI-Lab contributed under MIT before 2026-09-07); its NOTICE is reproduced in [`NOTICE`](NOTICE). The BF16 KDA copy in the same patch re-implements an idea from MiaAI-Lab PR #233 without its code. |
+| Ported upstream code in `patches/0600`, `patches/0610` | from later TensorFold releases (0.3.6.2, 0.5.0), MIT, Copyright (c) 2026 TensorFold contributors; each ported piece names its source commit ([`NOTICE`](NOTICE), [`docs/UPSTREAM-PORTS.md`](docs/UPSTREAM-PORTS.md)). |
+| xgrammar (structured output, `patches/0610`) | Apache-2.0 ([mlc-ai/xgrammar](https://github.com/mlc-ai/xgrammar)), installed into the image by pip, not vendored. |
 | Docker base image | NVIDIA Deep Learning Container License (`nvcr.io/nvidia/pytorch:26.07-py3`) |
 | Model weights (not included) | `neko-legends/GLM-5.3-Flash-Uncensored-EXL3`: ShapleyMCG License 1.0 per its model card (the Local Inference Lab Attribution License 1.0: MIT-like with a required attribution, given at the top of this README and in NOTICE). Its sources `orcarouter/GLM-5.3-Flash-Uncensored-FP8` and `zai-org/GLM-5.3-Flash` are MIT per their model cards. The weights are abliterated (refusals removed); you are responsible for how you use them. |
 | DFlash2 drafter (not included) | `incoai/GLM-5.3-Flash-DFlash2`: **CC BY-NC-ND 4.0, non-commercial only**. Never bundled; download it yourself, or run without it (MTP drafts only). |
@@ -573,6 +640,11 @@ Before publishing a fork: `scripts/check-public.sh` scans the tree for private I
   kits publish their numbers on.
 - [turboderp / ExLlamaV3](https://github.com/turboderp-org/exllamav3): the EXL3 format.
 - [incoai](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2): the DFlash2 drafter.
+- [kindlingai](https://github.com/kindlingai/glm-5.3-flash-gx10): the GX10 vLLM recipe behind the two-function NCCL
+  setting (W19) and the pipelined prefill-expert kernel idea (0590); ideas only, no code copied (their repository has
+  no licence; [`docs/KINDLING-AUDIT.md`](docs/KINDLING-AUDIT.md)).
+- [mlc-ai/xgrammar](https://github.com/mlc-ai/xgrammar) (Apache-2.0): the grammar engine behind structured output
+  (`patches/0610`).
 - [Z.ai](https://huggingface.co/zai-org/GLM-5.3-Flash): GLM-5.3-Flash.
 - [Vontra](https://huggingface.co/Vontra): the MLX checkpoints TensorFold's GLM recipe uses.
 - NVIDIA: the PyTorch container (`nvcr.io/nvidia/pytorch`).
