@@ -1,0 +1,303 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/video.py b/src/tensorfold/families/glm5_next/cuda/video.py
+new file mode 100644
+index 0000000..c31c9be
+--- /dev/null
++++ b/src/tensorfold/families/glm5_next/cuda/video.py
+@@ -0,0 +1,297 @@
++"""patches/0670: video inputs: bounded bytes, GLM's own frame choice, and the processor's spatiotemporal patches.
++
++GLM-5.3-Flash takes video as an ordinary special token: ``create_mm_token_type_ids`` says it in as many words
++("Glm5Next uses the same special token to denote images and video"), the difference being only the
++``<|begin_of_video|>`` / ``<|end_of_video|>`` frame around it and a ``mm_token_types`` 2 inside. So a video is a
++sequence of images to this server, and this module's whole job is to produce them the way the model's own
++``Glm5NextVideoProcessor`` (transformers 5.17.0, ``processor_config.json``) does:
++
++- ``sample_frames``: ``video_processor.fps`` (2) frames a second over the whole video, at most ``max_frames``,
++  deduplicated and padded to an even count.
++- ``resize``: ``smart_resize`` over the frame count (``temporal_factor`` = ``temporal_patch_size`` 2, ``factor`` =
++  ``patch_size * merge_size`` 28) with the video budget (``max_image_tokens`` 240000, 30x an image's 8000), then the
++  never-upscale rule and the pad to the canvas.
++- ``patchify``: ``temporal_patch_size`` frames share a patch, laid out ``(grid_t, grid_h // merge, grid_w // merge,
++  merge, merge, channel, temporal, patch, patch)``.
++
++That layout is exactly what ``vision_prep.preprocess`` gives a still image with ``temporal`` copies of one frame.
++So the output here is one ``Prepared`` per temporal group -- the group's ``temporal`` consecutive frames in the
++temporal axis instead of one frame repeated -- which means ``vision_prep.expand``, the tower and the KV masking
++need no video case at all: the prompt holds one ``<|begin_of_image|><|image|><|end_of_image|>`` run per group, in
++order, each with a ``{seconds:.1f} seconds`` stamp after it, the whole thing between the video tokens
++(``Glm5NextProcessor.replace_frame_token_id`` / ``replace_video_token``).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import io
++import json
++import math
++import os
++import time
++from dataclasses import dataclass, field
++
++from .vision_prep import VERSION, Prepared, Settings, VisionError, _resize_uint8, _env_int, smart_resize
++
++VIDEO_TYPES = ("video_url", "video", "input_video")
++
++# The model's video_processor: the frame rate and the pixel budget differ from the image processor's.
++VIDEO_FPS = 2.0
++VIDEO_MAX_FRAMES = 2048
++VIDEO_MAX_TOKENS = 240000
++
++
++@dataclass(frozen=True, slots=True)
++class VideoLimits:
++    """The server's video limits (``GLM53_TF_VIDEO_*``), and the model's own frame rate and frame ceiling."""
++
++    max_videos: int = 2
++    max_encoded_bytes: int = 64 * 1024 * 1024
++    max_total_encoded_bytes: int = 96 * 1024 * 1024
++    max_dimension: int = 8192
++    max_seconds: float = 3600.0
++    max_frames: int = VIDEO_MAX_FRAMES
++    fps: float = VIDEO_FPS
++    max_tokens: int = VIDEO_MAX_TOKENS
++    timeout: float = 20.0
++    total_timeout: float = 120.0
++
++    @classmethod
++    def read(cls) -> "VideoLimits":
++        d = cls()
++        out = cls(
++            max_videos=_env_int("GLM53_TF_VIDEO_MAX_VIDEOS", d.max_videos),
++            max_encoded_bytes=_env_int("GLM53_TF_VIDEO_MAX_BYTES", d.max_encoded_bytes),
++            max_total_encoded_bytes=_env_int("GLM53_TF_VIDEO_MAX_TOTAL_BYTES", d.max_total_encoded_bytes),
++            max_dimension=_env_int("GLM53_TF_VIDEO_MAX_DIMENSION", d.max_dimension),
++            max_seconds=float(os.environ.get("GLM53_TF_VIDEO_MAX_SECONDS", "") or d.max_seconds),
++            max_frames=_env_int("GLM53_TF_VIDEO_MAX_FRAMES", d.max_frames),
++            fps=float(os.environ.get("GLM53_TF_VIDEO_FPS", "") or d.fps),
++            max_tokens=_env_int("GLM53_TF_VIDEO_MAX_TOKENS", d.max_tokens),
++            timeout=float(os.environ.get("GLM53_TF_VIDEO_TIMEOUT", "") or d.timeout),
++            total_timeout=float(os.environ.get("GLM53_TF_VIDEO_TOTAL_TIMEOUT", "") or d.total_timeout),
++        )
++        if not (out.max_videos >= 1 and out.max_encoded_bytes > 0 and out.max_total_encoded_bytes > 0
++                and out.max_dimension > 0 and out.max_seconds > 0 and out.max_frames >= 2 and out.fps > 0
++                and out.max_tokens > 0 and out.timeout > 0 and out.total_timeout > 0):
++            raise ValueError("GLM53_TF_VIDEO_*: every limit must be positive and _MAX_VIDEOS >= 1")
++        return out
++
++
++def sample_indices(total_frames: int, source_fps: float, lim: VideoLimits) -> list[int]:
++    """``Glm5NextVideoProcessor.sample_frames``'s frame choice, as indices.
++
++    Target ``fps`` frames a second over the whole video (capped at ``max_frames`` and at the footage the video
++    processor's ``max_duration`` allows); the walk is by wall-clock second, and when it lands on fewer frames than
++    the target they are spread over the stretch it did cover. Duplicates go, and an odd count is padded by repeating
++    the last frame: ``patchify`` needs a multiple of ``temporal_patch_size``.
++    """
++
++    import numpy as np
++
++    if total_frames < 1 or not math.isfinite(source_fps) or source_fps <= 0:
++        raise VisionError("the video's frame count or rate is missing")
++    duration = total_frames / source_fps
++    max_seconds = int(duration)
++    extract = min(int(duration * lim.fps), lim.max_frames)
++    if total_frames < extract:
++        indices = np.linspace(0, total_frames - 1, extract, dtype=int).tolist()
++    else:
++        indices = []
++        second = 0.0
++        inv = 1.0 / lim.fps
++        for i in range(total_frames):
++            if i / source_fps >= second:
++                second += inv
++                indices.append(i)
++                if second >= max_seconds:
++                    break
++    if len(indices) < extract:
++        start, end = (indices[0], indices[-1]) if indices else (0, max(total_frames - 1, 0))
++        indices = np.linspace(start, end, extract, dtype=int).tolist()
++    elif len(indices) > extract:
++        indices = np.linspace(0, total_frames - 1, extract, dtype=int).tolist()
++    seen: set[int] = set()
++    uniq = [i for i in indices if not (i in seen or seen.add(i))]
++    if len(uniq) & 1:
++        uniq.append(uniq[-1])
++    return uniq
++
++
++def timestamps(indices: list[int], source_fps: float, groups: int) -> list[float]:
++    """The stamp of each temporal group: GLM takes every other sampled frame's time (``timestamps[::2]``, "mrope"),
++    pads with the last when the video is short, and ``replace_frame_token_id`` renders it to one decimal."""
++
++    seconds = [i / source_fps for i in indices[::2]]
++    out = list(seconds[:groups])
++    while len(out) < groups:
++        out.append(out[-1] if out else 0.0)
++    return out
++
++
++def video_canvas(height: int, width: int, num_frames: int, s: Settings, max_tokens: int) -> tuple[int, int, int, int]:
++    """(canvas h, canvas w, content h, content w) for a video: ``Glm5NextVideoProcessor.resize``'s sizes.
++
++    Like ``vision_prep.canvas_size`` but over the whole frame count, and the never-upscale rule is applied when the
++    frames already carry at least one token of pixels (``pixels_per_token * min_image_tokens``).
++    """
++
++    factor = s.patch * s.merge
++    t = s.temporal
++    target_h, target_w = smart_resize(num_frames=num_frames, height=height, width=width, temporal_factor=t,
++                                      factor=factor, min_pixels=s.min_tokens, max_pixels=max_tokens)
++    scale = min(target_h / height, target_w / width)
++    if num_frames * height * width >= t * factor ** 2 * s.min_tokens:
++        scale = min(1.0, scale)
++    content_h = max(1, min(target_h, math.floor(height * scale)))
++    content_w = max(1, min(target_w, math.floor(width * scale)))
++    return target_h, target_w, content_h, content_w
++
++
++def fit_frames(stack, target_h: int, target_w: int, content_h: int, content_w: int):
++    """``[frames, 3, h, w]`` uint8 -> every frame at (content_h, content_w), padded to the canvas.
++
++    The processor resizes the whole video tensor at once; bicubic is separable per frame, so doing one frame at a
++    time gives the same pixels and bounds the memory to the canvas rather than the source resolution.
++    """
++
++    import torch
++
++    out = []
++    for frame in stack:
++        frame = _resize_uint8(frame, (content_h, content_w))
++        if tuple(frame.shape[-2:]) != (target_h, target_w):
++            frame = torch.nn.functional.pad(
++                frame, (0, target_w - frame.shape[-1], 0, target_h - frame.shape[-2]), value=0)
++        out.append(frame)
++    return torch.stack(out).contiguous()
++
++
++def preprocess_groups(stack, s: Settings) -> list[Prepared]:
++    """``[frames, 3, canvas_h, canvas_w]`` uint8 (already resized and padded) -> one ``Prepared`` per temporal group.
++
++    ``Glm5NextVideoProcessor._preprocess``: rescale and normalize, then ``patchify``. The result is sliced by
++    ``grid_t`` so each group is an image the rest of the server already understands: ``grid`` (1, gh, gw), ``tokens``
++    ``gh * gw / merge**2`` (what ``replace_video_token`` puts in the prompt per group), and ``pixels``
++    ``[gh * gw, channel * temporal * patch * patch]``. Concatenating the groups is bit for bit the processor's
++    ``pixel_values_videos``.
++    """
++
++    import torch
++
++    t, p, m = s.temporal, s.patch, s.merge
++    frames = int(stack.shape[0])
++    if frames < t:
++        raise VisionError(f"a video needs at least {t} frames")
++    pad = -frames % t
++    if pad:
++        stack = torch.cat([stack, stack[-1:].expand(pad, -1, -1, -1)])
++    total = frames + pad
++    height, width = int(stack.shape[-2]), int(stack.shape[-1])
++    grid_t, grid_h, grid_w = total // t, height // p, width // p
++    mean = torch.tensor(s.mean) * (1.0 / s.rescale)
++    std = torch.tensor(s.std) * (1.0 / s.rescale)
++    x = stack.to(torch.float32)
++    x = (x - mean[None, :, None, None]) / std[None, :, None, None]
++    x = x.reshape(grid_t, t, 3, grid_h // m, m, p, grid_w // m, m, p)
++    x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)                # (grid_t, gh/m, gw/m, m, m, 3, t, p, p)
++    x = x.reshape(grid_t * grid_h * grid_w, 3 * t * p * p)
++    rows = x.reshape(grid_t, grid_h * grid_w, 3 * t * p * p)
++    out = []
++    for g in range(grid_t):
++        digest = hashlib.sha256(VERSION)
++        digest.update(s.key())
++        digest.update(json.dumps([1, grid_h, grid_w, total, g]).encode())
++        digest.update(stack[g * t:(g + 1) * t].numpy().tobytes())
++        out.append(Prepared(rows[g].contiguous(), (1, grid_h, grid_w), grid_h * grid_w // (m * m),
++                            digest.digest(), (height, width)))
++    return out
++
++
++def _av():
++    try:
++        import av
++    except ImportError:
++        raise VisionError("video inputs require PyAV (pip install av)") from None
++    return av
++
++
++def decode_video(data: bytes, lim: VideoLimits, deadline: float, s: Settings,
++                 max_tokens: int) -> tuple[list[Prepared], list[float]]:
++    """One video's bytes -> its temporal groups and their timestamps.
++
++    The sampled frames are decoded and scaled straight to the canvas, so memory follows the canvas and the frame
++    count rather than the source resolution. Everything after ``wanted[-1]`` is dropped, and a decode that outlives
++    its deadline is an error rather than a hung request.
++    """
++
++    import numpy as np
++    import torch
++
++    stream = None
++    try:
++        with _av().open(io.BytesIO(data), mode="r") as container:
++            if not container.streams.video:
++                raise VisionError("the video has no video stream")
++            stream = container.streams.video[0]
++            stream.thread_type = "AUTO"
++            height = int(stream.codec_context.height or 0)
++            width = int(stream.codec_context.width or 0)
++            if min(width, height) <= 0 or max(width, height) > lim.max_dimension:
++                raise VisionError("video dimensions are missing or exceed the pixel limit")
++            rate = stream.average_rate or stream.guessed_rate or 0
++            source_fps = float(rate)
++            seconds = float(stream.duration * stream.time_base) if stream.duration else (
++                container.duration / 1e6 if container.duration else 0.0)
++            total = int(stream.frames or round(seconds * source_fps))
++            if total < 1:
++                raise VisionError("the video's frame count is missing")
++            if total / source_fps > lim.max_seconds:
++                raise VisionError(f"videos are limited to {lim.max_seconds / 60:.0f} minutes")
++            wanted = sample_indices(total, source_fps, lim)
++            target_h, target_w, content_h, content_w = video_canvas(height, width, len(wanted), s, max_tokens)
++            keep = set(wanted)
++            frames: list = []
++            for n, frame in enumerate(container.decode(stream)):
++                if n > wanted[-1]:
++                    break
++                if time.monotonic() >= deadline:
++                    raise VisionError("video decoding exceeds the time limit")
++                if n in keep:
++                    rgb = frame.to_ndarray(format="rgb24")                  # native size, no scaler of PyAV's own
++                    if rgb.shape[0] != height or rgb.shape[1] != width:
++                        rgb = rgb[:height, :width]
++                    img = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).contiguous()
++                    frames.append(fit_frames(img[None], target_h, target_w, content_h, content_w)[0])
++    except VisionError:
++        raise
++    except (OSError, ValueError, MemoryError, RuntimeError) as exc:
++        raise VisionError(f"video bytes are invalid or unsupported ({type(exc).__name__}); use MP4 or WebM") \
++            from None
++    if len(frames) < 2:
++        raise VisionError("the video has fewer than two decodable frames")
++    stack = torch.stack(frames).contiguous()
++    groups = preprocess_groups(stack, s)
++    return groups, timestamps(wanted[:len(frames)], source_fps, len(groups))
++
++
++def load_video(source_data: bytes, s: Settings, lim: VideoLimits, deadline: float,
++               max_tokens: int) -> tuple[list[Prepared], list[float]]:
++    """One video's bytes -> its groups, bounded by the caller's remaining byte and time budget."""
++
++    return decode_video(source_data, lim, deadline, s, max_tokens)
++
++
++def video_structure(stamps: list[float]) -> str:
++    """``replace_video_token``'s prompt text: one ``<|begin_of_image|><|image|><|end_of_image|>{seconds} seconds``
++    per temporal group (``tokens`` image tokens each, which our ``expand`` writes as virtual rows), between the
++    video's own tokens. ``create_mm_token_type_ids`` needs the frame to tell a video from an image."""
++
++    body = "".join(f"{IMAGE_RUN}{stamp:.1f} seconds" for stamp in stamps)
++    return f"{VIDEO_BEGIN}{body}{VIDEO_END}"
++
++
++IMAGE_RUN = "<|begin_of_image|><|image|><|end_of_image|>"
++VIDEO_BEGIN = "<|begin_of_video|>"
++VIDEO_END = "<|end_of_video|>"
