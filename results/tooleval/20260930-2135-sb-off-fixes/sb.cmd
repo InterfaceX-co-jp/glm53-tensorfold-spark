@@ -1,0 +1,1 @@
+.venv/bin/python spark_bench.py eval --endpoint http://127.0.0.1:<port>/v1 --model GLM-5.3-Flash-EXL3 --label GLM53-TF-off-fixes --out-dir results/tooleval/20260930-2135-sb-off-fixes/sb --repeats 2 --temperature 0.3 --uncapped --timeout 0 --tier all --skip-throughput --thinking off 

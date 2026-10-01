@@ -7,9 +7,9 @@
   "TC-51 (Goal-Level Planning): Batched send_email with create_calendar_event in the same turn instead of waiting for the create_calendar_event result."
  ],
  "deployability": 86,
- "responsiveness": 78,
+ "responsiveness": 77,
  "total_scenarios": 69,
- "run_id": "2026-09-30T12-21-42.138358Z_f8ac1a1b",
+ "run_id": "2026-09-30T17-15-08.992392Z_1c9fedcd",
  "status": "completed",
  "config": {
   "model": "GLM-5.3-Flash-EXL3",
@@ -1019,11 +1019,11 @@
   "worst_category": "M Autonomous Planning (50%)",
   "worst_category_percent": 50,
   "deployability": 86,
-  "responsiveness": 78,
-  "median_turn_ms": 1308.0,
+  "responsiveness": 77,
+  "median_turn_ms": 1316.9,
   "alpha": 0.7,
-  "total_tokens": 405602,
-  "token_efficiency": 0.31
+  "total_tokens": 406830,
+  "token_efficiency": 0.3
  },
  "metadata": {
   "tool_version": "2.7.1.dev8+gc7b5b9550",

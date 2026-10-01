@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Walk-Run Cycle</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0e0f13;}
+  #app{position:fixed;inset:0;}
+  #hud{
+    position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
+    font-family:'Courier New',monospace;color:#c9cdd6;
+    background:rgba(14,15,19,.72);border:1px solid #2a2d36;
+    padding:10px 18px;border-radius:6px;font-size:14px;letter-spacing:2px;
+    user-select:none;pointer-events:none;
+  }
+  #hud b{color:#f0f2f6;}
+  #bar{
+    position:fixed;top:20px;left:50%;transform:translateX(-50%);
+    width:280px;height:4px;background:#23252d;border-radius:2px;overflow:hidden;
+  }
+  #bar span{display:block;height:100%;width:0;background:#d7dbe4;}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="bar"><span id="barFill"></span></div>
+<div id="hud">PHASE: <b id="phase">STAND</b> &nbsp;|&nbsp; t=<span id="tval">0.0</span>s / 10.0s</div>
+<script type="module">
+import * as THREE from './three.module.js';
+
+const CYCLE = 10.0;
+const clock = new THREE.Clock();
+let cycleT = 0;
+
+/* ---------- renderer / scene / camera ---------- */
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.getElementById('app').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0e0f13);
+scene.fog = new THREE.Fog(0x0e0f13, 14, 34);
+
+const camera = new THREE.PerspectiveCamera(42, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(0, 2.2, 9.5);
+camera.lookAt(0, 1.15, 0);
+
+/* ---------- lights ---------- */
+scene.add(new THREE.HemisphereLight(0x9aa3b5, 0x1a1c22, 0.85));
+const key = new THREE.DirectionalLight(0xffffff, 1.6);
+key.position.set(4, 8, 5);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.camera.left = -6; key.shadow.camera.right = 6;
+key.shadow.camera.top = 6;   key.shadow.camera.bottom = -6;
+key.shadow.camera.far = 25;
+key.shadow.bias = -0.0005;
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x88aaff, 0.5);
+rim.position.set(-6, 4, -4);
+scene.add(rim);
+
+/* ---------- treadmill-style ground ---------- */
+const ground = new THREE.Mesh(
+  new THREE.BoxGeometry(30, 0.4, 6),
+  new THREE.MeshStandardMaterial({ color:0x1b1d24, roughness:0.9 })
+);
+ground.position.y = -0.2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const beltMat = new THREE.MeshStandardMaterial({ color:0x2c2f3a, roughness:0.6 });
+const belt = new THREE.Mesh(new THREE.BoxGeometry(30, 0.06, 2.4), beltMat);
+belt.position.y = 0.03;
+belt.receiveShadow = true;
+scene.add(belt);
+
+/* belt stripes that scroll to imply motion */
+const stripes = [];
+const stripeMat = new THREE.MeshStandardMaterial({ color:0x4a4f5e, roughness:0.7 });
+for (let i = 0; i < 30; i++) {
+  const s = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.02, 2.2), stripeMat);
+  s.position.set(-15 + i * 1.0, 0.07, 0);
+  scene.add(s);
+  stripes.push(s);
+}
+
+/* side rails */
+const railMat = new THREE.MeshStandardMaterial({ color:0x3a3e4a, roughness:0.5, metalness:0.3 });
+for (const z of [-1.35, 1.35]) {
+  const rail = new THREE.Mesh(new THREE.BoxGeometry(30, 0.1, 0.12), railMat);
+  rail.position.set(0, 0.1, z);
+  scene.add(rail);
+}
+
+/* ---------- low-poly humanoid ---------- */
+const skin  = new THREE.MeshStandardMaterial({ color:0xd9b38c, roughness:0.75, flatShading:true });
+const shirt = new THREE.MeshStandardMaterial({ color:0x3e6b8f, roughness:0.8,  flatShading:true });
+const pants = new THREE.MeshStandardMaterial({ color:0x2f3340, roughness:0.85, flatShading:true });
+const shoe  = new THREE.MeshStandardMaterial({ color:0x1a1a1f, roughness:0.6,  flatShading:true });
+
+function limbMesh(w, h, d, mat) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.castShadow = true;
+  return m;
+}
+
+const figure = new THREE.Group();
+scene.add(figure);
+
+/* torso */
+const torso = limbMesh(0.62, 0.85, 0.34, shirt);
+torso.position.y = 1.32;
+figure.add(torso);
+
+/* hips */
+const hips = limbMesh(0.55, 0.25, 0.32, pants);
+hips.position.y = 0.82;
+figure.add(hips);
+
+/* head */
+const head = limbMesh(0.34, 0.38, 0.34, skin);
+head.position.y = 2.02;
+figure.add(head);
+
+/* arm pivot helper: pivot at shoulder, geometry hangs below */
+function makeArm(side) {
+  const pivot = new THREE.Group();
+  pivot.position.set(0.40 * side, 1.66, 0);
+  const upper = limbMesh(0.16, 0.55, 0.16, shirt);
+  upper.position.y = -0.275;
+  pivot.add(upper);
+  const fore = limbMesh(0.14, 0.45, 0.14, skin);
+  fore.position.y = -0.72;
+  pivot.add(fore);
+  figure.add(pivot);
+  return pivot;
+}
+const armL = makeArm(-1);
+const armR = makeArm(1);
+
+/* leg pivot helper: pivot at hip, geometry hangs below */
+function makeLeg(side) {
+  const pivot = new THREE.Group();
+  pivot.position.set(0.16 * side, 0.78, 0);
+  const thigh = limbMesh(0.20, 0.55, 0.20, pants);
+  thigh.position.y = -0.275;
+  pivot.add(thigh);
+  const shin = limbMesh(0.17, 0.45, 0.17, pants);
+  shin.position.y = -0.72;
+  pivot.add(shin);
+  const foot = limbMesh(0.19, 0.10, 0.34, shoe);
+  foot.position.set(0, -0.98, 0.06);
+  pivot.add(foot);
+  figure.add(pivot);
+  return pivot;
+}
+const legL = makeLeg(-1);
+const legR = makeLeg(1);
+
+/* ---------- phase helpers ---------- */
+function phaseOf(t) {
+  if (t < 2)  return { name:'STAND',  local:t,        dur:2 };
+  if (t < 5)  return { name:'WALK',   local:t - 2,     dur:3 };
+  if (t < 8)  return { name:'RUN',    local:t - 5,     dur:3 };
+  return       { name:'STAND',  local:t - 8,     dur:2 };
+}
+
+const phaseEl = document.getElementById('phase');
+const tEl = document.getElementById('tval');
+const barFill = document.getElementById('barFill');
+let lastName = '';
+
+/* ---------- animation ---------- */
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  cycleT = (cycleT + dt) % CYCLE;
+
+  const p = phaseOf(cycleT);
+  const u = p.local / p.dur;
+
+  /* smooth blend factor: 0 = stand pose, 1 = locomotion pose */
+  let blend = 0;
+  if (p.name === 'WALK' || p.name === 'RUN') blend = 1;
+  else blend = p.name === 'STAND' ? (p.local < p.dur / 2 ? 1 - p.local / (p.dur / 2) * 0 : 0) : 0;
+  /* ease stand->move at entry and move->stand at exit of each stand block */
+  if (p.name === 'STAND') {
+    const half = p.dur / 2;
+    if (p.local < half) {
+      /* first stand: ramp from 0 up quickly (start) */
+      blend = Math.min(1, p.local / 0.4) * 0; /* stays 0; pose handled by walk/run below */
+      blend = 0;
+    } else {
+      /* second stand: ramp down from running */
+      const e = (p.local - half) / half; // 0..1
+      blend = 1 - smooth(e);
+    }
+  }
+  /* For the FIRST stand block we want blend 0 (idle). For the SECOND, blend decays from 1. */
+
+  const running = p.name === 'RUN';
+  const walking = p.name === 'WALK';
+
+  /* locomotion params */
+  const freq   = running ? 7.5 : 4.4;          // stride frequency (rad/s scale)
+  const amp    = running ? 1.05 : 0.62;        // leg swing amplitude (rad)
+  const armAmp = running ? 1.15 : 0.55;        // arm swing amplitude (rad)
+  const lean   = running ? 0.22 : 0.05;        // forward lean (rad)
+  const bounce = running ? 0.09 : 0.035;       // vertical bob
+
+  const ph = p.local * freq;
+
+  /* idle breathing for stand */
+  const idleSway = Math.sin(p.local * 1.6) * 0.02;
+  const breathe  = Math.sin(p.local * 2.2) * 0.012;
+
+  /* target angles */
+  let legLx = 0, legRx = 0, armLx = 0, armRx = 0, kneeL = 0, kneeR = 0, elbowL = 0, elbowR = 0;
+  let bobY = 0, leanX = 0;
+
+  if (walking || running) {
+    legLx =  Math.sin(ph) * amp;
+    legRx = -Math.sin(ph) * amp;
+    armLx = -Math.sin(ph) * armAmp;
+    armRx =  Math.sin(ph) * armAmp;
+    /* knees bend when leg swings back -> forward transition */
+    kneeL = Math.max(0, -Math.sin(ph - 0.9)) * (running ? 1.5 : 0.85);
+    kneeR = Math.max(0,  Math.sin(ph - 0.9)) * (running ? 1.5 : 0.85);
+    elbowL = -(0.25 + Math.max(0, Math.sin(ph)) * (running ? 0.9 : 0.35));
+    elbowR = -(0.25 + Math.max(0, -Math.sin(ph)) * (running ? 0.9 : 0.35));
+    bobY = Math.abs(Math.cos(ph)) * bounce - bounce * 0.5;
+    leanX = lean;
+  } else {
+    legLx = idleSway * 0.4; legRx = -idleSway * 0.4;
+    armLx = idleSway;       armRx = -idleSway;
+    elbowL = elbowR = -0.15;
+    bobY = breathe;
+    leanX = 0;
+  }
+
+  /* blend locomotion -> stand for the trailing stand block */
+  if (p.name === 'STAND' && p.local >= p.dur / 2) {
+    const b = blend; // 1 -> 0
+    legLx = legLx * 0 + (Math.sin(ph) * amp) * b;
+    legRx = legRx * 0 + (-Math.sin(ph) * amp) * b;
+    armLx = (-Math.sin(ph) * armAmp) * b;
+    armRx = ( Math.sin(ph) * armAmp) * b;
+    kneeL = Math.max(0, -Math.sin(ph - 0.9)) * (running ? 1.5 : 0.85) * b;
+    kneeR = Math.max(0,  Math.sin(ph - 0.9)) * (running ? 1.5 : 0.85) * b;
+    elbowL = -(0.15 + 0.1 * b);
+    elbowR = -(0.15 + 0.1 * b);
+    bobY = Math.abs(Math.cos(ph)) * bounce * b - bounce * 0.5 * b + breathe;
+    leanX = lean * b;
+    /* keep locomotion phase running during decay so limbs settle smoothly */
+  }
+
+  /* apply pose */
+  legL.rotation.x = legLx;
+  legR.rotation.x = legRx;
+  armL.rotation.x = armLx;
+  armR.rotation.x = armRx;
+
+  /* knees/elbows as secondary rotation on shin/forearm groups:
+     we rotate the child shin mesh around its top — approximate by rotating
+     the shin about a pivot. Simplest: rotate shin mesh position-adjusted. */
+  applyKnee(legL, kneeL);
+  applyKnee(legR, kneeR);
+  applyElbow(armL, elbowL);
+  applyElbow(armR, elbowR);
+
+  figure.position.y = bobY;
+  figure.rotation.x = leanX;
+
+  /* belt scroll speed matches gait */
+  const beltSpeed = (walking ? 1.6 : running ? 4.2 : (p.name === 'STAND' && p.local >= 1 ? 4.2 * blend : 0));
+  for (const s of stripes) {
+    s.position.x -= beltSpeed * dt;
+    if (s.position.x < -15) s.position.x += 30;
+  }
+
+  /* HUD */
+  if (p.name !== lastName) { phaseEl.textContent = p.name; lastName = p.name; }
+  tEl.textContent = cycleT.toFixed(1);
+  barFill.style.width = (cycleT / CYCLE * 100) + '%';
+
+  renderer.render(scene, camera);
+}
+
+/* knee bend: rotate shin + foot around knee joint (top of shin) */
+function applyKnee(pivot, angle) {
+  const shin = pivot.children[1];
+  const foot = pivot.children[2];
+  /* pivot point at top of shin: y = -0.5 relative to pivot */
+  const py = -0.5;
+  shin.position.set(0, 0, 0);
+  foot.position.set(0, -0.48, 0.06);
+  const g = new THREE.Group();
+  /* cheap approach: rotate each child about (0, py, 0) */
+  rotateAboutY(shin, py, angle);
+  rotateAboutY(foot, py, angle);
+}
+function rotateAboutY(obj, py, angle) {
+  /* rotate obj around horizontal X axis passing through y=py in parent space */
+  const c = Math.cos(angle), s = Math.sin(angle);
+  const y = obj.position.y, z = obj.position.z;
+  obj.position.y = py + (y - py) * c - (z - 0) * s * 0 + 0; /* keep simple: only y-rot of x-axis rotation */
+  obj.position.z = (z) * c + (y - py) * s;
+  obj.rotation.x = angle;
+}
+/* recompute properly: rotation about X axis through point (0, py, 0):
+   y' = py + (y-py)cosA - z sinA ; z' = (y-py)sinA + z cosA */
+function applyElbow(pivot, angle) {
+  const fore = pivot.children[1];
+  const py = -0.55;
+  const y = fore.position.y, z = fore.position.z;
+  const c = Math.cos(angle), s = Math.sin(angle);
+  fore.position.y = py + (y - py) * c - z * s;
+  fore.position.z = (y - py) * s + z * c;
+  fore.rotation.x = angle;
+}
+
+function smooth(x) { return x * x * (3 - 2 * x); }
+
+/* fix rotateAboutY to correct formula */
+function rotateAboutYFix(obj, py, angle) {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  const y = obj.position.y, z = obj.position.z;
+  obj.position.y = py + (y - py) * c - z * s;
+  obj.position.z = (y - py) * s + z * c;
+  obj.rotation.x = angle;
+}
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* reset base offsets once so knee/elbow math is stable */
+legL.children[1].position.y = -0.5; legL.children[1].position.z = 0;
+legR.children[1].position.y = -0.5; legR.children[1].position.z = 0;
+legL.children[2].position.y = -0.48; legL.children[2].position.z = 0.06;
+legR.children[2].position.y = -0.48; legR.children[2].position.z = 0.06;
+armL.children[1].position.y = -0.55; armL.children[1].position.z = 0;
+armR.children[1].position.y = -0.55; armR.children[1].position.z = 0;
+
+/* pre-rotate base positions captured: store originals */
+function storeBase(pivot) {
+  pivot.userData.base = pivot.children.map(c => ({ y: c.position.y, z: c.position.z }));
+}
+[legL, legR, armL, armR].forEach(storeBase);
+
+/* rewrite applyKnee/applyElbow using stored bases */
+function applyJoint(pivot, angle, isLeg) {
+  const idx = isLeg ? [1, 2] : [1];
+  const py = isLeg ? -0.5 : -0.55;
+  for (const i of idx) {
+    const c0 = pivot.userData.base[i];
+    const obj = pivot.children[i];
+    const c = Math.cos(angle), s = Math.sin(angle);
+    obj.position.y = py + (c0.y - py) * c - c0.z * s;
+    obj.position.z = (c0.y - py) * s + c0.z * c;
+    obj.rotation.x = angle;
+  }
+}
+/* override earlier helpers */
+applyKnee = (p, a) => applyJoint(p, a, true);
+applyElbow = (p, a) => applyJoint(p, a, false);
+
+animate();
+</script>
+</body>
+</html>

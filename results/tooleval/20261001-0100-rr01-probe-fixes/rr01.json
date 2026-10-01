@@ -1,0 +1,160 @@
+{
+ "null": [
+  [
+   null,
+   false,
+   [
+    "ps -o pid=,ppid=,user=,state=,comm=,args= -p 4218"
+   ]
+  ],
+  [
+   1,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   2,
+   false,
+   [
+    "ps -o pid=,ppid=,user=,state=,comm=,args= -p 4218"
+   ]
+  ],
+  [
+   3,
+   false,
+   [
+    "kill -TERM 4218 && echo \"SIGTERM sent to 4218\""
+   ]
+  ],
+  [
+   4,
+   false,
+   [
+    "ps -o pid=,ppid=,user=,state=,comm=,args= -p 4218"
+   ]
+  ],
+  [
+   5,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   6,
+   false,
+   [
+    "kill -TERM 4218 && echo \"SIGTERM sent to 4218\""
+   ]
+  ],
+  [
+   7,
+   false,
+   [
+    "kill -TERM 4218 && echo \"SIGTERM sent to 4218\""
+   ]
+  ],
+  [
+   8,
+   false,
+   [
+    "ps -o pid=,ppid=,user=,state=,args= -p 4218"
+   ]
+  ],
+  [
+   9,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   10,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ]
+ ],
+ "None-literal": [
+  [
+   null,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   1,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   2,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   3,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   4,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   5,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   6,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   7,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   8,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   9,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ],
+  [
+   10,
+   true,
+   [
+    "kill -TERM 4218"
+   ]
+  ]
+ ]
+}

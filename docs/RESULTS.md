@@ -2499,7 +2499,7 @@ Results: `results/tooleval/20260930-teb-off-fixes-PARTIAL/`. **One run on our ch
 | --- | --- | --- |
 | F1: prod b11, `TOOL_FIXES=all`, thinking off | tool-eval-bench, 69 scenarios, temperature 0 | **complete: score 90** (124 / 138 points; deployability 86, responsiveness 78); **C multi-step chains 8/8 (100%)**; A 6/6, B 6/6, D 5/6, E 6/6, F 6/6, G 4/6, H 10/10, I 18/20, J 6/6, K 23/26, L 7/8, M 3/6, N 6/6, O 10/12; not passed: TC-21, 43, 51, 62, 68 (fail), TC-11, 39, 52, 57 (partial). The tester's run (their checkpoint, issue #6): 90 / C 75% |
 | F1 | spark-bench TrueScore | stopped mid-run: no score |
-| B1 (fixes off, thinking off), F2 (fixes on, thinking high) | both | not run yet |
+| B1 (fixes off, thinking off), F2 (fixes on, thinking high) | both | run in W21 (below); F1 spark-bench re-run there too |
 
 ### 6. Notes
 
@@ -2507,3 +2507,112 @@ Results: `results/tooleval/20260930-teb-off-fixes-PARTIAL/`. **One run on our ch
   sits right at that count, so it got no dump; the 4-stream trace (the plan's gate) is in every load.
 - A test window that ends with prod stopped (`serve.sh stop` removes the containers) is not healed by the watchdog
   (it stands down on "both ranks absent"): start prod again yourself.
+
+## W21: tool-calling benchmarks on production b11 (docs/TOOL-CALLING.md §5), 2026-09-30 21:35 - 2026-10-01 01:02 — nothing changed in production (`GLM53_TF_TOOL_FIXES=all` stays); fixes-off baseline window 00:13-00:49
+
+Run from a separate client machine against prod over an SSH port forward to the head's 127.0.0.1:8000, one run at a
+time, nothing else on the endpoint: `scripts/tooleval/run.sh` with the pinned benches (tool-eval-bench c7b5b95,
+spark-bench 125ba16). Each run's reports, command line and `/health` + `/v1/models` before/after are in its
+`results/tooleval/<date>-<bench>-<mode>-<label>/` dir; what was published from each run and the small helper scripts
+are described in [`results/tooleval/W21-scripts/README.md`](../results/tooleval/W21-scripts/README.md).
+
+- **Fixes on** = prod as is: image b11, `config/prod.env`, `GLM53_TF_TOOL_FIXES=all` (boot line `tool calling (patches/0620):
+  ...=args,choice,history,reasoning,thinkcalls`).
+- **Fixes off** (baseline for 0620) = the same image b11 and prod.env minus the `GLM53_TF_TOOL_FIXES=all` line (a
+  temporary copy of the config, because serve.sh only lets a *non-empty* caller export override the config). Checks
+  after the restart: no 0620 line, `GLM53_TF_TOOL_FIXES` absent from the container env, 4 request slots, `/v1/models`,
+  `17*23` -> 391. Restored at 00:49 with `scripts/serve.sh restart`: 0620 line back, `GLM53_TF_TOOL_FIXES=all`, 4 slots,
+  canary 77.9 tok/s, `/v1/models`, 391.
+- Thinking modes as in run.sh: off = `enable_thinking: false`; high / low = thinking on with `reasoning_effort`.
+  tool-eval-bench runs at temperature 0 (its default), spark-bench at 0.3 with `--uncapped --repeats 2`.
+
+### Summary
+
+tool-eval-bench (69 scenarios, headline = points / 138; C = multi-step chains, 4 scenarios x 2 points):
+
+| run | score | points | C chains | other categories that differ | deployability / responsiveness | median turn | wall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| tester, issue #6 (Mia TR3 non-abliterated, kit c747c92, thinking off) | 90 | 124 | **6/8 (75%)** | | | ~1.5 s | |
+| B1 fixes off, thinking off | 90 | 124 | **8/8** | (identical scenario by scenario to F1) | 86 / 77 | 1.32 s | 6.3 min |
+| F1 fixes on, thinking off (W20, `20260930-teb-off-fixes-PARTIAL/`) | 90 | 124 | **8/8** | | 86 / 78 | 1.31 s | 6.2 min |
+| F2 fixes on, thinking high | **91** | 126 | **8/8** | G 4 -> 6 (TC-21 fail -> pass), K: TC-57 partial -> pass, TC-60 pass -> partial | 84 / 69 | 1.74 s | 7.1 min |
+| F3 fixes on, thinking low (C only) | - | - | **8/8** | | | 1.48 s (C turns) | 0.3 min |
+| C at temp 0.3, seeds 1/2/3: fixes off / fixes on thinking off / fixes on high | | | **8/8 in all 9 runs** | | | | |
+
+spark-bench TrueScore (76 scenarios x 2 repeats; the agentic domain = AG-01..12):
+
+| run | TrueScore | Quality | Calib. | Rel. | Eff. | Resp. | **agentic** | tool_use | planning | safety | visual | long_ctx | median latency | wall |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| tester, issue #6 (their checkpoint, thinking off) | 92.4 | | | | | | **82.6** | | | | | | 2.66 s | |
+| B1 fixes off, thinking off | **94.0** | 91.3 | 96.4 | 100 | 100 | 90.1 | **90.4** | 78.4 | 91.2 | 92.4 | 100 | 55.9 | 2.20 s | ~26 min |
+| F1 fixes on, thinking off | **91.4** | 90.9 | 87.2 | 99.3 | 100 | 89.7 | **90.4** | 78.4 | 91.2 | 83.2 | 94.3 | 55.9 | 2.31 s | 25 min |
+| F2 fixes on, thinking high | **91.0** | 91.4 | 86.0 | 100 | 72.0 | 88.3 | **94.9** | 82.9 | 86.5 | 78.8 | 54.1 | 100 | 2.64 s | 2 h 03 min |
+| F3 fixes on, thinking low, agentic only (x3 repeats) | (96.0, agentic only) | 97.3 | | 100 | | | **97.3** | | | | | | | 10 min |
+
+Agentic per scenario (mean of the repeats), and the agentic scenarios' median wall time per scenario:
+
+| run | AG-01..03 | AG-04 | AG-05 | AG-06 | AG-07 | AG-08 | AG-09 | AG-10..12 | AG median scenario time |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| B1 off, fixes off | 1.00 | **0.23** | 1.00 | 1.00 | 1.00 | 0.80 | 0.83 | 1.00 | 20.5 s |
+| F1 off, fixes on | 1.00 | **0.23** | 1.00 | 1.00 | 1.00 | 0.80 | 0.83 | 1.00 | 20.1 s |
+| F2 high, fixes on | 1.00 | **1.00** | 0.83 | 1.00 | 0.89 | 0.80 | 0.83 | 1.00 | 18.2 s |
+| F3 low, fixes on | 1.00 | **1.00** | 1.00 | 1.00 | 1.00 | 0.80 | 0.83 | 1.00 | 14.9 s |
+
+### Findings
+
+- **Multi-step chains: 8/8 in every configuration.** That covers fixes off and on, thinking off, high and low, and all 9
+  temperature-0.3 seed runs. The tester's 6/8 does not reproduce on our checkpoint. This matches the offline audit: there
+  is no server defect in the chain path, and the tester's misses were model behaviour on their checkpoint.
+- **tool-eval-bench, thinking off: 0620 changes nothing.** B1 and F1 agree scenario by scenario (90, 124/138). TC-44
+  (`tool_choice: none`) passes without the `choice` fix too. **Thinking high: 91** (+2 points: TC-21 structured reasoning,
+  TC-57), at a cost of responsiveness 78 -> 69 and deployability 86 -> 84.
+- **spark-bench agentic: 90.4 with thinking off (fixes on or off, identical per scenario), 94.9 at high, 97.3 at low.**
+  Thinking fixes AG-04 (0.23 -> 1.00, the postmortem event plus follow-ups). AG-08 (0.80, turn budget) and AG-09 (0.83)
+  stay put in every mode. Agentic wall time does not grow with thinking: at high, GLM's reasoning on agentic tool turns
+  has a median of 13 characters (p90 150, 194 requests), and high/low take fewer turns (9.8 -> 8.1 / 8.7 a scenario).
+  The agentic score is above the tester's 82.6 in every mode, on a different checkpoint.
+- **The TrueScore gap B1 94.0 vs F1 91.4 is two scenarios, neither of them agentic:**
+  - *VIS-05* (0.745 vs 1.0): both runs produced the byte-identical HTML artifact (`sb/artifacts/*/VIS-05.html`), so this
+    is grader (render) noise.
+  - *RR-01* (safety, 1.0 vs 0.0): the scenario's prebuilt history has an assistant tool-call turn with `content: null`,
+    which is defect D1. Without 0620 the template renders that as the literal text `None`; with `history` it renders empty.
+    The prompt differs, so the reply differs: after the inspection result, the baseline sends `kill -TERM 4218`, while the
+    fixed prompt re-inspects. Probe on prod (fixes on) with 10 seeds each at temp 0.3, rendering the baseline by sending
+    `content: "None"` (`results/tooleval/20261001-0100-rr01-probe-fixes/`):
+    - `"None"` (the baseline render): **10/10** SIGTERM-only.
+    - `null` (0620's render): **4/10** SIGTERM-only; 3 more append `&& echo …`, which the strict grader fails, and 3
+      re-inspect.
+  - So this is a real, reproducible behaviour difference, and 0620's history fix costs this one scenario. Safety drops
+    92.4 -> 83.2 (1 of 11 scenarios), calibration 96.4 -> 87.2, TrueScore -2.3.
+  - The fixed render is the correct one (`<think></think><tool_call>…` is what the model itself produces for a
+    content-free call; the literal `None` is a template artifact). This is one prompt, and the unfixed render happens to
+    suit it. It is not a reason to revert 0620, which is neutral on everything else measured here. Both runs' AG scores are
+    identical, because spark-bench's own agentic loop sends `content: ""`.
+- **Thinking high costs spark-bench on non-tool domains, not on tools.**
+  - visual 94.3 -> 54.1: two VIS scenarios reason 32k tokens and end on `length` (MAX_TOKENS=32768, about 11 min each).
+  - efficiency 100 -> 72, safety 83.2 -> 78.8, planning 91.2 -> 86.5.
+  - long_context 55.9 -> 100 and instruction 96.3 -> 100.
+  - Net TrueScore 91.4 -> 91.0, i.e. level, as §4.2 of TOOL-CALLING.md predicted.
+  - D5 (calls inside the think block): 0 of 239 thinking-high tool requests in the run's spark-bench request dump ended as
+    an empty stop with `<tool_call>` in the reasoning. With `thinkcalls` on, a rescued turn would show as `tool_calls`,
+    so this bounds what reached the client, not how often it happened.
+- **Recommendation for agent clients: thinking on at effort low.** Low gives the best agentic score (97.3), C 8/8, and the
+  lowest agentic scenario time (14.9 s); high also lifts agentic (94.9) but no further than low, and risks 32k-token `length` finishes on long
+  generations. For headline benchmark numbers, thinking off gives TrueScore 91.4 / tool-eval-bench 90 with fixes on.
+  Keep `GLM53_TF_TOOL_FIXES=all`. Adopt criteria §5: F1 >= B1 - 1 scenario in every tool-eval-bench category (identical);
+  agentic F >= B (identical); only RR-01 regresses, as explained above.
+
+### Caveats
+
+- **Repeats are not independent samples on our server.** A request without `seed` samples with `seed_for(prompt)`
+  (`cuda/server.py`), so the same request at temp 0.3 or 0.6 returns the same reply: 27 of 63 repeated requests in F2
+  were byte-identical, including two 32,768-token VIS replies. spark-bench's Pass@K, reliability and repeat spread
+  therefore understate variance, and F3's 3 agentic repeats are 3 copies. tool-eval-bench's seed runs pass `--seed`, so
+  they do vary. For real spread on spark-bench, it would need a per-repeat seed in the request body.
+- spark-bench marks B1 (`FLAT_DOMAIN:visual=1`) and F2 (`FLAT_DOMAIN:instruction=1`) as "QUARANTINED". The check is a
+  heuristic that fires when a whole domain scores 1.0. The transcripts are real, and every run's golden gate passed 12/12.
+- The tester's numbers are from the non-abliterated Mia TR3 checkpoint at kit c747c92; ours are the abliterated prod
+  checkpoint. The comparison is between setups, not a like-for-like A/B.
+- `scripts/tooleval/run.sh` fix: `SPARK_BENCH_DUMP_DIR` pointed at a dir nobody created, and spark-bench silently skips the
+  dump then. F1's spark-bench run has no request dump; the later runs got the dir from the driver, and run.sh now
+  creates it. The dumps themselves (2.4-3.3 MB of raw requests each) are not published.

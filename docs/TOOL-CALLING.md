@@ -1,7 +1,7 @@
 # Tool calling: multi-step chains on our stack (issue #6), patch 0620, and a benchmark plan
 
-Written 2026-09-30, offline (host tests only; the one benchmark run on the W20 production server is in
-`results/tooleval/20260930-teb-off-fixes-PARTIAL/`: tool-eval-bench 90, multi-step chains 8/8). Scope: **multi-step tool chains** (tool-eval-bench category C) and spark-bench's
+Written 2026-09-30, offline (host tests only). The §5 benchmark runs on production followed in W21: results and the
+recommended client settings are in **§7** (tool-eval-bench 90 / 90 / 91, multi-step chains 8/8 in every configuration). Scope: **multi-step tool chains** (tool-eval-bench category C) and spark-bench's
 **agentic** domain. The safety category, TC-43 and the abliteration trade-off are left out on purpose.
 
 ## 1. Summary
@@ -280,7 +280,7 @@ Validation:
 - **The tester's checkpoint differs from ours** (Mia TR3 against the abliterated one), so their numbers are not our
   baseline. §5 measures ours.
 
-## 5. Test plan (once the Sparks are free: after W20, prod restored)
+## 5. Test plan (run in W21: results in §7)
 
 Runner: `scripts/tooleval/run.sh {setup | teb | sb | both | chains} {off | low | high} [label]`.
 - Defaults: `BASE_URL=http://127.0.0.1:8000/v1`, `MODEL=GLM-5.3-Flash-EXL3`.
@@ -342,3 +342,52 @@ Separately, recommend the thinking setting to clients from B2/B3/F2/F3 (quality 
   `GLM53_TF_TOKENIZER_DIR=<ckpt tokenizer dir> PYTHONPATH=<tree>/src pytest -q`.
 - `scripts/tooleval/run.sh`: installs and runs both benchmarks.
 - `docs/PATCHES.md`: the 0620 row, section and tests entry.
+
+## 7. Results (W21, production b11)
+
+Full tables, per-scenario numbers and caveats: [docs/RESULTS.md](RESULTS.md) W21; run folders under `results/tooleval/`
+([what is published](../results/tooleval/W21-scripts/README.md)). One run per configuration on our abliterated
+checkpoint; tool-eval-bench at temperature 0, spark-bench at 0.3 with 2 repeats.
+
+| configuration | tool-eval-bench | chains (C) | spark-bench TrueScore | agentic |
+| --- | --- | --- | --- | --- |
+| fixes off, thinking off (B1) | 90 | 8/8 | 94.0 | 90.4 |
+| fixes on, thinking off (F1) | 90 | 8/8 | 91.4 | 90.4 |
+| fixes on, thinking high (F2) | 91 | 8/8 | 91.0 | 94.9 |
+| fixes on, thinking low (F3, C + agentic only) | - | 8/8 | - | **97.3** |
+
+Category C was also 8/8 in all 9 temperature-0.3 runs with `--seed 1/2/3` (fixes off, fixes on with thinking off, fixes
+on at high).
+
+**Recommendation.**
+- **Agent work: thinking on at effort low.** It gives the best agentic score (97.3), chains 8/8, and the fastest
+  agentic runs (median 14.9 s a scenario, against 20.1 s thinking off and 18.2 s at high). Thinking fixes AG-04 (0.23 ->
+  1.00) at either effort.
+- **High effort** also helps agentic (94.9) and tool-eval-bench (91), but long generations can reason up to the 32k
+  `MAX_TOKENS` cap and end on `length`: two of spark-bench's visual scenarios did (visual 94.3 -> 54.1), which pulls
+  the TrueScore back to level (91.0).
+- **Thinking off** remains the setting for headline numbers comparable to the tester's (tool-eval-bench 90, TrueScore
+  91.4 with fixes on).
+- **Keep the 0620 fixes on** (`GLM53_TF_TOOL_FIXES=all`). With thinking off, fixes on and off are identical scenario by
+  scenario on tool-eval-bench and on spark-bench's agentic domain.
+
+**Why fixes off scores higher on TrueScore (94.0 vs 91.4).** The gap is two non-agentic scenarios. VIS-05 produced the
+byte-identical HTML in both runs and was graded differently (grader noise). RR-01 (safety) is a real difference: its
+prebuilt history has an assistant tool-call turn with `content: null`. Without 0620 the template renders it as the text
+`None` (defect D1); with 0620 it renders empty, which matches what the model itself produces for a content-free call.
+The two prompts lead to different replies: re-sending the history on production with 10 seeds each, the `"None"`
+render gave the SIGTERM-only answer the grader wants 10/10, the empty render 4/10 (3 more appended `&& echo …`, which
+the strict grader fails, and 3 inspected the process again first). So the unfixed render happens to suit this one
+prompt. That costs one of spark-bench's 11 safety scenarios; nothing else measured moved, and the fix stays.
+
+**Seeds and spark-bench repeats.** A request without `seed` does not get a fresh random seed on our server: it samples
+with a seed derived from the prompt, so the same request at the same temperature returns the same reply. spark-bench
+sends no seed, so its repeats of a scenario are often identical (27 of 63 repeated requests in F2 were byte-identical),
+and its Pass@K, reliability and repeat spread understate the real variance. tool-eval-bench's seeded runs (`--seed N`)
+do vary. To measure spread with spark-bench, give each repeat its own `seed` in the request body.
+
+**Comparison with the independent tester (issue #6).** They ran kit `c747c92` with the non-abliterated Mia TR3
+checkpoint, thinking off: tool-eval-bench 90 with chains 6/8, TrueScore 92.4 with agentic 82.6. Our thinking-off runs
+give 90 with chains 8/8, TrueScore 91.4-94.0 and agentic 90.4. The checkpoints and the server versions differ, so this
+compares two setups, not the server alone; it does show that the chain misses do not reproduce on ours, in line with
+the audit in §3 that found no server defect on the chain path.
