@@ -1,0 +1,56 @@
+run_id,timestamp,tier,model,label,endpoint,topology,parallelism,context,batch,spec_decode,workload,metric,value,unit,notes
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:50:48,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,golden_gate,PASS,,golden gate PASSED: 12/12 cases
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:50:49,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,grader_git,125ba16,,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:50:49,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,served_model,GLM-5.3-Flash-EXL3,,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:50:49,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,preflight_tool_probe,PASS,,get_weather
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:50:49,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,request_policy,uncapped,,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:50:49,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,request_timeout,none,s,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:50:49,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,runaway_char_window,4096,characters,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:50:49,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,runaway_phrase_window,8192,characters,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:50:49,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,runaway_abort_backend,disconnect,,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,quarantine,clean,,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,verified_flat,none,,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,methodology,v6.8.0-full-uncapped,,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,run_valid,PASS,,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,error_rate,0.0,percent,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,repeats,3,count,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,pass_at_1,100.0,percent,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,pass_at_k,100.0,percent,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,reliability_gap,0.0,percent,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,score_stddev,0.07,frac,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,provenance,mean_scenario_stddev,0.0,frac,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,overall,truescore,96.0,score0-100,thinking=on
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,overall,capability_score,97.3,score0-100,thinking=on
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,overall,operational_score,70.0,score0-100,thinking=on
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,overall,quality,97.3,score0-100,thinking=on
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,overall,reliability,100.0,score0-100,thinking=on
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,overall,efficiency,100.0,score0-100,thinking=on
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,overall,responsiveness,57.2,score0-100,thinking=on
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,overall,median_latency,14.98,s,
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,overall,total_output_tokens,25170,tok,12 scenarios
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,agentic,domain_quality,97.3,score0-100,capability n=12
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,agentic,domain_reliability,100.0,score0-100,capability
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-01,score,1.0,frac,"agentic:agentic 6/6: ✓ 3+ weather checks, ✓ calendar che"
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-01,output_tokens,2370,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-02,score,1.0,frac,"agentic:agentic 6/6: ✓ calendar checked, ✓ event created"
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-02,output_tokens,2070,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-03,score,1.0,frac,"agentic:agentic 6/6: ✓ boston weather checked, ✓ calenda"
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-03,output_tokens,1671,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-04,score,1.0,frac,"agentic:agentic 7/7: ✓ calendar checked, ✓ postmortem ev"
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-04,output_tokens,3522,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-05,score,1.0,frac,"agentic:agentic 6/6: ✓ 3 weather checks, ✓ calendar chec"
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-05,output_tokens,2385,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-06,score,1.0,frac,"agentic:agentic 7/7: ✓ denver weather checked, ✓ boulder"
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-06,output_tokens,3120,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-07,score,1.0,frac,"agentic:agentic 9/9: ✓ all 4 cities' weather checked, ✓ "
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-07,output_tokens,2052,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-08,score,0.8,frac,"agentic:agentic 7/7: ✓ calendar retried after failure, ✓"
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-08,output_tokens,3093,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-09,score,0.833,frac,agentic:agentic 5/6: ✓ query with properly NESTED date_r
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-09,output_tokens,1074,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-10,score,1.0,frac,"agentic:agentic 8/8: ✓ denver + boulder weather checked,"
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-10,output_tokens,2211,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-11,score,1.0,frac,agentic:agentic 5/5: ✓ event titled with the buried code
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-11,output_tokens,810,tok,agentic
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-12,score,1.0,frac,"agentic:agentic 5/5: ✓ finance-ops emailed, ✓ FINAL amou"
+GLM53-TF-low-fixes-20261001-005003,2026-10-01T00:59:59,eval,GLM-5.3-Flash-EXL3,GLM53-TF-low-fixes,http://127.0.0.1:<port>/v1,unknown,1,,,na,AG-12,output_tokens,792,tok,agentic

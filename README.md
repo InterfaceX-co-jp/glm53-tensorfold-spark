@@ -22,6 +22,23 @@ included here. See [Licensing](#licensing).
 
 SPDX-License-Identifier: Apache-2.0 (this project's own code, scripts, benchmarks and docs; see [Licensing](#licensing)).
 
+## Tool calling (W21)
+
+Both tool-calling benchmarks from issue #6 on production (image b11, our abliterated checkpoint), with the 0620 fixes
+on and off and thinking off / high / low; one run per configuration. Details:
+[`docs/TOOL-CALLING.md` §7](docs/TOOL-CALLING.md#7-results-w21-production-b11), [`docs/RESULTS.md`](docs/RESULTS.md) W21.
+
+| configuration | tool-eval-bench | multi-step chains | spark-bench TrueScore | agentic |
+|---|---:|---:|---:|---:|
+| fixes off, thinking off | 90 | 8/8 | 94.0 | 90.4 |
+| fixes on, thinking off | 90 | 8/8 | 91.4 | 90.4 |
+| fixes on, thinking high | 91 | 8/8 | 91.0 | 94.9 |
+| fixes on, thinking low (chains + agentic only) | - | 8/8 | - | **97.3** |
+
+For agent clients: **thinking on at effort low** (best agentic score, fastest agentic runs). The fixes stay on; the
+fixes-off TrueScore lead is one safety scenario whose history renders differently without them (explained in §7).
+The independent tester's run (different checkpoint): tool-eval-bench 90, chains 6/8, TrueScore 92.4, agentic 82.6.
+
 ## What's new (W20)
 
 Patch 0620 (tool-calling fixes, 77 patches in total), test window W20 and a new 3-run RigMark. Production config
@@ -42,7 +59,7 @@ tool calls); `tool_choice: none` / a named function and `parallel_tool_calls: fa
 were typed by the first schema type only; complete calls at the end of an unclosed think block were dropped. Host
 only, same bits: requests without tools are untouched (every W20 hash equal). One tool-eval-bench run on production
 (thinking off, our abliterated checkpoint): **score 90, multi-step chains 8/8** (the tester's run on their checkpoint:
-90, chains 6/8). One partial run, not an average; spark-bench was stopped before it finished.
+90, chains 6/8). Full runs with fixes on / off and thinking off / high / low: [Tool calling (W21)](#tool-calling-w21).
 ([`docs/TOOL-CALLING.md`](docs/TOOL-CALLING.md), [`results/tooleval/`](results/tooleval/20260930-teb-off-fixes-PARTIAL/README.md))
 
 **RigMark, W20 production, 3 runs averaged** (Alex Ellis's [RigMark](https://github.com/alexellis/rigmark) standard
@@ -356,6 +373,7 @@ Long prompts refused or cut short: [Context smaller than expected](docs/TRYING.m
 
 ## Contents
 
+- [Tool calling (W21)](#tool-calling-w21)
 - [What's new (W20)](#whats-new-w20) (tool calling, RigMark 3-run)
 - [What's new (W19)](#whats-new-w19)
 - [What's new (2026-09-30)](#whats-new-2026-09-30)

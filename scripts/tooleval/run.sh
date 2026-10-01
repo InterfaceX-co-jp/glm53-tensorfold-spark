@@ -91,6 +91,7 @@ run_teb() {        # $1 = mode, $2 = dir, $3.. = extra args (scenario / category
 
 run_sb() {         # $1 = mode, $2 = dir, $3.. = extra args
     local mode=$1 dir=$2; shift 2
+    mkdir -p "$dir/sb-dump"   # spark-bench opens raw_dump.jsonl in it and silently skips the dump if the dir is missing
     [[ -x $CACHE/spark-bench/.venv/bin/python ]] || die "spark-bench not installed: scripts/tooleval/run.sh setup"
     local args=(eval --endpoint "$BASE_URL" --model "$MODEL" --label "GLM53-TF-$mode${LABEL:+-$LABEL}"
                 --out-dir "$dir/sb" --repeats "${SB_REPEATS:-2}" --temperature "${SB_TEMP:-0.3}"

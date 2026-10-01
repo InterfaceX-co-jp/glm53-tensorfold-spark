@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fig. 01 — Gait Study</title>
+<style>
+  :root{ --paper:#e9e2d5; --ink:#26201a; --rust:#c4552f; --ochre:#b3822c; --muted:#8a8177; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden}
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  canvas{display:block}
+  #hud{position:fixed;top:24px;left:26px;pointer-events:none;user-select:none}
+  .kicker{font-size:10px;letter-spacing:.24em;opacity:.5}
+  #phaseLabel{font-size:36px;font-weight:700;letter-spacing:.05em;margin-top:8px;transition:color .25s}
+  #phaseMeta{font-size:11px;letter-spacing:.08em;opacity:.6;margin-top:4px}
+  .bar{display:flex;gap:3px;margin-top:16px;width:252px;padding-bottom:15px}
+  .seg{position:relative;height:6px;background:rgba(38,32,26,.13)}
+  .seg i{position:absolute;left:0;top:0;bottom:0;width:0}
+  .seg:nth-child(1) i,.seg:nth-child(4) i{background:var(--muted)}
+  .seg:nth-child(2) i{background:var(--ochre)}
+  .seg:nth-child(3) i{background:var(--rust)}
+  .seg span{position:absolute;top:9px;left:0;font-size:8px;letter-spacing:.16em;opacity:.45;white-space:nowrap}
+  #caption{position:fixed;left:26px;bottom:20px;font-size:9px;letter-spacing:.2em;opacity:.4;pointer-events:none;user-select:none}
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="kicker">GAIT LOOP &middot; 10.0 S</div>
+  <div id="phaseLabel">STAND</div>
+  <div id="phaseMeta"></div>
+  <div class="bar">
+    <div class="seg" style="flex:2"><i></i><span>STAND</span></div>
+    <div class="seg" style="flex:3"><i></i><span>WALK</span></div>
+    <div class="seg" style="flex:3"><i></i><span>RUN</span></div>
+    <div class="seg" style="flex:2"><i></i><span>STAND</span></div>
+  </div>
+</div>
+<div id="caption">FIG. 01 &mdash; GAIT STUDY &middot; SIDE ELEVATION</div>
+
+<script type="module">
+import * as THREE from './three.module.js';
+
+/* ---------------- renderer / scene / camera ---------------- */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const PAPER = 0xe9e2d5;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(PAPER);
+scene.fog = new THREE.Fog(PAPER, 9, 26);
+
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, .1, 100);
+camera.position.set(.4, 1.6, 7.2);
+camera.lookAt(.15, .92, 0);
+
+/* ---------------- lights ---------------- */
+scene.add(new THREE.HemisphereLight(0xfff6e8, 0xcabda6, .85));
+const sun = new THREE.DirectionalLight(0xffffff, 1.7);
+sun.position.set(3.5, 6.5, 4.5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { near: 1, far: 16, left: -4, right: 4, top: 5, bottom: -2 });
+sun.shadow.camera.updateProjectionMatrix();
+sun.shadow.normalBias = .03;
+scene.add(sun);
+const fillLight = new THREE.DirectionalLight(0xfff2dd, .35);
+fillLight.position.set(-4, 2.5, -3);
+scene.add(fillLight);
+
+/* ---------------- materials & helpers ---------------- */
+const mat = c => new THREE.MeshStandardMaterial({ color: c, flatShading: true, roughness: .92, metalness: 0 });
+const M = {
+  rust: mat(0xc4552f), dark: mat(0x3a332c), cream: mat(0xefe6d8),
+  ink: mat(0x26201a), belt: mat(0x4a423a), deck: mat(0x2e2a26),
+};
+function box(w, h, d, m, x = 0, y = 0, z = 0) {
+  const g = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m);
+  g.position.set(x, y, z);
+  g.castShadow = g.receiveShadow = true;
+  return g;
+}
+
+/* ---------------- ground ---------------- */
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(60, 60),
+  new THREE.MeshStandardMaterial({ color: 0xdfd5c2, roughness: 1 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+/* ---------------- treadmill ---------------- */
+const BELT_TOP = .215;
