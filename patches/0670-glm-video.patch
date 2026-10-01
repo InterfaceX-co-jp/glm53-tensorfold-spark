@@ -1,0 +1,437 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/image_fetch.py b/src/tensorfold/families/glm5_next/cuda/image_fetch.py
+--- a/src/tensorfold/families/glm5_next/cuda/image_fetch.py
++++ b/src/tensorfold/families/glm5_next/cuda/image_fetch.py
+@@ -37,7 +37,12 @@
+ from urllib.parse import quote, urljoin, urlsplit
+ 
+ MEDIA_TYPES = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP", "image/gif": "GIF"}
++# patches/0670: the container formats a video may arrive in. ``_MEDIA_NAMES`` is how the two sets are named in a
++# message: the image wording is what tests/test_upstream_ports.py checks, so it is kept word for word.
++VIDEO_MEDIA_TYPES = {"video/mp4": "MP4", "video/webm": "WEBM", "video/quicktime": "MOV", "video/x-matroska": "MKV"}
++_MEDIA_NAMES = {"image": "JPEG, PNG, WebP or GIF", "video": "MP4, WebM, QuickTime or Matroska"}
+ _DNS_SLOTS = threading.BoundedSemaphore(4)
++_DOWNLOAD = threading.local()          # patches/0670: what this thread's download may be
+ _REDIRECTS = {301, 302, 303, 307, 308}
+ _SPECIAL_V4 = (ipaddress.ip_network("192.0.0.0/24"), ipaddress.ip_network("168.63.129.16/32"))
+ _SPECIAL_V6 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"),
+@@ -154,9 +159,22 @@
+     sock.close()
+ 
+ 
++def _media() -> tuple[dict[str, str], str]:
++    """patches/0670: (the content types, what to call them) for the download this thread is making.
++
++    A thread-local rather than another parameter of ``_request``: that call is what ``tests/test_upstream_ports.py``
++    replaces with a stub to walk redirects, rebinding and deadlines without a network, so an image download has to
++    keep making exactly the same one. ``fetch_image`` sets it and puts back what was there.
++    """
++
++    return getattr(_DOWNLOAD, "now", (MEDIA_TYPES, "image"))
++
++
+ def _request(scheme: str, host: str, port: int, target: str, addresses: list[tuple], max_bytes: int,
+              deadline: float) -> tuple[bytes | None, str | None, str | None]:
+     """One GET on the first checked address: (bytes, None, type) or (None, redirect location, None)."""
++
++    media_types, what = _media()
+ 
+     timeout = _remaining(deadline)
+     family, kind, protocol, _, address = addresses[0]
+@@ -176,26 +194,26 @@
+             sock.settimeout(_remaining(deadline))
+             sock.do_handshake()
+         connection.sock = sock
+-        connection.request("GET", target, headers={"Accept": ", ".join(MEDIA_TYPES), "Accept-Encoding": "identity",
++        connection.request("GET", target, headers={"Accept": ", ".join(media_types), "Accept-Encoding": "identity",
+                                                    "User-Agent": USER_AGENT})
+         response = connection.getresponse()
+         _remaining(deadline)
+         if response.status in _REDIRECTS:
+             location = response.getheader("Location")
+             if not location:
+-                raise ImageFetchError("image redirect has no destination")
++                raise ImageFetchError(f"{what} redirect has no destination")
+             return None, location, None
+         if response.status != 200:
+-            raise ImageFetchError(f"image download returned HTTP {response.status}")
++            raise ImageFetchError(f"{what} download returned HTTP {response.status}")
+         if response.getheader("Content-Encoding", "identity").lower() != "identity":
+-            raise ImageFetchError("compressed HTTP image responses are unsupported")
++            raise ImageFetchError(f"compressed HTTP {what} responses are unsupported")
+         media = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
+-        if media not in MEDIA_TYPES:
+-            raise ImageFetchError("image URL content type must be JPEG, PNG, WebP or GIF")
++        if media not in media_types:
++            raise ImageFetchError(f"{what} URL content type must be {_MEDIA_NAMES[what]}")
+         length = response.getheader("Content-Length")
+         if length is not None:
+             if not length.isascii() or not length.isdecimal() or int(length) > max_bytes:
+-                raise ImageFetchError(f"image larger than {max_bytes} bytes (GLM53_TF_VISION_MAX_BYTES)")
++                raise ImageFetchError(f"{what} larger than {max_bytes} bytes (GLM53_TF_VISION_MAX_BYTES)")
+         data = bytearray()
+         while len(data) <= max_bytes:
+             try:
+@@ -209,7 +227,7 @@
+                 break
+             data.extend(chunk)
+         if len(data) > max_bytes:
+-            raise ImageFetchError(f"image larger than {max_bytes} bytes (GLM53_TF_VISION_MAX_BYTES)")
++            raise ImageFetchError(f"{what} larger than {max_bytes} bytes (GLM53_TF_VISION_MAX_BYTES)")
+         _remaining(deadline)
+         return bytes(data), None, media
+     finally:
+@@ -218,10 +236,17 @@
+         _close_socket(sock)
+ 
+ 
+-def fetch_image(url: str, *, max_bytes: int, deadline: float, policy: Policy = Policy()) -> tuple[bytes, str]:
+-    """(bytes, declared type) of an image URL: each hop (the URL, then every redirect) checked, resolved, its
+-    addresses checked, then fetched from the checked address; everything before ``deadline`` (``time.monotonic``)."""
+-
++def fetch_image(url: str, *, max_bytes: int, deadline: float, policy: Policy = Policy(),
++                media_types: dict[str, str] = MEDIA_TYPES, what: str = "image") -> tuple[bytes, str]:
++    """(bytes, declared type) of a media URL: each hop (the URL, then every redirect) checked, resolved, its
++    addresses checked, then fetched from the checked address; everything before ``deadline`` (``time.monotonic``).
++
++    ``media_types`` / ``what`` (patches/0670): the accepted content types and what to call them in a message. The
++    default is the image set, so every existing call is unchanged.
++    """
++
++    was = _media()
++    _DOWNLOAD.now = (media_types, what)
+     try:
+         for redirect in range(policy.max_redirects + 1):
+             scheme, host, port, target = check_url(url, policy)
+@@ -230,10 +255,12 @@
+             if location is None:
+                 return data, media
+             if redirect == policy.max_redirects:
+-                raise ImageFetchError("image download has too many redirects")
++                raise ImageFetchError(f"{what} download has too many redirects")
+             url = urljoin(url, location)
+     except ImageFetchError:
+         raise
+     except (OSError, ValueError, http.client.HTTPException):
+-        raise ImageFetchError("image download failed or timed out") from None
+-    raise ImageFetchError("image download failed")
++        raise ImageFetchError(f"{what} download failed or timed out") from None
++    finally:
++        _DOWNLOAD.now = was
++    raise ImageFetchError(f"{what} download failed")
+diff --git a/src/tensorfold/families/glm5_next/cuda/vision_prep.py b/src/tensorfold/families/glm5_next/cuda/vision_prep.py
+--- a/src/tensorfold/families/glm5_next/cuda/vision_prep.py
++++ b/src/tensorfold/families/glm5_next/cuda/vision_prep.py
+@@ -32,6 +32,16 @@
+   request log's hashes) therefore tells two images apart with no change to it, and shares state between requests
+   only where the image is the same. The engine's embedding (``vision.py``) turns those ids into the vision tower's
+   rows; nothing else reads them (the lookup drafter never proposes one).
++- **Video** (patches/0670, ``video.py``). OpenAI chat messages may also carry ``{"type": "video_url",
++  "video_url": {"url": ...}}`` parts. GLM-5.3-Flash writes a video with the same ``<|image|>`` token it writes an
++  image with (``Glm5NextProcessor.create_mm_token_type_ids`` says so: "Glm5Next uses the same special token to
++  denote images and video"), so a video is ``grid_t`` images as far as this module, ``expand``, the tower and the
++  KV masking are concerned: ``Host.render`` decodes it into one ``Prepared`` per temporal group, and ``splice``
++  writes one ``<|begin_of_image|><|image|><|end_of_image|>`` run per group, each followed by that group's
++  ``{seconds:.1f} seconds`` stamp, the whole thing between ``<|begin_of_video|>`` and ``<|end_of_video|>`` -- what
++  the processor's ``replace_video_token`` builds. The frames, the canvas and the patches come from the model's own
++  ``Glm5NextVideoProcessor`` (30x an image's pixel budget, 2 frames a second, two frames a patch);
++  ``tests/video_parity.py`` checks every one of them against it on CPU, bit for bit.
+ """
+ 
+ from __future__ import annotations
+@@ -102,6 +112,13 @@
+     return raw == "1"
+ 
+ 
++def _video():
++    """patches/0670: ``video.py``, imported here because it imports this module for the processor's arithmetic."""
++
++    from . import video as module
++    return module
++
++
+ @dataclass
+ class Settings:
+     """The processor (``processor_config.json``), the special ids (``config.json``) and the server's limits."""
+@@ -118,6 +135,11 @@
+     begin_token: int = 154830
+     end_token: int = 154831
+     vision_config: dict = field(default_factory=dict)
++    # patches/0670: the video tokens (config.json). The placeholders stay ``image_token``; these frame them, which is
++    # how ``create_mm_token_type_ids`` tells a video from a still image.
++    video_token: int = 154855
++    video_start_token: int = 154832
++    video_end_token: int = 154833
+     # server limits (GLM53_TF_VISION_*)
+     max_images: int = 8
+     cap_tokens: int = 0                # 0: the processor's max_image_tokens
+@@ -159,6 +181,9 @@
+                 s.image_token = int(cfg.get("image_token_id", s.image_token))
+                 s.begin_token = int(cfg.get("image_start_token_id", s.begin_token))
+                 s.end_token = int(cfg.get("image_end_token_id", s.end_token))
++                s.video_token = int(cfg.get("video_token_id", s.video_token))                   # patches/0670
++                s.video_start_token = int(cfg.get("video_start_token_id", s.video_start_token))
++                s.video_end_token = int(cfg.get("video_end_token_id", s.video_end_token))
+                 s.vision_config = dict(cfg.get("vision_config") or {})
+         s.max_images = _env_int("GLM53_TF_VISION_MAX_IMAGES", s.max_images)
+         s.cap_tokens = _env_int("GLM53_TF_VISION_MAX_TOKENS", 0)
+@@ -376,6 +401,57 @@
+     return raw
+ 
+ 
++def load_video_bytes(url: str, s: Settings, lim, deadline: float | None = None) -> bytes:
++    """patches/0670: a video part's bytes: a ``data:`` URL, or (GLM53_TF_VISION_FETCH=1) an ``https`` download.
++
++    The same hardened download images use (``image_fetch``: the URL and every redirect checked, resolved, the
++    connection pinned to the checked address), told the container formats a video may be and the video byte ceiling
++    (``GLM53_TF_VIDEO_MAX_BYTES``, 64 MB: an image's is 20 MB).
++    """
++
++    if not isinstance(url, str) or not url:
++        raise VisionError("a video part needs a URL (video_url.url)")
++    if url.startswith("data:"):
++        head, sep, data = url.partition(",")
++        if not sep:
++            raise VisionError("a data: URL without a comma")
++        if ";base64" not in head:
++            raw = urllib.parse.unquote_to_bytes(data)
++        else:
++            if len(data) > (lim.max_encoded_bytes * 4) // 3 + 8:
++                raise VisionError(f"video larger than {lim.max_encoded_bytes} bytes "
++                                  "(GLM53_TF_VIDEO_MAX_BYTES)")
++            try:
++                raw = base64.b64decode(data.strip(), validate=False)
++            except (binascii.Error, ValueError):
++                raise VisionError("the data: URL is not valid base64") from None
++        if len(raw) > lim.max_encoded_bytes:
++            raise VisionError(f"video larger than {lim.max_encoded_bytes} bytes (GLM53_TF_VIDEO_MAX_BYTES)")
++        return raw
++    try:
++        scheme = urllib.parse.urlsplit(url).scheme.lower()
++    except ValueError:
++        scheme = ""
++    if scheme not in ("http", "https"):
++        raise VisionError(f"video URL scheme {scheme or '(none)'!r}: only data:, http and https are accepted")
++    if not s.fetch:
++        raise VisionError("this server does not fetch video URLs (GLM53_TF_VISION_FETCH=0): send a data: URL")
++    from . import image_fetch               # patches/0600 (upstream 391713e): no URL in any message
++
++    policy = image_fetch.Policy(http=s.fetch_http, private=s.fetch_private)
++    now = time.monotonic()
++    until = now + lim.timeout if deadline is None else min(deadline, now + lim.timeout)
++    try:
++        raw, _ = image_fetch.fetch_image(url, max_bytes=lim.max_encoded_bytes, deadline=until, policy=policy,
++                                         media_types=image_fetch.VIDEO_MEDIA_TYPES, what="video")
++    except image_fetch.ImageFetchError as exc:
++        text = str(exc)
++        if "GLM53_TF_VIDEO_MAX_BYTES" in text:
++            raise VisionError(text) from None
++        raise VisionError(f"could not fetch the video URL: {text}") from None
++    return raw
++
++
+ def decode(raw: bytes, s: Settings):
+     """Bytes -> an RGB ``PIL.Image`` (vLLM's conversion: transparency composited on white)."""
+ 
+@@ -413,28 +489,45 @@
+ # -- content parts ---------------------------------------------------------------------------------------------------
+ @dataclass
+ class Ref:
+-    """One image part: where it is and how much detail was asked."""
++    """One media part: where it is, how much detail was asked, and (patches/0670) which kind it is.
++
++    A video's temporal groups and their timestamps are filled in by ``Host.render``: the prompt's frame structure
++    depends on them, so the video is decoded before the chat template runs, and ``Host.request`` then reuses what
++    is already on the reference instead of decoding it twice.
++    """
+ 
+     url: str
+     detail: str | None = None
++    kind: str = "image"
++    groups: list["Prepared"] = field(default_factory=list)
++    stamps: list[float] = field(default_factory=list)
+ 
+ 
+ def part_ref(part: Any) -> Ref | None:
+-    """An image content part's reference, None for any other part. Raises for a malformed image part."""
+-
+-    if not isinstance(part, dict) or part.get("type") not in IMAGE_TYPES:
++    """A media content part's reference, None for any other part. Raises for a malformed media part.
++
++    patches/0670: the video forms (``video_url``, ``video``, ``input_video``) are named exactly as the image ones
++    are and carry ``kind="video"``, so the host can tell them apart from then on.
++    """
++
++    if not isinstance(part, dict) or part.get("type") not in IMAGE_TYPES + _video().VIDEO_TYPES:
+         return None
+     kind = part["type"]
+-    val = part.get("image_url") if kind != "image" else (part.get("image") or part.get("image_url") or part.get("url"))
+-    if kind == "input_image" and val is None:
+-        val = part.get("url")
++    image = kind in IMAGE_TYPES
++    if image:
++        val = part.get("image_url") if kind != "image" else (part.get("image") or part.get("image_url")
++                                                             or part.get("url"))
++        if kind == "input_image" and val is None:
++            val = part.get("url")
++    else:
++        val = part.get("video_url") or part.get("video") or part.get("url")
+     detail = part.get("detail")
+     if isinstance(val, dict):
+         detail = val.get("detail", detail)
+         val = val.get("url")
+     if not isinstance(val, str) or not val:
+         raise VisionError(f"an {kind} part needs a URL string")
+-    return Ref(val, str(detail).lower() if detail is not None else None)
++    return Ref(val, str(detail).lower() if detail is not None else None, "image" if image else "video")
+ 
+ 
+ def markup(messages: list, nonce: str) -> tuple[list, list[Ref]]:
+@@ -464,34 +557,45 @@
+ 
+ 
+ def count_images(messages: Any) -> int:
++    """How many media parts the messages carry: images, and patches/0670 videos too. The host's vision path runs
++    whenever this is non-zero (``Host.render`` then applies the per-kind limits)."""
++
+     if not isinstance(messages, list):
+         return 0
++    types = IMAGE_TYPES + _video().VIDEO_TYPES
+     n = 0
+     for m in messages:
+         content = m.get("content") if isinstance(m, dict) else None
+         if isinstance(content, list):
+-            n += sum(1 for p in content if isinstance(p, dict) and p.get("type") in IMAGE_TYPES)
++            n += sum(1 for p in content if isinstance(p, dict) and p.get("type") in types)
+     return n
+ 
+ 
+-def splice(text: str, nonce: str, count: int, s: Settings) -> tuple[str, list[int]]:
+-    """The rendered text with each sentinel replaced by ``<|begin_of_image|><|image|><|end_of_image|>``, and the
+-    indices of the images the template kept, in prompt order."""
++def splice(text: str, nonce: str, refs: list[Ref], s: Settings) -> tuple[str, list[int]]:
++    """The rendered text with each sentinel replaced by that part's prompt form, and the indices of the parts the
++    template kept, in prompt order.
++
++    An image is one ``PLACEHOLDER``. A video (patches/0670) is ``<|begin_of_video|>``, then one such run per
++    temporal group with that group's ``{seconds:.1f} seconds`` stamp after it, then ``<|end_of_video|>`` -- the
++    processor's ``replace_video_token``. The number of groups comes from the video's frame count, which is why
++    ``Host.render`` decoded the videos before the template ran.
++    """
+ 
+     order = []
+     out = text
+     positions = []
+-    for i in range(count):
++    for i in range(len(refs)):
+         tag = sentinel(nonce, i)
+         at = out.find(tag)
+         if at >= 0:
+             positions.append((at, i))
+     for _, i in sorted(positions):
+         order.append(i)
+-    for i in range(count):
+-        out = out.replace(sentinel(nonce, i), PLACEHOLDER)
++    for i, ref in enumerate(refs):
++        replacement = _video().video_structure(ref.stamps) if ref.kind == "video" else PLACEHOLDER
++        out = out.replace(sentinel(nonce, i), replacement)
+     if "\x00tf-image-" in out:
+-        raise VisionError("an image sentinel survived the chat template")
++        raise VisionError("a media sentinel survived the chat template")
+     return out, order
+ 
+ 
+@@ -584,6 +688,7 @@
+ 
+     def __init__(self, model_dir: Path | None) -> None:
+         self.s = Settings.read(model_dir)
++        self.video = _video().VideoLimits.read()            # patches/0670: the video limits (GLM53_TF_VIDEO_*)
+         self.registry = Registry()
+         self.cache: OrderedDict[tuple[str, int], Prepared] = OrderedDict()
+         self.cache_bytes = 0
+@@ -628,16 +733,52 @@
+         return prep
+ 
+     def render(self, template, messages: list, *, tools, enable_thinking, extra) -> tuple[str, list[Ref]]:
+-        """The chat template's text with image placeholders, and the image references it kept, in prompt order."""
++        """The chat template's text with media placeholders, and the media references it kept, in prompt order.
++
++        patches/0670: the videos are decoded here rather than in ``request``. ``splice`` has to write one image run
++        per temporal group and the number of groups follows from the frame count, so it must be known before the
++        prompt is tokenized. What is decoded stays on the reference and ``request`` reuses it.
++        """
+ 
+         nonce = secrets.token_hex(6)
+         marked, refs = markup(messages, nonce)
+-        if len(refs) > self.s.max_images:
+-            raise VisionError(f"{len(refs)} images in one request: at most {self.s.max_images} "
++        images = sum(1 for r in refs if r.kind == "image")
++        videos = len(refs) - images
++        if images > self.s.max_images:
++            raise VisionError(f"{images} images in one request: at most {self.s.max_images} "
+                               "(GLM53_TF_VISION_MAX_IMAGES)")
++        if videos > self.video.max_videos:
++            raise VisionError(f"{videos} videos in one request: at most {self.video.max_videos} "
++                              "(GLM53_TF_VIDEO_MAX_VIDEOS)")
++        if videos:
++            self._slot()                        # patches/0600: bounded preparations (503 past the queue)
++            try:
++                deadline = time.monotonic() + self.s.fetch_total
++                for ref in refs:
++                    if ref.kind == "video":
++                        ref.groups, ref.stamps = self.prepare_video(ref, deadline)
++            finally:
++                self.slots.release()
+         text = template.render(marked, tools=tools, enable_thinking=enable_thinking, extra=extra)
+-        text, order = splice(text, nonce, len(refs), self.s)
++        text, order = splice(text, nonce, refs, self.s)
+         return text, [refs[i] for i in order]
++
++    def prepare_video(self, ref: Ref, deadline: float | None = None) -> tuple[list[Prepared], list[float]]:
++        """patches/0670: a video part decoded, sampled and patched into its temporal groups, and their stamps.
++
++        Each group is a ``Prepared`` like an image's (one ``<|image|>`` run, ``tokens`` rows), so the engine's
++        embedding and the KV masking need no video case. The rows are the registry's virtual ids, keyed by the
++        group's own frames: the same group of frames anywhere in any request shares the state it seeds.
++        """
++
++        module = _video()
++        until = time.monotonic() + self.video.total_timeout if deadline is None else deadline
++        data = load_video_bytes(ref.url, self.s, self.video, deadline)
++        most = min(self.video.max_tokens, self.s.cap_tokens) if self.s.cap_tokens else self.video.max_tokens
++        groups, stamps = module.decode_video(data, self.video, until, self.s, most)
++        for group in groups:
++            group.vids = self.registry.vids(group.digest, group.tokens)
++        return groups, stamps
+ 
+     def request(self, refs: list[Ref]) -> Request:
+         if not refs:
+@@ -645,6 +786,14 @@
+         self._slot()                        # patches/0600: bounded preparations (503 past the queue)
+         try:
+             deadline = time.monotonic() + self.s.fetch_total
+-            return Request([self.prepare_ref(r, deadline) for r in refs])
++            images: list[Prepared] = []
++            for ref in refs:
++                if getattr(ref, "kind", "image") == "video":                    # patches/0670
++                    if not ref.groups:                  # render() decodes the videos: the prompt needs the groups
++                        raise VisionError("the video was not prepared: render the prompt first")
++                    images.extend(ref.groups)           # one Prepared per temporal group, in prompt order
++                else:
++                    images.append(self.prepare_ref(ref, deadline))
++            return Request(images)
+         finally:
+             self.slots.release()
+diff --git a/src/tensorfold/families/glm5_next/cuda/app.py b/src/tensorfold/families/glm5_next/cuda/app.py
+--- a/src/tensorfold/families/glm5_next/cuda/app.py
++++ b/src/tensorfold/families/glm5_next/cuda/app.py
+@@ -190,6 +190,10 @@
+             s = self.vision.s
+             print(f"[tensorfold] vision (patches/0500): image_url parts on; {s.min_tokens}-{s.budget(None)} tokens an "
+                   f"image, at most {s.max_images} a request; URL fetch {'on' if s.fetch else 'off'}", flush=True)
++            v = self.vision.video                                       # patches/0670
++            print(f"[tensorfold] video (patches/0670): video_url parts on; up to {v.max_frames} frames at {v.fps:g} "
++                  f"fps, {v.max_tokens} tokens a video, at most {v.max_videos} a request; at most "
++                  f"{v.max_encoded_bytes // (1024 * 1024)} MB of video", flush=True)
+         self.effort_field, self.default_effort = effort_env()       # patches/0150
+         from .toolfix import ToolFixes      # patches/0620: GLM53_TF_TOOL_FIXES (off: every request as before)
+ 
