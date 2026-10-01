@@ -1,0 +1,332 @@
+diff --git a/docs/glm-visible-pools.md b/docs/glm-visible-pools.md
+new file mode 100644
+index 00000000..e766fb0f
+--- /dev/null
++++ b/docs/glm-visible-pools.md
+@@ -0,0 +1,63 @@
++# GLM visible-pool selection measurements
++
++Candidate retains the power-of-two allocation buckets and RB=1. Pool-score
++programs beyond the last visible pool store -inf without dot products. Radix
++selection scans only max(512, complete visible pools) per row. Keeping at least
++512 entries preserves the previous lower-index -inf ties at the dense boundary.
++No new allocation sizes, host position reads or graph keys are introduced.
++
++## GB10 kernels
++
++Generated tensors at GLM per-rank shapes: 32 index heads, width 128; latent
++attention 32 heads, width 512. A full model remained resident during these
++microbenchmarks. CUDA graphs replayed with changing device positions.
++
++At position 205000, complete select_tokens graph replay (ms):
++
++| Rows | Original | Candidate | Reduction | Sparse latent attention |
++|---:|---:|---:|---:|---:|
++| 1 | 0.4493 | 0.3636 | 19.1% | 0.0613 |
++| 6 | 0.4611 | 0.3669 | 20.4% | 0.1380 |
++| 16 | 0.5771 | 0.4577 | 20.7% | 0.2544 |
++
++Selection still costs more than sparse attention; this does not solve all DSA
++cost. Skipping dot products alone reduced complete selection much less; skipping
++the radix padding is necessary. Larger RB did not consistently improve timings,
++so production uses RB=1.
++
++Baseline/candidate tokens, counts and latent attention outputs were bit-equal
++at positions 2049, 16383, 199999, 205000, for 1/6/16 rows, eager and graph replay,
++including negative device-position offsets. 60 earlier score comparisons also
++matched bitwise. The harness requires an original sparse.py via POOL_REFERENCE.
++
++CUDA tests: 37 existing GLM kernel/latent tests passed, plus 10 visible radix
++selection cases covering random scores, all ties, zero pools and graph capture.
++Host suite before the radix change: 3160 passed, 738 skipped. CPU cannot execute
++these CUDA-only changes; the final candidate was verified by the CUDA tests.
++
++## Full GLM EXL3, two actual GB10 ranks
++
++Same checkpoint and local production performance patches as the decisions
++validation deployment; only sparse.py was replaced on both ranks for this test.
++Context 200000, drafts loaded, greedy requests, thinking off. Three repeated
++requests for each of two prompts, baseline then candidate with a restart:
++
++- 3616 prompt tokens: all three choices identical before/after. Baseline times
++  7.787/9.280/7.569 s; candidate 12.434/7.526/7.540 s. First candidate request
++  includes cold/JIT work: no reliable speed claim from this small sample.
++- 18016 prompt tokens: all three choices identical before/after. Baseline
++  33.593/34.083/33.342 s; candidate 32.874/32.914/32.907 s. Median reduction
++  about 2.0%, not a controlled throughput result.
++
++These prompts exercise sparse selection but not the 205k endpoint. A full-model
++long-context decode/profile and speculative-policy matrix remain unmeasured.
++The kernel timings at 205k are not full-model timings at that context.
++
++## Qwen3.8-27B / M4 Max
++
++Qwen does not use GLM's CUDA DSA pool selector. MLX paths are unchanged as well.
++A full Vontra/Qwen3.8-27B-MLX-4bit server on the candidate branch, context 1024,
++drafts off, returned HELLO, 4 for 2+2, and Dzień dobry for good morning; each
++request repeated twice with identical choices. This is a smoke test, not an
++acceleration claim or baseline/candidate numerical parity test. Server stopped.
++Full GLM on the 48 GB Mac was not loaded in this run.
+diff --git a/src/tensorfold/families/glm5_next/cuda/sparse.py b/src/tensorfold/families/glm5_next/cuda/sparse.py
+index 56582b89..3b872d51 100644
+--- a/src/tensorfold/families/glm5_next/cuda/sparse.py
++++ b/src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -76,6 +76,15 @@ def _scores(QI, W, w_stride, PK, OUT, POS, R, NP, scale, wscale, H: tl.constexpr
+     pb = tl.program_id(1)
+     P = tl.load(POS)
+     p = pb * BP + tl.arange(0, BP)
++    # Keep bucket-sized allocations for graph reuse, but do no dot products
++    # for tiles beyond this row block's last visible complete pool.
++    visible = (P + tl.minimum((rb + 1) * RB, R)) // 4
++    if pb * BP >= visible:
++        for i in tl.static_range(RB):
++            r = rb * RB + i
++            if r < R:
++                tl.store(OUT + r * NP + p, float("-inf"), mask=p < NP)
++        return
+     d = tl.arange(0, D)
+     hh = tl.arange(0, HP)
+     hok = hh < H
+@@ -113,20 +122,21 @@ def _order_key(s):
+ 
+ 
+ @triton.jit
+-def _select_rows(S, OUT, NP, K: tl.constexpr, BLOCK: tl.constexpr):
++def _select_rows(S, OUT, NP, POS, K: tl.constexpr, BLOCK: tl.constexpr, VISIBLE: tl.constexpr):
+     """Program r: a radix select (8 bits a pass) finds the K-th best score, then one pass in pool order writes the pools above it and the lowest ties."""
+ 
+     r = tl.program_id(0).to(tl.int64)
+     row = S + r * NP
++    limit = tl.minimum(NP, tl.maximum(K, (tl.load(POS) + r + 1) // 4)) if VISIBLE else NP
+     bins = tl.arange(0, 256)
+     prefix = tl.zeros((), dtype=tl.uint32)
+     fixed = tl.zeros((), dtype=tl.uint32)
+     need = K
+     for p in tl.static_range(4):
+         hist = tl.zeros((256,), dtype=tl.int32)
+-        for c in range(0, NP, BLOCK):
++        for c in range(0, limit, BLOCK):
+             i = c + tl.arange(0, BLOCK)
+-            ok = i < NP
++            ok = i < limit
+             u = _order_key(tl.load(row + i, mask=ok, other=0.0))
+             match = ok & ((u & fixed) == prefix)
+             hist += tl.histogram(((u >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=match)
+@@ -137,9 +147,9 @@ def _select_rows(S, OUT, NP, K: tl.constexpr, BLOCK: tl.constexpr):
+         fixed = fixed | (tl.full((), 0xFF, tl.uint32) << (24 - 8 * p))
+     written = 0
+     equal_seen = 0
+-    for c in range(0, NP, BLOCK):
++    for c in range(0, limit, BLOCK):
+         i = c + tl.arange(0, BLOCK)
+-        ok = i < NP
++        ok = i < limit
+         u = _order_key(tl.load(row + i, mask=ok, other=0.0))
+         eq = (ok & (u == prefix)).to(tl.int32)
+         take = (ok & (u > prefix)) | ((eq == 1) & (tl.cumsum(eq, 0) - eq + equal_seen < need))
+@@ -149,13 +159,14 @@ def _select_rows(S, OUT, NP, K: tl.constexpr, BLOCK: tl.constexpr):
+         equal_seen += tl.sum(eq, 0)
+ 
+ 
+-def top_pools(scores: torch.Tensor, k: int) -> torch.Tensor:
++def top_pools(scores: torch.Tensor, k: int, pos_dev: torch.Tensor | None = None) -> torch.Tensor:
+     """``_top_pools``'s pools in one kernel, ascending, without int64 keys, top-k or sort."""
+     R, NP = scores.shape
+     if NP < k or not scores.is_contiguous():
+         return _top_pools(scores, k)
+     out = torch.empty((R, k), dtype=torch.int64, device=scores.device)
+-    _select_rows[(R,)](scores, out, NP, K=k, BLOCK=1024, num_warps=4)
++    _select_rows[(R,)](scores, out, NP, pos_dev if pos_dev is not None else scores,
++                       K=k, BLOCK=1024, VISIBLE=pos_dev is not None, num_warps=4)
+     return out
+ 
+ 
+@@ -180,7 +191,7 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: in
+     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
+     _scores[(R, triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, np_max, D ** -0.5, wscale,
+                                          H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, RB=1, num_warps=4)
+-    pools = top_pools(scores, TOPK_POOLS)                                               # ascending pool index
++    pools = top_pools(scores, TOPK_POOLS, pos_dev)                                               # ascending pool index
+     dev = qi.device
+     width = TOPK_POOLS * POOL + POOL - 1
+     # all rows at once: the 512 pools' tokens ascending, then the incomplete last pool's visible tokens; rows within the dense limit count 0
+diff --git a/tests/cuda/test_glm_visible_pools.py b/tests/cuda/test_glm_visible_pools.py
+new file mode 100644
+index 00000000..07ce5b78
+--- /dev/null
++++ b/tests/cuda/test_glm_visible_pools.py
+@@ -0,0 +1,28 @@
++"""Visible-only radix scans retain lower-index ties, including dense-limit rows."""
++import pytest
++import torch
++
++from tensorfold.families.glm5_next.cuda import sparse
++
++
++@pytest.mark.parametrize("pos", [0, 2048, 2051, 4095, 205000])
++@pytest.mark.parametrize("ties", [False, True])
++def test_visible_top_pools_matches_full_reference(pos, ties):
++    rows, width = 6, 65536
++    torch.manual_seed(127)
++    scores = torch.zeros((rows, width), device="cuda") if ties else torch.rand((rows, width), device="cuda")
++    index = torch.arange(width, device="cuda")
++    visible = (pos + torch.arange(rows, device="cuda") + 1) // 4
++    scores.masked_fill_(index[None, :] >= visible[:, None], float("-inf"))
++    position = torch.tensor([pos], device="cuda", dtype=torch.int32)
++    want = sparse._top_pools(scores, 512)
++    got = sparse.top_pools(scores, 512, position)
++    assert torch.equal(want, got)
++    for _ in range(3):
++        sparse.top_pools(scores, 512, position)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        replayed = sparse.top_pools(scores, 512, position)
++    graph.replay()
++    torch.cuda.synchronize()
++    assert torch.equal(want, replayed)
+diff --git a/tools/bench_glm_pool_scores.py b/tools/bench_glm_pool_scores.py
+new file mode 100644
+index 00000000..8bebc8b4
+--- /dev/null
++++ b/tools/bench_glm_pool_scores.py
+@@ -0,0 +1,55 @@
++"""Measure GLM pool-score row reuse on CUDA without loading model weights.
++
++PYTHONPATH=src python tools/bench_glm_pool_scores.py
++Uses GLM's real per-rank index shapes, but generated inputs; not an end-to-end
++model benchmark. Each candidate must match RB=1 bitwise before timing.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import os
++
++import torch
++import triton
++
++from tensorfold.families.glm5_next.cuda import sparse
++
++
++def main():
++    torch.manual_seed(127)
++    reference = sparse
++    if os.environ.get("POOL_REFERENCE"):
++        spec = importlib.util.spec_from_file_location("pool_reference", os.environ["POOL_REFERENCE"])
++        reference = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(reference)
++    for pos in (2048, 16384, 205000):
++        for rows in (1, 3, 6, 8, 16):
++            heads, width = 32, 128
++            pools = sparse.pool_bucket(pos, rows, 65536)
++            qi = torch.randn((rows, heads * width), device="cuda", dtype=torch.bfloat16)
++            weights = torch.randn((rows, heads), device="cuda", dtype=torch.bfloat16)
++            keys = torch.randn((65538, width), device="cuda", dtype=torch.bfloat16)
++            position = torch.tensor([pos], device="cuda", dtype=torch.int32)
++            ref = torch.empty((rows, pools), device="cuda", dtype=torch.float32)
++            out = torch.empty_like(ref)
++
++            def score(rb, dest, module=sparse, rows=rows, pools=pools, qi=qi, weights=weights,
++                      keys=keys, position=position, width=width, heads=heads):
++                module._scores[(triton.cdiv(rows, rb), triton.cdiv(pools, 64))](
++                    qi, weights, weights.stride(0), keys, dest, position, rows, pools,
++                    width ** -0.5, 1.0 / 5.656854249492381, H=heads, HP=heads,
++                    D=width, BP=64, RB=rb, num_warps=4)
++
++            score(1, ref, reference)
++            baseline = triton.testing.do_bench(lambda ref=ref: score(1, ref, reference), warmup=100, rep=200)
++            for rb in (1, 2, 4, 8):
++                score(rb, out)
++                assert torch.equal(ref, out), (pos, rows, rb)
++                ms = triton.testing.do_bench(lambda rb=rb, out=out: score(rb, out), warmup=100, rep=200)
++                print(json.dumps({"position": pos, "rows": rows, "pools": pools, "rb": rb,
++                                  "ms": ms, "speedup": baseline / ms, "bits_equal": True}), flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/bench_glm_selection.py b/tools/bench_glm_selection.py
+new file mode 100644
+index 00000000..586af7a8
+--- /dev/null
++++ b/tools/bench_glm_selection.py
+@@ -0,0 +1,79 @@
++"""Baseline/candidate GLM DSA selection and latent attention, eager and graphs.
++
++POOL_REFERENCE must name upstream sparse.py. Inputs use real per-rank GLM
++shapes, not trained weights. JSONL reports graph replay latency separately.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import os
++
++import torch
++import triton
++
++from tensorfold.families.glm5_next.cuda import latent, sparse
++
++
++def capture(fn):
++    for _ in range(3):
++        fn()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        result = fn()
++    return graph, result
++
++
++def main():
++    spec = importlib.util.spec_from_file_location("pool_reference", os.environ["POOL_REFERENCE"])
++    reference = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(reference)
++    torch.manual_seed(128)
++    for pos in (2049, 16383, 199999, 205000):
++        for rows in (1, 6, 16):
++            bucket = sparse.pool_bucket(pos, rows, 65536)
++            qi = torch.randn((rows, 32 * 128), device="cuda", dtype=torch.bfloat16)
++            weights = torch.randn((rows, 32), device="cuda", dtype=torch.bfloat16)
++            keys = torch.randn((65538, 128), device="cuda", dtype=torch.bfloat16)
++            position = torch.tensor([pos], device="cuda", dtype=torch.int32)
++
++            def select(module, qi=qi, weights=weights, keys=keys, position=position, pos=pos, rows=rows):
++                return module.select_tokens(qi, weights, keys, pos, rows, 65536, position)
++
++            old = select(reference)
++            new = select(sparse)
++            assert all(torch.equal(a, b) for a, b in zip(old, new)), (pos, rows)
++            gb, ob = capture(lambda: select(reference))
++            gn, on = capture(lambda: select(sparse))
++            # Replays must read changing device positions, including partial pool boundaries.
++            for offset in (0, -1, -3, -127):
++                position.fill_(pos + offset)
++                gb.replay()
++                gn.replay()
++                torch.cuda.synchronize()
++                assert all(torch.equal(a, b) for a, b in zip(ob, on)), (pos, rows, offset)
++            position.fill_(pos)
++            timings = {}
++            for name, fn in (("baseline_eager", lambda: select(reference)),
++                             ("candidate_eager", lambda: select(sparse)),
++                             ("baseline_graph", gb.replay), ("candidate_graph", gn.replay)):
++                timings[name] = triton.testing.do_bench(fn, warmup=50, rep=200)
++            qa = torch.randn((rows, 32, 512), device="cuda", dtype=torch.bfloat16)
++            cache = torch.randn((pos + rows + 1, 512), device="cuda", dtype=torch.bfloat16)
++            out = torch.empty_like(qa)
++            gb.replay()
++            gn.replay()
++            latent.sparse_attention(qa, cache, ob[0], ob[1], out, 256 ** -0.5)
++            want = out.clone()
++            latent.sparse_attention(qa, cache, on[0], on[1], out, 256 ** -0.5)
++            assert torch.equal(want, out)
++            ga, _ = capture(lambda cache=cache: latent.sparse_attention(qa, cache, on[0], on[1], out, 256 ** -0.5))
++            timings["attention_graph"] = triton.testing.do_bench(ga.replay, warmup=50, rep=200)
++            print(json.dumps({"pos": pos, "rows": rows, "bucket": bucket,
++                              "bits_equal": True, "ms": timings}), flush=True)
++            del ga, gb, gn, cache
++
++
++if __name__ == "__main__":
++    main()

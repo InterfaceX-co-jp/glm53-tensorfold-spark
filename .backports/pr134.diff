@@ -1,0 +1,751 @@
+diff --git a/docs/recipes/glm-5.3-flash.md b/docs/recipes/glm-5.3-flash.md
+index 97cf8dca..cae620ab 100644
+--- a/docs/recipes/glm-5.3-flash.md
++++ b/docs/recipes/glm-5.3-flash.md
+@@ -53,6 +53,13 @@ conversation takes the attention caches, a kept prompt's rows are saved. Kept st
+ when it is less, and the memory estimate includes it. It serves one request at a time. Both ranks finish a started
+ reply after a client disconnects.
+ 
++DFlash2 attends only its 2,048-row sliding window: a block pass reads only the window's tiles, and the drafter keeps
++its context in a ring of that window, its block and a tile (2,176 rows, 21 MiB a rank whatever the window, instead
++of 10 KiB a rank for every token of the window). A kept prompt DFlash2 can resume from holds a copy of the window
++(20 MiB a rank, within `TF_GLM_CACHE_GIB`). The drafts are the same bits. `TF_GLM_DRAFT_RING=0` keeps the
++whole-window buffer instead (give both ranks the same value). The memory estimate counts the draft model as it is
++held (4-bit copies and its selector's codebooks, 0.63 GiB a rank), not at 4 bytes a checkpoint value.
++
+ ### Long contexts: the latent cache
+ 
+ The DSA layers are NoPE MLA: head h's key is `Wk_h c` and its value `Wv_h c`, with `c` the token's 512-wide
+diff --git a/src/tensorfold/cuda/capacity.py b/src/tensorfold/cuda/capacity.py
+index 0136925c..2022b107 100644
+--- a/src/tensorfold/cuda/capacity.py
++++ b/src/tensorfold/cuda/capacity.py
+@@ -230,8 +230,10 @@ def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, t
+           geometry: Geometry | Callable, transform: Callable, *, rank: int = 0, world: int = 1,
+           gather: Callable | None = None, draft_dir: Path | None = None,
+           draft_geometry: Geometry | Callable | None = None, startup_copies: int = 0,
+-          extra_files: tuple[Path, ...] = (), files: list[Path] | None = None) -> dict:
+-    """Reach the same refusal or capacity before either rank allocates model tensors."""
++          extra_files: tuple[Path, ...] = (), files: list[Path] | None = None,
++          draft_weights: Callable[[Path], Weights] | None = None) -> dict:
++    """Reach the same refusal or capacity before either rank allocates model tensors. ``draft_weights``: what the
++    draft model holds, from its folder (default: its checkpoint at 4 bytes a value, or more)."""
+ 
+     error = None
+     plan = None
+@@ -245,8 +247,8 @@ def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, t
+                               weights.mapped + more.mapped)
+         weights = Weights(weights.resident, weights.staging + startup_copies * weights.resident, weights.mapped)
+         if draft_dir is not None:
+-            draft = estimate_weights(draft_dir, lambda name, info: (math.prod(info["shape"]) *
+-                                      max(4, itemsize(info, name)), 0))
++            draft = draft_weights(draft_dir) if draft_weights is not None else estimate_weights(
++                draft_dir, lambda name, info: (math.prod(info["shape"]) * max(4, itemsize(info, name)), 0))
+             weights = Weights(weights.resident + draft.resident, weights.staging + draft.staging, weights.mapped)
+             if draft_geometry is not None:
+                 draft_geometry = draft_geometry(config(draft_dir)) if callable(draft_geometry) else draft_geometry
+diff --git a/src/tensorfold/cuda/geometry.py b/src/tensorfold/cuda/geometry.py
+index ee444c2a..2e496ec5 100644
+--- a/src/tensorfold/cuda/geometry.py
++++ b/src/tensorfold/cuda/geometry.py
+@@ -3,7 +3,9 @@
+ from __future__ import annotations
+ 
+ import math
+-from .capacity import Geometry, itemsize
++import re
++
++from .capacity import Geometry, Weights, headers, itemsize
+ 
+ PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
+ PREFILL_ATT_ROWS = 256  # Flash Next's prompt attention block
+@@ -245,6 +247,15 @@ def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool) -> in
+     return select + 128 * heads * (kd + 2) * 4 * ((topk + 515) // 512)
+ 
+ 
++def draft_ring_rows(window: int, block: int, tile: int = 64) -> int:
++    """Rows of GLM's DFlash2 context ring (``dflash2.Drafter``, TF_GLM_DRAFT_RING): a block pass at context end s
++    reads keys from the ``tile``-row tile holding s - window (older rows are masked for every query; ``window`` is the
++    drafter's, sliding_window - 1) through its own rows s .. s + block - 1, at most window + block + tile - 1 rows,
++    here rounded up to whole tiles; a kept state's window rows (window + 1) fit as well."""
++
++    return -(-(window + block + tile - 1) // tile) * tile
++
++
+ def draft_geometry(t: dict, world: int, reserve: int, *, bounded: bool = False, streams: int = 1,
+                    kept: int = 0) -> Geometry:
+     layers = int(t["num_hidden_layers"])
+@@ -261,6 +272,65 @@ def bytes_at(capacity: int) -> int:
+     return Geometry(bytes_at, reserve)
+ 
+ 
++def dflash2_geometry(t: dict, world: int, reserve: int, *, ring: bool) -> Geometry:
++    """GLM's DFlash2 drafter (``dflash2.Drafter``) on each of ``world`` ranks: one context of keys and values, a ring
++    of ``draft_ring_rows`` rows whatever the window (``ring``, TF_GLM_DRAFT_RING; a flat buffer when the window is
++    smaller) or ``capacity`` + block rows, and a block pass's activations. Kept prompt states' copies of its window
++    count in the kept-state budget (``snapshot_bytes``)."""
++
++    layers = int(t["num_hidden_layers"])
++    heads = int(t["num_key_value_heads"]) // world
++    hd = int(t["head_dim"])
++    block = int((t.get("dflash_config") or {}).get("block_size", 16))
++    window = int(t.get("sliding_window", 0))
++    fixed = 16 * max(64, block) * (int(t["hidden_size"]) + int(t["intermediate_size"])) * 4
++    rows = draft_ring_rows(window - 1, block) if ring and window > 0 else 0
++
++    def bytes_at(capacity: int) -> int:
++        slots = capacity + block if not rows else min(rows, capacity + block)
++        return fixed + 2 * layers * heads * hd * slots * 2
++    return Geometry(bytes_at, reserve)
++
++
++def dflash2_weights(draft_dir, world: int) -> Weights:
++    """What GLM's DFlash2 drafter (``dflash2.Drafter``) holds on each of ``world`` ranks, not its checkpoint's BF16:
++    4-bit copies (``qmm.quantize4``: groups of 64 with BF16 scales and biases, rows padded to 128) of fc, the
++    convolutions' kernel projections and this rank's attention and MLP rows (k and v twice: in qkv and in kv); BF16
++    norms, base kernels and selector projection; the selector's float32 codebooks in host memory (the same memory on
++    GB10). Staging: the largest matrix read and uploaded in BF16 with its quantization temporaries (float32 groups
++    of up to 8,192 rows, the packer's int64 lanes)."""
++
++    h = headers(draft_dir)
++    shape = {name: [int(x) for x in info["shape"]] for name, info in h.items()}
++
++    def q4(n: int, k: int) -> int:
++        return -(-n // 128) * 128 * k * 9 // 16
++
++    mats = [tuple(shape["fc.weight"])]
++    quantized = {"fc.weight"}
++    for i in sorted({int(m.group(1)) for m in map(re.compile(r"layers\.(\d+)\.").match, shape) if m}):
++        p = f"layers.{i}."
++        q, k, v = (shape[p + f"self_attn.{x}_proj.weight"] for x in "qkv")
++        o, gate, up, down = (shape[p + x] for x in ("self_attn.o_proj.weight", "mlp.gate_proj.weight",
++                                                      "mlp.up_proj.weight", "mlp.down_proj.weight"))
++        d = q[1]
++        mats += [((q[0] + k[0] + v[0]) // world, d), ((k[0] + v[0]) // world, d), (o[0], o[1] // world),
++                 ((gate[0] + up[0]) // world, d), (down[0], down[1] // world)]
++        quantized |= {p + x for x in ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
++                                      "self_attn.o_proj.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight",
++                                      "mlp.down_proj.weight")}
++        for conv in ("attention_conv", "mlp_conv"):
++            name = p + conv + ".kernel_projection.weight"
++            mats.append(tuple(shape[name]))
++            quantized.add(name)
++    resident = sum(q4(n, k) for n, k in mats)
++    for name, dims in shape.items():
++        if name not in quantized:
++            resident += math.prod(dims) * (4 if name.endswith("_codebook") else 2)
++    staging = max(4 * n * k + 24 * min(n, 8192) * k for n, k in mats)
++    return Weights(resident, staging, 0)
++
++
+ def _gdn_dims(t: dict, world: int) -> tuple:
+     d, heads = int(t["hidden_size"]), int(t["num_attention_heads"])
+     nk, nv = int(t["linear_num_key_heads"]) // world, int(t["linear_num_value_heads"]) // world
+diff --git a/src/tensorfold/families/glm5_next/cuda/decode.py b/src/tensorfold/families/glm5_next/cuda/decode.py
+index 6a012362..759882d2 100644
+--- a/src/tensorfold/families/glm5_next/cuda/decode.py
++++ b/src/tensorfold/families/glm5_next/cuda/decode.py
+@@ -241,15 +241,42 @@ class Snapshot:
+     drafter_end: int
+     rows: list | None = None      # the attention rows of ids, saved when another conversation took the live caches
+     nbytes: int = 0
++    drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
+ 
+ 
+ def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
+                   drafter=None) -> Snapshot:
++    """A ring drafter's window rows are copied now (``_ring_window``): its next rows overwrite them in the ring."""
+     st = e.st
+     rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
+-    return Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
++    snap = Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
+                     st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1,
+                     drafter.context_end if drafter is not None else -1)
++    if drafter is not None and getattr(drafter, "ring", 0) and snap.drafter_end == len(snap.ids):
++        snap.drafter_rows = _ring_window(drafter, len(snap.ids))
++    return snap
++
++
++def _ring_slots(drafter, n: int) -> torch.Tensor:
++    """Where a ring drafter (``drafter.ring`` rows) holds the window rows a block pass at context end n reads
++    (positions n - window - 1 .. n - 1, one spare): those positions modulo the ring."""
++    lo = max(0, n - drafter.window - 1)
++    return torch.arange(lo, n, device=drafter.kc[0].device) % drafter.ring
++
++
++def _ring_window(drafter, n: int) -> list[torch.Tensor]:
++    """A copy of a ring drafter's window rows before n, in position order."""
++    idx = _ring_slots(drafter, n)
++    return [c.index_select(1, idx) for c in drafter.kc] + [c.index_select(1, idx) for c in drafter.vc]
++
++
++def _put_ring_window(drafter, n: int, rows: list[torch.Tensor]) -> None:
++    idx = _ring_slots(drafter, n)
++    caches = list(drafter.kc) + list(drafter.vc)
++    if len(rows) != len(caches) or any(r.shape[1] != idx.numel() for r in rows):
++        raise ValueError("a kept state's DFlash2 window does not match the drafter's ring")
++    for c, r in zip(caches, rows):
++        c.index_copy_(1, idx, r)
+ 
+ 
+ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
+@@ -275,6 +302,7 @@ def save_rows(e: Engine, snap: Snapshot) -> None:
+     snap.rows = [v.clone() for v in views]
+     snap.nbytes = sum(r.numel() * r.element_size() for r in snap.rows)
+     snap.drafter_end = -1
++    snap.drafter_rows = None
+ 
+ 
+ def row_bytes(e: Engine, snap: Snapshot) -> int:
+@@ -283,8 +311,9 @@ def row_bytes(e: Engine, snap: Snapshot) -> int:
+ 
+ 
+ def snapshot_bytes(snap: Snapshot) -> int:
+-    """Device memory a kept snapshot holds: its KDA states, conv windows, pending MTP rows and any saved rows."""
+-    held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else [])
++    """Device memory a kept snapshot holds: its KDA states, conv windows, pending MTP rows, a ring drafter's window
++    and any saved rows."""
++    held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else []) + (snap.drafter_rows or [])
+     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
+ 
+ 
+@@ -303,6 +332,10 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
+     st.set_mtp_len(max(snap.mtp_len, 0))
+     st.mtp_drafted = 0
+     if drafter is not None:
++        if getattr(drafter, "ring", 0):
++            if snap.drafter_rows is None or snap.drafter_end != len(snap.ids):
++                raise ValueError("this snapshot kept no DFlash2 window for the drafter's ring")
++            _put_ring_window(drafter, snap.drafter_end, snap.drafter_rows)
+         drafter.context_end = snap.drafter_end
+         drafter.pos_dev.fill_(snap.drafter_end)
+ 
+diff --git a/src/tensorfold/families/glm5_next/cuda/dflash2.py b/src/tensorfold/families/glm5_next/cuda/dflash2.py
+index ebace1fc..263a5539 100644
+--- a/src/tensorfold/families/glm5_next/cuda/dflash2.py
++++ b/src/tensorfold/families/glm5_next/cuda/dflash2.py
+@@ -87,8 +87,15 @@ def _prep_kernel(QKV, QN, KN, COS, SIN, QO, KO, VO, L, stride, eps,
+ 
+ @triton.jit
+ def _dattn_kernel(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.constexpr, NH: tl.constexpr,
+-                  HD: tl.constexpr, CAP: tl.constexpr, BK: tl.constexpr, CAUSAL: tl.constexpr):
+-    """Each KV head attends its query groups to sliding-window context and block keys, masking future block keys when causal, with fp32 softmax."""
++                  HD: tl.constexpr, CAP: tl.constexpr, BK: tl.constexpr, CAUSAL: tl.constexpr,
++                  RING: tl.constexpr = False, SKIP: tl.constexpr = True):
++    """Each KV head attends its query groups to sliding-window context and block keys, masking future block keys when causal, with fp32 softmax.
++
++    The loop starts at the tile holding the window's first row s - window, not at 0: every tile before it is masked
++    for every query, and a masked tile leaves the running max, sum and accumulator bit for bit as they were
++    (max(-1e30, -inf) = -1e30, alpha = exp(0) = 1, p = 0), so the tiles that are run see the same keys at the same
++    offsets and the output is the same bits (SKIP=False runs every tile from 0, the reference the tests compare
++    against). RING: K and V hold logical row p at p % CAP (``Drafter.ring``), which needs SKIP."""
+ 
+     kvh = tl.program_id(0)
+     M: tl.constexpr = G * N
+@@ -103,11 +110,18 @@ def _dattn_kernel(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.const
+     m_i = tl.full([M], -1e30, tl.float32)
+     l_i = tl.zeros([M], tl.float32)
+     acc = tl.zeros([M, HD], tl.float32)
+-    for start in range(0, klen, BK):
++    lo = 0
++    if SKIP:
++        lo = tl.maximum(s - window, 0) // BK * BK
++    for start in range(lo, klen, BK):
+         kk = start + tl.arange(0, BK)
+         kin = kk < klen
+-        k = tl.load(K + (kvh * CAP + kk[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
+-        v = tl.load(V + (kvh * CAP + kk[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
++        if RING:
++            row = kk % CAP
++        else:
++            row = kk
++        k = tl.load(K + (kvh * CAP + row[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
++        v = tl.load(V + (kvh * CAP + row[:, None]) * HD + d[None, :], mask=kin[:, None], other=0.0)
+         sc = tl.dot(q, tl.trans(k)) * scale
+         ok = kin[None, :] & (((kk[None, :] < s) & (qpos[:, None] - kk[None, :] <= window)) | (kk[None, :] >= s))
+         if CAUSAL:
+@@ -165,7 +179,12 @@ class DraftLayer:
+ class Drafter:
+     """Draft one sequence from position-indexed context using device lengths and static buffers shared by eager execution and CUDA graphs."""
+ 
+-    def __init__(self, draft_dir: str | Path, w: Weights, *, block: int | None = None, capacity: int = 2560) -> None:
++    def __init__(self, draft_dir: str | Path, w: Weights, *, block: int | None = None, capacity: int = 2560,
++                 ring: bool = False) -> None:
++        """``ring`` (TF_GLM_DRAFT_RING): keep the context in a ring of ``geometry.draft_ring_rows`` rows (all a block
++        pass reads: its sliding window and its own rows) instead of ``capacity`` rows; the drafts are the same bits.
++        Kept states then copy the window when taken (``decode.take_snapshot``), since the ring overwrites it."""
++
+         path = Path(draft_dir)
+         cfg = json.loads((path / "config.json").read_text())
+         dc = cfg["dflash_config"]
+@@ -241,7 +260,12 @@ def get(name: str) -> torch.Tensor:
+         torch.cuda.empty_cache()
+         self.inv_freq = 1.0 / theta ** (torch.arange(hd // 2, device=dev, dtype=torch.float32) * 2 / hd)
+         # Block rows sit past committed context and the next context update overwrites them.
+-        self.cap = capacity + self.block
++        from tensorfold.cuda.geometry import draft_ring_rows
++
++        self.capacity = capacity
++        rows = draft_ring_rows(self.window, self.block) if ring and self.window >= 0 else 0
++        self.ring = rows if 0 < rows < capacity + self.block else 0     # 0: a flat buffer, logical row p at p
++        self.cap = self.ring or capacity + self.block
+         self.kc = [torch.zeros((KV, self.cap, hd), dtype=torch.bfloat16, device=dev) for _ in self.layers]
+         self.vc = [torch.zeros((KV, self.cap, hd), dtype=torch.bfloat16, device=dev) for _ in self.layers]
+         self.pos_dev = torch.zeros((1,), dtype=torch.int64, device=dev)
+@@ -265,6 +289,12 @@ def reset(self) -> None:
+         self.context_end = 0
+         self.pos_dev.zero_()
+ 
++    def _slots(self, n: int) -> torch.Tensor:
++        """Where the rows at positions context_end .. context_end + n - 1 go: those positions, modulo the ring."""
++
++        idx = self.pos_dev + self.ar[:n]
++        return idx % self.ring if self.ring else idx
++
+     # -- pieces -------------------------------------------------------------------------------------------------
+     def _rotary(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+         pos = (self.pos_dev + self.ar[:rows]).to(torch.float32)
+@@ -313,7 +343,7 @@ def _layer(self, i: int, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+         out = torch.empty((rows, self.heads * self.hd), dtype=torch.bfloat16, device=self.dev)
+         _dattn_kernel[(self.kvh,)](q, self.kc[i], self.vc[i], out, self.pos_dev, self.window, self.hd ** -0.5,
+                                    N=rows, G=self.heads // self.kvh, NH=self.heads, HD=self.hd, CAP=self.cap, BK=64,
+-                                   CAUSAL=self.causal, num_warps=4)
++                                   CAUSAL=self.causal, RING=bool(self.ring), num_warps=4)
+         x = _dconv(self._row(out, L.o), dyn, L.a_base, 1, self.gs, x)
+         normed, xs = self._norm(x, L.post_norm)
+         dyn = _mm(normed, L.m_kp, xs)
+@@ -327,7 +357,7 @@ def _layer(self, i: int, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+     def _taps_compute(self, n: int) -> None:
+         ctx, _ = self._norm(_mm(self.tap_in[:n], self.fc), self.hidden_norm)
+         cos, sin = self._rotary(n)
+-        idx = self.pos_dev + self.ar[:n]
++        idx = self._slots(n)
+         for i, L in enumerate(self.layers):
+             _, k, v = self._prep(_mm(ctx, L.kv), L, cos, sin, 0)
+             self.kc[i].index_copy_(1, idx, k)
+@@ -341,7 +371,7 @@ def add_taps(self, taps: torch.Tensor) -> None:
+         for start in range(0, taps.shape[0], self.tap_in.shape[0]):
+             part = taps[start:start + self.tap_in.shape[0]]
+             n = part.shape[0]
+-            if self.context_end + n > self.cap - self.block:
++            if self.context_end + n > self.capacity:
+                 raise ValueError("drafter context past its capacity")
+             self.tap_in[:n].copy_(part)
+             g = self.tap_graphs.get(n)
+@@ -359,7 +389,7 @@ def _block_compute(self) -> None:
+         x = torch.empty((n, self.D), dtype=torch.bfloat16, device=self.dev)
+         glue.embed(self.ids, self.w.embed, self.D, 1, x)
+         cos, sin = self._rotary(n)
+-        idx = self.pos_dev + self.ar[:n]
++        idx = self._slots(n)
+         for i in range(len(self.layers)):
+             x = self._layer(i, x, cos, sin, idx)
+         h, hs = self._norm(x[1:], self.norm)
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 43c1af4e..fdbbd509 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -17,6 +17,10 @@
+ GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
+ MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
+ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
++# TF_GLM_DRAFT_RING=0: DFlash2 keeps its context in a flat buffer of the whole window (10,240 bytes a slot on each
++# rank) instead of a ring of its 2,048-row sliding window and block (2,176 rows, 21.25 MiB; ``dflash2.Drafter``);
++# the drafts are the same bits either way
++DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
+ 
+ 
+ def encode_policy(spec: str) -> list[int]:
+@@ -96,7 +100,8 @@ def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy
+         from .weights import Config, load
+         from .split import rule
+         from tensorfold.cuda.capacity import admit
+-        from tensorfold.cuda.geometry import PREFILL_ROWS, draft_geometry, mla_geometry, split_weights
++        from tensorfold.cuda.geometry import (PREFILL_ROWS, dflash2_geometry, dflash2_weights, mla_geometry,
++                                              split_weights)
+ 
+         encode_policy(policy)                           # a bad default fails here, not in the first request
+         torch.cuda.set_device(0)
+@@ -115,14 +120,15 @@ def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy
+                                    lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
+                                                              latent=LATENT),
+                                    split_weights(rule), rank=rank, world=2, gather=self._gather_ints,
+-                                   draft_dir=drafter, draft_geometry=lambda text: draft_geometry(text, 2, MAX_ROWS))
++                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
++                                   draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
+         self.limit = self.capacity_plan["context_window"]
+         capacity = self.capacity_plan["cache_slots"]
+         long_context = self.limit > cfg.dense_limit
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows]
++                prefill_rows, int(DRAFT_RING)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -130,7 +136,7 @@ def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy
+         both = self._gather_ints(mine + [spare >> 20])
+         if both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+-                               "TF_GLM_LATENT): "
++                               "TF_GLM_LATENT, TF_GLM_DRAFT_RING): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -152,7 +158,7 @@ def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy
+         if drafter is not None:
+             from .dflash2 import Drafter
+ 
+-            self.drafter = Drafter(drafter, w, capacity=capacity)
++            self.drafter = Drafter(drafter, w, capacity=capacity, ring=DRAFT_RING)
+         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True, graph_rows=GRAPH_ROWS,
+                         long_context=long_context, taps=self.drafter.tap_layers if self.drafter is not None else ())
+         if self.drafter is not None:
+@@ -299,7 +305,7 @@ def _resume(self, prompt: list[int], code: list[int]):
+ 
+     def _drop(self, snap) -> None:
+         """Forget a kept snapshot and free its saved rows now, even while a caller still holds the object."""
+-        snap.rows, snap.nbytes = None, 0
++        snap.rows, snap.nbytes, snap.drafter_rows = None, 0, None
+         self.cache.remove(snap)
+ 
+     def _remember(self, snap) -> None:
+diff --git a/tests/cuda/test_glm_draft_ring.py b/tests/cuda/test_glm_draft_ring.py
+new file mode 100644
+index 00000000..d4775249
+--- /dev/null
++++ b/tests/cuda/test_glm_draft_ring.py
+@@ -0,0 +1,152 @@
++"""DFlash2's block attention from the window's first tile, and its context ring (TF_GLM_DRAFT_RING), against the
++loop over every context tile from 0 and the flat buffer, bit for bit: the attention kernel over contexts far past the
++window (the ring wrapped many times, its other rows garbage), and the synthetic drafter of test_glm_engine end to end
++(eager and CUDA graphs): the same candidates, logits and selector rows at every round over contexts longer than the
++window, after a kept state is taken, the ring overwritten and the state restored.
++
++Small: one-layer drafter, no engine (no admission), a few MiB of caches."""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA only", allow_module_level=True)
++
++from tensorfold.cuda.geometry import draft_ring_rows  # noqa: E402
++from test_glm_engine import DRAFT, D, V, _drafter  # noqa: E402
++
++
++@pytest.mark.parametrize("window", [2047, 48])
++@pytest.mark.parametrize("causal", [False, True])
++def test_the_window_loop_and_the_ring_keep_the_full_loops_bits(window, causal):
++    from tensorfold.families.glm5_next.cuda.dflash2 import _dattn_kernel
++
++    gen = torch.Generator(device="cuda").manual_seed(window)
++    H, KV, N, HD = 16, 4, 8, 128
++    ring = draft_ring_rows(window, N)
++    flat_cap = 13000
++    kc = torch.randn((KV, flat_cap, HD), generator=gen, device="cuda").bfloat16()
++    vc = torch.randn((KV, flat_cap, HD), generator=gen, device="cuda").bfloat16()
++    q = torch.randn((H, N, HD), generator=gen, device="cuda").bfloat16()
++
++    def run(k, v, cap, s, ring_mode, skip=True):
++        out = torch.empty((N, H * HD), dtype=torch.bfloat16, device="cuda")
++        _dattn_kernel[(KV,)](q, k, v, out, torch.tensor([s], device="cuda"), window, HD ** -0.5, N=N, G=H // KV,
++                             NH=H, HD=HD, CAP=cap, BK=64, CAUSAL=causal, RING=ring_mode, SKIP=skip, num_warps=4)
++        return out
++
++    starts = sorted({0, 1, 7, 63, 64, 65, window - 1, window, window + 1, window + 63, window + 64, ring - N,
++                     ring, ring + 1, 2 * ring + 5, 4095, 4096, 5000, 12345, flat_cap - N})
++    for s in starts:
++        want = run(kc, vc, flat_cap, s, False, skip=False)       # the old loop: every tile from 0
++        assert torch.equal(run(kc, vc, flat_cap, s, False), want), s         # the loop from the window's tile
++        rk = torch.randn((KV, ring, HD), generator=gen, device="cuda").bfloat16() * 100      # stale rows
++        rv = torch.randn((KV, ring, HD), generator=gen, device="cuda").bfloat16() * 100
++        pos = torch.arange(max(0, s + N - ring), s + N, device="cuda")
++        rk[:, pos % ring], rv[:, pos % ring] = kc[:, pos], vc[:, pos]
++        assert torch.equal(run(rk, rv, ring, s, True), want), s
++
++
++def _weights():
++    from tensorfold.families.glm5_next.cuda import qmm
++
++    g = torch.Generator(device="cuda").manual_seed(5)
++    embed = (torch.randn((V, D), generator=g, device="cuda") * 0.05).bfloat16()
++    head = qmm.quantize4((torch.randn((V, D), generator=g, device="cuda") * 0.03).bfloat16())
++    return SimpleNamespace(device=torch.device("cuda"), rank=0, world=1, comm=None, embed=embed, head=head,
++                           draft_head=None, vocab_offset=0)
++
++
++def _engine_stub():
++    """What ``take_snapshot`` and ``restore`` touch of an engine besides the drafter."""
++
++    st = SimpleNamespace(cur=[], rec=[torch.zeros(1, device="cuda")], conv=torch.zeros(1, device="cuda"), mtp_len=0,
++                         mtp_drafted=0, set_pos=lambda n: None, set_mtp_len=lambda n: None)
++    return SimpleNamespace(st=st)
++
++
++@pytest.fixture(scope="module", params=[2048, 49], ids=["window2047", "window48"])
++def pair(request, tmp_path_factory):
++    from tensorfold.families.glm5_next.cuda.dflash2 import Drafter
++
++    path = tmp_path_factory.mktemp(f"dring{request.param}")
++    _drafter(path)
++    (path / "config.json").write_text(json.dumps(dict(DRAFT, sliding_window=request.param)))
++    w = _weights()
++    flat = Drafter(path, w, capacity=12000, ring=False)
++    ring = Drafter(path, w, capacity=12000, ring=True)
++    assert flat.ring == 0 and ring.ring == draft_ring_rows(request.param - 1, flat.block) and ring.cap == ring.ring
++    assert ring.nbytes() < flat.nbytes()
++    yield flat, ring
++    del flat, ring
++    torch.cuda.empty_cache()
++
++
++def _drive(pair, seed: int) -> int:
++    """Prompt chunks and decode rounds far past the window on both drafters, a kept state taken, the context run on
++    past it (the ring overwritten), restored and run on again; every round's candidates compared bit for bit."""
++
++    from tensorfold.families.glm5_next.cuda import decode
++
++    flat, ring = pair
++    rng = np.random.default_rng(seed)
++    width = flat.tap_in.shape[1]
++    gen = torch.Generator(device="cuda").manual_seed(seed)
++    e = _engine_stub()
++    rounds = 0
++
++    def taps(n: int) -> torch.Tensor:
++        return (torch.randn((n, width), generator=gen, device="cuda") * 0.5).bfloat16()
++
++    def both_add(n: int) -> None:
++        t = taps(n)
++        flat.add_taps(t)
++        ring.add_taps(t)
++        assert flat.context_end == ring.context_end
++
++    def compare(k: int) -> None:
++        nonlocal rounds
++        for _ in range(k):
++            pending, depth = int(rng.integers(0, 1000)), int(rng.integers(1, flat.block))
++            a, b = flat.candidates(pending, depth), ring.candidates(pending, depth)
++            assert all(np.array_equal(x, y) for x, y in zip(a, b)), (flat.context_end, rounds)
++            rounds += 1
++            both_add(int(rng.integers(1, 9)))
++
++    for d in (flat, ring):
++        d.reset()
++    for n in (300, 64, 1000, 17, 2100):                  # a prompt in chunks: 3,481 rows
++        both_add(n)
++    compare(40)
++    n = flat.context_end
++    snaps = [decode.take_snapshot(e, list(range(n)), None, mtp=False, drafter=d) for d in (flat, ring)]
++    assert snaps[0].drafter_rows is None and snaps[1].drafter_rows is not None
++    both_add(3000)                                       # another conversation, past the ring many times over
++    compare(20)
++    for d, s in zip((flat, ring), snaps):
++        decode.restore(e, s, d)
++    compare(60)                                          # resumed: the kept window came back
++    for n in (64, 1500):                                 # a longer prompt resumed from there, then decode on
++        both_add(n)
++    compare(40)
++    return rounds
++
++
++def test_the_ring_drafts_the_flat_buffers_bits_eager(pair):
++    assert _drive(pair, 1) == 160
++
++
++def test_the_ring_drafts_the_flat_buffers_bits_in_cuda_graphs(pair):
++    for d in pair:
++        d.capture()
++    try:
++        assert _drive(pair, 2) == 160
++    finally:
++        for d in pair:
++            d.block_graph, d.tap_graphs = None, {}
+diff --git a/tests/test_glm_draft_ring.py b/tests/test_glm_draft_ring.py
+new file mode 100644
+index 00000000..467a218d
+--- /dev/null
++++ b/tests/test_glm_draft_ring.py
+@@ -0,0 +1,174 @@
++"""DFlash2's context ring (TF_GLM_DRAFT_RING) on CPU: its size and startup estimate, the drafter's weights as held,
++and the kept-state plumbing (``decode.take_snapshot`` / ``save_rows`` / ``restore``): a ring drafter whose ring the
++reply has wrapped reads, after a kept state is restored, the window a flat drafter reads. The kernel and the
++drafter's bits are under test in tests/cuda/test_glm_draft_ring.py."""
++
++from __future__ import annotations
++
++import importlib
++from types import SimpleNamespace
++
++import pytest
++
++from tensorfold.cuda.geometry import dflash2_geometry, dflash2_weights, draft_geometry, draft_ring_rows
++from tests.test_cuda_geometry import allocations  # noqa: F401  (fixture: fake triton, so decode imports)
++
++pytestmark = pytest.mark.torch
++
++# GLM-5.3-Flash-DFlash2's config.json (the sizes the estimate reads)
++DFLASH2 = {"num_hidden_layers": 5, "num_key_value_heads": 8, "head_dim": 128, "hidden_size": 4096,
++           "intermediate_size": 12288, "sliding_window": 2048, "dflash_config": {"block_size": 8}}
++
++
++def test_the_ring_holds_the_window_the_block_and_a_tile():
++    assert draft_ring_rows(2047, 8) == 2176                   # 2,047 + 8 + 63 = 2,118 rows, whole 64-row tiles
++    assert draft_ring_rows(48, 8) == 128
++    assert all(draft_ring_rows(w, 8) % 64 == 0 and draft_ring_rows(w, 8) >= w + 8 + 63 for w in range(1, 3000))
++
++
++def test_the_estimate_no_longer_grows_with_the_window():
++    old = draft_geometry(DFLASH2, 2, 16)                      # what GLM reserved before: two flat copies
++    flat = dflash2_geometry(DFLASH2, 2, 16, ring=False)
++    ring = dflash2_geometry(DFLASH2, 2, 16, ring=True)
++    assert old.bytes_at(1 << 20) - old.bytes_at((1 << 20) - 1) == 20480
++    assert flat.bytes_at(1 << 20) - flat.bytes_at((1 << 20) - 1) == 10240     # K,V x 5 layers x 4 heads x 128 x 2 B
++    fixed = flat.bytes_at(0) - 10240 * 8
++    assert fixed == old.bytes_at(0) - 20480 * 8
++    assert ring.bytes_at(1 << 20) == ring.bytes_at(4096) == fixed + 10240 * 2176      # one ring, 21.25 MiB
++    assert ring.bytes_at(1000) == flat.bytes_at(1000) == fixed + 10240 * (1000 + 8)   # a smaller window: flat
++    assert old.bytes_at(1 << 20) - ring.bytes_at(1 << 20) > 20 * 2 ** 30 - 30 * 2 ** 20
++    unwindowed = dict(DFLASH2, sliding_window=0)
++    assert dflash2_geometry(unwindowed, 2, 16, ring=True).bytes_at(5000) == fixed + 10240 * 5008
++
++
++def test_the_drafters_weights_are_its_4bit_copies(tmp_path):
++    """The weights estimate of a checkpoint with GLM-5.3-Flash-DFlash2's shapes (headers only, no data)."""
++
++    import json
++    import struct
++
++    D, H, KV, hd, inter, V, R = 4096, 32, 8, 128, 12288, 154880, 256
++    shapes = {"fc.weight": [D, 5 * D], "hidden_norm.weight": [D], "norm.weight": [D],
++              "candidate_selector.hidden_projection.weight": [R, D],
++              "candidate_selector.predecessor_codebook": [V, R], "candidate_selector.successor_codebook": [V, R]}
++    for i in range(5):
++        p = f"layers.{i}."
++        shapes.update({p + "self_attn.q_proj.weight": [H * hd, D], p + "self_attn.k_proj.weight": [KV * hd, D],
++                       p + "self_attn.v_proj.weight": [KV * hd, D], p + "self_attn.o_proj.weight": [D, H * hd],
++                       p + "self_attn.q_norm.weight": [hd], p + "self_attn.k_norm.weight": [hd],
++                       p + "mlp.gate_proj.weight": [inter, D], p + "mlp.up_proj.weight": [inter, D],
++                       p + "mlp.down_proj.weight": [D, inter], p + "input_layernorm.weight": [D],
++                       p + "post_attention_layernorm.weight": [D]})
++        for conv in ("attention_conv", "mlp_conv"):
++            shapes.update({p + conv + ".base_kernel": [2, 2, D],
++                           p + conv + ".kernel_projection.weight": [4 * D // 16, D]})
++    header, off = {}, 0
++    for name, shape in shapes.items():
++        n = 2
++        for x in shape:
++            n *= x
++        header[name] = {"dtype": "BF16", "shape": shape, "data_offsets": [off, off + n]}
++        off += n
++    raw = json.dumps(header).encode()
++    (tmp_path / "model.safetensors").write_bytes(struct.pack("<Q", len(raw)) + raw)
++    w = dflash2_weights(tmp_path, 2)
++    q4 = 9 / 16                                               # bytes a value: 4 bits, BF16 scale and bias a 64
++    per_layer = ((32 + 16) * hd // 2 * D + 16 * hd // 2 * D + D * H * hd // 2 + 2 * inter // 2 * D + D * inter // 2
++                 + 2 * 4 * D // 16 * D) * q4
++    bf16 = 2 * (2 * D + R * D + 5 * (2 * hd + 2 * D + 2 * 4 * D))
++    assert w.resident == int(D * 5 * D * q4 + 5 * per_layer) + bf16 + 2 * V * R * 4
++    assert 0.62 * 2 ** 30 < w.resident < 0.64 * 2 ** 30        # 4-bit copies 0.33 GiB, host codebooks 0.30 GiB
++    assert 2 * off > 6.8 * w.resident                          # the old estimate: 4 bytes a value (4.37 GiB)
++    assert w.staging == 4 * D * 5 * D + 24 * D * 5 * D        # fc: read, uploaded and quantized in one piece
++
++
++class FakeDrafter:
++    """The context side of ``dflash2.Drafter``: rows land at their position (flat) or at position % ring, each row
++    tagged with its position and the conversation that wrote it."""
++
++    window, block, KV, HD = 48, 8, 2, 4
++
++    def __init__(self, torch, *, ring: bool) -> None:
++        self.torch = torch
++        self.ring = draft_ring_rows(self.window, self.block) if ring else 0
++        cap = self.ring or 4096
++        self.kc = [torch.zeros((self.KV, cap, self.HD), dtype=torch.float32) for _ in range(2)]
++        self.vc = [torch.zeros((self.KV, cap, self.HD), dtype=torch.float32) for _ in range(2)]
++        self.context_end = 0
++        self.pos_dev = torch.zeros((1,), dtype=torch.int64)
++
++    def reset(self) -> None:
++        self.context_end = 0
++        self.pos_dev.zero_()
++
++    def add(self, n: int, tag: int) -> None:
++        for p in range(self.context_end, self.context_end + n):
++            slot = p % self.ring if self.ring else p
++            for i, (k, v) in enumerate(zip(self.kc, self.vc)):
++                k[:, slot] = tag * 1e6 + p * 10 + i
++                v[:, slot] = -(tag * 1e6 + p * 10 + i)
++        self.context_end += n
++        self.pos_dev.fill_(self.context_end)
++
++    def window_rows(self) -> list:
++        """What a block pass at context_end reads: the rows context_end - window .. context_end - 1."""
++        s = self.context_end
++        idx = [p % self.ring if self.ring else p for p in range(max(0, s - self.window), s)]
++        return [c[:, idx].clone() for c in self.kc + self.vc]
++
++
++def _engine(torch):
++    st = SimpleNamespace(cur=[], rec=[torch.zeros(3)], conv=torch.zeros(2), mtp_len=0, mtp_drafted=0, kc=[], vc=[],
++                         index=None, set_pos=lambda n: None, set_mtp_len=lambda n: None)
++    return SimpleNamespace(st=st)
++
++
++def test_a_restored_state_reads_the_flat_drafters_window_after_the_ring_wrapped(allocations):  # noqa: F811
++    import torch
++
++    decode = importlib.import_module("tensorfold.families.glm5_next.cuda.decode")
++    e = _engine(torch)
++    flat, ring = FakeDrafter(torch, ring=False), FakeDrafter(torch, ring=True)
++    assert ring.ring == 128
++    for d in (flat, ring):
++        d.add(300, tag=1)                                    # a prompt
++    snaps = [decode.take_snapshot(e, list(range(300)), None, mtp=False, drafter=d) for d in (flat, ring)]
++    assert snaps[0].drafter_rows is None
++    assert [r.shape[1] for r in snaps[1].drafter_rows] == [ring.window + 1] * 4
++    held = decode.snapshot_bytes(snaps[0])
++    assert decode.snapshot_bytes(snaps[1]) == held + 4 * ring.KV * (ring.window + 1) * ring.HD * 4
++    for d in (flat, ring):
++        d.add(3 * ring.ring + 5, tag=2)                      # its reply, past the ring three times
++    assert all((a == b).all() for a, b in zip(ring.window_rows(), flat.window_rows()))
++    kept = [p % ring.ring for p in range(300 - ring.window - 1, 300)]
++    assert not (ring.kc[0][:, kept] == snaps[1].drafter_rows[0]).any()     # the reply overwrote the kept window
++    for d, s in zip((flat, ring), snaps):                    # the next prompt of the conversation resumes
++        decode.restore(e, s, d)
++        assert d.context_end == 300 and int(d.pos_dev) == 300
++    assert all((a == b).all() for a, b in zip(ring.window_rows(), flat.window_rows()))
++    cold = FakeDrafter(torch, ring=True)
++    cold.add(300, tag=1)
++    assert all((a == b).all() for a, b in zip(ring.window_rows(), cold.window_rows()))
++    for d in (flat, ring):
++        d.add(40, tag=3)
++    assert all((a == b).all() for a, b in zip(ring.window_rows(), flat.window_rows()))
++
++
++def test_a_saved_state_drops_the_window_and_a_ring_needs_one(allocations):  # noqa: F811
++    import torch
++
++    decode = importlib.import_module("tensorfold.families.glm5_next.cuda.decode")
++    e = _engine(torch)
++    ring = FakeDrafter(torch, ring=True)
++    ring.add(20, tag=1)
++    snap = decode.take_snapshot(e, list(range(20)), None, mtp=False, drafter=ring)
++    assert snap.drafter_rows is not None and snap.drafter_rows[0].shape[1] == 20      # shorter than the window
++    decode.save_rows(e, snap)                                # another conversation took the caches
++    assert snap.drafter_end == -1 and snap.drafter_rows is None
++    assert decode.snapshot_bytes(snap) == 3 * 4 + 2 * 4
++    stale = decode.Snapshot(list(range(20)), torch.zeros(3), torch.zeros(2), None, -1, 20)
++    with pytest.raises(ValueError, match="window"):
++        decode.restore(e, stale, ring)
++    ring.add(5, tag=2)
++    other = decode.take_snapshot(e, list(range(20)), None, mtp=False, drafter=ring)      # the drafter ran on
++    assert other.drafter_end == 25 and other.drafter_rows is None

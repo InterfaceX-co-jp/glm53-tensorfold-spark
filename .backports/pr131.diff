@@ -1,0 +1,395 @@
+diff --git a/docs/recipes/glm-5.3-flash.md b/docs/recipes/glm-5.3-flash.md
+index 97cf8dca..799dcfe3 100644
+--- a/docs/recipes/glm-5.3-flash.md
++++ b/docs/recipes/glm-5.3-flash.md
+@@ -21,12 +21,19 @@ when those terms fit the intended use. The CLI uses it automatically once it has
+ Without it, the engine uses MTP drafts; `--drafter none` explicitly selects MTP-only drafting.
+ Give both ranks the same drafter setting. `--no-drafts` disables all drafting for the serial reference.
+ A checkpoint with neither an MTP head nor a supplied DFlash2 model is refused unless drafts are disabled.
++`TF_GLM_MTP` (`auto` by default) decides whether the CUDA engine loads the MTP head: `auto` leaves it out when
++DFlash2 is loaded or drafts are disabled, `1` keeps it beside DFlash2 (so MTP policies and `auto`'s per-round choice
++stay available), `0` leaves it out. Left out, it saves each rank the head's weights (about 2 GiB for this checkpoint),
++its cache rows and decode buffers, and prompts skip its absorb; MTP policies (and `--mtp-drafts N`) then draft with
++DFlash2. Replies are the same either way. Give both ranks the same setting.
+ 
+ ### Draft policies
+ 
+-For the affine checkpoint, the default `auto` policy uses MTP for sampled requests. For greedy requests with DFlash2 available,
++For the affine checkpoint with its MTP head loaded, the default `auto` policy uses MTP for sampled requests.
++For greedy requests with DFlash2 loaded beside the head (`TF_GLM_MTP=1`),
+ it compares committed tokens per estimated round time and chooses a drafter. It periodically probes
+ the other drafter and discards its old rate after switching away, so later probes can change the choice.
++Without the head (`TF_GLM_MTP=auto` beside DFlash2, or `0`), `auto` drafts with DFlash2.
+ Every policy verifies against the same target, and `"draft": false` selects the serial reference.
+ A request can select a policy after `@` in its model ID, such as `bench@c3:0.35`, or with `tf_policy`.
+ `--mtp-drafts N` selects a fixed depth at startup. With DFlash2 available, `--mtp-drafts 0` selects
+diff --git a/src/tensorfold/cuda/geometry.py b/src/tensorfold/cuda/geometry.py
+index ee444c2a..1b25219e 100644
+--- a/src/tensorfold/cuda/geometry.py
++++ b/src/tensorfold/cuda/geometry.py
+@@ -193,7 +193,10 @@ def _indexed_prefill_row(t: dict, world: int, h: int, hk: int, hd: int, nv: int,
+             + 12 * streams + 64)
+ 
+ 
+-def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False) -> Geometry:
++def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
++                 mtp: bool | None = None) -> Geometry:
++    """GLM's engine: ``mtp`` whether it holds the MTP head's caches and decode buffers (None: when the checkpoint has
++    one; GLM's TF_GLM_MTP can leave it out)."""
+     linear, attention = layer_counts(t)
+     lin = t.get("linear_attn_config") or {}
+     heads = int(t["num_attention_heads"]) // world
+@@ -202,7 +205,7 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     conv = int(lin.get("short_conv_kernel_size", t.get("linear_conv_kernel_dim", 4)))
+     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
+     vd, index = int(t["v_head_dim"]), int(t.get("index_head_dim", 128))
+-    mtp = int(t.get("num_nextn_predict_layers", 0)) > 0
++    mtp = int(t.get("num_nextn_predict_layers", 0)) > 0 if mtp is None else bool(mtp)
+     rows, d, streams = 64, int(t["hidden_size"]), int(t.get("hc_mult", 4))
+     fixed = linear * (4 * lh * ld * ld * 4 + 3 * (conv - 1) * 3 * lh * ld * 2)
+     fixed += linear * rows * (3 * lh * ld + 2 * ld + lh) * 2
+diff --git a/src/tensorfold/families/glm5_next/cuda/engine.py b/src/tensorfold/families/glm5_next/cuda/engine.py
+index 43c1af4e..5364cf86 100644
+--- a/src/tensorfold/families/glm5_next/cuda/engine.py
++++ b/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -81,6 +81,33 @@ def _ints_f64(lo: int, hi: int) -> float:
+     return struct.unpack("<d", struct.pack("<2i", lo, hi))[0]
+ 
+ 
++MTP_DEFAULT = "auto"                  # TF_GLM_MTP when unset: "1" keeps the MTP head beside DFlash2 as before
++
++
++def mtp_head(drafter: bool, serial_only: bool, layers: int, value: str | None = None) -> bool:
++    """TF_GLM_MTP: whether the engine loads and runs the checkpoint's MTP head (``layers``: its
++    num_nextn_predict_layers). auto (MTP_DEFAULT): off when a DFlash2 drafter is loaded or no request drafts
++    (--no-drafts), on otherwise; 1: on whenever the checkpoint has one (MTP drafts and auto's per-round choice
++    between both drafters stay available beside DFlash2); 0: off. Off, the head's weights, caches and decode buffers
++    are never allocated, prompts skip its absorb, and MTP policies draft with DFlash2 instead (``_effective``): the
++    same replies, since drafts only propose."""
++
++    value = os.environ.get("TF_GLM_MTP", "") if value is None else value
++    value = value.strip().lower() or MTP_DEFAULT
++    if value not in ("0", "1", "auto"):
++        raise ValueError(f"TF_GLM_MTP: 0, 1 or auto, not {value!r}")
++    if value == "auto":
++        return bool(layers) and not drafter and not serial_only
++    return value == "1" and bool(layers)
++
++
++def without_mtp(transform, layers: int):
++    """A startup weight transform that leaves out the MTP layer's tensors (``layers.<num_hidden_layers>.``)."""
++
++    prefix = f"model.language_model.layers.{layers}."
++    return lambda name, info: (0, 0) if name.startswith(prefix) else transform(name, info)
++
++
+ class GlmEngine:
+     """GLM-5.3-Flash on two ranks (this one ``rank``): weights, MTP and DFlash2 drafting, per-request policies."""
+ 
+@@ -111,10 +138,16 @@ def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy
+         explicit = context is not None if context_explicit is None else bool(context_explicit)
+         from . import LATENT
+ 
++        # TF_GLM_MTP (``mtp_head``): off, the MTP layer's tensors are not loaded, nor its caches and decode buffers
++        # allocated, so the estimate drops them too
++        self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
++        weights_estimate = split_weights(rule)
++        if not self.mtp_on:
++            weights_estimate = without_mtp(weights_estimate, cfg.layers)
+         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+                                    lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
+-                                                             latent=LATENT),
+-                                   split_weights(rule), rank=rank, world=2, gather=self._gather_ints,
++                                                             latent=LATENT, mtp=self.mtp_on),
++                                   weights_estimate, rank=rank, world=2, gather=self._gather_ints,
+                                    draft_dir=drafter, draft_geometry=lambda text: draft_geometry(text, 2, MAX_ROWS))
+         self.limit = self.capacity_plan["context_window"]
+         capacity = self.capacity_plan["cache_slots"]
+@@ -122,7 +155,7 @@ def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy
+         # both ranks must run the same calls: refuse to start when they were given different settings
+         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows]
++                prefill_rows, int(self.mtp_on)]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -130,7 +163,7 @@ def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy
+         both = self._gather_ints(mine + [spare >> 20])
+         if both[0][:-1] != both[1][:-1]:
+             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+-                               "TF_GLM_LATENT): "
++                               "TF_GLM_LATENT, TF_GLM_MTP): "
+                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
+                                "(or pass --drafter none to both) and give both the same flags")
+         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+@@ -140,14 +173,18 @@ def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy
+         if rank == 0 and self.cache_bytes < wanted:
+             print(f"[tensorfold] other conversations' prompts are kept in {self.cache_bytes / 2 ** 30:.1f} GiB, what "
+                   f"the {self.limit}-token window leaves (TF_GLM_CACHE_GIB asks {wanted / 2 ** 30:.1f})", flush=True)
+-        w = load(model_dir, rank=rank)
++        if not self.mtp_on and drafter is None and not serial_only:
++            raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
++                             "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
++                             "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
++        w = load(model_dir, rank=rank, mtp=self.mtp_on)
+         w.comm = self.comm
+         self.comm.barrier()
+-        if w.mtp is None and drafter is None and not serial_only:
+-            raise ValueError("this checkpoint has no MTP head and no DFlash2 draft model was given, so every round "
+-                             "would decode one token: pull the draft model on both machines (--drafter), or pass "
+-                             "--no-drafts to both for the serial reference")
+         self.w = w
++        if rank == 0 and cfg.mtp_layers and not self.mtp_on:
++            print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
++                  (os.environ.get("TF_GLM_MTP", "").strip() or MTP_DEFAULT) + "): " +
++                  ("DFlash2 drafts every request" if drafter is not None else "--no-drafts"), flush=True)
+         self.drafter = None
+         if drafter is not None:
+             from .dflash2 import Drafter
+@@ -161,9 +198,10 @@ def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy
+         if rank == 0:
+             c = self.costs
+             print(f"[tensorfold] drafter timings (ms, fastest of 7): {c['timed']}", flush=True)
+-            print("[tensorfold] drafter costs (ms): verify " + " ".join(f"{v:.1f}" for v in c["verify"]) +
+-                  f"; MTP draft {c['mtp']:.2f} (+{c['mtp_step']:.2f} a chained draft, +{c['mtp_row']:.2f} a row); "
+-                  f"DFlash2 block {c['block']:.2f} (+{c['taps_row']:.3f} a tap row)", flush=True)
++            mtp = (f"; MTP draft {c['mtp']:.2f} (+{c['mtp_step']:.2f} a chained draft, +{c['mtp_row']:.2f} a row)"
++                   if w.mtp is not None else "")
++            print("[tensorfold] drafter costs (ms): verify " + " ".join(f"{v:.1f}" for v in c["verify"]) + mtp +
++                  f"; DFlash2 block {c['block']:.2f} (+{c['taps_row']:.3f} a tap row)", flush=True)
+         self.eos = tuple(w.cfg.eos)
+         self.model_dir = Path(model_dir)
+         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
+diff --git a/src/tensorfold/families/glm5_next/cuda/weights.py b/src/tensorfold/families/glm5_next/cuda/weights.py
+index bc0b47f4..9729e4b4 100644
+--- a/src/tensorfold/families/glm5_next/cuda/weights.py
++++ b/src/tensorfold/families/glm5_next/cuda/weights.py
+@@ -240,8 +240,9 @@ def add(t):
+         return total
+ 
+ 
+-def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
+-    """Read one of two ranks from a full checkpoint or rank folder, including MTP and its half of the vocabulary head."""
++def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
++    """Read one of two ranks from a full checkpoint or rank folder, including MTP (unless ``mtp`` is False: TF_GLM_MTP
++    off, whose tensors are then never read) and its half of the vocabulary head."""
+ 
+     from .split import RankReader
+ 
+@@ -319,8 +320,8 @@ def mlp(p: str) -> MLPW:
+     def expert_names(i: int) -> list[str]:
+         """Layer ``i``'s expert tensors in the order ``moe`` reads them (none for a dense layer; ``cfg.layers``: MTP)."""
+ 
+-        mtp = i == cfg.layers and cfg.mtp_layers
+-        if not mtp and (i >= cfg.layers or cfg.mlp_kinds[i] != "moe"):
++        mtp_layer = i == cfg.layers and cfg.mtp_layers and mtp
++        if not mtp_layer and (i >= cfg.layers or cfg.mlp_kinds[i] != "moe"):
+             return []
+         p, parts = PREFIX + f"layers.{i}.mlp.", ("trellis", "suh", "svh") if exl3 else ("weight", "scales", "biases")
+         names = []
+@@ -420,7 +421,7 @@ def layer(i: int, plain: bool = False) -> LayerW:
+             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
+                            hb[rank * vl:(rank + 1) * vl].to(dev))
+         mtpw = None
+-        if cfg.mtp_layers:
++        if cfg.mtp_layers and mtp:
+             i = cfg.layers
+             mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
+                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
+diff --git a/tests/cuda/conftest.py b/tests/cuda/conftest.py
+index 4869882d..d7eb7938 100644
+--- a/tests/cuda/conftest.py
++++ b/tests/cuda/conftest.py
+@@ -1,6 +1,11 @@
+ """The CUDA engines' tests: collected only where PyTorch sees an NVIDIA GPU (DGX Spark, in NVIDIA's container)."""
+ 
+ import importlib.util
++import os
++
++# GLM's engines here load the MTP head beside the DFlash2 drafter (TF_GLM_MTP=1, the default off beside a drafter),
++# so both drafters and the per-round choice between them stay under test; TF_GLM_MTP's own tests set it per engine
++os.environ.setdefault("TF_GLM_MTP", "1")
+ 
+ 
+ def _cuda() -> bool:
+diff --git a/tests/cuda/test_glm_engine.py b/tests/cuda/test_glm_engine.py
+index 9c805c0f..d747c9a7 100644
+--- a/tests/cuda/test_glm_engine.py
++++ b/tests/cuda/test_glm_engine.py
+@@ -451,6 +451,73 @@ def test_no_mtp_head_drafts_with_dflash2(engine_n, sampling):
+         assert stats["min_rows"] >= 2 and "m" not in stats.get("drafters", ""), (policy, stats)
+ 
+ 
++@pytest.fixture(scope="module")
++def engine_off(tmp_path_factory):
++    """engine_f's checkpoint and drafter under TF_GLM_MTP=auto (the default beside a drafter): the checkpoint's MTP
++    head is not loaded; TF_GLM_MTP=0 without a drafter refuses to start."""
++
++    import os
++
++    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
++
++    path = tmp_path_factory.mktemp("glm_off")
++    _checkpoint(path / "model")
++    _drafter(path / "dflash2")
++    old = os.environ.get("TF_GLM_MTP")
++    try:
++        os.environ["TF_GLM_MTP"] = "0"
++        with pytest.raises(ValueError, match="TF_GLM_MTP=0 leaves no MTP head"):
++            GlmEngine(path / "model", rank=0, master="", port=0, comm=_TwoCopies())
++        os.environ["TF_GLM_MTP"] = "auto"
++        return GlmEngine(path / "model", rank=0, master="", port=0, drafter=path / "dflash2", comm=_TwoCopies())
++    finally:
++        if old is None:
++            os.environ.pop("TF_GLM_MTP", None)
++        else:
++            os.environ["TF_GLM_MTP"] = old
++
++
++@pytest.mark.parametrize("sampling", [Sampling(1234, 1.0, 20, 0.95), None], ids=["sampled", "greedy"])
++def test_mtp_off_beside_dflash2_gives_the_same_replies(engine_off, engine_f, sampling):
++    """Without the MTP head (TF_GLM_MTP off) the engine holds neither its weights, caches nor decode buffers, estimates
++    less, and every policy (MTP ones through DFlash2) gives the replies the engine with the head gives."""
++
++    from tensorfold.families.glm5_next.cuda.engine import DFLASH_POLICY, encode_policy
++
++    off, on = engine_off, engine_f
++    assert off.w.mtp is None and off.e.mbuf is None and not hasattr(off.e.st, "mtp_kc")
++    assert on.w.mtp is not None and on.e.mbuf is not None and hasattr(on.e.st, "mtp_kc")
++    assert off.w.nbytes() < on.w.nbytes()
++    for key in ("weight_bytes_estimate", "cache_workspace_bytes_estimate"):
++        assert off.capacity_plan[key] < on.capacity_plan[key], key
++    assert off._effective(encode_policy("auto")) == encode_policy(DFLASH_POLICY)
++    assert off._effective(encode_policy("auto:1:1:0")) == encode_policy(DFLASH_POLICY)
++    assert off._effective(encode_policy("2")) == encode_policy("f2")
++    prompt = list(np.random.default_rng(6).integers(0, 1000, size=41))
++    serial, _ = _generate(on, prompt, sampling, draft=False, tokens=40)
++    assert _generate(off, prompt, sampling, draft=False, tokens=40)[0] == serial
++    for policy in (None, "auto", "auto:1:1:0", "2", "c3:0.35", "a:0.6:0.85", "f3", "fc5:0.3"):
++        drafted, stats = _generate(off, prompt, sampling, policy=policy, tokens=40)
++        assert drafted == serial, policy
++        assert stats["min_rows"] >= 2 and "m" not in stats.get("drafters", ""), (policy, stats)
++
++
++def test_mtp_off_resumes(engine_off):
++    """Kept prompt states without the head's rows resume like fresh prefills."""
++
++    sampling = Sampling(11, 1.0, 20, 0.95)
++    first = list(np.random.default_rng(12).integers(0, 1000, size=30))
++    reply, _ = _generate(engine_off, first, sampling, tokens=30)
++    after = first + reply + [21, 22]
++    for policy in ("auto", "2", "f3"):
++        warm, stats = _generate(engine_off, after, sampling, policy=policy)
++        assert stats["cached"] == len(first), policy
++        _forget(engine_off)
++        cold, stats = _generate(engine_off, after, sampling, policy=policy)
++        assert stats["cached"] == 0 and warm == cold, policy
++        _generate(engine_off, first, sampling, tokens=30)                        # the prompt's state again
++
++
+ @pytest.fixture(scope="module")
+ def engine_long(tmp_path_factory):
+     """The model with a context past the dense limit (2,051 tokens), so rows attend to DSA-selected tokens."""
+diff --git a/tests/test_cuda_capacity.py b/tests/test_cuda_capacity.py
+index c048bee2..c60e6df3 100644
+--- a/tests/test_cuda_capacity.py
++++ b/tests/test_cuda_capacity.py
+@@ -44,7 +44,8 @@ def test_glm_nonfit_refuses_before_weight_load(tmp_path, monkeypatch):
+     from tensorfold.families.glm5_next.cuda import engine
+     import sys
+ 
+-    weights = SimpleNamespace(Config=SimpleNamespace(read=lambda *a: SimpleNamespace(dense_limit=2051)), load=None)
++    glm = SimpleNamespace(dense_limit=2051, mtp_layers=1, layers=4)
++    weights = SimpleNamespace(Config=SimpleNamespace(read=lambda *a: glm), load=None)
+     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.weights", weights)
+     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.decode", SimpleNamespace(Engine=None))
+ 
+@@ -59,7 +60,7 @@ def test_glm_nonfit_refuses_before_weight_load(tmp_path, monkeypatch):
+     monkeypatch.setattr(torch.cuda, "set_device", lambda *a: None)
+     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a: (6 * 1024**3, 8 * 1024**3))
+     monkeypatch.setattr(capacity, "_meminfo", lambda: None)      # a Spark's MemAvailable would admit it
+-    monkeypatch.setattr(weights.Config, "read", lambda *a: SimpleNamespace(dense_limit=2051))
++    monkeypatch.setattr(weights.Config, "read", lambda *a: glm)
+     monkeypatch.setattr(engine.GlmEngine, "_gather_ints", lambda self, x: [x, x])
+     def load(*a, **kw):
+         pytest.fail("weight allocation was reached before startup admission")
+@@ -136,7 +137,8 @@ def both(send, recv):
+     for family in ("qwen3_5", "qwen4_exp", "glm5_next"):
+         prefix = f"tensorfold.families.{family}.cuda"
+         weights = SimpleNamespace(load=load, draft_token_ids=lambda *a: None,
+-                                  Config=SimpleNamespace(read=lambda *a: SimpleNamespace(dense_limit=2051)))
++                                  Config=SimpleNamespace(read=lambda *a: SimpleNamespace(dense_limit=2051, mtp_layers=1,
++                                                                                         layers=4)))
+         monkeypatch.setitem(sys.modules, prefix + ".weights", weights)
+         monkeypatch.setitem(sys.modules, prefix + ".decode", SimpleNamespace(Engine=None))
+     import torch.distributed as dist
+diff --git a/tests/test_glm_mtp_setting.py b/tests/test_glm_mtp_setting.py
+new file mode 100644
+index 00000000..f801e360
+--- /dev/null
++++ b/tests/test_glm_mtp_setting.py
+@@ -0,0 +1,63 @@
++"""TF_GLM_MTP on CPU: when GLM's CUDA engine loads the MTP head, and that leaving it out leaves its tensors, cache
++rows and decode buffers out of the startup estimate. The engine end to end (replies with and without the head) is
++tests/cuda/test_glm_engine.py's."""
++
++from __future__ import annotations
++
++import pytest
++
++from tensorfold.cuda import geometry
++from tensorfold.families.glm5_next.cuda.engine import MTP_DEFAULT, mtp_head, without_mtp
++
++
++def test_the_setting(monkeypatch):
++    # auto: on without a drafter, off beside DFlash2 or without drafts
++    for value in ("auto", " AUTO "):
++        assert mtp_head(False, False, 1, value) is True
++        assert mtp_head(True, False, 1, value) is False
++        assert mtp_head(False, True, 1, value) is False
++    assert mtp_head(True, False, 1, "1") is True and mtp_head(False, True, 1, "1") is True
++    assert mtp_head(False, False, 1, "0") is False
++    for value in ("", "1", "0"):                      # a checkpoint without the head never has one
++        assert mtp_head(False, False, 0, value) is False
++    for bad in ("2", "on", "yes", "-1"):
++        with pytest.raises(ValueError, match="TF_GLM_MTP"):
++            mtp_head(False, False, 1, bad)
++    for args in ((True, False, 1), (False, False, 1), (False, True, 1)):       # unset or empty: MTP_DEFAULT
++        assert mtp_head(*args, "") is mtp_head(*args, MTP_DEFAULT), args
++        monkeypatch.delenv("TF_GLM_MTP", raising=False)
++        assert mtp_head(*args) is mtp_head(*args, MTP_DEFAULT), args
++    monkeypatch.setenv("TF_GLM_MTP", "1")
++    assert mtp_head(True, False, 1) is True
++
++
++def test_the_weight_estimate_leaves_out_only_the_head():
++    base = lambda name, info: (7, 1)                                         # noqa: E731
++    t = without_mtp(base, 45)
++    assert t("model.language_model.layers.45.mlp.experts.0.gate_proj.trellis", {}) == (0, 0)
++    assert t("model.language_model.layers.45.eh_proj.weight", {}) == (0, 0)
++    for kept in ("model.language_model.layers.44.mlp.gate.weight", "model.language_model.layers.4.eh_proj.weight",
++                 "model.language_model.layers.450.x", "lm_head.weight", "model.language_model.embed_tokens.weight"):
++        assert t(kept, {}) == (7, 1), kept
++
++
++TEXT = {"hidden_size": 512, "num_attention_heads": 8, "num_hidden_layers": 4,
++        "layer_types": ["linear_attention", "full_attention"] * 2, "linear_num_heads": 8,
++        "qk_nope_head_dim": 256, "v_head_dim": 256, "vocab_size": 1024, "kv_lora_rank": 512,
++        "moe_intermediate_size": 512, "num_experts_per_tok": 2}
++
++
++@pytest.mark.parametrize("latent", [True, False])
++def test_the_geometry_follows_the_setting_not_the_config(latent):
++    """mla_geometry(mtp=False) on a checkpoint with the head is the geometry of one without it, and smaller by the
++    head's cache rows (latent and indexer) at every capacity."""
++
++    with_head = {**TEXT, "num_nextn_predict_layers": 1}
++    without = {**TEXT, "num_nextn_predict_layers": 0}
++    for slots in (2560, 65536, 1 << 20):
++        off = geometry.mla_geometry(with_head, 2, 16, latent=latent, mtp=False).bytes_at(slots)
++        assert off == geometry.mla_geometry(without, 2, 16, latent=latent).bytes_at(slots)
++        on = geometry.mla_geometry(with_head, 2, 16, latent=latent).bytes_at(slots)
++        assert on == geometry.mla_geometry(without, 2, 16, latent=latent, mtp=True).bytes_at(slots)
++        rows = slots * 512 * 2 if latent else slots * 4 * 512 * 2
++        assert on - off > rows + (2 * slots + slots // 4 + 2) * 128 * 2
