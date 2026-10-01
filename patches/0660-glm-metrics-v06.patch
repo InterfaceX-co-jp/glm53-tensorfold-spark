@@ -1,0 +1,340 @@
+diff --git a/src/tensorfold/cuda/health.py b/src/tensorfold/cuda/health.py
+--- a/src/tensorfold/cuda/health.py
++++ b/src/tensorfold/cuda/health.py
+@@ -32,6 +32,25 @@
+ request ends. 0150's fields (``ok``, ``mode``, ``inflight``, ``requests``, ``errors``, ...) are unchanged, and
+ ``/metrics`` is unchanged.
+ 
++patches/0660 (upstream v0.6.0's ``server/metrics.py``, MIT, by MiaAI Lab and ashhart): ``/metrics`` gains the metric
++families upstream publishes under upstream's names, so a v0.6.0 dashboard or scrape config reads this server too:
++
++- ``tensorfold_requests_running`` / ``tensorfold_requests_waiting``: the batch engine's occupied slots and the jobs in
++  its admission queue (0150's ``tensorfold_requests_inflight`` counts the HTTP requests instead: a queued request is in
++  flight but not running).
++- ``tensorfold_generation_tokens_total``: upstream's name for ``tensorfold_completion_tokens_total``.
++- ``tensorfold_mtp_drafted_total`` / ``tensorfold_mtp_accepted_total``: the drafter's proposals and the rows kept. An
++  accepted over drafted below ~0.5 means a mismatched drafter, the same signal as tokens a round but cumulative.
++- ``tensorfold_kv_cache_usage_ratio{pool="N"}``: per live slot, the engine's own position over its context window.
++- ``tensorfold_request_latency_seconds`` / ``tensorfold_time_to_first_token_seconds``: histograms with upstream's
++  bucket edges, so p50/p95 of both are readable. Latency spans arrival to the last token (a failed request is counted
++  too: it held the server), TTFT only requests that produced a token.
++
++The engine's slots, queue and pool ratios are read without a lock and only as sizes and positions, as upstream does: a
++scrape must never block a round, and a scrape must never fail one. A server whose engine is not a batch engine (or
++whose slots are not readable yet) publishes pool 0 at 0 and counts the HTTP requests as running, which is all 0150
++alone could see.
++
+ A request is stalled when its last token (or its start, before the first token) is older than ``GLM53_TF_STALL_S``
+ (default 0: never) plus, before the first token, its prompt at ``GLM53_TF_STALL_PREFILL_TPS`` tokens a second
+ (default 200, well under the slowest measured prefill, so a 1M prompt gets ~83 min before it counts).
+@@ -46,6 +65,10 @@
+ from typing import Any
+ 
+ MODES = ("basic", "strict")
++
++# patches/0660: upstream v0.6.0's histogram edges. Request latency and time to first token share them; +Inf is added
++# when rendered.
++BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0)
+ 
+ 
+ def env_mode() -> str:
+@@ -63,6 +86,31 @@
+     if value < 0:
+         raise ValueError(f"{name}={raw}: must be >= 0")
+     return value
++
++
++class Histogram:
++    """patches/0660: counts in one bucket each; rendering adds them up into Prometheus's cumulative buckets."""
++
++    def __init__(self) -> None:
++        self.counts = [0] * (len(BUCKETS) + 1)
++        self.total = 0.0
++        self.n = 0
++
++    def observe(self, value: float) -> None:
++        value = max(0.0, float(value))
++        self.n += 1
++        self.total += value
++        for i, edge in enumerate(BUCKETS):
++            if value <= edge:
++                self.counts[i] += 1
++                return
++        self.counts[-1] += 1
++
++    def copy(self) -> "Histogram":
++        other = Histogram()
++        other.counts = list(self.counts)
++        other.total, other.n = self.total, self.n
++        return other
+ 
+ 
+ class Health:
+@@ -83,9 +131,13 @@
+         self.last_done = None
+         self.counters: dict[str, float] = {k: 0 for k in (
+             "requests", "errors", "rejected", "prompt_tokens", "completion_tokens", "cached_tokens",
+-            "decode_rounds", "decode_seconds", "prefill_seconds")}
++            "decode_rounds", "decode_seconds", "prefill_seconds",
++            "drafted", "accepted")}                     # patches/0660: the drafter's proposals and the rows kept
+         # patches/0600: upstream's /health totals (every ended request, failed ones included)
+         self.totals: dict[str, float] = dict.fromkeys(TOTALS, 0)
++        # patches/0660: upstream's two histograms
++        self.latency = Histogram()
++        self.ttft = Histogram()
+ 
+     # -- request lifecycle -------------------------------------------------------------------------------------
+ 
+@@ -94,22 +146,28 @@
+             rid = self.next_id
+             self.next_id += 1
+             now = self.clock()
+-            self.inflight[rid] = {"prompt": float(prompt_tokens), "start": now, "last": now, "tokens": 0.0}
++            self.inflight[rid] = {"prompt": float(prompt_tokens), "start": now, "last": now, "tokens": 0.0,
++                                  "first": 0.0}
+             return rid
+ 
+     def progress(self, rid: int, n: int) -> None:
+         with self.lock:
+             entry = self.inflight.get(rid)
+             if entry is not None:
+-                entry["last"] = self.clock()
++                now = self.clock()
++                if entry["tokens"] == 0:
++                    entry["first"] = now                # patches/0660: the first token's clock time
++                entry["last"] = now
+                 entry["tokens"] += n
+ 
+     def end(self, rid: int, *, stats: dict[str, Any] | None = None, completion_tokens: int = 0,
+             error: BaseException | None = None) -> None:
+         with self.lock:
++            now = self.clock()
+             entry = self.inflight.pop(rid, None)
+-            self.last_done = self.clock()
+-            self._fold(entry, stats if error is None else None)          # patches/0600
++            self.last_done = now
++            self._timed(entry, now)                                   # patches/0660
++            self._fold(entry, stats if error is None else None)       # patches/0600
+             c = self.counters
+             c["requests"] += 1
+             if error is not None:
+@@ -124,6 +182,17 @@
+             c["decode_rounds"] += float(stats.get("rounds", 0) or 0)
+             c["decode_seconds"] += float(stats.get("decode_s", 0) or 0)
+             c["prefill_seconds"] += float(stats.get("prefill_s", 0) or 0)
++            c["drafted"] += float(stats.get("drafted", 0) or 0)       # patches/0660
++            c["accepted"] += float(stats.get("accepted", 0) or 0)     # patches/0660
++
++    def _timed(self, entry: dict[str, float] | None, now: float) -> None:
++        """patches/0660: one finished request into upstream's latency and time-to-first-token histograms."""
++
++        if entry is None:
++            return
++        self.latency.observe(now - entry["start"])
++        if entry["first"]:
++            self.ttft.observe(entry["first"] - entry["start"])
+ 
+     def _fold(self, entry: dict[str, float] | None, stats: dict[str, Any] | None) -> None:
+         """patches/0600: an ended request into upstream's totals (its prompt, the tokens it emitted, its stats)."""
+@@ -204,8 +273,9 @@
+         code = 503 if self.mode == "strict" and not body["ok"] else 200
+         return code, body
+ 
+-    def metrics(self, served: str = "") -> str:
+-        """Prometheus text exposition (counters and gauges, one ``model`` label)."""
++    def metrics(self, served: str = "", app=None) -> str:
++        """Prometheus text exposition (counters, gauges and patches/0660's histograms, one ``model`` label).
++        ``app``: the running app, for the engine's slots, queue and pool ratios (patches/0660)."""
+ 
+         with self.lock:
+             now = self.clock()
+@@ -214,7 +284,9 @@
+             stalled = len(self._stalled(now))
+             fatal = int(self.fatal is not None)
+             uptime = now - self.started
+-        label = '{model="%s"}' % served.replace("\\", "\\\\").replace('"', '\\"')
++            latency, ttft = self.latency.copy(), self.ttft.copy()       # patches/0660
++        ratios, running, waiting = _engine_view(app, inflight)          # patches/0660
++        label = 'model="%s"' % served.replace("\\", "\\\\").replace('"', '\\"')
+         rows = [
+             ("tensorfold_requests_total", "counter", "completions finished (errors included)", c["requests"]),
+             ("tensorfold_request_errors_total", "counter", "completions that raised", c["errors"]),
+@@ -224,20 +296,32 @@
+             ("tensorfold_cached_tokens_total", "counter", "prompt tokens resumed instead of prefilled",
+              c["cached_tokens"]),
+             ("tensorfold_completion_tokens_total", "counter", "generated tokens", c["completion_tokens"]),
++            ("tensorfold_generation_tokens_total", "counter",
++             "generated tokens (upstream v0.6.0's name for completion_tokens_total)", c["completion_tokens"]),
+             ("tensorfold_decode_rounds_total", "counter", "decode rounds (tokens / rounds: draft acceptance)",
+              c["decode_rounds"]),
+             ("tensorfold_decode_seconds_total", "counter", "seconds decoding", c["decode_seconds"]),
+             ("tensorfold_prefill_seconds_total", "counter", "seconds prefilling", c["prefill_seconds"]),
++            ("tensorfold_mtp_drafted_total", "counter", "draft tokens proposed by the drafter", c["drafted"]),
++            ("tensorfold_mtp_accepted_total", "counter", "draft tokens kept (accepted / drafted: drafter health)",
++             c["accepted"]),
+             ("tensorfold_requests_inflight", "gauge", "completions running now", inflight),
++            ("tensorfold_requests_running", "gauge", "slots the batch engine is working on now", running),
++            ("tensorfold_requests_waiting", "gauge", "completions queued for a slot", waiting),
+             ("tensorfold_requests_stalled", "gauge", "running completions past GLM53_TF_STALL_S", stalled),
+             ("tensorfold_engine_fatal", "gauge", "1 once the engine raised (restart both ranks)", fatal),
+             ("tensorfold_uptime_seconds", "gauge", "seconds since the server started", uptime),
+         ]
+-        out = []
++        out: list[str] = []
+         for name, kind, doc, value in rows:
+             value = float(value)
+             shown = str(int(value)) if value.is_integer() else f"{value:.6f}"
+-            out += [f"# HELP {name} {doc}", f"# TYPE {name} {kind}", f"{name}{label} {shown}"]
++            out += [f"# HELP {name} {doc}", f"# TYPE {name} {kind}", f"{name}{{{label}}} {shown}"]
++        _pool_lines(out, ratios)                               # patches/0660
++        _histogram(out, "tensorfold_request_latency_seconds", "Seconds from arrival to the reply's last token.",
++                   latency, label)                             # patches/0660
++        _histogram(out, "tensorfold_time_to_first_token_seconds", "Seconds from arrival to the first generated token.",
++                   ttft, label)                                # patches/0660
+         return "\n".join(out) + "\n"
+ 
+ 
+@@ -245,6 +329,131 @@
+ STATS = {"prefill_s": "prefill_seconds_total", "decode_s": "decode_seconds_total", "cached": "cached_tokens_total",
+          "rounds": "rounds_total", "drafted": "drafted_total", "accepted": "accepted_total"}
+ TOTALS = ("requests_total", "prompt_tokens_total", "completion_tokens_total", *STATS.values())
++
++
++def _num(value: float) -> str:
++    """patches/0660: upstream's number rendering for a ratio (an integer loses the fraction, a float keeps it)."""
++
++    value = float(value)
++    if value == int(value):
++        return str(int(value))
++    return f"{value:.6f}".rstrip("0").rstrip(".")
++
++
++def _edge(value: float) -> str:
++    """patches/0660: a bucket's ``le`` as upstream writes it (``0.01``, ``0.25``, ``1``, ``2.5``)."""
++
++    return f"{value:.4f}".rstrip("0").rstrip(".")
++
++
++def _histogram(out: list[str], name: str, doc: str, hist: Histogram, label: str) -> None:
++    """patches/0660: one histogram family: cumulative buckets, ``_sum`` and ``_count``, the model label kept."""
++
++    out += [f"# HELP {name} {doc}", f"# TYPE {name} histogram"]
++    cumulative = 0
++    for edge, count in zip(BUCKETS, hist.counts):
++        cumulative += count
++        out.append(f'{name}_bucket{{le="{_edge(edge)}",{label}}} {cumulative}')
++    out.append(f'{name}_bucket{{le="+Inf",{label}}} {cumulative + hist.counts[-1]}')
++    out.append(f"{name}_sum{{{label}}} {_num(hist.total)}")
++    out.append(f"{name}_count{{{label}}} {hist.n}")
++
++
++def _pool_lines(out: list[str], ratios: list[tuple[str, float]]) -> None:
++    """patches/0660: ``tensorfold_kv_cache_usage_ratio``, one series per live slot (``pool="0" 0`` when idle)."""
++
++    out += ["# HELP tensorfold_kv_cache_usage_ratio Tokens in a stream cache divided by that stream's context window.",
++            "# TYPE tensorfold_kv_cache_usage_ratio gauge"]
++    out += [f'tensorfold_kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}' for pool, ratio in ratios]
++
++
++def _engine_view(app, inflight: int) -> tuple[list[tuple[str, float]], int, int]:
++    """patches/0660: ``app``'s (pool ratios, running, waiting), read without a lock and only as sizes and positions.
++
++    ``App`` and ``Batcher`` are the engine's; this runs on an HTTP scrape thread, so a shape it does not expect (or
++    an engine that is not a batch engine at all) falls back to the 0150 view: the HTTP requests are running, nothing
++    is waiting, one idle pool. A scrape must not be able to block a round, and it must not be able to fail one."""
++
++    try:
++        return _pools(app), _running(app, inflight), _waiting(app)
++    except Exception:
++        return [("0", 0.0)], inflight, 0
++
++
++def _batch(app):
++    """patches/0660: the app's batch engine, or None when it is not one (or not built yet)."""
++
++    return getattr(getattr(app, "engine", None), "batch", None)
++
++
++def _slots(app) -> list:
++    """patches/0660: the batch engine's ``seqs`` as a list, ``None`` holes kept: an index in it is a slot number."""
++
++    seqs = getattr(_batch(app), "seqs", None)
++    if not seqs:
++        return []
++    return list(seqs)
++
++
++def _running(app, inflight: int) -> int:
++    """patches/0660: slots the engine is working on (upstream's ``requests_running``). The HTTP request count is the
++    fallback for a server that is not a batch engine: 0150 alone could only see those."""
++
++    slots = [s for s in _slots(app) if s is not None]
++    return len(slots) if slots else inflight
++
++
++def _waiting(app) -> int:
++    """patches/0660: jobs the batch engine is holding for a free slot (upstream's ``requests_waiting``)."""
++
++    queue = getattr(_batch(app), "queue", None)
++    return len(queue) if queue is not None else 0
++
++
++def _window(app) -> int:
++    """patches/0660: the engine's context window in tokens (0: not readable)."""
++
++    for owner, name in ((getattr(app, "engine", None), "limit"), (app, "context_window")):
++        value = getattr(owner, name, None) if owner is not None else None
++        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
++            return value
++    return 0
++
++
++def _lengths(app) -> list[int]:
++    """patches/0660: the tokens in each live slot's cache, oldest slot first. The engine's own position when it has
++    one (``Batcher`` keeps every slot's state in ``states[slot].pos``, so ``seqs``' ``None`` holes are not skipped
++    here), else the prompt prefilled plus the tokens emitted."""
++
++    slots = _slots(app)
++    states = getattr(_batch(app), "states", None)
++    out = []
++    for i, slot in enumerate(slots):
++        if slot is None:
++            continue
++        state = states[i] if states is not None and i < len(states) else None
++        pos = getattr(state, "pos", None)
++        if isinstance(pos, int) and not isinstance(pos, bool):
++            out.append(max(0, pos))
++            continue
++        done, emitted = getattr(slot, "done", 0), getattr(slot, "emitted", 0)
++        if isinstance(done, int) and isinstance(emitted, int):
++            out.append(max(0, done + emitted))
++    return out
++
++
++def _pools(app) -> list[tuple[str, float]]:
++    """patches/0660: one ratio per live slot: the tokens in its cache over the engine's context window. An idle
++    server (or one whose engine is not readable) publishes pool 0 at 0, as upstream does, so the series always
++    exists."""
++
++    lengths = _lengths(app)
++    if not lengths:
++        return [("0", 0.0)]
++    limit = _window(app)
++    if limit <= 0:
++        return [(str(i), 0.0) for i in range(len(lengths))]
++    return [(str(i), min(1.0, n / limit)) for i, n in enumerate(lengths)]
+ 
+ 
+ def engine_view(app) -> dict[str, Any]:
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -969,7 +969,7 @@
+             elif self.path.rstrip("/") in ("/health", "/v1/health"):
+                 self._json(*app.health.status(app))         # patches/0150; 0600: upstream's live totals too
+             elif self.path.rstrip("/") == "/metrics":       # patches/0150: Prometheus text
+-                data = app.health.metrics(app.served).encode()
++                data = app.health.metrics(app.served, app).encode()
+                 self.send_response(200)
+                 self.send_header("Content-Type", "text/plain; version=0.0.4")
+                 self.send_header("Content-Length", str(len(data)))
