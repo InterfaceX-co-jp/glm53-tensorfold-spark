@@ -1,0 +1,117 @@
+diff --git a/docs/api.md b/docs/api.md
+index 9ebf3efa..7a0c1f63 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -173,7 +173,10 @@ On a unified-memory GPU (the DGX Spark's GB10), the CUDA server's allocations co
+ charged to a container's memory limit (`docker run --memory`, cgroup `memory.max`): the limit neither caps the
+ model's weights and cache nor keeps them from crowding other work on the machine. The server sizes its window from the
+ host's `MemAvailable` less a reserve (a tenth of RAM, at least 4 GiB); to leave room for other containers, start it
+-with a smaller `--context` or `--parallel`.
++with a smaller `--context` or `--parallel`. `TENSORFOLD_MEMORY_RESERVE_GIB` replaces that reserve (at least 2 GiB)
++when you know the machine's headroom: a larger one leaves more for other work, a smaller one more for KV caches. The
++reserve also carries CUDA context, NCCL and workspace memory the estimate does not count, and exhausting a unified
++GPU's memory can freeze the host, so lower it only with room to spare.
+ 
+ ## Responses
+ 
+diff --git a/src/tensorfold/cuda/capacity.py b/src/tensorfold/cuda/capacity.py
+index 0136925c..2b053480 100644
+--- a/src/tensorfold/cuda/capacity.py
++++ b/src/tensorfold/cuda/capacity.py
+@@ -5,6 +5,7 @@
+ from dataclasses import dataclass
+ import json
+ import math
++import os
+ from pathlib import Path
+ import re
+ import struct
+@@ -154,13 +155,28 @@ def unified(torch) -> bool:
+         return False
+ 
+ 
++def reserve_bytes(total: int, *, host: bool = False) -> int:
++    """What the startup budget leaves free: max(4 GiB, a tenth of ``total``), or TENSORFOLD_MEMORY_RESERVE_GIB (>= 2)."""
++
++    value = os.environ.get("TENSORFOLD_MEMORY_RESERVE_GIB", "").strip()
++    if not value:
++        return max(4 * GIB, total // 10 if host else math.ceil(total / 10))
++    try:
++        gib = float(value)
++    except ValueError:
++        gib = math.nan
++    if not 2 <= gib <= total / GIB:
++        raise ValueError(f"TENSORFOLD_MEMORY_RESERVE_GIB={value}: a number of GiB from 2 to the memory's size")
++    return int(gib * GIB)
++
++
+ def available_bytes(torch) -> int:
+     free, total = map(int, torch.cuda.mem_get_info())
+-    available = max(0, free - max(4 * GIB, math.ceil(total / 10)))
++    available = max(0, free - reserve_bytes(total))
+     memory = _meminfo()
+     if memory is None:
+         return available
+-    host = max(0, memory["MemAvailable"] - max(4 * GIB, memory["MemTotal"] // 10))
++    host = max(0, memory["MemAvailable"] - reserve_bytes(memory["MemTotal"], host=True))
+     # one pool on a unified GPU: reclaimable page cache is available; a discrete GPU is bounded by both
+     return host if unified(torch) else min(available, host)
+ 
+diff --git a/tests/test_memory_reserve.py b/tests/test_memory_reserve.py
+new file mode 100644
+index 00000000..2cbb785f
+--- /dev/null
++++ b/tests/test_memory_reserve.py
+@@ -0,0 +1,52 @@
++"""TENSORFOLD_MEMORY_RESERVE_GIB: what the CUDA startup budget leaves free (default max(4 GiB, a tenth of memory))."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from tensorfold.cuda import capacity
++
++GIB = capacity.GIB
++
++
++def test_default_reserve_is_unchanged(monkeypatch):
++    monkeypatch.delenv("TENSORFOLD_MEMORY_RESERVE_GIB", raising=False)
++    odd = 121 * GIB + 7                                  # the GPU path rounds a tenth up, the host path down
++    assert capacity.reserve_bytes(odd) == -(-odd // 10)
++    assert capacity.reserve_bytes(odd, host=True) == odd // 10
++    assert capacity.reserve_bytes(20 * GIB) == 4 * GIB
++    assert capacity.reserve_bytes(20 * GIB, host=True) == 4 * GIB
++
++
++def test_override(monkeypatch):
++    monkeypatch.setenv("TENSORFOLD_MEMORY_RESERVE_GIB", "6")
++    assert capacity.reserve_bytes(121 * GIB) == 6 * GIB
++    assert capacity.reserve_bytes(121 * GIB, host=True) == 6 * GIB
++    monkeypatch.setenv("TENSORFOLD_MEMORY_RESERVE_GIB", " 2.5 ")
++    assert capacity.reserve_bytes(121 * GIB) == int(2.5 * GIB)
++
++
++@pytest.mark.parametrize("value", ["1", "0", "-3", "200", "nan", "lots"])
++def test_out_of_range_or_not_a_number_refuses(monkeypatch, value):
++    monkeypatch.setenv("TENSORFOLD_MEMORY_RESERVE_GIB", value)
++    with pytest.raises(ValueError, match="TENSORFOLD_MEMORY_RESERVE_GIB"):
++        capacity.reserve_bytes(121 * GIB)
++
++
++def _cuda(free, total):
++    return SimpleNamespace(cuda=SimpleNamespace(mem_get_info=lambda: (free, total)))
++
++
++def test_available_bytes_uses_the_reserve(monkeypatch):
++    meminfo = {"MemTotal": 121 * GIB, "MemAvailable": 110 * GIB}
++    monkeypatch.setattr(capacity, "_meminfo", lambda: meminfo)
++    monkeypatch.setattr(capacity, "unified", lambda torch: True)
++    torch = _cuda(100 * GIB, 121 * GIB)
++    monkeypatch.delenv("TENSORFOLD_MEMORY_RESERVE_GIB", raising=False)
++    assert capacity.available_bytes(torch) == 110 * GIB - 121 * GIB // 10
++    monkeypatch.setenv("TENSORFOLD_MEMORY_RESERVE_GIB", "6")
++    assert capacity.available_bytes(torch) == 104 * GIB
++    monkeypatch.setattr(capacity, "unified", lambda torch: False)      # a discrete GPU: bounded by both
++    assert capacity.available_bytes(torch) == 94 * GIB
++    monkeypatch.setattr(capacity, "_meminfo", lambda: None)
++    assert capacity.available_bytes(torch) == 94 * GIB

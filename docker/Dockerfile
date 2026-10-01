@@ -40,6 +40,7 @@ COPY vendor/TensorFold /src/TensorFold
 COPY patches /src/patches
 # PATCHES: space-separated patch number prefixes to apply (e.g. "0001 0002 0003"); empty = every patch, in order
 ARG PATCHES=""
+# patches/0670 (video input) decodes with PyAV, whose wheels bundle FFmpeg: the runtime base needs no new library.
 RUN cd /src/TensorFold \
  && for p in $(ls /src/patches/*.patch 2>/dev/null | sort); do \
       n=$(basename "$p" | cut -c1-4); \
@@ -47,7 +48,8 @@ RUN cd /src/TensorFold \
       echo "applying $p"; git apply --verbose "$p" || patch -p1 --forward < "$p" || exit 1; done \
  && pip install --no-deps /src/TensorFold \
  && pip install "huggingface-hub>=0.24" "tokenizers>=0.20" "safetensors>=0.4" "jinja2>=3.1" \
- && python -c "import tensorfold, torch, triton; print('tensorfold', tensorfold.__file__, 'torch', torch.__version__, 'triton', triton.__version__)"
+ && pip install "av>=14" \
+ && python -c "import tensorfold, torch, triton, av; print('tensorfold', tensorfold.__file__, 'torch', torch.__version__, 'triton', triton.__version__, 'av', av.__version__)"
 
 COPY docker/entrypoint.sh /usr/local/bin/glm53-tf-entrypoint
 ENTRYPOINT ["/usr/local/bin/glm53-tf-entrypoint"]

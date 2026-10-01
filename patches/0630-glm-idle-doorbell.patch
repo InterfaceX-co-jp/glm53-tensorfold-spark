@@ -1,0 +1,60 @@
+--- c/src/tensorfold/families/glm5_next/cuda/engine.py
++++ i/src/tensorfold/families/glm5_next/cuda/engine.py
+@@ -877,6 +877,41 @@
+         self.comm.all_gather(mine, got)
+         return [got[:len(values)].tolist(), got[len(values):].tolist()]
+ 
++    # -- the idle doorbell (upstream TensorFold #132) ---------------------------------------------------------------
++    # Between requests rank 1 used to wait inside the next header's all-gather: an NCCL kernel spinning on its GPU
++    # and a host thread spinning in the copy that waits for it, for as long as the server stayed idle, so an idle
++    # pair held a GPU and a core. Rank 0 now sets a key in the rendezvous TCP store (``comm.store``) before each
++    # request's header travels, and rank 1 blocks on that socket first: an idle rank 1 holds neither. The rings are
++    # numbered in order, so one that arrives while rank 1 is still serving the previous request is not lost.
++    # A communicator without a store (patches/0230's RoCE path, or a test fake) skips the doorbell and both ranks
++    # wait in the all-gather exactly as before.
++
++    def _store(self):
++        return getattr(self.comm, "store", None)
++
++    def _ring(self) -> None:
++        store = self._store()
++        if store is not None:
++            self._bell = getattr(self, "_bell", 0) + 1
++            store.set(f"tf_glm_request_{self._bell}", b"1")
++
++    def _await_bell(self) -> None:
++        store = self._store()
++        if store is None:
++            return
++        from datetime import timedelta
++
++        key = f"tf_glm_request_{getattr(self, '_bell', 0) + 1}"
++        while True:
++            try:
++                store.wait([key], timedelta(hours=1))
++                break
++            except Exception as e:      # an idle hour: wait again (a lost rank 0 is a connection error instead)
++                if "timeout" not in str(e).lower():
++                    raise
++        store.delete_key(key)
++        self._bell = getattr(self, "_bell", 0) + 1
++
+     def _share(self, values: list[int] | None) -> list[int]:
+         """Rank 0's int list on every rank (a length, then the values, through the all-gather)."""
+ 
+@@ -1199,6 +1234,7 @@
+                   *knobs_mod.encode(values)] + code          # patches/0090: the knobs rank 1 applies
+         if gram is not None:                # patches/0610: the grammar in front (rank 1 compiles the same)
+             header = grammar_mod.pack(gram) + header
++        self._ring()                        # wakes rank 1, which idles on the store, not in the all-gather
+         self._share(header)
+         self._share(list(prompt))
+         from . import vision as vision_mod
+@@ -1256,6 +1292,7 @@
+ 
+         cpupin.serving()                    # patches/0370 (GLM53_TF_CPU_PIN)
+         while True:
++            self._await_bell()              # rank 1 waits here for rank 0's request, not inside the all-gather
+             cpupin.tick()
+             header = self._share(None)
+             gram = None
