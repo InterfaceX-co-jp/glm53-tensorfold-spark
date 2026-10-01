@@ -1,0 +1,225 @@
+--- c/src/tensorfold/engine/tool_draft.py
++++ i/src/tensorfold/engine/tool_draft.py
+@@ -28,7 +28,11 @@
+ from typing import Any, Sequence
+ 
+ _OPEN = "<tool_call>"
++# patches/0650: GLM's other call body, ``<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...``
++# (the checkpoint's own chat template writes it). The tags a style-B call can begin with.
++_GLM_TAGS = ("<function=", "<arg_key>", "</tool_call>")
+ _END = "\x00end"  # placeholder: after a closed call the draft is the end-of-turn token
++_ARG_VALUE_END = "</arg_value>"   # patches/0650
+ _SINGLE_LINE = re.compile(r"path|file|dir|name|pattern|glob|url|query|id|mode|lang|cwd|limit|offset",
+                           re.IGNORECASE)
+ 
+@@ -280,7 +284,12 @@
+ 
+     _TAIL = "</parameter>"
+ 
+-    def __init__(self, tools: Sequence[dict[str, Any]] | None) -> None:
++    def __init__(self, tools: Sequence[dict[str, Any]] | None, *, types_of=None, typed=None) -> None:
++        """``types_of(name, key)``: the JSON types the tool's schema allows for a parameter, or None when it
++        types none; ``typed(name, key, raw)``: the value the end-of-reply parser would build. patches/0650:
++        both are only needed for GLM's ``<arg_key>`` body, where a value's type decides whether it can
++        stream as text or must be buffered to its closing tag and emitted as typed JSON."""
++
+         self.known = {name.lower(): name for name in tool_schema(tools)}
+         self.pos = 0
+         self.state = "outside"
+@@ -289,6 +298,11 @@
+         self.lead = False       # the framing newline after <parameter=NAME> has not arrived yet
+         self.held = ""
+         self.streamed = False
++        self.types_of = types_of
++        self.typed = typed
++        self.name = None        # style B: the resolved tool name the arguments belong to
++        self.key = None
++        self.buf = ""
+ 
+     def _args(self, fragment: str) -> dict[str, Any]:
+         return {"tool_calls": [{"index": self.index, "function": {"arguments": fragment}}]}
+@@ -313,22 +327,49 @@
+                 self.state = "call"
+             elif self.state == "call":
+                 m = re.match(r"\s*<function=([^>\n]+)>\n?", rest)
+-                if m is None:
+-                    if len(rest) > 256 or (rest.strip() and not rest.strip().startswith("<")):
+-                        self.state = "abort"  # not a call we can follow: the end parser decides
++                if m is not None:
++                    name = self.known.get(m.group(1).strip().lower())
++                    if name is None:
++                        self.state = "abort"
++                        break
++                    self.index += 1
++                    self.streamed = True
++                    out.append({"tool_calls": [{"index": self.index, "id": f"call_{uuid.uuid4().hex[:24]}",
++                                                "type": "function",
++                                                "function": {"name": name, "arguments": ""}}]})
++                    self.args_open = False
++                    self.pos += m.end()
++                    self.state = "function"
++                    continue
++                # patches/0650: GLM's other body -- <tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...
++                # The name runs to the first "<", which must begin <arg_key> (arguments) or </tool_call> (none).
++                lt = rest.find("<")
++                if lt < 0:
++                    if len(rest) > 256:
++                        self.state = "abort"
++                    break
++                tail = rest[lt:]
++                if tail.startswith("<function=") or any(t.startswith(tail) and len(tail) < len(t)
++                                                       for t in _GLM_TAGS):
++                    if len(rest) > 256:
++                        self.state = "abort"
++                    break                    # still arriving (or style A's tag, which then handles it)
++                if not (tail.startswith("<arg_key>") or tail.startswith("</tool_call>")):
++                    self.state = "abort"     # not a call we can follow: the end parser decides
+                     break
+-                name = self.known.get(m.group(1).strip().lower())
++                name = self.known.get(rest[:lt].strip().lower())
+                 if name is None:
+                     self.state = "abort"
+                     break
+                 self.index += 1
+                 self.streamed = True
++                self.name = name
+                 out.append({"tool_calls": [{"index": self.index, "id": f"call_{uuid.uuid4().hex[:24]}",
+                                             "type": "function",
+                                             "function": {"name": name, "arguments": ""}}]})
+                 self.args_open = False
+-                self.pos += m.end()
+-                self.state = "function"
++                self.pos += lt
++                self.state = "glm_args"
+             elif self.state == "function":
+                 m = re.match(r"\s*<parameter=([^>\n]+)>\n?", rest)
+                 if m is not None:
+@@ -368,6 +409,53 @@
+                 out.append(self._args('"'))
+                 self.pos += len(self._TAIL)
+                 self.state = "function"
++            elif self.state == "glm_args":
++                # patches/0650: expect <arg_key>KEY</arg_key><arg_value> or the end of the call.
++                m = re.match(r"\s*<arg_key>(.*?)</arg_key>\s*<arg_value>", rest, re.DOTALL)
++                if m is not None:
++                    self.key = m.group(1).strip()
++                    self.buf = ""
++                    self.text_value = self._is_text(self.key)
++                    out.append(self._args(("," if self.args_open else "{") + self._esc_key(self.key)
++                                          + (':"' if self.text_value else ":")))
++                    self.args_open = True
++                    self.pos += m.end()
++                    self.state = "glm_value"
++                    continue
++                m = re.match(r"\s*</tool_call>", rest)
++                if m is not None:
++                    out.append(self._args("}" if self.args_open else "{}"))
++                    self.pos += m.end()
++                    self.state = "outside"
++                    continue
++                if any(t.startswith(rest) for t in ("<arg_key>", "</tool_call>")) or len(rest) < 64:
++                    break                    # still arriving
++                self.state = "abort"
++                break
++            elif self.state == "glm_value":
++                # patches/0650: a string-typed value is the text as written, so it streams; any other value
++                # is buffered and emitted as the typed JSON the end-of-reply parser would build.
++                end = rest.find(_ARG_VALUE_END)
++                if self.text_value:
++                    keep = rest if end < 0 else rest[:end]
++                    if end < 0:
++                        keep = keep[: max(0, len(keep) - (len(_ARG_VALUE_END) - 1))]     # may begin the tag
++                    if keep:
++                        out.append(self._args(self._esc(keep)))
++                        self.pos += len(keep)
++                    if end < 0:
++                        break
++                    out.append(self._args('"'))
++                    self.pos += len(_ARG_VALUE_END)
++                    self.state = "glm_args"
++                    continue
++                if end < 0:
++                    self.buf = rest          # not consumed: self.pos stays, so it grows each round
++                    break
++                raw = rest[:end]
++                out.append(self._args(self._typed_json(raw)))
++                self.pos += end + len(_ARG_VALUE_END)
++                self.state = "glm_args"
+             elif self.state == "closing":
+                 m = re.match(r"\s*</tool_call>", rest)
+                 if m is None:
+@@ -381,5 +469,21 @@
+ 
+         return json.dumps(key, ensure_ascii=False)
+ 
++    def _is_text(self, key: str) -> bool:
++        """patches/0650: True when the tool's schema types this parameter as a string (or allows one), so the
++        ``<arg_value>`` text is the value as written and can stream. An untyped schema buffers instead."""
++
++        types = self.types_of(self.name, key) if self.types_of is not None else None
++        return bool(types) and "string" in types
++
++    def _typed_json(self, raw: str) -> str:
++        """patches/0650: the buffered ``<arg_value>`` as the JSON the end-of-reply parser would build
++        (``parse_tool_calls`` dumps with ``separators=(",", ":")``, so this must too)."""
++
++        import json
++
++        value = self.typed(self.name, self.key, raw) if self.typed is not None else raw
++        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
++
+ 
+ __all__ = ["ToolCallProposer", "ToolCallStreamer", "tool_schema"]
+--- c/src/tensorfold/cuda/server.py
++++ i/src/tensorfold/cuda/server.py
+@@ -358,6 +358,39 @@
+     return raw
+ 
+ 
++def _param_prop(tools: list[dict[str, Any]], name: str | None, key: str) -> Any:
++    """patches/0650: the schema property of ``key`` in tool ``name``, as ``_glm_call`` looks it up."""
++
++    for t in tools or []:
++        if _tool_name(t).lower() == str(name or "").lower():
++            fn = t.get("function") if isinstance(t.get("function"), dict) else t
++            return ((fn.get("parameters") or {}).get("properties") or {}).get(key) if isinstance(fn, dict) else None
++    return None
++
++
++def _param_types(tools: list[dict[str, Any]], name: str | None, key: str) -> Any:
++    """patches/0650: the JSON types the parameter allows, or None when it types none."""
++
++    return schema_types(_param_prop(tools, name, key))
++
++
++def _param_value(tools: list[dict[str, Any]], name: str | None, key: str, raw: str) -> Any:
++    """patches/0650: the value ``_glm_call`` builds for this parameter -- the same rule, so the streamed
++    deltas concatenate to the end-of-reply parser's JSON."""
++
++    by_schema = "args" in tool_fixes()                      # patches/0620
++    prop = _param_prop(tools, name, key)
++    if by_schema:
++        return typed_value(raw, prop)
++    kind = prop.get("type") if isinstance(prop, dict) else None
++    if kind == "string":
++        return raw
++    try:
++        return json.loads(raw)
++    except (json.JSONDecodeError, ValueError):
++        return _closed_value(raw, kind)
++
++
+ def parse_tool_calls(text: str, tools: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]] | None]:
+     """Qwen ``<tool_call><function=name><parameter=k>v</parameter></function></tool_call>``, GLM
+     ``<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>``, or JSON bodies."""
+@@ -766,7 +799,9 @@
+         # them, so a long call (a whole file) does not leave the stream silent until the reply ends. ``stream_raw``
+         # holds the reply with the call markup still in it -- what ``visible`` has before ``hide_tool_calls``
+         # strips it -- and the streamer is fed that after every round.
+-        calls_stream = ToolCallStreamer(tools) if tools else None
++        calls_stream = ToolCallStreamer(tools,
++                                        types_of=lambda n, k: _param_types(tools, n, k),
++                                        typed=lambda n, k, raw: _param_value(tools, n, k, raw)) if tools else None
+         stream_raw = [""]
+ 
+         def visible(finished: bool, raw: str | None = None) -> tuple[str, str]:
